@@ -143,32 +143,8 @@ def vision_classify(image_path, source_name):
          
     b64 = base64.b64encode(small).decode('utf-8')
 
-    prompt_instruction = (
-        "You are an image classifier for an AI image dataset.\n\n"
-        "Respond ONLY with valid JSON, no markdown:\n"
-        "{\n"
-        '  "photorealistic_style": true/false,\n'
-        '  "has_ai_flaws": true/false,\n'
-        '  "woman_present": true/false,\n'
-        '  "nsfw": true/false,\n'
-        '  "quality_score": 1-10,\n'
-        '  "category": "InstagramInfluencer|NSFW|Professional|Amateur|Unknown|DISCARD",\n'
-        '  "reason": "One sentence."\n'
-        "}\n\n"
-        "RULES:\n"
-        "- photorealistic_style: TRUE if photorealistic/hyperrealistic. FALSE if anime/cartoon/painting/3D.\n"
-        "- has_ai_flaws: TRUE only if SEVERE obvious AI artifacts (melted faces, extra fingers).\n"
-        "- woman_present: TRUE if human female is primary subject.\n"
-        "- nsfw: TRUE if explicit nudity or sexual content.\n"
-        "- quality_score: 1-10 overall quality.\n\n"
-        "CATEGORY RULES:\n"
-        "- DISCARD: Not photorealistic OR no woman OR severe AI flaws (score <= 3).\n"
-        "- NSFW: Photorealistic woman, explicit content.\n"
-        "- InstagramInfluencer: Photorealistic woman, social media style. No nudity.\n"
-        "- Professional: Photorealistic woman, studio/editorial. No nudity.\n"
-        "- Amateur: Photorealistic woman, casual/selfie style.\n"
-        "- Unknown: Photorealistic woman, doesn't fit above."
-    )
+    from vision_prompt import build_classification_prompt, apply_scores
+    prompt_instruction = build_classification_prompt()
 
     try:
         response = client.chat.completions.create(
@@ -193,20 +169,7 @@ def vision_classify(image_path, source_name):
         )
 
         raw = response.choices[0].message.content
-        result = json.loads(raw)
-        
-        photorealistic = result.get("photorealistic_style", False)
-        woman = result.get("woman_present", False)
-        nsfw = result.get("nsfw", False)
-        qual = result.get("quality_score", 0)
-
-        if not photorealistic or not woman:
-            result["category"] = "DISCARD"
-        elif qual <= 3:
-            result["category"] = "DISCARD"
-        elif nsfw:
-            result["category"] = "NSFW"
-
+        result = apply_scores(json.loads(raw))
         final_category = result.get("category", "Unknown")
         
         # Save to sorted folder with source-based subfolder

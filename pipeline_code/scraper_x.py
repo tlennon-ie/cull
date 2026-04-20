@@ -73,21 +73,28 @@ def build_searches(topic: str) -> list:
 SEARCHES = build_searches(TOPIC)
 
 
-# ── Specific accounts to scrape ─────────────────────────────────────────────
-ACCOUNTS = [
-    "AFantagirl85190",
-    "PrometheanAIX",
-    "brindleyai",
-    "KeorUnreal",
-    "EXM7777",
-    "daaaaanc",
-    "Artist04048661",
-    "rowundd",
-    "NameIsSudee",
-    "underwoodxie96",
-    "johnnprofits",
-    "aimodelabuser",
+# ── Accounts to scrape (admin-configurable) ─────────────────────────────────
+# Read from X_ACCOUNTS env var (comma-separated). Empty string = search-only
+# mode (no per-account scraping). Admins edit from the dashboard Settings tab.
+_DEFAULT_ACCOUNTS: list[str] = [
+    "AFantagirl85190", "PrometheanAIX", "brindleyai", "KeorUnreal",
+    "EXM7777", "daaaaanc", "Artist04048661", "rowundd",
+    "NameIsSudee", "underwoodxie96", "johnnprofits", "aimodelabuser",
 ]
+
+
+def _load_accounts() -> list[str]:
+    raw = os.environ.get("X_ACCOUNTS")
+    if raw is None:
+        return list(_DEFAULT_ACCOUNTS)
+    return [a.strip().lstrip("@") for a in raw.split(",") if a.strip()]
+
+
+ACCOUNTS: list[str] = _load_accounts()
+if ACCOUNTS:
+    print(f"[scraper_x] Targeting {len(ACCOUNTS)} accounts + search results", flush=True)
+else:
+    print("[scraper_x] X_ACCOUNTS empty - search results only, no per-account scraping", flush=True)
 
 SCROLL_ROUNDS = 6
 SCROLL_PAUSE  = 2.0

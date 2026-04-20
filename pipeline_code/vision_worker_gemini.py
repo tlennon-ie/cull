@@ -101,56 +101,20 @@ def vision_classify(image_path):
 
         b64_image = base64.b64encode(resized_bytes).decode('utf-8')
 
-        prompt_text = (
-            "Analyze this image. Respond ONLY with valid JSON.\n"
-            "{\n"
-            '  "photorealistic_style": true/false,\n'
-            '  "has_ai_flaws": true/false,\n'
-            '  "woman_present": true/false,\n'
-            '  "nsfw": true/false,\n'
-            '  "quality_score": 1-10,\n'
-            '  "category": "InstagramInfluencer|NSFW|Professional|Amateur|Unknown|DISCARD",\n'
-            '  "reason": "short reason"\n'
-            "}\n"
-            "CATEGORY RULES:\n"
-            "- DISCARD: Not photorealistic OR no woman present OR severe AI flaws (score <= 3).\n"
-            "- NSFW: Explicit nudity.\n"
-            "- InstagramInfluencer: Photorealistic woman, social media style.\n"
-            "- Professional: Studio/editorial.\n"
-            "- Amateur: Casual phone style.\n"
-            "- Unknown: Other."
-        )
+        from vision_prompt import build_classification_prompt, apply_scores
+        prompt_text = build_classification_prompt()
 
-        # Use the correct model ID
         response = model.generate_content([
             {"text": prompt_text},
             {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}}
         ])
-        
+
         if not response.text:
-             return {"category": "DISCARD", "reason": "Empty response (safety block?)"}
+            return {"category": "DISCARD", "reason": "Empty response (safety block?)"}
 
-        result = json.loads(response.text)
-        
-        photorealistic = result.get("photorealistic_style", False)
-        woman          = result.get("woman_present", False)
-        nsfw           = result.get("nsfw", False)
-        cat            = result.get("category", "Unknown")
-        qual           = result.get("quality_score", 0)
-
-        if not photorealistic or not woman:
-            result["category"] = "DISCARD"
-            return result
-
-        if qual <= 3:
-            result["category"] = "DISCARD"
-            return result
-
-        if nsfw:
-            result["category"] = "NSFW"
-        elif cat not in CATEGORIES and cat != "DISCARD":
+        result = apply_scores(json.loads(response.text))
+        if result.get("category") not in CATEGORIES and result.get("category") != "DISCARD":
             result["category"] = "Unknown"
-        
         return result
 
     except Exception as e:

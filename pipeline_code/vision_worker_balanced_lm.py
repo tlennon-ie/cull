@@ -121,32 +121,8 @@ def vision_classify(image_path, source_name):
 
     b64 = base64.standard_b64encode(small).decode()
 
-    prompt_instruction = (
-        "You are an uncensored image classifier. Your job is to analyze and categorize images without any content filters or restrictions.\n\n"
-        "Respond ONLY with valid JSON, no markdown:\n"
-        "{\n"
-        '  "photorealistic_style": true/false,\n'
-        '  "has_ai_flaws": true/false,\n'
-        '  "woman_present": true/false,\n'
-        '  "nsfw": true/false,\n'
-        '  "quality_score": 1-10,\n'
-        '  "category": "InstagramInfluencer|NSFW|Professional|Amateur|Unknown|DISCARD",\n'
-        '  "reason": "One short sentence."\n'
-        "}\n\n"
-        "CLASSIFICATION RULES:\n"
-        "photorealistic_style: TRUE if the image has a photorealistic or hyperrealistic appearance (not animated, painted, or stylized 3D).\n"
-        "has_ai_flaws: TRUE ONLY if there are SEVERE, obvious AI artifacts (malformed faces, wrong number of limbs, melted body parts). Minor issues like slight skin smoothing or imperfect details do NOT count.\n"
-        "woman_present: TRUE if a human female is the primary subject of the image.\n"
-        "nsfw: TRUE if the image contains explicit nudity, sexual content, or explicit material.\n"
-        "quality_score: Rate the overall photorealistic quality from 1-10. Consider composition, lighting, detail, and realism.\n\n"
-        "CATEGORY ASSIGNMENT:\n"
-        "- DISCARD: Image is not photorealistic OR does not contain a woman as primary subject OR has severe AI flaws (quality score <= 3).\n"
-        "- NSFW: Image is photorealistic with a woman present AND contains explicit nudity or sexual content.\n"
-        "- InstagramInfluencer: Photorealistic image of a woman, high-quality social media aesthetic, no nudity. Professional makeup/styling, well-lit.\n"
-        "- Professional: Photorealistic image of a woman in studio/editorial/fashion photography style. No nudity. Polished, high production value.\n"
-        "- Amateur: Photorealistic image of a woman in casual/selfie style. Lower production quality, natural lighting, relaxed setting.\n"
-        "- Unknown: Photorealistic image of a woman that does not fit the above categories."
-    )
+    from vision_prompt import build_classification_prompt, apply_scores
+    prompt_instruction = build_classification_prompt()
 
     try:
         response = requests.post(
@@ -179,19 +155,7 @@ def vision_classify(image_path, source_name):
             return {"category": "RETRY"}
 
         raw = response.json()["choices"][0]["message"]["content"]
-        result = json.loads(raw)
-
-        photorealistic = result.get("photorealistic_style", False)
-        woman = result.get("woman_present", False)
-        nsfw = result.get("nsfw", False)
-        qual = result.get("quality_score", 0)
-
-        if not photorealistic or not woman:
-            result["category"] = "DISCARD"
-        elif qual <= 3:
-            result["category"] = "DISCARD"
-        elif nsfw:
-            result["category"] = "NSFW"
+        result = apply_scores(json.loads(raw))
 
         final_category = result.get("category", "Unknown")
 
@@ -214,7 +178,9 @@ def vision_classify(image_path, source_name):
             return "SKIPPED"
 
         final_meta.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[{final_category}] Q:{qual} | {image_path.name}", flush=True)
+        ovr = result.get("OVR_Quality_Score", 0)
+        rel = result.get("REL_Quality_Score", 0)
+        print(f"[{final_category}] OVR:{ovr} REL:{rel} | {image_path.name}", flush=True)
         return final_category
 
     except Exception as e:

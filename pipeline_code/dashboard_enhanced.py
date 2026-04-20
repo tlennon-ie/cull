@@ -323,11 +323,21 @@ def api_pipeline_stop():
 
 ALLOWED_VISION_WORKERS = [
     "balanced-groq",
-    "balanced-lm",
+    "balanced-lm",            # targets LMSTUDIO_PRIMARY_*
+    "balanced-lm-secondary",  # same worker script, forced to LMSTUDIO_SECONDARY_* via env override
     "lm-autodetect",
     "gemini",
     "groq",
 ]
+
+_VISION_WORKER_DESCRIPTIONS = {
+    "balanced-groq":          "Groq cloud, llama-4-scout - fast",
+    "balanced-lm":            "LMStudio PRIMARY endpoint",
+    "balanced-lm-secondary":  "LMStudio SECONDARY endpoint (runs in parallel)",
+    "lm-autodetect":          "LMStudio, auto-picks vision-capable model",
+    "gemini":                 "Gemini 2.5 Flash (cloud)",
+    "groq":                   "Legacy single-threaded Groq",
+}
 
 
 def _active_vision_workers() -> list[str]:
@@ -372,6 +382,11 @@ SETTINGS_KEYS: list[str] = [
     "TOPIC_GENERATION_HINTS",
     "REDDIT_SUBREDDITS",
     "MIN_PROMPT_LENGTH",
+    "X_ACCOUNTS",
+    "VISION_OVR_MIN_SCORE",
+    "VISION_REL_MIN_SCORE",
+    "VISION_SCORE_NOTES",
+    "PIPELINE_RECONCILE_SECONDS",
     "PIPELINE_BASE_DIR",
     "PIPELINE_QUEUE",
     "PIPELINE_SORTED",
@@ -415,6 +430,24 @@ def api_settings_post():
                 value = str(parsed)
             except ValueError:
                 errors[key] = "must be a non-negative integer"
+                continue
+        if key in {"VISION_OVR_MIN_SCORE", "VISION_REL_MIN_SCORE"} and value:
+            try:
+                parsed = int(value)
+                if parsed < 0 or parsed > 100:
+                    raise ValueError
+                value = str(parsed)
+            except ValueError:
+                errors[key] = "must be an integer 0-100"
+                continue
+        if key == "PIPELINE_RECONCILE_SECONDS" and value:
+            try:
+                parsed = int(value)
+                if parsed < 1 or parsed > 3600:
+                    raise ValueError
+                value = str(parsed)
+            except ValueError:
+                errors[key] = "must be an integer 1-3600"
                 continue
         if key in PATH_KEYS and value:
             try:
@@ -1053,6 +1086,45 @@ HTML_TEMPLATE = r"""<!doctype html>
             <input x-model="settings.MIN_PROMPT_LENGTH" type="number" min="0"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
+            <input x-model="settings.X_ACCOUNTS" placeholder="account1,account2,account3"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Vision quality scoring</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          Every classification now emits two 0-100 scores. <code>OVR_Quality_Score</code> judges absolute
+          craft (composition, lighting, colour, emotion, …). <code>REL_Quality_Score</code> judges how
+          closely the image matches the configured topic at its platonic best. Reserve 90+ for the rarest
+          images. Either threshold forces a DISCARD when not met; set 0 to disable.
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
+            <input x-model="settings.VISION_OVR_MIN_SCORE" type="number" min="0" max="100"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
+            <input x-model="settings.VISION_REL_MIN_SCORE" type="number" min="0" max="100"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Scoring notes (appended to rubric - nudge the model toward your taste)</span>
+            <textarea x-model="settings.VISION_SCORE_NOTES" rows="3"
+                      placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Supervisor reconcile interval (seconds)</span>
+            <input x-model="settings.PIPELINE_RECONCILE_SECONDS" type="number" min="1" max="3600"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+            <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
+          </label>
         </div>
       </div>
 
@@ -1188,17 +1260,18 @@ function dashboard() {
       {id:'errors',   label:'Errors'},
       {id:'settings', label:'Settings'},
     ],
-    providers: ['balanced-groq','balanced-lm','lm-autodetect','groq','gemini'],
+    providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect','groq','gemini'],
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '',
     workerDescriptions: {
-      'balanced-groq':  'Groq cloud, llama-4-scout - fast, handles NSFW',
-      'balanced-lm':    'LMStudio with explicit primary model',
-      'lm-autodetect':  'LMStudio, auto-picks the loaded vision model (VL)',
-      'gemini':         'Google Gemini 2.5 Flash - paid cloud',
-      'groq':           'Legacy single-threaded Groq worker',
+      'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
+      'balanced-lm':            'LMStudio PRIMARY endpoint',
+      'balanced-lm-secondary':  'LMStudio SECONDARY endpoint (parallel with -primary)',
+      'lm-autodetect':          'LMStudio, auto-picks the loaded vision model (VL)',
+      'gemini':                 'Google Gemini 2.5 Flash - paid cloud',
+      'groq':                   'Legacy single-threaded Groq worker',
     },
     queueFiles: [], history: [], activity: [], promptCache: {},
     lastRefresh: '...',
