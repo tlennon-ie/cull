@@ -176,6 +176,18 @@ class Supervisor:
         self._active: dict[str, subprocess.Popen] = {}  # label -> proc
         self._desired_snapshot: dict[str, AgentSpec] = {}
         self._stop = threading.Event()
+        # mtime of the .env file the last time we spawned / restarted. When the
+        # dashboard writes new values the mtime changes, which we detect here
+        # and use to trigger a soft restart so every child picks up fresh env.
+        self._env_mtime: float = self._current_env_mtime()
+        self._queue_dir: Path | None = None  # set by run_topic before start()
+
+    @staticmethod
+    def _current_env_mtime() -> float:
+        try:
+            return ENV_PATH.stat().st_mtime
+        except OSError:
+            return 0.0
 
     def _spawn(self, spec: AgentSpec) -> None:
         script_path = PIPELINE_CODE_DIR / spec.script
@@ -216,12 +228,50 @@ class Supervisor:
             except Exception:
                 pass
 
+    def _sweep_stale_processing(self) -> None:
+        """Revert `.processing` files back to their original name before respawning.
+
+        Vision workers rename an image to `<stem>.processing` while classifying.
+        If we terminate mid-flight, the rename is orphaned and the image never
+        gets reprocessed. After a restart we put them back so they re-enter the
+        queue on the next poll.
+        """
+        if self._queue_dir is None or not self._queue_dir.exists():
+            return
+        reverted = 0
+        for proc_file in self._queue_dir.glob("**/*.processing"):
+            try:
+                original = proc_file.with_suffix("")
+                if not original.exists():
+                    proc_file.rename(original)
+                    reverted += 1
+            except OSError:
+                pass
+        if reverted:
+            print(f"  [env-reload] restored {reverted} in-flight image(s) to the queue", flush=True)
+
     def reconcile(self) -> None:
         _reload_env()
+        env_changed = False
+        current_mtime = self._current_env_mtime()
+        if current_mtime and current_mtime != self._env_mtime:
+            env_changed = True
+            print("  [env-reload] .env changed - restarting all child processes so new settings take effect", flush=True)
+            self._env_mtime = current_mtime
+
         desired = compute_desired_agents(self.topic)
         self._desired_snapshot = desired
 
         with self._lock:
+            if env_changed:
+                # Hard reset: refresh base_env, kill everything, sweep stale state.
+                # The normal reconcile loop below will respawn desired agents with
+                # the new env on the same tick.
+                self.base_env = {**self.base_env, **os.environ}
+                for label in list(self._active.keys()):
+                    self._terminate(label)
+                self._sweep_stale_processing()
+
             # Stop anything that isn't desired or has exited.
             for label in list(self._active.keys()):
                 proc = self._active[label]
@@ -293,6 +343,7 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
         os.environ["PIPELINE_VISION_WORKERS"] = vision_worker
 
     supervisor = Supervisor(topic=topic, base_env=base_env, log_file=log_file)
+    supervisor._queue_dir = queue_dir  # so stale .processing cleanup knows where to look
 
     def _handle_sigint(_sig, _frame):
         supervisor.shutdown()

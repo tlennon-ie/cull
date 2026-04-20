@@ -28,19 +28,28 @@ SEEN_FILE = BASE_DIR / f"seen_civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}_
 
 SEARCH_URL = f"https://search-new.{CIVITAI_DOMAIN}/multi-search?x-meilisearch-client=Meilisearch%20instant-meilisearch%20(v0.13.5)"
 CDN_BASE   = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA")
-TOKEN      = os.getenv("CIVITAI_API_KEY", "")
+
+# Civitai.red runs on a separate auth backend, so the admin can supply a dedicated
+# key via CIVITAI_API_RED_KEY. Fall back to the .com key if only one is set.
+if CIVITAI_DOMAIN == "civitai.red":
+    TOKEN = os.getenv("CIVITAI_API_RED_KEY", "").strip() or os.getenv("CIVITAI_API_KEY", "").strip()
+else:
+    TOKEN = os.getenv("CIVITAI_API_KEY", "").strip()
 
 if not TOKEN:
-    raise ValueError("❌ CIVITAI_API_KEY not found in .env file")
+    raise ValueError(
+        f"No API key available for Civitai domain '{CIVITAI_DOMAIN}'. "
+        f"Set CIVITAI_API_KEY (and optionally CIVITAI_API_RED_KEY) in .env."
+    )
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "*/*"
+    "Accept": "*/*",
 }
 
-print(f"[Civitai Scraper] Using domain: {CIVITAI_DOMAIN} | Search: {SEARCH_URL[:80]}...")
+print(f"[Civitai Scraper] Domain: {CIVITAI_DOMAIN} | Key: ...{TOKEN[-4:]} | Search: {SEARCH_URL[:80]}...", flush=True)
 
 # Supported Base Models (from user list)
 BASE_MODELS = [
