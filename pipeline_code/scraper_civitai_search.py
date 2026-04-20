@@ -26,7 +26,14 @@ if CIVITAI_DOMAIN not in {"civitai.com", "civitai.red"}:
 SOURCE_KEY = "civitai_red" if CIVITAI_DOMAIN == "civitai.red" else "civitai"
 SEEN_FILE = BASE_DIR / f"seen_civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}_{SLUG}.json"
 
-SEARCH_URL = f"https://search-new.{CIVITAI_DOMAIN}/multi-search?x-meilisearch-client=Meilisearch%20instant-meilisearch%20(v0.13.5)"
+# civitai.red is a UI rebrand - there is no dedicated `search-new.civitai.red`
+# Meilisearch host. Both domains share civitai.com's search backend. Admins can
+# still override via CIVITAI_SEARCH_URL if they have a custom mirror.
+_SEARCH_HOST = os.environ.get("CIVITAI_SEARCH_HOST", "search-new.civitai.com").strip()
+SEARCH_URL = os.environ.get(
+    "CIVITAI_SEARCH_URL",
+    f"https://{_SEARCH_HOST}/multi-search?x-meilisearch-client=Meilisearch%20instant-meilisearch%20(v0.13.5)",
+)
 CDN_BASE   = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA")
 
 # Civitai.red runs on a separate auth backend, so the admin can supply a dedicated
@@ -49,7 +56,11 @@ HEADERS = {
     "Accept": "*/*",
 }
 
-print(f"[Civitai Scraper] Domain: {CIVITAI_DOMAIN} | Key: ...{TOKEN[-4:]} | Search: {SEARCH_URL[:80]}...", flush=True)
+print(
+    f"[Civitai Scraper] Domain={CIVITAI_DOMAIN} | Key=...{TOKEN[-4:]} | "
+    f"Search host={_SEARCH_HOST} | URL={SEARCH_URL[:90]}...",
+    flush=True,
+)
 
 # Supported Base Models (from user list)
 BASE_MODELS = [

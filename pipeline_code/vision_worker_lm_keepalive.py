@@ -175,7 +175,11 @@ def vision_classify(image_path, source_name):
         )
 
         if response.status_code != 200:
-            print(f"  [LMS Error {response.status_code}]", flush=True)
+            print(
+                f"  [LMS Error {response.status_code}] model={LMS_MODEL} url={LMS_URL} "
+                f"body={response.text[:600].replace(chr(10), ' ')}",
+                flush=True,
+            )
             processing_path.rename(image_path)
             return {"category": "RETRY"}
 

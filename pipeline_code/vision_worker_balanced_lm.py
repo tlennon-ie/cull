@@ -150,7 +150,11 @@ def vision_classify(image_path, source_name):
         )
 
         if response.status_code != 200:
-            print(f"  [LMS Error {response.status_code}]", flush=True)
+            print(
+                f"  [LMS Error {response.status_code}] model={LMS_MODEL} url={LMS_URL} "
+                f"body={response.text[:600].replace(chr(10), ' ')}",
+                flush=True,
+            )
             processing_path.rename(image_path)
             return {"category": "RETRY"}
 
@@ -192,11 +196,28 @@ def vision_classify(image_path, source_name):
             pass
         return {"category": "RETRY"}
 
+_VISION_HINTS = ("vl", "vision", "visual", "llava", "gemma-3", "qwen3-vl",
+                 "qwen2.5-vl", "qwen2-vl", "moondream", "minicpm-v", "pixtral")
+
+
+def _looks_vision_capable(model_id: str) -> bool:
+    return any(h in (model_id or "").lower() for h in _VISION_HINTS)
+
+
 def run_vision_worker():
     print(f"=== Vision Worker (LMStudio with Keepalive) ===")
+    print(f"  URL:   {LMS_URL}")
     print(f"  Model: {LMS_MODEL}")
     print(f"  Workers: {PARALLEL_WORKERS}")
     print(f"  Keepalive: Every {KEEPALIVE_INTERVAL}s")
+    if LMS_MODEL and not _looks_vision_capable(LMS_MODEL):
+        print(
+            f"  [WARNING] Model '{LMS_MODEL}' does not look vision-capable. "
+            "Expected a VL model (e.g. qwen2.5-vl-7b, qwen3-vl-8b, gemma-3-*, "
+            "llava-*). LMStudio will likely return 400 on every image. "
+            "Update LMSTUDIO_PRIMARY_MODEL / LMSTUDIO_SECONDARY_MODEL in Settings.",
+            flush=True,
+        )
     print()
 
     # Start keepalive thread FIRST - keep model warm

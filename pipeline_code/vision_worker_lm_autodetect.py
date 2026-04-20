@@ -173,7 +173,8 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
         )
 
         if response.status_code != 200:
-            print(f"  [LMS Error {response.status_code}] {response.text[:100]}", flush=True)
+            # Dump the full response body once so VL-vs-text model mismatches etc. are diagnosable.
+            print(f"  [LMS Error {response.status_code}] {response.text[:600].replace(chr(10),' ')}", flush=True)
             processing_path.rename(image_path)
             return {"category": "RETRY", "error": f"LMS API error {response.status_code}"}
 
