@@ -127,45 +127,65 @@ def save_to_queue(source: str, image_path: Path, prompt_text: str = "", metadata
         image_path.unlink(missing_ok=True)
         return None
 
+_QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp")
+
+
+def _discover_source_dirs() -> list[Path]:
+    """Every immediate subdirectory of BASE_QUEUE_DIR is a potential source.
+
+    Using the filesystem as the source of truth means admin-configured labels
+    (e.g. LOCAL_IMPORT_NAME=my_dataset) are picked up automatically, without
+    needing to be registered in SOURCES. Names that don't match our safe-id
+    pattern are ignored so stray files can't confuse the worker.
+    """
+    if not BASE_QUEUE_DIR.exists():
+        return []
+    dirs: list[Path] = []
+    for child in BASE_QUEUE_DIR.iterdir():
+        if child.is_dir() and _SAFE_SOURCE.match(child.name):
+            dirs.append(child)
+    return dirs
+
+
+def _images_in(source_dir: Path) -> list[Path]:
+    images: list[Path] = []
+    for pattern in _QUEUE_IMAGE_GLOBS:
+        images.extend(source_dir.glob(pattern))
+    return sorted(images)
+
+
 def list_queue_sources():
-    """List all source directories and their image counts"""
-    counts = {}
-    for source, dir_name in SOURCES.items():
-        source_dir = BASE_QUEUE_DIR / dir_name
-        if source_dir.exists():
-            images = list(source_dir.glob("*.jpg")) + list(source_dir.glob("*.png"))
-            if images:
-                counts[source] = len(images)
+    """List every source directory that currently contains images."""
+    counts: dict[str, int] = {}
+    for source_dir in _discover_source_dirs():
+        imgs = _images_in(source_dir)
+        if imgs:
+            counts[source_dir.name] = len(imgs)
     return counts
 
+
 def get_next_image_round_robin():
+    """Return (source_name, image_path) cycling fairly across every non-empty source.
+
+    Discovers source folders from the filesystem so LOCAL_IMPORT_NAME and any
+    future sources participate automatically.
     """
-    Get next image in round-robin fashion across all sources
-    This ensures fair processing: one from civitai, one from zforfree, etc.
-    """
-    all_images = []
-    
-    # Collect images from all sources
-    source_images = {}
-    for source, dir_name in SOURCES.items():
-        source_dir = BASE_QUEUE_DIR / dir_name
-        if source_dir.exists():
-            images = sorted(list(source_dir.glob("*.jpg")) + list(source_dir.glob("*.png")))
-            if images:
-                source_images[source] = images
-    
+    source_images: dict[str, list[Path]] = {}
+    for source_dir in _discover_source_dirs():
+        imgs = _images_in(source_dir)
+        if imgs:
+            source_images[source_dir.name] = imgs
+
     if not source_images:
         return None, None
-    
-    # Build round-robin list
+
+    # Round-robin across sources, oldest-first within each source.
+    all_images: list[tuple[str, Path]] = []
     max_len = max(len(v) for v in source_images.values())
     for i in range(max_len):
         for source in sorted(source_images.keys()):
             if i < len(source_images[source]):
                 all_images.append((source, source_images[source][i]))
-    
-    if all_images:
-        source, img_path = all_images[0]
-        return source, img_path
-    
-    return None, None
+
+    source, img_path = all_images[0]
+    return source, img_path
