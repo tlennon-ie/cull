@@ -27,7 +27,7 @@ try:
     print("[TEST] OS OK", flush=True)
     
     # Test queue dir
-    BASE_DIR = Path("I:/AI/openclaw/workspace/prompt-library")
+    BASE_DIR = Path(str(base_dir()))
     QUEUE_DIR = BASE_DIR / "queue" / "realistic_female_influencer"
     print(f"[TEST] Queue dir exists: {QUEUE_DIR.exists()}", flush=True)
     
@@ -42,5 +42,6 @@ try:
 except Exception as e:
     print(f"[ERROR] {str(e)}", flush=True)
     import traceback
+from paths import base_dir
     traceback.print_exc()
     sys.exit(1)

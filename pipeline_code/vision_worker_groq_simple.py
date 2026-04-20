@@ -14,8 +14,9 @@ import time
 from pathlib import Path
 from PIL import Image
 from groq import Groq
+from paths import base_dir
 
-BASE_DIR = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR = Path(str(base_dir()))
 SLUG = "realistic_female_influencer"
 SORTED_DIR = BASE_DIR / "sorted" / SLUG
 

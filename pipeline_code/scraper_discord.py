@@ -14,8 +14,9 @@ load_dotenv()
 USER_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not USER_TOKEN:
     print("[scraper_discord] WARNING: DISCORD_BOT_TOKEN not set in .env", flush=True)
+from paths import base_dir
 
-BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 QUEUE_DIR  = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
@@ -24,35 +25,11 @@ SEEN_FILE  = BASE_DIR / f"seen_discord_{SLUG}.json"
 # Import queue manager
 from queue_manager import save_to_queue
 
-# Topic keyword pre-filter — cheap string check before downloading
-# Keeps only prompts mentioning women/people; blocks furniture/landscape/random
-TOPIC_KEYWORDS_RE = re.compile(
-    r"\bwom[ae]n\b|\bgirl\b|\bfemale\b|\blady\b|\bladies\b|\bshe\b|\bher\b|"
-    r"\binfluencer\b|\bmodel\b|\bbeauty\b|\bportra(?:it|ying)\b|\bperson\b|\bface\b|"
-    r"\bbody\b|\bhair\b|\bskin\b|\blips\b|\beyes\b|\bbreasts?\b|\bnude\b|\bnaked\b|"
-    r"\bsexy\b|\blingerie\b|\bbikini\b|\bbabe\b|\bhot\b|\bpinup\b|\bcurvy\b|"
-    r"\bblonde\b|\bbrunette\b|\bredhead\b|\b1girl\b|\bsolo\b",
-    re.IGNORECASE
-)
+from topic_filter import load_config as _load_topic_config, passes as _topic_passes
 
 MESSAGES_PER_CHANNEL = 400
-MIN_PROMPT_LENGTH    = 40
-FAKE_PROMPT_RE = re.compile(
-    r"my workflow|my lora|my model|my pack|my preset|made with|check (?:my|out)|"
-    r"link in bio|dm me|for sale|patreon|onlyfans|subscribe|follow me|commission|"
-    r"workflow\s*\+\s*lora|best (?:picture|image|photo|gen)|i(?:'ve)? generated|"
-    r"i made|i created|these are|here(?:'s| is) my|look at|what do you think|"
-    r"rate this|feedback|drop (?:a|your)|let me know", re.IGNORECASE
-)
-GENERATION_KEYWORDS_RE = re.compile(
-    r"photorealistic|hyperrealistic|cinematic|8k|4k|detailed|sharp focus|bokeh|"
-    r"depth of field|dof|lighting|portrait|photograph|camera|lens|masterpiece|"
-    r"best quality|ultra realistic|skin texture|natural light|studio light|"
-    r"golden hour|intricate|detailed face|((long|short|curly|wavy|straight)\s+hair)|"
-    r"(wearing|dressed in|outfit|clothing)|(\d+\s*steps?)|cfg|sampler|"
-    r"negative prompt|lora:|<lora|model:|checkpoint|aperture|f\/\d|mm lens|"
-    r"subject|expression|skin|eyes|teeth|lips|pose", re.IGNORECASE
-)
+_TOPIC_CFG = _load_topic_config()
+MIN_PROMPT_LENGTH = _TOPIC_CFG.min_prompt_length
 DL_HEADERS = {"Authorization": USER_TOKEN}
 
 def load_seen():
@@ -63,16 +40,11 @@ def load_seen():
 def save_seen(seen):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
-def is_valid_prompt(text):
-    if not text or len(text.strip()) < MIN_PROMPT_LENGTH:
-        return False
-    if FAKE_PROMPT_RE.search(text.strip()):
-        return False
-    if not GENERATION_KEYWORDS_RE.search(text):
-        return False
-    if not TOPIC_KEYWORDS_RE.search(text):
-        return False
-    return True
+def is_valid_prompt(text, context: str = "") -> bool:
+    """Shared topic-aware filter. `context` is any surrounding text (channel,
+    message author); `text` is the prompt itself."""
+    ok, _reason = _topic_passes(context, text, cfg=_TOPIC_CFG)
+    return ok
 
 def fetch_messages(channel_id, limit=400):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"

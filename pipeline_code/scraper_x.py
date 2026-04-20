@@ -14,7 +14,11 @@ from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 load_dotenv()
 
-BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+_TOPIC_CFG = _load_topic_config()
+from paths import base_dir
+
+BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
@@ -150,6 +154,13 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
     if dedup_key in seen:
         return False
     seen.add(dedup_key)
+
+    # Topic filter: reject off-topic / spammy tweets before downloading.
+    context = f"{author} {source}"
+    ok, reason = _topic_passes(context, prompt, cfg=_TOPIC_CFG)
+    if not ok:
+        print(f"    SKIP {dedup_key} ({reason})", flush=True)
+        return False
 
     stem = dedup_key
     

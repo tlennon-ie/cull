@@ -13,11 +13,12 @@ from pathlib import Path
 
 try:
     from PIL import Image
+from paths import base_dir
 except Exception as e:
     print(f"[FATAL] PIL failed: {e}")
     sys.exit(1)
 
-BASE_DIR = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR = Path(str(base_dir()))
 SLUG = "realistic_female_influencer"
 QUEUE_DIR = BASE_DIR / "queue" / SLUG
 SORTED_DIR = BASE_DIR / "sorted" / SLUG

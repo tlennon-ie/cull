@@ -9,8 +9,9 @@ COMPREHENSIVE SCRAPER AUDIT
 import json, os, requests, tempfile
 from pathlib import Path
 from collections import defaultdict
+from paths import base_dir
 
-BASE_DIR = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR = Path(str(base_dir()))
 QUEUE_DIR = BASE_DIR / "queue" / "realistic_female_influencer"
 
 print("=" * 80)

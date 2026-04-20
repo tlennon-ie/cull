@@ -8,8 +8,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
+from paths import base_dir
 
-BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))

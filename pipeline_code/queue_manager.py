@@ -12,9 +12,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from paths import base_dir
+
 load_dotenv()
 
-BASE_DIR = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+BASE_DIR = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
@@ -35,15 +37,27 @@ SOURCES = {
     "unknown": "unknown",
 }
 
+import re as _re
+
+_SAFE_SOURCE = _re.compile(r"^[a-z0-9_]+$")
+
+
 def get_queue_dir(source: str):
-    """Get or create queue directory for a source"""
-    source_key = source.lower().replace(" ", "_")
-    # Map common source names to keys
+    """Get or create the queue directory for a source.
+
+    Known sources (see SOURCES) keep their canonical folder name. Unknown but
+    safe identifiers (lowercase alphanumerics + underscore, e.g. an admin-
+    configured LOCAL_IMPORT_NAME) are allowed through as-is so the local-folder
+    feeder and any future sources don't collapse into `unknown/`.
+    """
+    source_key = source.lower().replace(" ", "_").replace("-", "_")
     if source_key in SOURCES:
         dir_name = SOURCES[source_key]
+    elif _SAFE_SOURCE.match(source_key):
+        dir_name = source_key
     else:
         dir_name = "unknown"
-    
+
     queue_dir = BASE_QUEUE_DIR / dir_name
     queue_dir.mkdir(parents=True, exist_ok=True)
     return queue_dir
@@ -52,7 +66,7 @@ def save_to_queue(source: str, image_path: Path, prompt_text: str = "", metadata
     """Save image and metadata to source-specific queue"""
     import json
     import shutil
-    
+
     queue_dir = get_queue_dir(source)
     
     try:

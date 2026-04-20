@@ -10,9 +10,10 @@ from pathlib import Path
 from datetime import datetime
 from groq import Groq
 from PIL import Image
+from paths import base_dir
 
 # Config
-BASE_DIR   = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR   = Path(str(base_dir()))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 QUEUE_DIR  = Path(os.environ.get("PIPELINE_QUEUE",  str(BASE_DIR / "queue" / SLUG)))
 SORTED_DIR = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted" / SLUG)))

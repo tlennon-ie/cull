@@ -11,9 +11,10 @@ from PIL import Image
 
 # Config
 from dotenv import load_dotenv
+from paths import base_dir
 load_dotenv()
 
-BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 _RAW_SORTED = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))

@@ -74,7 +74,8 @@ SCRAPERS: list[dict[str, str]] = [
     {"name": "Civitai-Com", "description": "Civitai (civitai.com)"},
     {"name": "Civitai-Red", "description": "Civitai (civitai.red)"},
     {"name": "Web",         "description": "Reddit / ZforFree.com / promptsref"},
-    {"name": "ZFF-Local",   "description": "Mirror I:\\AI\\Scripts\\zforfree\\downloads"},
+    {"name": "ZFF-Local",   "description": "ZforFree local folder (legacy)"},
+    {"name": "Local-local", "description": "Admin-configured local folder (LOCAL_IMPORT_*)"},
 ]
 
 sys.path.insert(0, str(PIPELINE_CODE_DIR))
@@ -327,6 +328,85 @@ def api_vision_workers_toggle():
     if current:
         update_env("PIPELINE_VISION_WORKER", current[0])
     return jsonify({"success": True, "active": current})
+
+
+SETTINGS_KEYS: list[str] = [
+    "PIPELINE_TOPIC",
+    "PIPELINE_SLUG",
+    "TOPIC_KEYWORDS_EXTRA",
+    "TOPIC_BANNED_KEYWORDS",
+    "TOPIC_GENERATION_HINTS",
+    "REDDIT_SUBREDDITS",
+    "MIN_PROMPT_LENGTH",
+    "PIPELINE_BASE_DIR",
+    "PIPELINE_QUEUE",
+    "PIPELINE_SORTED",
+    "LOG_DIR",
+    "ZFORFREE_LOCAL_SRC",
+    "LOCAL_IMPORT_DIR",
+    "LOCAL_IMPORT_NAME",
+    "LOCAL_IMPORT_ENABLED",
+]
+PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
+                       "LOG_DIR", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"}
+
+
+def _slugify(topic: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_")
+    return slug or "default"
+
+
+@app.route("/api/settings")
+def api_settings_get():
+    return jsonify({key: os.environ.get(key, "") for key in SETTINGS_KEYS})
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    data = request.get_json() or {}
+    errors: dict[str, str] = {}
+    changes: dict[str, str] = {}
+
+    for key, value in data.items():
+        if key not in SETTINGS_KEYS:
+            errors[key] = "unknown setting"
+            continue
+        value = ("" if value is None else str(value)).strip()
+        if key == "MIN_PROMPT_LENGTH" and value:
+            try:
+                parsed = int(value)
+                if parsed < 0 or parsed > 10000:
+                    raise ValueError
+                value = str(parsed)
+            except ValueError:
+                errors[key] = "must be a non-negative integer"
+                continue
+        if key in PATH_KEYS and value:
+            try:
+                p = Path(value)
+                if not p.is_absolute():
+                    errors[key] = "must be an absolute path"
+                    continue
+                # Refuse obviously unsafe roots.
+                if str(p).lower() in {r"c:\\windows", r"c:\\"}:
+                    errors[key] = "path not allowed"
+                    continue
+            except Exception as exc:
+                errors[key] = f"invalid path: {exc}"
+                continue
+        changes[key] = value
+
+    if errors:
+        return jsonify({"success": False, "errors": errors, "applied": {}}), 400
+
+    # Auto-derive slug if topic changed and slug not explicitly provided.
+    if "PIPELINE_TOPIC" in changes and "PIPELINE_SLUG" not in changes:
+        changes["PIPELINE_SLUG"] = _slugify(changes["PIPELINE_TOPIC"])
+
+    for key, value in changes.items():
+        update_env(key, value)
+
+    return jsonify({"success": True, "applied": changes, "restart_required": True})
 
 
 @app.route("/api/vision/provider", methods=["POST"])
@@ -879,6 +959,123 @@ HTML_TEMPLATE = r"""<!doctype html>
       </table></div>
     </section>
 
+    <!-- SETTINGS -->
+    <section x-show="active === 'settings'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <h3 class="font-semibold">Topic &amp; scraper filters</h3>
+            <p class="text-xs text-slate-400">Changes write to <code>.env</code>. Stop + Start the pipeline to apply.</p>
+          </div>
+          <div class="flex gap-2">
+            <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
+            <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+          </div>
+        </div>
+        <template x-if="settingsBanner">
+          <div class="bg-indigo-950/60 border border-indigo-700 text-indigo-200 text-xs px-3 py-2 rounded mb-3" x-text="settingsBanner"></div>
+        </template>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Topic</span>
+            <input x-model="settings.PIPELINE_TOPIC" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+            <span class="text-[10px] text-slate-500">Slug auto-derives from topic unless you override below.</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Slug (folder name)</span>
+            <input x-model="settings.PIPELINE_SLUG" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
+            <input x-model="settings.TOPIC_KEYWORDS_EXTRA" placeholder="leave empty = auto-derive from topic"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
+            <input x-model="settings.TOPIC_BANNED_KEYWORDS" placeholder="link in bio, dm me, patreon, onlyfans..."
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
+            <input x-model="settings.TOPIC_GENERATION_HINTS" placeholder="photorealistic, cinematic, cfg, lora..."
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
+            <input x-model="settings.REDDIT_SUBREDDITS"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
+            <input x-model="settings.MIN_PROMPT_LENGTH" type="number" min="0"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Paths</h3>
+        <p class="text-xs text-slate-400 mb-3">Absolute paths only. Pipeline must be stopped before changing these.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Pipeline base dir (parent of queue/, sorted/)</span>
+            <input x-model="settings.PIPELINE_BASE_DIR"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Queue dir</span>
+            <input x-model="settings.PIPELINE_QUEUE"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Sorted dir</span>
+            <input x-model="settings.PIPELINE_SORTED"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Log dir</span>
+            <input x-model="settings.LOG_DIR"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">ZforFree local source</span>
+            <input x-model="settings.ZFORFREE_LOCAL_SRC"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Local folder import</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          Mirror any folder on disk into the queue. Expected layout: <code>&lt;n&gt;.jpg|png|webp</code>
+          paired with <code>&lt;n&gt;.txt</code> (prompt). Items already under
+          <code>&lt;sorted&gt;/&lt;slug&gt;/*/&lt;label&gt;/</code> are skipped automatically.
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Local import folder (absolute path)</span>
+            <input x-model="settings.LOCAL_IMPORT_DIR" placeholder="e.g. D:\\my-dataset"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Source label (queue subfolder)</span>
+            <input x-model="settings.LOCAL_IMPORT_NAME" placeholder="local"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+            <span class="text-[10px] text-slate-500">Lowercase, letters/digits/underscore. Used as the queue + sorted subfolder name.</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Enabled</span>
+            <select x-model="settings.LOCAL_IMPORT_ENABLED"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </label>
+        </div>
+      </div>
+    </section>
+
     <!-- ERRORS -->
     <section x-show="active === 'errors'" class="card rounded-xl p-5">
       <h3 class="font-semibold mb-3 text-rose-300">Recent errors</h3>
@@ -940,11 +1137,13 @@ function dashboard() {
       {id:'queue',    label:'Queue'},
       {id:'logs',     label:'Historical'},
       {id:'errors',   label:'Errors'},
+      {id:'settings', label:'Settings'},
     ],
     providers: ['balanced-groq','balanced-lm','lm-autodetect','groq','gemini'],
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
+    settings: {}, settingsBanner: '',
     workerDescriptions: {
       'balanced-groq':  'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':    'LMStudio with explicit primary model',
@@ -957,7 +1156,7 @@ function dashboard() {
     modal: { open:false, imageUrl:'', prompt:'', name:'', source:'', category:'', summary:'' },
 
     async refresh() {
-      const [s, scr, mods, q, h, a, vw] = await Promise.all([
+      const [s, scr, mods, q, h, a, vw, settings] = await Promise.all([
         fetch('/api/status').then(r=>r.json()),
         fetch('/api/scrapers').then(r=>r.json()),
         fetch('/api/lmstudio/models').then(r=>r.json()),
@@ -965,6 +1164,7 @@ function dashboard() {
         fetch('/api/logs/history?limit=200').then(r=>r.json()),
         fetch('/api/activity?limit=12').then(r=>r.json()),
         fetch('/api/vision/workers').then(r=>r.json()),
+        fetch('/api/settings').then(r=>r.json()),
       ]);
       this.status = s;
       this.scrapers = scr;
@@ -973,10 +1173,26 @@ function dashboard() {
       this.history = h;
       this.activity = a;
       this.visionWorkers = vw;
+      // Only overwrite settings if the user isn't mid-edit (empty settings object).
+      if (Object.keys(this.settings).length === 0) this.settings = settings;
       this.provider = s.pipeline?.vision_worker || this.provider;
       this.throttle = s.pipeline?.throttle ?? this.throttle;
       this.lastRefresh = new Date().toLocaleTimeString();
     },
+    async saveSettings() {
+      this.settingsBanner = 'Saving...';
+      const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(this.settings)});
+      const j = await r.json();
+      if (j.success) {
+        this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
+        setTimeout(() => this.settingsBanner = '', 6000);
+      } else {
+        this.settingsBanner = 'Errors: ' + JSON.stringify(j.errors);
+      }
+      this.refresh();
+    },
+    reloadSettings() { this.settings = {}; this.refresh(); },
     async toggleVisionWorker(name, enabled) {
       await fetch('/api/vision/workers/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})}); this.refresh();

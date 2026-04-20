@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from paths import base_dir
 
 load_dotenv()
 
@@ -38,7 +39,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 PY: str = sys.executable
 PIPELINE_CODE_DIR: Path = Path(os.environ.get("PIPELINE_CODE_DIR", Path(__file__).parent))
-BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 
 
 CHANNEL_GROUPS: list[list[dict]] = [
@@ -160,13 +161,18 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
 
     human_keywords = ("influencer", "instagram", "woman", "girl", "female", "male", "man",
                       "person", "portrait", "model", "instagrammer")
-    if any(kw in topic.lower() for kw in human_keywords):
-        if os.environ.get("ZFORFREE_LOCAL_ENABLED", "true").lower() == "true":
+    topic_is_human = any(kw in topic.lower() for kw in human_keywords)
+
+    if os.environ.get("ZFORFREE_LOCAL_ENABLED", "false").lower() == "true":
+        if topic_is_human:
             launch("feed_zforfree_local.py", "ZFF-Local", loop=True, loop_sleep=3600)
         else:
-            print("  Skipping ZFF-Local (ZFORFREE_LOCAL_ENABLED=false)", flush=True)
-    else:
-        print(f"  Skipping ZFF-Local (topic '{topic}' is not human/photo focused)", flush=True)
+            print(f"  Skipping ZFF-Local (topic '{topic}' is not human/photo focused)", flush=True)
+
+    # Generic admin-configured local folder mirror (any path, any label).
+    if os.environ.get("LOCAL_IMPORT_ENABLED", "false").lower() == "true":
+        label = os.environ.get("LOCAL_IMPORT_NAME", "local").strip() or "local"
+        launch("feed_local_folder.py", f"Local-{label}", loop=True, loop_sleep=3600)
 
     # Vision workers: PIPELINE_VISION_WORKERS is a comma-separated list,
     # so we can run e.g. "balanced-groq,lm-autodetect" in parallel. Falls back

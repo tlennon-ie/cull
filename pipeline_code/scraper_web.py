@@ -15,7 +15,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", "I:/AI/openclaw/workspace/prompt-library"))
+from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+from paths import base_dir
+
+BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
@@ -186,14 +189,27 @@ def scrape_reddit(seen: set) -> int:
     if seen_file.exists():
         seen.update(json.loads(seen_file.read_text()))
 
+    topic_cfg = _load_topic_config()
     queries = build_reddit_queries(TOPIC)
+    subreddit_allowlist = {s.strip().lower() for s in
+                           os.environ.get("REDDIT_SUBREDDITS", "").split(",") if s.strip()}
+    if subreddit_allowlist:
+        print(f"  Reddit allowlist: {sorted(subreddit_allowlist)}", flush=True)
+
     saved = 0
+    dropped_offtopic = 0
+    dropped_subreddit = 0
 
     for query in queries:
-        print(f"  Reddit query: {query}", flush=True)
+        # If an allowlist is set, restrict each query to those subreddits via OR syntax.
+        effective_query = query
+        if subreddit_allowlist:
+            sub_filter = " OR ".join(f"subreddit:{s}" for s in sorted(subreddit_allowlist))
+            effective_query = f"({query}) ({sub_filter})"
+        print(f"  Reddit query: {effective_query}", flush=True)
         for sort in ["relevance", "new", "top"]:
             try:
-                url = f"https://www.reddit.com/search.json?q={requests.utils.quote(query)}&sort={sort}&t=month&limit=50&type=link"
+                url = f"https://www.reddit.com/search.json?q={requests.utils.quote(effective_query)}&sort={sort}&t=month&limit=50&type=link"
                 r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=15)
                 if r.status_code == 429:
                     print("  Reddit rate limit, sleeping 15s...")
@@ -216,11 +232,22 @@ def scrape_reddit(seen: set) -> int:
                         continue
                     seen.add(post_id)
 
+                    # Subreddit allowlist (belt + braces: the query already restricts)
+                    if subreddit_allowlist and subreddit.lower() not in subreddit_allowlist:
+                        dropped_subreddit += 1
+                        continue
+
                     # Extract prompt from title + body
                     combined  = f"{title}\n{body}"
                     prompt    = extract_prompt(combined)
                     if len(prompt) < 30:
                         prompt = title  # fallback to title as minimal prompt
+
+                    # Topic filter: drop spam / off-topic / weak prompts.
+                    ok, reason = _topic_passes(combined, prompt, cfg=topic_cfg)
+                    if not ok:
+                        dropped_offtopic += 1
+                        continue
 
                     # Get image URLs from post
                     img_urls  = reddit_image_urls(d)
@@ -256,7 +283,11 @@ def scrape_reddit(seen: set) -> int:
 
         seen_file.write_text(json.dumps(list(seen)))
 
-    print(f"  Reddit done: {saved} saved", flush=True)
+    print(
+        f"  Reddit done: saved={saved} dropped_offtopic={dropped_offtopic} "
+        f"dropped_subreddit={dropped_subreddit}",
+        flush=True,
+    )
     return saved
 
 

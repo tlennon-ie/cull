@@ -15,9 +15,10 @@ import requests
 # Import queue manager
 sys.path.insert(0, str(Path(__file__).parent))
 from queue_manager import get_next_image_round_robin
+from paths import base_dir
 
 # Config
-BASE_DIR   = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR   = Path(str(base_dir()))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 SORTED_DIR = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted" / SLUG)))
 

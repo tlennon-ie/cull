@@ -7,8 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
 from datetime import datetime
+from paths import base_dir
 
-BASE_DIR   = Path("I:/AI/openclaw/workspace/prompt-library")
+BASE_DIR   = Path(str(base_dir()))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 QUEUE_DIR  = Path(os.environ.get("PIPELINE_QUEUE",  str(BASE_DIR / "queue" / SLUG)))
 SORTED_DIR = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted" / SLUG)))
