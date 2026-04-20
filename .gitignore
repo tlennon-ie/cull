@@ -1,0 +1,70 @@
+# ─── Environment & Secrets ────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.template
+!.env.example
+
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ─── Virtualenvs ───────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Tooling caches ────────────────────────────────────────────────────────
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.cache/
+*.cache
+.coverage
+htmlcov/
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+logs/
+logs_test/
+*.log
+
+# ─── Pipeline local state (large / machine-specific) ───────────────────────
+queue/
+sorted/
+seen_*.json
+dashboard_state.json
+
+# ─── Temp / archive ────────────────────────────────────────────────────────
+archive/
+temp/
+tmp/
+*.tmp
+
+# ─── IDE / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Credentials safety net ────────────────────────────────────────────────
+*credentials*
+*secret*
+*token*
+*password*
+!credentials.template
+!*credentials*.example
+
+# ─── Exception: allow template and example files ──────────────────────────
+!.env.template
+!.env.example

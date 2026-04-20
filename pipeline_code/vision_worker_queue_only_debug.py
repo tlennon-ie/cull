@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+QUEUE-ONLY VISION WORKER - DEBUG VERSION
+Process ONLY the files in queue/ folder.
+With detailed error reporting.
+"""
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import json
+import base64
+import io
+import sys
+import traceback
+from pathlib import Path
+from PIL import Image
+import time
+from groq import Groq
+
+BASE_DIR = Path("I:/AI/openclaw/workspace/prompt-library")
+SLUG = "realistic_female_influencer"
+QUEUE_DIR = BASE_DIR / "queue" / SLUG
+SORTED_DIR = BASE_DIR / "sorted" / SLUG
+
+GROQ_KEYS = [k.strip() for k in (os.environ.get("GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY", "")).split(",") if k.strip()]
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+print("[INIT] Creating category directories...", flush=True)
+CATEGORIES = ["InstagramInfluencer", "Professional", "Cinematic", "Vintage", "Fantasy", "Sports", "Amateur", "Unknown", "DISCARD"]
+for cat in CATEGORIES:
+    (SORTED_DIR / cat).mkdir(parents=True, exist_ok=True)
+
+_key_idx = 0
+
+def detect_source(filename):
+    """Detect source from filename"""
+    filename_lower = filename.lower()
+    
+    if "civitai_" in filename_lower:
+        return "civitai"
+    elif "zff_" in filename_lower or "unknown_zff_" in filename_lower:
+        return "zforfree"
+    elif filename_lower.startswith(("ud_", "unstable_")):
+        return "discord_ud"
+    elif filename_lower.startswith(("mj_", "midjourney_")):
+        return "discord_mj"
+    elif "reddit_" in filename_lower:
+        return "reddit"
+    elif filename_lower.startswith(("x_", "twitter_")):
+        return "twitter_x"
+    elif "grok" in filename_lower:
+        return "grok"
+    elif "nanobanana" in filename_lower:
+        return "nanobanana"
+    
+    return "unknown"
+
+def resize_image(img_bytes, max_size=1024*1024):
+    """Resize image to fit within limit"""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        if buffer.tell() < max_size:
+            return buffer.getvalue()
+        
+        w, h = img.size
+        scale = (max_size / buffer.tell() * 0.8) ** 0.5
+        img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+        
+        buf_final = io.BytesIO()
+        img.save(buf_final, format="JPEG", quality=70)
+        return buf_final.getvalue()
+    except Exception as e:
+        print(f"  [RESIZE_ERROR] {str(e)[:80]}", flush=True)
+        return None
+
+def classify_with_groq(b64_image, attempt=1):
+    """Classify using Groq"""
+    global _key_idx
+    
+    try:
+        key = GROQ_KEYS[_key_idx % len(GROQ_KEYS)]
+        _key_idx += 1
+        
+        client = Groq(api_key=key)
+        
+        prompt = """Analyze this image. Respond ONLY with valid JSON (no markdown):
+{
+  "photorealistic": true/false,
+  "ai_flaws": true/false,
+  "woman_present": true/false,
+  "nsfw": true/false,
+  "quality": 1-10,
+  "style": "portrait|selfie|fashion|editorial|cinematic|vintage|fantasy|sports|other"
+}
+
+RULES:
+- photorealistic: True if photo-realistic/hyperrealistic. False if cartoon/painting/3D/anime.
+- ai_flaws: True ONLY if OBVIOUS severe defects (melted faces, extra limbs).
+- woman_present: True if adult human female is PRIMARY subject.
+- nsfw: True ONLY if explicit nudity/sexual content.
+- quality: 1-3 poor, 4-6 okay, 7-10 excellent.
+- style: What you see in composition."""
+
+        response = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                    ]
+                }
+            ],
+            model=GROQ_MODEL,
+            temperature=0.1,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+            timeout=30
+        )
+        
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        if attempt < 2:
+            return classify_with_groq(b64_image, attempt + 1)
+        return None
+
+def process_queue():
+    """Process ALL files in queue folder"""
+    print("=" * 70, flush=True)
+    print("QUEUE-ONLY VISION WORKER", flush=True)
+    print("=" * 70, flush=True)
+    print("", flush=True)
+    
+    try:
+        # Get all images from queue
+        print(f"[SCAN] Scanning {QUEUE_DIR}...", flush=True)
+        all_images = list(QUEUE_DIR.rglob("*.jpg")) + list(QUEUE_DIR.rglob("*.png"))
+        all_images = [p for p in all_images if p.parent.name != "realistic_female_influencer"]  # Skip root
+        
+        print(f"[FOUND] {len(all_images)} images in queue", flush=True)
+        print("", flush=True)
+        
+        if not all_images:
+            print("[DONE] Queue is empty!", flush=True)
+            return
+        
+        stats = {"processed": 0, "errors": 0, "moved": 0, "start": time.time()}
+        
+        for i, img_path in enumerate(all_images):
+            if i % 25 == 0:
+                elapsed = time.time() - stats["start"]
+                rate = i / max(elapsed, 0.1)
+                remaining = (len(all_images) - i) / max(rate, 0.1)
+                pct = (i / len(all_images)) * 100
+                print(f"[{i}/{len(all_images)}] {pct:.0f}% | {remaining:.0f}s remaining | errors: {stats['errors']}", flush=True)
+            
+            try:
+                img_bytes = img_path.read_bytes()
+                if not img_bytes:
+                    continue
+                
+                # Classify
+                small_bytes = resize_image(img_bytes)
+                if not small_bytes:
+                    img_path.unlink(missing_ok=True)
+                    continue
+                
+                b64 = base64.b64encode(small_bytes).decode('utf-8')
+                result = classify_with_groq(b64)
+                
+                if result is None:
+                    stats["errors"] += 1
+                    continue
+                
+                # Apply logic
+                photorealistic = result.get("photorealistic", False)
+                ai_flaws = result.get("ai_flaws", False)
+                woman_present = result.get("woman_present", False)
+                nsfw = result.get("nsfw", False)
+                quality = result.get("quality", 5)
+                style = result.get("style", "other").lower()
+                
+                category = "Unknown"
+                
+                if not photorealistic or not woman_present or ai_flaws or quality <= 2:
+                    category = "DISCARD"
+                elif nsfw:
+                    category = "NSFW" if quality >= 7 else "DISCARD"
+                elif style in ["selfie", "portrait"] and quality >= 6:
+                    category = "InstagramInfluencer"
+                elif style == "editorial" and quality >= 6:
+                    category = "Professional"
+                elif style == "cinematic" and quality >= 6:
+                    category = "Cinematic"
+                elif style == "vintage" and quality >= 6:
+                    category = "Vintage"
+                elif style == "fantasy" and quality >= 6:
+                    category = "Fantasy"
+                elif style == "sports" and quality >= 6:
+                    category = "Sports"
+                elif style == "fashion" and quality >= 5:
+                    category = "Amateur"
+                elif quality <= 3:
+                    category = "DISCARD"
+                else:
+                    category = "Unknown"
+                
+                # Detect source
+                source = detect_source(img_path.name)
+                
+                # Create destination
+                dest_dir = SORTED_DIR / category / source
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest_img = dest_dir / img_path.name
+                
+                # Move image
+                img_path.rename(dest_img)
+                
+                # Move related files (.txt, .meta.json)
+                stem = img_path.stem
+                for ext in [".txt", ".meta.json"]:
+                    src = img_path.with_stem(stem).with_suffix(ext)
+                    if src.exists():
+                        dst = dest_dir / src.name
+                        src.rename(dst)
+                
+                # Save vision.json
+                vision_path = dest_img.with_stem(stem).with_suffix(".vision.json")
+                result["category"] = category
+                result["source"] = source
+                vision_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
+                
+                stats["moved"] += 1
+                stats["processed"] += 1
+            
+            except Exception as e:
+                stats["errors"] += 1
+                print(f"  [FILE_ERROR] {img_path.name}: {str(e)[:80]}", flush=True)
+                traceback.print_exc()
+        
+        elapsed = time.time() - stats["start"]
+        
+        print("", flush=True)
+        print("=" * 70, flush=True)
+        print("QUEUE PROCESSING COMPLETE", flush=True)
+        print("=" * 70, flush=True)
+        print(f"Processed: {stats['processed']}", flush=True)
+        print(f"Moved: {stats['moved']}", flush=True)
+        print(f"Errors: {stats['errors']}", flush=True)
+        print(f"Time: {elapsed/60:.1f} minutes", flush=True)
+        print("=" * 70, flush=True)
+    
+    except Exception as e:
+        print(f"[FATAL] {str(e)}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    process_queue()
