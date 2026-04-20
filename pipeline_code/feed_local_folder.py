@@ -42,6 +42,26 @@ QUEUE_DIR: Path = queue_dir(SLUG)
 SORTED_DIR: Path = sorted_dir(SLUG)
 SEEN_FILE: Path = base_dir() / f"seen_{SOURCE_NAME}_{SLUG}.json"
 
+# Migration: read legacy seen files / scan legacy sorted subfolders so admins
+# switching from ZFF-Local (or any prior feeder) to this generic importer don't
+# re-queue items they already processed. Configure with:
+#   LOCAL_IMPORT_MIGRATE_FROM=<seen_prefix>:<stem_prefix>:<sorted_src>,<...>,
+# e.g. "zff_local:zff:zforfree" means also load seen_zff_local_<slug>.json,
+# check for files with `zff_<stem>` under <sorted>/<slug>/*/zforfree/, and
+# treat items matching those as already-done.
+_DEFAULT_MIGRATIONS = "zff_local:zff:zforfree"
+_MIGRATION_SPECS: list[dict[str, str]] = []
+for spec in os.environ.get("LOCAL_IMPORT_MIGRATE_FROM", _DEFAULT_MIGRATIONS).split(","):
+    spec = spec.strip()
+    if not spec:
+        continue
+    parts = spec.split(":")
+    _MIGRATION_SPECS.append({
+        "seen_prefix": parts[0] if len(parts) > 0 else "",
+        "stem_prefix": parts[1] if len(parts) > 1 else "",
+        "sorted_src": parts[2] if len(parts) > 2 else parts[0],
+    })
+
 MIN_PROMPT_LENGTH: int = int(os.environ.get("MIN_PROMPT_LENGTH", 40))
 MIN_IMAGE_BYTES: int = 5000
 IMAGE_SUFFIXES: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
@@ -49,12 +69,23 @@ ENABLED: bool = os.environ.get("LOCAL_IMPORT_ENABLED", "false").lower() == "true
 
 
 def load_seen() -> set[str]:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except json.JSONDecodeError:
-            logger.warning("seen file corrupt, starting fresh: %s", SEEN_FILE)
-    return set()
+    """Seen set = current file + any legacy files named `seen_<prefix>_<slug>.json`.
+
+    Legacy merges are a one-way inbound copy; we never write back to the old file.
+    """
+    seen: set[str] = set()
+    files = [SEEN_FILE]
+    for spec in _MIGRATION_SPECS:
+        prefix = spec.get("seen_prefix", "")
+        if prefix:
+            files.append(base_dir() / f"seen_{prefix}_{SLUG}.json")
+    for path in files:
+        if path.exists():
+            try:
+                seen |= set(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("seen file corrupt, skipping: %s", path)
+    return seen
 
 
 def save_seen(seen: set[str]) -> None:
@@ -62,19 +93,38 @@ def save_seen(seen: set[str]) -> None:
     SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
 
+def _match_in(source_dir: Path, filename_prefix: str, stem: str) -> bool:
+    """True if any file starting with `<filename_prefix>_<stem>` exists in source_dir."""
+    if not source_dir.exists():
+        return False
+    # Vision worker appends `_<timestamp>_<rand>` to the original stem when
+    # moving to sorted, so we match by prefix instead of exact filename.
+    target_prefix = f"{filename_prefix}_{stem}"
+    return any(f.name.startswith(target_prefix) for f in source_dir.iterdir()
+               if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES)
+
+
 def already_sorted(stem: str) -> bool:
-    """True if this stem appears under <sorted>/<slug>/*/<source_name>/."""
-    qname = f"{SOURCE_NAME}_{stem}"
+    """True if this stem appears anywhere under sorted/, including legacy locations.
+
+    Checks, in order:
+      1. <sorted>/<slug>/*/<SOURCE_NAME>/<SOURCE_NAME>_<stem>* (native path)
+      2. For each migration spec: <sorted>/<slug>/*/<sorted_src>/<stem_prefix>_<stem>*
+         (so ZFF's `sorted/*/zforfree/zff_<stem>.*` counts as done.)
+    """
     if not SORTED_DIR.exists():
         return False
+    native_prefix = SOURCE_NAME
+    legacy = [(spec["sorted_src"], spec["stem_prefix"]) for spec in _MIGRATION_SPECS
+              if spec.get("sorted_src") and spec.get("stem_prefix")]
+
     for category in SORTED_DIR.iterdir():
         if not category.is_dir():
             continue
-        target = category / SOURCE_NAME
-        if not target.exists():
-            continue
-        for suffix in IMAGE_SUFFIXES:
-            if (target / f"{qname}{suffix}").exists():
+        if _match_in(category / SOURCE_NAME, native_prefix, stem):
+            return True
+        for sorted_src, stem_prefix in legacy:
+            if _match_in(category / sorted_src, stem_prefix, stem):
                 return True
     return False
 

@@ -68,15 +68,33 @@ PIPELINE_SORTED: Path = Path(os.environ.get("PIPELINE_SORTED", "sorted"))
 LOG_DIR: Path = Path(os.environ.get("LOG_DIR", "logs_test"))
 FLASK_PORT: int = int(os.environ.get("FLASK_PORT", 5000))
 
-SCRAPERS: list[dict[str, str]] = [
+_STATIC_SCRAPERS: list[dict[str, str]] = [
     {"name": "X.com",       "description": "X.com (Playwright + cookies, no API)"},
     {"name": "Discord-1",   "description": "Discord UD channels"},
     {"name": "Civitai-Com", "description": "Civitai (civitai.com)"},
     {"name": "Civitai-Red", "description": "Civitai (civitai.red)"},
     {"name": "Web",         "description": "Reddit / ZforFree.com / promptsref"},
     {"name": "ZFF-Local",   "description": "ZforFree local folder (legacy)"},
-    {"name": "Local-local", "description": "Admin-configured local folder (LOCAL_IMPORT_*)"},
 ]
+
+
+def _scraper_definitions() -> list[dict[str, str]]:
+    """Compute the live scraper list.
+
+    The admin-configurable local folder runs under the label `Local-<LOCAL_IMPORT_NAME>`,
+    so the toggle here must follow whatever the user set in Settings - otherwise
+    toggling `Local-local` has no effect when the feeder actually ran as e.g.
+    `Local-my_dataset`.
+    """
+    local_name = (os.environ.get("LOCAL_IMPORT_NAME") or "local").strip() or "local"
+    local_entry = {
+        "name": f"Local-{local_name}",
+        "description": f"Admin-configured local folder ({os.environ.get('LOCAL_IMPORT_DIR') or '(LOCAL_IMPORT_DIR unset)'})",
+    }
+    return [*_STATIC_SCRAPERS, local_entry]
+
+
+SCRAPERS = _STATIC_SCRAPERS  # kept for anything still importing this module-level constant
 
 sys.path.insert(0, str(PIPELINE_CODE_DIR))
 try:
@@ -230,7 +248,23 @@ def api_status():
 @app.route("/api/scrapers")
 def api_scrapers():
     disabled = disabled_set()
-    return jsonify([{**s, "enabled": s["name"] not in disabled} for s in SCRAPERS])
+    return jsonify([{**s, "enabled": s["name"] not in disabled} for s in _scraper_definitions()])
+
+
+@app.route("/api/scrapers/bulk", methods=["POST"])
+def api_scrapers_bulk():
+    data = request.get_json() or {}
+    action = data.get("action")
+    defs = _scraper_definitions()
+    names = [s["name"] for s in defs]
+
+    if action == "disable_all":
+        update_env("SCRAPER_DISABLED", ",".join(sorted(names)))
+        return jsonify({"success": True, "disabled": names})
+    if action == "enable_all":
+        update_env("SCRAPER_DISABLED", "")
+        return jsonify({"success": True, "disabled": []})
+    return jsonify({"error": "action must be disable_all|enable_all"}), 400
 
 
 @app.route("/api/scrapers/toggle", methods=["POST"])
@@ -238,7 +272,7 @@ def api_scraper_toggle():
     data = request.get_json() or {}
     name = data.get("name")
     enabled = bool(data.get("enabled"))
-    if name not in {s["name"] for s in SCRAPERS}:
+    if name not in {s["name"] for s in _scraper_definitions()}:
         return jsonify({"error": "Unknown scraper"}), 400
     current = disabled_set()
     (current.discard if enabled else current.add)(name)
@@ -346,6 +380,7 @@ SETTINGS_KEYS: list[str] = [
     "LOCAL_IMPORT_DIR",
     "LOCAL_IMPORT_NAME",
     "LOCAL_IMPORT_ENABLED",
+    "LOCAL_IMPORT_MIGRATE_FROM",
 ]
 PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
                        "LOG_DIR", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"}
@@ -803,8 +838,16 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     <!-- SCRAPERS -->
     <section x-show="active === 'scrapers'" class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Scraper controls</h3>
-      <p class="text-xs text-slate-400 mb-4">Toggles persist to <code>.env</code> (SCRAPER_DISABLED). New scrapers will be picked up when you start the pipeline.</p>
+      <div class="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <h3 class="font-semibold">Scraper controls</h3>
+          <p class="text-xs text-slate-400 mt-1">Toggles persist to <code>.env</code> (SCRAPER_DISABLED). Restart the pipeline to pick up changes.</p>
+        </div>
+        <div class="flex gap-2">
+          <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off (vision only)</button>
+          <button @click="scrapersBulk('enable_all')" class="px-3 py-1.5 text-xs bg-emerald-600/80 hover:bg-emerald-500 rounded font-medium">All on</button>
+        </div>
+      </div>
       <div class="grid gap-2">
         <template x-for="s in scrapers" :key="s.name">
           <div class="flex items-center justify-between bg-slate-900/60 border border-slate-800 rounded px-4 py-3">
@@ -1072,6 +1115,12 @@ HTML_TEMPLATE = r"""<!doctype html>
               <option value="false">false</option>
             </select>
           </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Migrate dedup from (optional, comma-sep)</span>
+            <input x-model="settings.LOCAL_IMPORT_MIGRATE_FROM" placeholder="zff_local:zff:zforfree"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            <span class="text-[10px] text-slate-500">Each spec <code>&lt;seen_prefix&gt;:&lt;stem_prefix&gt;:&lt;sorted_src&gt;</code> re-uses a legacy feeder's dedup history.</span>
+          </label>
         </div>
       </div>
     </section>
@@ -1211,6 +1260,10 @@ function dashboard() {
     async toggleScraper(name, enabled) {
       await fetch('/api/scrapers/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})}); this.refresh();
+    },
+    async scrapersBulk(action) {
+      await fetch('/api/scrapers/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action})}); this.refresh();
     },
     async setProvider() {
       await fetch('/api/vision/provider', {method:'POST', headers:{'Content-Type':'application/json'},
