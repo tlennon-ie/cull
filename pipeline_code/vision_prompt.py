@@ -85,6 +85,39 @@ _NON_HUMAN_SUBJECT_HINTS = (
     "flower (alone)", "fruit", "machine", "engine",
 )
 
+# Substrings that betray a screenshot / phone UI / browser chrome instead
+# of a clean photograph of a person.
+_SCREENSHOT_HINTS = (
+    "screenshot", "screen capture", "screen-capture", "phone screen",
+    "smartphone", "iphone", "android screen", " ios ", "status bar",
+    "battery icon", "wifi icon", "browser window", "browser chrome",
+    "address bar", "url bar", "tab bar", "navigation bar",
+    "reddit ui", "twitter ui", "instagram ui", " app interface ",
+    "u/", "r/", "post title", "upvote", "downvote", "comment thread",
+    "messaging app", "chat window", "menu bar", "system tray",
+    "screen ", "screen,", "screen.",
+)
+
+# Substrings that say "this is a multi-panel comparison / collage", not a
+# single photograph.
+_COMPOSITE_HINTS = (
+    "side-by-side", "side by side", "split image", "comparison",
+    "comparison grid", "two panels", "three panels", "four panels",
+    "panel ", "multi-panel", "grid of images", "image grid", "collage",
+    "diptych", "triptych", "before and after", "before/after",
+    "labelled panels", "labeled panels", "annotated image",
+    "two versions", "three versions", "four versions",
+)
+
+# Watermark / text-overlay keywords - branded captions, generation-tool
+# annotations, etc.
+_TEXT_OVERLAY_HINTS = (
+    "watermark", "branded text", "logo overlay", "title text",
+    "caption text", "text overlay", "text label", "subtitle",
+    "annotation", "graphic overlay", "promotional text",
+    "headline text", "infographic", "meme",
+)
+
 # Words whose presence in description / primary_subject signals an actual
 # female human is the (or a) subject. If NONE of these appear we cannot
 # trust woman_present=True even if the model insists.
@@ -155,8 +188,11 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         f"Curation topic (for REL_Quality_Score only): {cfg.topic!r}\n\n"
         "Return ONLY valid JSON (no markdown, no commentary), in this exact shape:\n"
         "{\n"
-        '  "description": "1-2 sentence literal description of what the pixels show.",\n'
+        '  "description": "1-2 sentence literal description of WHAT THE WHOLE IMAGE CONTAINS, including any UI / labels / panels / watermarks / borders.",\n'
         '  "primary_subject": "the main subject in plain words (e.g. wine glass on table, woman seated, group of monsters)",\n'
+        '  "is_screenshot": true/false,\n'
+        '  "is_composite_grid": true/false,\n'
+        '  "contains_text_overlay": true/false,\n'
         '  "is_human_photograph": true/false,\n'
         '  "art_medium": "photograph | digital_painting | anime | 3d_render | illustration | mixed | unclear",\n'
         '  "photorealistic_style": true/false,\n'
@@ -174,6 +210,23 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         "Then make every binary judgement consistent with that description. "
         "Your description and labels MUST agree - if your description says "
         "'boulder smashing a car' you cannot then say woman_present=true.\n"
+        "- BEFORE describing the subject, scan the WHOLE frame for: phone or "
+        "browser UI elements (status bar, battery icon, app chrome, reddit/"
+        "twitter/instagram interface, comment threads, address bars), "
+        "side-by-side panels or comparison grids (multiple distinct images "
+        "separated by borders or labels), and large text overlays / "
+        "watermarks (e.g. 'Flux 9B', '1GIRL GARDENS', subtitle text, brand "
+        "logos). If you see any of these, set the matching is_screenshot / "
+        "is_composite_grid / contains_text_overlay field to true and "
+        "MENTION it in `description`. These images are NEVER valid "
+        "influencer photographs and category MUST be DISCARD.\n"
+        "- An image is a SCREENSHOT if you can see system chrome around the "
+        "actual photo (status bar, battery, time, OS icons, app UI, post "
+        "metadata). Do not strip the chrome out of your description.\n"
+        "- An image is a COMPOSITE/GRID if it contains 2+ separate images, "
+        "even if they all show similar subjects. Hint: visible vertical or "
+        "horizontal seams, repeated near-identical figures, distinct titles "
+        "above each panel, or labels like 'Model A vs Model B'.\n"
         "- art_medium = `photograph` ONLY for an actual camera-captured (or "
         "AI-generated *photoreal*) image of a real-looking subject. Anime, "
         "cel-shaded art, hand-drawn illustration, oil/watercolour painting, "
@@ -255,6 +308,40 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     if any(token in art_medium for token in _NON_PHOTO_MEDIUMS):
         result["photorealistic_style"] = False
         reasons.append(f"art_medium={art_medium}")
+
+    # ─── Container guards: screenshots, composite grids, text overlays ─
+    # The model can describe an embedded face inside a screenshot or one panel
+    # of a side-by-side and miss the surrounding chrome. We catch both via:
+    #   1) the model's own boolean flags (is_screenshot / is_composite_grid /
+    #      contains_text_overlay), and
+    #   2) keyword detection in the description, in case the flags weren't set
+    #      but the words leaked through anyway.
+    if result.get("is_screenshot"):
+        reasons.append("is_screenshot=true")
+    if result.get("is_composite_grid"):
+        reasons.append("is_composite_grid=true")
+    if result.get("contains_text_overlay"):
+        reasons.append("contains_text_overlay=true")
+
+    screenshot_token = _contains(combined, _SCREENSHOT_HINTS)
+    if screenshot_token:
+        result["is_screenshot"] = True
+        reasons.append(f"description mentions screenshot/UI ({screenshot_token.strip()!r})")
+    grid_token = _contains(combined, _COMPOSITE_HINTS)
+    if grid_token:
+        result["is_composite_grid"] = True
+        reasons.append(f"description mentions composite/grid ({grid_token.strip()!r})")
+    overlay_token = _contains(combined, _TEXT_OVERLAY_HINTS)
+    if overlay_token:
+        result["contains_text_overlay"] = True
+        reasons.append(f"description mentions overlay ({overlay_token.strip()!r})")
+
+    if (result.get("is_screenshot") or result.get("is_composite_grid")
+            or result.get("contains_text_overlay")):
+        # Force the photoreal/woman gates closed so the DISCARD path below
+        # fires consistently regardless of what the model returned.
+        result["photorealistic_style"] = False
+        result["woman_present"] = False
 
     # The model often calls a sculpture / mannequin / doll a 'photograph of a
     # real human'. The word it uses gives it away.
