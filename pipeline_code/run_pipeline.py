@@ -201,6 +201,11 @@ class Supervisor:
         self._active: dict[str, subprocess.Popen] = {}  # label -> proc
         self._desired_snapshot: dict[str, AgentSpec] = {}
         self._stop = threading.Event()
+        # When a child exits on its own, we hold off respawning until the
+        # spec's loop_sleep window has elapsed - otherwise a fast-failing
+        # scraper (e.g. Discord 401-looping every second) gets respawned on
+        # every reconcile tick and floods the log.
+        self._cooldown_until: dict[str, float] = {}
         # mtime of the .env file the last time we spawned / restarted. When the
         # dashboard writes new values the mtime changes, which we detect here
         # and use to trigger a soft restart so every child picks up fresh env.
@@ -317,14 +322,28 @@ class Supervisor:
                 if label not in desired:
                     self._terminate(label)
                 elif exited:
-                    # Respect the per-spec loop_sleep cooldown before respawn.
+                    # Mark the cooldown window so we don't respawn next tick.
                     self._active.pop(label, None)
-                    print(f"  [·] {label} exited (code {proc.returncode}), will restart on next tick", flush=True)
+                    spec = desired.get(label)
+                    cooldown = float(spec.loop_sleep if spec else 60)
+                    self._cooldown_until[label] = time.monotonic() + cooldown
+                    print(
+                        f"  [·] {label} exited (code {proc.returncode}); "
+                        f"next respawn in {int(cooldown)}s",
+                        flush=True,
+                    )
 
-            # Start anything desired that isn't active.
+            # Start anything desired that isn't active and isn't cooling down.
+            now = time.monotonic()
             for label, spec in desired.items():
-                if label not in self._active:
-                    self._spawn(spec)
+                if label in self._active:
+                    continue
+                until = self._cooldown_until.get(label, 0.0)
+                if until > now:
+                    continue  # still in cooldown
+                if until and until <= now:
+                    self._cooldown_until.pop(label, None)
+                self._spawn(spec)
 
     def run(self) -> None:
         """Reconcile loop with fast-path env-change detection.

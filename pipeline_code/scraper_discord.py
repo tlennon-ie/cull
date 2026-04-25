@@ -11,9 +11,16 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-USER_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+USER_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 if not USER_TOKEN:
     print("[scraper_discord] WARNING: DISCORD_BOT_TOKEN not set in .env", flush=True)
+
+# Discord requires `Authorization: Bot <token>` for bot tokens, and a raw
+# `Authorization: <token>` for user (selfbot) tokens. Bot tokens are JWT-ish
+# (three dot-separated segments), user tokens look different. Default to
+# the bot prefix - that's what the env var name promises - but allow a manual
+# override via DISCORD_AUTH_PREFIX="" for users running a self-bot.
+_AUTH_PREFIX = os.environ.get("DISCORD_AUTH_PREFIX", "Bot ")
 from paths import base_dir
 
 BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
@@ -30,7 +37,7 @@ from topic_filter import load_config as _load_topic_config, passes as _topic_pas
 MESSAGES_PER_CHANNEL = 400
 _TOPIC_CFG = _load_topic_config()
 MIN_PROMPT_LENGTH = _TOPIC_CFG.min_prompt_length
-DL_HEADERS = {"Authorization": USER_TOKEN}
+DL_HEADERS = {"Authorization": f"{_AUTH_PREFIX}{USER_TOKEN}".strip()}
 
 def load_seen():
     if SEEN_FILE.exists():
@@ -46,13 +53,32 @@ def is_valid_prompt(text, context: str = "") -> bool:
     ok, _reason = _topic_passes(context, text, cfg=_TOPIC_CFG)
     return ok
 
+_AUTH_HINT_SHOWN = False
+
+
 def fetch_messages(channel_id, limit=400):
+    global _AUTH_HINT_SHOWN
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     results, params = [], {"limit": 100}
     while len(results) < limit:
         resp = requests.get(url, headers=DL_HEADERS, params=params)
         if resp.status_code == 403:
-            print(f"  [SKIP] No access: {channel_id}")
+            print(f"  [SKIP] No access: {channel_id} (bot not in server / missing intent)")
+            return []
+        if resp.status_code == 401:
+            if not _AUTH_HINT_SHOWN:
+                tail = USER_TOKEN[-6:] if USER_TOKEN else "(empty)"
+                print(
+                    f"  [AUTH-FAIL 401] DISCORD_BOT_TOKEN ending ...{tail} rejected. "
+                    f"Header was 'Authorization: {_AUTH_PREFIX}<token>'. "
+                    "Common fixes: regenerate the token in the Discord Developer Portal, "
+                    "or set DISCORD_AUTH_PREFIX='' if this is a user/self-bot token "
+                    "(no 'Bot ' prefix).",
+                    flush=True,
+                )
+                _AUTH_HINT_SHOWN = True
+            else:
+                print(f"  [ERR] 401 on {channel_id}", flush=True)
             return []
         if resp.status_code != 200:
             print(f"  [ERR] {resp.status_code}")
