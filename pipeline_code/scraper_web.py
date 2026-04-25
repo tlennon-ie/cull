@@ -469,10 +469,22 @@ PROMPTSREF_PAGES = [
 ]
 
 def scrape_promptsref(seen: set) -> int:
+    """Promptsref pages are TEXT-ONLY prompt libraries (no images). Queueing
+    them as images is meaningless - the vision worker can't classify a 700-byte
+    text file - so we now write them to a sidecar JSONL library that downstream
+    scripts can consume, and skip the queue entirely. This stops the
+    `[QUEUE-ERROR] Temp file too small` log spam.
+    """
     saved = 0
     seen_file = BASE_DIR / f"seen_promptsref_{SLUG}.json"
     if seen_file.exists():
-        seen.update(json.loads(seen_file.read_text()))
+        try:
+            seen.update(json.loads(seen_file.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    library = BASE_DIR / f"promptsref_library_{SLUG}.jsonl"
+    library.parent.mkdir(parents=True, exist_ok=True)
 
     for page_url, source_label in PROMPTSREF_PAGES:
         print(f"  promptsref: {page_url}", flush=True)
@@ -517,45 +529,31 @@ def scrape_promptsref(seen: set) -> int:
                     continue
                 seen.add(dedup_key)
 
-                # promptsref doesn't always have an associated image per prompt
-                # Save as a text-only queue item - vision worker will handle it
+                # No image attached on promptsref - record the prompt to the
+                # sidecar library only. We deliberately do NOT push to the
+                # vision queue (would be rejected as too small + classifying
+                # bare text is meaningless).
                 stem = dedup_key
-                
-                # Create dummy image (will be saved as metadata only)
-                # For text-only prompts, we still need to save them to the queue
-                meta_data = {
-                    "message_id":      stem,
-                    "image_url":       "",
-                    "source_channel":  source_label,
-                    "source_guild":    "promptsref.com",
-                    "author":          "promptsref",
-                    "timestamp":       datetime.utcnow().isoformat(),
-                    "page_url":        page_url,
-                    "pipeline_topic":  TOPIC,
-                    "prompt_only":     True,  # Flag that this is text-only
+                record = {
+                    "message_id":     stem,
+                    "source_channel": source_label,
+                    "source_guild":   "promptsref.com",
+                    "captured_at":    datetime.utcnow().isoformat(),
+                    "page_url":       page_url,
+                    "pipeline_topic": TOPIC,
+                    "prompt":         prompt_text,
                 }
-                
-                # Save prompt-only to queue (using queue_manager API)
-                # Since we don't have an image, create a minimal text marker
-                with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode='w') as tmp:
-                    tmp.write(prompt_text)
-                    tmp_path = Path(tmp.name)
-                
-                result = queue_save("nanobanana", tmp_path, prompt_text, meta_data)
-                if result:
-                    print(f"  SAVED {stem} (prompt only) | {prompt_text[:70]}", flush=True)
-                    saved += 1
-                    # Persist after every save so a kill mid-run doesn't lose progress.
-                    seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
-                else:
-                    tmp_path.unlink(missing_ok=True)
+                with library.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                saved += 1
+                seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
             seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
         except Exception as e:
             print(f"  [promptsref ERR] {page_url}: {e}")
 
-    print(f"  promptsref done: {saved} saved", flush=True)
+    print(f"  promptsref done: {saved} prompts written to {library.name}", flush=True)
     return saved
 
 
