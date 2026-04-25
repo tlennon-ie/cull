@@ -124,7 +124,15 @@ def update_env(key: str, value: str) -> None:
     pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
     text = ENV_PATH.read_text(encoding="utf-8")
     line = f"{key}={value}"
-    text = pattern.sub(line, text) if pattern.search(text) else text.rstrip() + f"\n{line}\n"
+    # `re.sub` interprets backslashes in the replacement string as regex
+    # escapes (\1, \A, \g<1> etc.). Windows paths like `I:\AI\openclaw` would
+    # therefore raise PatternError ("bad escape \A"). Using a lambda short-
+    # circuits replacement-string parsing and lets us insert the value as a
+    # literal.
+    if pattern.search(text):
+        text = pattern.sub(lambda _match: line, text)
+    else:
+        text = text.rstrip() + f"\n{line}\n"
     ENV_PATH.write_text(text, encoding="utf-8")
     os.environ[key] = value
 
