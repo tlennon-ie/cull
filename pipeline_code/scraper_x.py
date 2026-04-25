@@ -197,10 +197,12 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
     
     # Save to source-based queue
     result = queue_save("twitter_x", tmp_path, prompt, meta_data)
-    
+
     if result:
         size_kb = result.stat().st_size // 1024
         print(f"    SAVED {result.name} ({size_kb}KB) | {prompt[:80] or '(no prompt)'}")
+        # Persist dedup IDs immediately so a kill / restart can't lose them.
+        save_seen(seen)
         return True
     else:
         seen.discard(dedup_key)
@@ -491,13 +493,78 @@ async def scrape_promptsref(ctx, seen: set, saved_count: list):
 
 
 # ── Seen helpers ─────────────────────────────────────────────────────────────
+
+# Pull dedup keys back out of sorted filenames. Vision worker writes:
+#   <category>_x_<tweet_id>_<img_hash>_<ts>_<rand>.<ext>
+# So the dedup key matches `x_<tweet>_<hash>` - same shape we add to `seen`.
+_X_KEY_FROM_SORTED = re.compile(r"_(x_[A-Za-z0-9]+_[A-Za-z0-9]+)_\d+_\d+\.")
+
+# Same shape lives in queue/ when an item is pending classification.
+_X_KEY_FROM_QUEUE = re.compile(r"^(x_[A-Za-z0-9]+_[A-Za-z0-9]+)\.")
+
+
+def _scan_sorted_for_x_keys() -> set[str]:
+    """Find every X dedup key already classified under <sorted>/<slug>/."""
+    sorted_root = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
+    sorted_slug = sorted_root if sorted_root.name == SLUG else sorted_root / SLUG
+    if not sorted_slug.exists():
+        return set()
+    found: set[str] = set()
+    for path in sorted_slug.glob("**/twitter_x/*"):
+        if not path.is_file():
+            continue
+        m = _X_KEY_FROM_SORTED.search(path.name)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def _scan_queue_for_x_keys() -> set[str]:
+    """Find every X dedup key still pending in <queue>/<slug>/twitter_x/."""
+    target = QUEUE_DIR / "twitter_x"
+    if not target.exists():
+        return set()
+    found: set[str] = set()
+    for path in target.iterdir():
+        if not path.is_file():
+            continue
+        m = _X_KEY_FROM_QUEUE.match(path.name)
+        if m:
+            found.add(m.group(1))
+    return found
+
+
 def load_seen():
+    """Load dedup IDs from three independent sources so a missing seen file
+    or an interrupted prior run doesn't make us re-pull the same tweets:
+      1. The seen JSON itself (cheap, O(N))
+      2. `<sorted>/<slug>/**/twitter_x/*` filename scan (already-classified)
+      3. `<queue>/<slug>/twitter_x/*` filename scan (still pending)
+    """
+    seen: set[str] = set()
     if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
+        try:
+            seen |= set(json.loads(SEEN_FILE.read_text()))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"  [seen] {SEEN_FILE.name} unreadable: {exc}", flush=True)
+    sorted_keys = _scan_sorted_for_x_keys()
+    queue_keys = _scan_queue_for_x_keys()
+    new_from_disk = (sorted_keys | queue_keys) - seen
+    if new_from_disk:
+        print(
+            f"  [seen] +{len(new_from_disk)} ids recovered from disk "
+            f"(sorted={len(sorted_keys)}, queue={len(queue_keys)})",
+            flush=True,
+        )
+    seen |= sorted_keys
+    seen |= queue_keys
+    return seen
+
 
 def save_seen(seen):
-    SEEN_FILE.write_text(json.dumps(list(seen)))
+    """Write incrementally so a kill mid-run doesn't lose our progress."""
+    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

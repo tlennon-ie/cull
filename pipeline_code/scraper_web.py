@@ -184,10 +184,47 @@ def reddit_image_urls(post_data: dict) -> list:
 
     return list(dict.fromkeys(urls))  # dedup preserving order
 
+_REDDIT_KEY_FROM_SORTED = re.compile(r"_reddit_([A-Za-z0-9]+)_(\d+)_\d+_\d+\.")
+_REDDIT_KEY_FROM_QUEUE = re.compile(r"^reddit_([A-Za-z0-9]+)_(\d+)\.")
+
+
+def _scan_disk_for_reddit_post_ids() -> set[str]:
+    """Walk sorted/ + queue/ for already-handled Reddit posts.
+
+    Vision worker writes `<cat>_reddit_<post_id>_<i>_<ts>_<rand>.<ext>` and
+    queue items are `reddit_<post_id>_<i>.<ext>`. We just need post_id.
+    """
+    found: set[str] = set()
+    sorted_root = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
+    sorted_slug = sorted_root if sorted_root.name == SLUG else sorted_root / SLUG
+    if sorted_slug.exists():
+        for path in sorted_slug.glob("**/reddit/*"):
+            if path.is_file():
+                m = _REDDIT_KEY_FROM_SORTED.search(path.name)
+                if m:
+                    found.add(m.group(1))
+    queue_target = QUEUE_DIR / "reddit"
+    if queue_target.exists():
+        for path in queue_target.iterdir():
+            if path.is_file():
+                m = _REDDIT_KEY_FROM_QUEUE.match(path.name)
+                if m:
+                    found.add(m.group(1))
+    return found
+
+
 def scrape_reddit(seen: set) -> int:
     seen_file = BASE_DIR / f"seen_reddit_{SLUG}.json"
     if seen_file.exists():
-        seen.update(json.loads(seen_file.read_text()))
+        try:
+            seen.update(json.loads(seen_file.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    disk_keys = _scan_disk_for_reddit_post_ids()
+    new_from_disk = disk_keys - seen
+    if new_from_disk:
+        print(f"  [seen-reddit] +{len(new_from_disk)} post_ids recovered from disk", flush=True)
+    seen |= disk_keys
 
     topic_cfg = _load_topic_config()
     queries = build_reddit_queries(TOPIC)
@@ -273,6 +310,9 @@ def scrape_reddit(seen: set) -> int:
                                 }, source="reddit")
                                 if ok:
                                     saved += 1
+                                    # Persist seen IDs every successful save so a kill
+                                    # mid-run can't make the next pass re-grab the same posts.
+                                    seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
                         except Exception as e:
                             pass
 
@@ -281,7 +321,7 @@ def scrape_reddit(seen: set) -> int:
             except Exception as e:
                 print(f"  [Reddit ERR] {query}/{sort}: {e}")
 
-        seen_file.write_text(json.dumps(list(seen)))
+        seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
     print(
         f"  Reddit done: saved={saved} dropped_offtopic={dropped_offtopic} "
@@ -505,10 +545,12 @@ def scrape_promptsref(seen: set) -> int:
                 if result:
                     print(f"  SAVED {stem} (prompt only) | {prompt_text[:70]}", flush=True)
                     saved += 1
+                    # Persist after every save so a kill mid-run doesn't lose progress.
+                    seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
                 else:
                     tmp_path.unlink(missing_ok=True)
 
-            seen_file.write_text(json.dumps(list(seen)))
+            seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
         except Exception as e:
             print(f"  [promptsref ERR] {page_url}: {e}")
