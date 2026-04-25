@@ -560,12 +560,21 @@ def api_set_model():
 # ── API: queue / thumbnails / prompts ─────────────────────────────────────────
 
 def _recent_queue_files(limit: int = 60) -> list[Path]:
+    """List newest queue images. Race-tolerant: vision workers can move files
+    out from under us between glob and stat - we just drop those entries."""
     if not PIPELINE_QUEUE.exists():
         return []
     files: list[Path] = []
-    for pattern in ("*.jpg", "*.png", "*.webp"):
+    for pattern in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         files.extend(PIPELINE_QUEUE.glob(f"**/{pattern}"))
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return -1.0  # bubble missing files to the bottom
+
+    files.sort(key=_safe_mtime, reverse=True)
     return files[:limit]
 
 
@@ -574,7 +583,10 @@ def api_queue_files():
     limit = int(request.args.get("limit", 60))
     results: list[dict[str, Any]] = []
     for path in _recent_queue_files(limit):
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except OSError:
+            continue  # vision worker grabbed it mid-listing - skip
         prompt_path = path.with_suffix(".txt")
         prompt = ""
         if prompt_path.exists():
@@ -675,7 +687,10 @@ def api_logs_history():
     if not PIPELINE_SORTED.exists():
         return jsonify([])
 
-    meta_files = list(PIPELINE_SORTED.glob("**/*.vision.json"))
+    meta_files = [
+        p for p in PIPELINE_SORTED.glob("**/*.vision.json")
+        if not _is_in_archive(p)
+    ]
     meta_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     out: list[dict[str, Any]] = []
@@ -685,8 +700,11 @@ def api_logs_history():
         except (OSError, json.JSONDecodeError):
             continue
         stem = meta.name.replace(".vision.json", "")
-        img_candidate = next(meta.parent.glob(f"{stem}.*"), None)
-        if img_candidate is None or img_candidate == meta:
+        img_candidate = next(
+            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
+            None,
+        )
+        if img_candidate is None or not img_candidate.exists():
             continue
         # meta.parent = .../sorted/<slug>/<Category>/<source>
         category_name = meta.parent.parent.name
@@ -711,25 +729,47 @@ def api_logs_history():
     return jsonify(out)
 
 
+_IMAGE_EXTS_FOR_ACTIVITY: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in _IMAGE_EXTS_FOR_ACTIVITY
+
+
+def _is_in_archive(path: Path) -> bool:
+    """Skip files under the bookkeeping folders the requeue tool maintains."""
+    return any(part.startswith(".") for part in path.relative_to(PIPELINE_SORTED).parts)
+
+
 @app.route("/api/activity")
 def api_activity():
     """Newest classified items from <PIPELINE_SORTED> so the UI can show what just got processed."""
     limit = int(request.args.get("limit", 12))
     if not PIPELINE_SORTED.exists():
         return jsonify([])
-    meta_files: list[Path] = []
-    for pattern in ("**/*.vision.json",):
-        meta_files.extend(PIPELINE_SORTED.glob(pattern))
+    meta_files: list[Path] = [
+        p for p in PIPELINE_SORTED.glob("**/*.vision.json")
+        if not _is_in_archive(p)
+    ]
     meta_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     results: list[dict[str, Any]] = []
-    for meta in meta_files[:limit]:
+    for meta in meta_files:
+        if len(results) >= limit:
+            break
         try:
             payload = json.loads(meta.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         stem = meta.name.replace(".vision.json", "")
-        img_candidate = next((meta.parent.glob(f"{stem}.*")), None)
-        if img_candidate is None:
+        # Restrict the alongside-the-meta lookup to actual image files - the
+        # naive `glob(stem.*)` matched the .vision.json itself when the
+        # image had been archived elsewhere, then the dashboard tried to
+        # render JSON as a thumbnail.
+        img_candidate = next(
+            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
+            None,
+        )
+        if img_candidate is None or not img_candidate.exists():
             continue
         results.append({
             "name": img_candidate.name,
