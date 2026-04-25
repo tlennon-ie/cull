@@ -101,7 +101,7 @@ def vision_classify(image_path):
 
         b64_image = base64.b64encode(resized_bytes).decode('utf-8')
 
-        from vision_prompt import build_classification_prompt, apply_scores
+        from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json
         prompt_text = build_classification_prompt()
 
         response = model.generate_content([
@@ -112,7 +112,12 @@ def vision_classify(image_path):
         if not response.text:
             return {"category": "DISCARD", "reason": "Empty response (safety block?)"}
 
-        result = apply_scores(json.loads(response.text))
+        parsed = _safe_parse_vision_json(response.text)
+        if parsed is None:
+            preview = (response.text or "")[:300].replace("\n", " ")
+            print(f"  [Error] empty/invalid JSON from Gemini; raw={preview!r}", flush=True)
+            return {"category": "RETRY"}
+        result = apply_scores(parsed)
         if result.get("category") not in CATEGORIES and result.get("category") != "DISCARD":
             result["category"] = "Unknown"
         return result

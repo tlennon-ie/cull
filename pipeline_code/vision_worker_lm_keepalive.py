@@ -183,8 +183,17 @@ def vision_classify(image_path, source_name):
             processing_path.rename(image_path)
             return {"category": "RETRY"}
 
+        from vision_prompt import _safe_parse_vision_json
         raw = response.json()["choices"][0]["message"]["content"]
-        result = json.loads(raw)
+        result = _safe_parse_vision_json(raw)
+        if result is None:
+            preview = (raw or "")[:300].replace("\n", " ")
+            print(f"  [Error] empty/invalid JSON from {LMS_MODEL}; raw={preview!r}", flush=True)
+            try:
+                processing_path.rename(image_path)
+            except OSError:
+                pass
+            return {"category": "RETRY"}
 
         photorealistic = result.get("photorealistic_style", False)
         woman = result.get("woman_present", False)

@@ -23,7 +23,9 @@ labels (the wineglass / cartoon / CG fantasy bugs).
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -314,4 +316,47 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     return result
 
 
-__all__ = ["ScoreConfig", "build_classification_prompt", "apply_scores"]
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _safe_parse_vision_json(raw: str | None) -> dict[str, Any] | None:
+    """Extract a JSON object from a vision worker response.
+
+    Models occasionally return:
+      * an empty string (LMStudio sometimes does this on overload),
+      * markdown-fenced JSON despite being told not to,
+      * trailing prose around a JSON blob.
+
+    This helper tolerates all three. Returns the parsed dict, or None if the
+    response can't be salvaged - in which case the worker should log the raw
+    content and re-queue the image.
+    """
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    # Strip markdown fences first.
+    fenced = _FENCED_JSON.search(text)
+    if fenced:
+        text = fenced.group(1)
+    # Direct parse.
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Last-resort: grab the largest {...} substring.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+__all__ = [
+    "ScoreConfig",
+    "build_classification_prompt",
+    "apply_scores",
+    "_safe_parse_vision_json",
+]

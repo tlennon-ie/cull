@@ -144,7 +144,7 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
 
     b64 = base64.standard_b64encode(small).decode()
 
-    from vision_prompt import build_classification_prompt, apply_scores  # local import keeps module load-order safe
+    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json  # local import keeps module load-order safe
     prompt_instruction = build_classification_prompt()
 
     try:
@@ -179,7 +179,16 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
             return {"category": "RETRY", "error": f"LMS API error {response.status_code}"}
 
         raw = response.json()["choices"][0]["message"]["content"]
-        result = apply_scores(json.loads(raw))
+        parsed = _safe_parse_vision_json(raw)
+        if parsed is None:
+            preview = (raw or "")[:300].replace("\n", " ")
+            print(f"  [Error] empty/invalid JSON from {model_name}; raw={preview!r}", flush=True)
+            try:
+                processing_path.rename(image_path)
+            except OSError:
+                pass
+            return {"category": "RETRY"}
+        result = apply_scores(parsed)
 
         final_category = result.get("category", "Unknown")
 

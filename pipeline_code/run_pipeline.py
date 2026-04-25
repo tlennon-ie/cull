@@ -37,9 +37,34 @@ PY: str = sys.executable
 PIPELINE_CODE_DIR: Path = Path(os.environ.get("PIPELINE_CODE_DIR", Path(__file__).parent))
 BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 
-RECONCILE_SECONDS: int = int(os.environ.get("PIPELINE_RECONCILE_SECONDS", 5))
+RECONCILE_SECONDS: int = int(os.environ.get("PIPELINE_RECONCILE_SECONDS", 2))
 
 ENV_PATH: Path = Path(os.environ.get("WORKSPACE_ROOT", PIPELINE_CODE_DIR.parent)) / ".env"
+
+# Env vars whose CHANGE means in-flight children read stale config and must
+# be respawned. Toggling SCRAPER_DISABLED or PIPELINE_VISION_WORKERS isn't
+# in this list — those drive the desired-set, not in-process behaviour, so
+# they are handled by the normal start/stop reconcile without restarting
+# unrelated children.
+STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
+    "PIPELINE_TOPIC", "PIPELINE_SLUG", "PIPELINE_BASE_DIR",
+    "PIPELINE_QUEUE", "PIPELINE_SORTED", "LOG_DIR",
+    "X_ACCOUNTS", "REDDIT_SUBREDDITS", "TOPIC_KEYWORDS_EXTRA",
+    "TOPIC_BANNED_KEYWORDS", "TOPIC_GENERATION_HINTS", "MIN_PROMPT_LENGTH",
+    "LMSTUDIO_PRIMARY_URL", "LMSTUDIO_PRIMARY_MODEL", "LMSTUDIO_PRIMARY_TIMEOUT",
+    "LMSTUDIO_SECONDARY_URL", "LMSTUDIO_SECONDARY_MODEL", "LMSTUDIO_SECONDARY_TIMEOUT",
+    "GROQ_API_KEYS", "GROQ_API_KEY", "GROQ_MODEL",
+    "GEMINI_API_KEY", "GEMINI_MODEL",
+    "VISION_OVR_MIN_SCORE", "VISION_REL_MIN_SCORE", "VISION_SCORE_NOTES",
+    "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY", "CIVITAI_DOMAINS",
+    "CIVITAI_SEARCH_URL", "CIVITAI_SEARCH_HOST", "CIVITAI_TRPC_BASE",
+    "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR", "LOCAL_IMPORT_NAME",
+    "LOCAL_IMPORT_MIGRATE_FROM", "TWITTER_COOKIES",
+)
+
+
+def _structural_env_snapshot() -> dict[str, str]:
+    return {key: os.environ.get(key, "") for key in STRUCTURAL_ENV_KEYS}
 
 
 # ── Static scrapers ────────────────────────────────────────────────────────────
@@ -180,6 +205,7 @@ class Supervisor:
         # dashboard writes new values the mtime changes, which we detect here
         # and use to trigger a soft restart so every child picks up fresh env.
         self._env_mtime: float = self._current_env_mtime()
+        self._struct_snapshot: dict[str, str] = _structural_env_snapshot()
         self._queue_dir: Path | None = None  # set by run_topic before start()
 
     @staticmethod
@@ -252,22 +278,34 @@ class Supervisor:
 
     def reconcile(self) -> None:
         _reload_env()
-        env_changed = False
+        structural_changed = False
         current_mtime = self._current_env_mtime()
         if current_mtime and current_mtime != self._env_mtime:
-            env_changed = True
-            print("  [env-reload] .env changed - restarting all child processes so new settings take effect", flush=True)
             self._env_mtime = current_mtime
+            self.base_env = {**self.base_env, **os.environ}
+            new_snapshot = _structural_env_snapshot()
+            if new_snapshot != self._struct_snapshot:
+                structural_changed = True
+                # Identify exactly which keys flipped — useful in the supervisor log.
+                diff = [
+                    f"{k}: {self._struct_snapshot.get(k, '')!r} -> {new_snapshot.get(k, '')!r}"
+                    for k in STRUCTURAL_ENV_KEYS
+                    if self._struct_snapshot.get(k) != new_snapshot.get(k)
+                ]
+                self._struct_snapshot = new_snapshot
+                print("  [env-reload] structural change detected; soft-restarting children", flush=True)
+                for line in diff[:6]:
+                    print(f"    - {line}", flush=True)
+            else:
+                # SCRAPER_DISABLED / PIPELINE_VISION_WORKERS only — start/stop deltas
+                # are handled by the normal reconcile loop below; no restart needed.
+                print("  [env-reload] toggle change picked up (no soft-restart needed)", flush=True)
 
         desired = compute_desired_agents(self.topic)
         self._desired_snapshot = desired
 
         with self._lock:
-            if env_changed:
-                # Hard reset: refresh base_env, kill everything, sweep stale state.
-                # The normal reconcile loop below will respawn desired agents with
-                # the new env on the same tick.
-                self.base_env = {**self.base_env, **os.environ}
+            if structural_changed:
                 for label in list(self._active.keys()):
                     self._terminate(label)
                 self._sweep_stale_processing()
@@ -289,11 +327,29 @@ class Supervisor:
                     self._spawn(spec)
 
     def run(self) -> None:
-        print(f"\nSupervisor online. Reconciling every {RECONCILE_SECONDS}s.", flush=True)
+        """Reconcile loop with fast-path env-change detection.
+
+        Background: full reconciles run every RECONCILE_SECONDS, but we ALSO
+        poll .env's mtime every 0.5s. When the dashboard writes a setting the
+        mtime bumps within milliseconds, so toggles feel instant (~1s) instead
+        of waiting for the next full reconcile tick.
+        """
+        print(
+            f"\nSupervisor online. Full reconcile every {RECONCILE_SECONDS}s; "
+            "env-change polled at 0.5s for instant toggles.",
+            flush=True,
+        )
+        env_poll_interval = 0.5
         try:
+            self.reconcile()  # initial
+            last_full = time.monotonic()
             while not self._stop.is_set():
-                self.reconcile()
-                time.sleep(RECONCILE_SECONDS)
+                time.sleep(env_poll_interval)
+                now = time.monotonic()
+                env_bumped = self._current_env_mtime() != self._env_mtime
+                if env_bumped or (now - last_full) >= RECONCILE_SECONDS:
+                    self.reconcile()
+                    last_full = now
         except KeyboardInterrupt:
             print("\nPipeline stopped by user.", flush=True)
         finally:
