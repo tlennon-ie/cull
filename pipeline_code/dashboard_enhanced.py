@@ -391,6 +391,8 @@ SETTINGS_KEYS: list[str] = [
     "REDDIT_SUBREDDITS",
     "MIN_PROMPT_LENGTH",
     "X_ACCOUNTS",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_AUTH_MODE",
     "VISION_OVR_MIN_SCORE",
     "VISION_REL_MIN_SCORE",
     "VISION_SCORE_NOTES",
@@ -457,6 +459,11 @@ def api_settings_post():
             except ValueError:
                 errors[key] = "must be an integer 1-3600"
                 continue
+        if key == "DISCORD_AUTH_MODE" and value:
+            if value.lower() not in {"bot", "user", "auto"}:
+                errors[key] = "must be 'bot', 'user', or 'auto'"
+                continue
+            value = value.lower()
         if key in PATH_KEYS and value:
             try:
                 p = Path(value)
@@ -1098,6 +1105,37 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
             <input x-model="settings.X_ACCOUNTS" placeholder="account1,account2,account3"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Discord access</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          The Discord scraper supports two auth styles:
+          <code>bot</code> sends <code>Authorization: Bot &lt;token&gt;</code> (use a token from
+          the Discord Developer Portal, the bot must be a member of each server).
+          <code>user</code> sends the token raw and lets your <em>personal</em> Discord account
+          read every server you're a member of - including private ones where you can't add a bot.
+          Grab your account token from devtools: discord.com → F12 → Network tab → any
+          <code>/api/v9/&hellip;</code> request → Headers → copy the <code>authorization</code> value.
+          <span class="text-amber-300">User mode is against Discord's TOS; your account, your risk.</span>
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Discord token (bot or user account)</span>
+            <input x-model="settings.DISCORD_BOT_TOKEN" type="password"
+                   placeholder="paste token, no quotes"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Auth mode</span>
+            <select x-model="settings.DISCORD_AUTH_MODE"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="auto">auto (try bot → fall back to user on 401)</option>
+              <option value="bot">bot (Developer-Portal token)</option>
+              <option value="user">user (personal account token)</option>
+            </select>
           </label>
         </div>
       </div>

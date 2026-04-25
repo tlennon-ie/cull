@@ -11,16 +11,36 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
+# DISCORD_BOT_TOKEN holds either a real bot token OR a personal user-account
+# token, depending on DISCORD_AUTH_MODE:
+#   "bot"   - prepend "Bot " to the Authorization header (real Discord bot).
+#   "user"  - send the token raw (your own account; required when the bot
+#             can't be added to private servers).
+#   "auto"  - try `Bot <token>` first, fall back to raw on 401. Default.
+# DISCORD_AUTH_PREFIX (legacy) still works as a manual override.
 USER_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 if not USER_TOKEN:
     print("[scraper_discord] WARNING: DISCORD_BOT_TOKEN not set in .env", flush=True)
 
-# Discord requires `Authorization: Bot <token>` for bot tokens, and a raw
-# `Authorization: <token>` for user (selfbot) tokens. Bot tokens are JWT-ish
-# (three dot-separated segments), user tokens look different. Default to
-# the bot prefix - that's what the env var name promises - but allow a manual
-# override via DISCORD_AUTH_PREFIX="" for users running a self-bot.
-_AUTH_PREFIX = os.environ.get("DISCORD_AUTH_PREFIX", "Bot ")
+_AUTH_MODE = os.environ.get("DISCORD_AUTH_MODE", "auto").strip().lower()
+_LEGACY_PREFIX = os.environ.get("DISCORD_AUTH_PREFIX")
+if _LEGACY_PREFIX is not None:
+    # Honour legacy override: empty string -> user mode, "Bot " -> bot mode.
+    _AUTH_MODE = "user" if _LEGACY_PREFIX.strip() == "" else "bot"
+
+if _AUTH_MODE == "bot":
+    _AUTH_HEADER = f"Bot {USER_TOKEN}"
+elif _AUTH_MODE == "user":
+    _AUTH_HEADER = USER_TOKEN
+else:  # auto - start as bot, may flip to user on 401
+    _AUTH_MODE = "auto"
+    _AUTH_HEADER = f"Bot {USER_TOKEN}"
+
+print(
+    f"[scraper_discord] Auth mode={_AUTH_MODE!r}, header prefix="
+    f"{'Bot ' if _AUTH_HEADER.startswith('Bot ') else '(none/user-token)'}",
+    flush=True,
+)
 from paths import base_dir
 
 BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
@@ -37,7 +57,7 @@ from topic_filter import load_config as _load_topic_config, passes as _topic_pas
 MESSAGES_PER_CHANNEL = 400
 _TOPIC_CFG = _load_topic_config()
 MIN_PROMPT_LENGTH = _TOPIC_CFG.min_prompt_length
-DL_HEADERS = {"Authorization": f"{_AUTH_PREFIX}{USER_TOKEN}".strip()}
+DL_HEADERS = {"Authorization": _AUTH_HEADER}
 
 def load_seen():
     if SEEN_FILE.exists():
@@ -56,6 +76,27 @@ def is_valid_prompt(text, context: str = "") -> bool:
 _AUTH_HINT_SHOWN = False
 
 
+def _flip_auth_to_user() -> bool:
+    """In auto-mode, flip the global Authorization header to user-token style.
+
+    Returns True if the flip happened (so the caller can retry once).
+    """
+    global _AUTH_HEADER, _AUTH_MODE
+    if _AUTH_MODE != "auto":
+        return False
+    if not _AUTH_HEADER.startswith("Bot "):
+        return False
+    _AUTH_HEADER = USER_TOKEN
+    DL_HEADERS["Authorization"] = _AUTH_HEADER
+    print(
+        "  [auth-fallback] 401 with 'Bot <token>'; retrying as USER token "
+        "(your personal account). Set DISCORD_AUTH_MODE=user in .env to "
+        "skip this dance on next run.",
+        flush=True,
+    )
+    return True
+
+
 def fetch_messages(channel_id, limit=400):
     global _AUTH_HINT_SHOWN
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
@@ -63,23 +104,32 @@ def fetch_messages(channel_id, limit=400):
     while len(results) < limit:
         resp = requests.get(url, headers=DL_HEADERS, params=params)
         if resp.status_code == 403:
-            print(f"  [SKIP] No access: {channel_id} (bot not in server / missing intent)")
+            print(f"  [SKIP] No access: {channel_id} (token not a member of server / missing intent)")
             return []
         if resp.status_code == 401:
-            if not _AUTH_HINT_SHOWN:
-                tail = USER_TOKEN[-6:] if USER_TOKEN else "(empty)"
-                print(
-                    f"  [AUTH-FAIL 401] DISCORD_BOT_TOKEN ending ...{tail} rejected. "
-                    f"Header was 'Authorization: {_AUTH_PREFIX}<token>'. "
-                    "Common fixes: regenerate the token in the Discord Developer Portal, "
-                    "or set DISCORD_AUTH_PREFIX='' if this is a user/self-bot token "
-                    "(no 'Bot ' prefix).",
-                    flush=True,
-                )
-                _AUTH_HINT_SHOWN = True
+            # Auto mode: flip from Bot -> user once and retry the same request.
+            if _flip_auth_to_user():
+                resp = requests.get(url, headers=DL_HEADERS, params=params)
+                if resp.status_code == 200:
+                    pass  # fall through to normal handling
+                else:
+                    print(f"  [ERR] 401 even after user-token fallback ({channel_id})", flush=True)
+                    return []
             else:
-                print(f"  [ERR] 401 on {channel_id}", flush=True)
-            return []
+                if not _AUTH_HINT_SHOWN:
+                    tail = USER_TOKEN[-6:] if USER_TOKEN else "(empty)"
+                    print(
+                        f"  [AUTH-FAIL 401] token ending ...{tail} rejected in mode={_AUTH_MODE!r}. "
+                        "Fixes: (a) regenerate the token in the Discord Developer Portal, "
+                        "or (b) flip DISCORD_AUTH_MODE between 'bot' / 'user' / 'auto' in Settings. "
+                        "User mode = use your personal Discord account token (against TOS but works "
+                        "for private servers your account is in).",
+                        flush=True,
+                    )
+                    _AUTH_HINT_SHOWN = True
+                else:
+                    print(f"  [ERR] 401 on {channel_id}", flush=True)
+                return []
         if resp.status_code != 200:
             print(f"  [ERR] {resp.status_code}")
             break
