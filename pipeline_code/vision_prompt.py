@@ -54,8 +54,7 @@ _RUBRIC_ANCHOR = (
 
 # Substrings whose presence in the model's `art_medium` field forces the
 # image off the photorealistic track even if the model also said
-# `photorealistic_style: true`. These are the cases admins reported being
-# misclassified (anime/CG/illustration coming through as InstagramInfluencer).
+# `photorealistic_style: true`.
 _NON_PHOTO_MEDIUMS = (
     "anime", "cartoon", "illustration", "drawing", "painting", "sketch",
     "digital_painting", "digital painting", "concept_art", "concept art",
@@ -63,6 +62,51 @@ _NON_PHOTO_MEDIUMS = (
     "watercolor", "watercolour", "vector", "comic", "manga", "pixel_art",
     "pixel art", "polaroid_drawing",
 )
+
+# If any of these appears in the model's `description` or `primary_subject`,
+# it is NOT a photo of a real human even when the model claims otherwise -
+# catches statues, busts, mannequins, dolls, etc.
+_NON_HUMAN_OBJECT_TERMS = (
+    "sculpture", "sculpted", "statue", "bust", "mannequin", "doll",
+    "figurine", "puppet", "carved", "monument", "wax figure", "android",
+    "robot", "mascot",
+)
+
+# Tokens that mark an obviously non-human primary subject.
+_NON_HUMAN_SUBJECT_HINTS = (
+    "boulder", "asteroid", "rock", "vehicle", " car ", " car,", "sedan",
+    "truck", "motorbike", "motorcycle", "building", "skyscraper",
+    "landscape", "mountain", "forest", "beach scene", "cityscape",
+    "monster", "creature", "demon", "alien", "animal", "wolf", "dog",
+    "cat ", "horse", "bird", "fish", "insect", "object", "wineglass",
+    "wine glass", "cup", "bottle", "food", "pasta", "burger", "salad",
+    "flower (alone)", "fruit", "machine", "engine",
+)
+
+# Words whose presence in description / primary_subject signals an actual
+# female human is the (or a) subject. If NONE of these appear we cannot
+# trust woman_present=True even if the model insists.
+_FEMININE_TERMS = (
+    "woman", "women", "girl", "girls", "female", "lady", "ladies",
+    "she ", " she,", " her ", "actress", "model ", "model,", "model.",
+    "selfie", "blonde", "brunette", "redhead", "auburn", "instagrammer",
+    "influencer", "daughter", "mother", "sister", "wife", "bride",
+    "queen", "princess", "her hair", "feminine",
+)
+
+
+def _contains(text: str, terms: tuple[str, ...]) -> str | None:
+    """Return the first matched term (lowercased) or None.
+
+    Comparison is whole-text substring on the lowercased text - simple and
+    deterministic. Tokens with surrounding spaces in the constants enforce a
+    rough word-boundary check (e.g. ' car ' won't trip on 'carbon').
+    """
+    haystack = (text or "").lower()
+    for term in terms:
+        if term.lower() in haystack:
+            return term.lower()
+    return None
 
 
 @dataclass(frozen=True)
@@ -125,20 +169,32 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         "}\n\n"
         "STRICT JUDGEMENT RULES (no exceptions):\n"
         "- Fill `description` and `primary_subject` FIRST, from the pixels only. "
-        "If the primary subject is not a human, all of (is_human_photograph, "
-        "photorealistic_style, woman_present) MUST be false. No exceptions.\n"
+        "Then make every binary judgement consistent with that description. "
+        "Your description and labels MUST agree - if your description says "
+        "'boulder smashing a car' you cannot then say woman_present=true.\n"
         "- art_medium = `photograph` ONLY for an actual camera-captured (or "
-        "AI-generated *photoreal*) image. Anime, cel-shaded art, hand-drawn "
-        "illustration, oil/watercolour painting, comic art, polaroid-drawing, "
-        "stylised 3D, concept art -> the matching label, NEVER `photograph`.\n"
-        "- photorealistic_style = TRUE ONLY when art_medium = `photograph`. "
-        "Visible brush strokes, line art, cel shading, painterly textures, "
-        "exaggerated proportions, or stylised lighting all force FALSE.\n"
-        "- woman_present = TRUE ONLY if you can clearly see a real human "
-        "female face or body in the frame as a primary or co-primary subject. "
-        "DO NOT INFER a woman from the topic, caption, prompt, or context. "
-        "If the subject is an object, animal, monster, landscape, or a "
-        "non-photoreal figure, woman_present is FALSE.\n"
+        "AI-generated *photoreal*) image of a real-looking subject. Anime, "
+        "cel-shaded art, hand-drawn illustration, oil/watercolour painting, "
+        "comic, manga, stylised 3D, concept art -> the matching label, "
+        "NEVER `photograph`. SIGNALS that mean NOT a photograph: cel-shaded "
+        "skin, oversized eyes, hand-drawn outlines, flat colour fills, "
+        "exaggerated saturated hair, painterly brush textures, 2D-render "
+        "look, anime/manga aesthetic. If you see ANY of these, art_medium "
+        "is one of {anime, illustration, digital_painting} and "
+        "photorealistic_style MUST be false.\n"
+        "- A photograph of a STATUE, BUST, MANNEQUIN, DOLL, or SCULPTURE is "
+        "NOT a photograph of a real human. is_human_photograph is FALSE in "
+        "those cases, and woman_present is FALSE even if the sculpture "
+        "depicts a female form.\n"
+        "- photorealistic_style = TRUE ONLY when art_medium = `photograph` "
+        "AND the subject reads as a real-world scene/person. Visible brush "
+        "strokes, line art, cel shading, painterly textures, exaggerated "
+        "proportions, or stylised lighting all force FALSE.\n"
+        "- woman_present = TRUE ONLY if a real human female face or body is "
+        "clearly visible as the primary OR co-primary subject of the image. "
+        "Background pedestrians do NOT count. Sculpted/illustrated/animated "
+        "figures do NOT count. DO NOT INFER a woman from the topic, caption, "
+        "prompt, or context.\n"
         "- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face, "
         "wrong finger count, melted limbs, warped text).\n"
         "- nsfw = TRUE only for explicit nudity or sexual content.\n\n"
@@ -187,11 +243,37 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     result["REL_Quality_Score"] = rel
 
     # ─── Self-contradiction guards ────────────────────────────────────────
+    description = result.get("description") or ""
+    primary_subject = result.get("primary_subject") or ""
+    combined = f"{description}\n{primary_subject}"
+
     art_medium = (result.get("art_medium") or "").strip().lower()
+    reasons: list[str] = []
+
     if any(token in art_medium for token in _NON_PHOTO_MEDIUMS):
         result["photorealistic_style"] = False
-        if "score_reason" not in result:
-            result["score_reason"] = f"art_medium={art_medium} is not photograph"
+        reasons.append(f"art_medium={art_medium}")
+
+    # The model often calls a sculpture / mannequin / doll a 'photograph of a
+    # real human'. The word it uses gives it away.
+    statue_token = _contains(combined, _NON_HUMAN_OBJECT_TERMS)
+    if statue_token:
+        result["is_human_photograph"] = False
+        result["woman_present"] = False
+        reasons.append(f"non-human object detected ({statue_token!r})")
+
+    # Description / subject describes an obviously non-human main subject.
+    object_token = _contains(combined, _NON_HUMAN_SUBJECT_HINTS)
+    if object_token:
+        result["woman_present"] = False
+        reasons.append(f"primary subject is non-human ({object_token.strip()!r})")
+
+    # If no feminine term shows up anywhere in the description but the model
+    # claimed woman_present=True, the model is gaming the topic. Force False.
+    if result.get("woman_present") and not _contains(combined, _FEMININE_TERMS):
+        result["woman_present"] = False
+        reasons.append("woman_present=True but no feminine term in description")
+
     if not result.get("is_human_photograph", False):
         result["woman_present"] = False
 
@@ -201,15 +283,20 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
 
     if not photoreal or not has_woman or not is_human_photo:
         result["category"] = "DISCARD"
-        if "score_reason" not in result:
-            reasons: list[str] = []
-            if not photoreal:
-                reasons.append("not photorealistic")
-            if not has_woman:
-                reasons.append("no woman in frame")
-            if not is_human_photo:
-                reasons.append("not a real human photograph")
-            result["score_reason"] = "; ".join(reasons)
+        if not photoreal:
+            reasons.append("not photorealistic")
+        if not has_woman:
+            reasons.append("no woman in frame")
+        if not is_human_photo:
+            reasons.append("not a real human photograph")
+        # De-duplicate while keeping order so the audit trail is readable.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for r in reasons:
+            if r not in seen:
+                ordered.append(r)
+                seen.add(r)
+        result["score_reason"] = "; ".join(ordered) or "self-contradiction"
     elif result.get("has_ai_flaws") and int(result.get("quality_score", 0) or 0) <= 4:
         result["category"] = "DISCARD"
         result["score_reason"] = "severe AI flaws + low quality_score"
