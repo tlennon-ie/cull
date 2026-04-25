@@ -133,14 +133,25 @@ _FEMININE_TERMS = (
 def _contains(text: str, terms: tuple[str, ...]) -> str | None:
     """Return the first matched term (lowercased) or None.
 
-    Comparison is whole-text substring on the lowercased text - simple and
-    deterministic. Tokens with surrounding spaces in the constants enforce a
-    rough word-boundary check (e.g. ' car ' won't trip on 'carbon').
+    Each term is matched with WORD BOUNDARIES so "rock" doesn't fire on
+    "rocky terrain" and "her" doesn't fire on "weather". Multi-word terms
+    that already contain spaces or symbols (e.g. "side-by-side", "u/") are
+    matched as substrings since their non-letter characters give them an
+    implicit boundary.
     """
     haystack = (text or "").lower()
     for term in terms:
-        if term.lower() in haystack:
-            return term.lower()
+        t = term.lower()
+        if not t:
+            continue
+        # Multi-word / punctuation-bearing terms - keep substring match.
+        if any(ch in t for ch in (" ", "-", "/", ".", ",")):
+            if t in haystack:
+                return t
+            continue
+        # Single-word terms - require word boundaries on both sides.
+        if re.search(rf"\b{re.escape(t)}\b", haystack):
+            return t
     return None
 
 
@@ -345,26 +356,49 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
 
     # The model often calls a sculpture / mannequin / doll a 'photograph of a
     # real human'. The word it uses gives it away.
-    statue_token = _contains(combined, _NON_HUMAN_OBJECT_TERMS)
-    if statue_token:
+    # Two flavours of "non-human" check, each with different precedence:
+    #
+    # 1) _NON_HUMAN_OBJECT_TERMS (statue / sculpted / bust / mannequin / doll
+    #    / carved). If ANY of these appear in primary_subject, the image is
+    #    a photograph OF an inanimate object, not a real human - even if the
+    #    object happens to be female-shaped ("female torso (bust)").
+    #
+    # 2) _NON_HUMAN_SUBJECT_HINTS (boulder / car / landscape / rock / animal
+    #    etc). These often appear in scene descriptions where the woman is
+    #    still the actual subject ("woman in bikini against rocky terrain").
+    #    So we only treat as non-human when primary_subject DOESN'T also
+    #    name a female - i.e. these are background props, not the subject.
+    feminine_in_description = _contains(combined, _FEMININE_TERMS)
+    feminine_in_primary = _contains(primary_subject, _FEMININE_TERMS)
+
+    statue_in_primary = _contains(primary_subject, _NON_HUMAN_OBJECT_TERMS)
+    statue_in_combined = _contains(combined, _NON_HUMAN_OBJECT_TERMS)
+    if statue_in_primary or (statue_in_combined and not feminine_in_primary):
         result["is_human_photograph"] = False
         result["woman_present"] = False
-        reasons.append(f"non-human object detected ({statue_token!r})")
+        token = statue_in_primary or statue_in_combined
+        reasons.append(f"non-human object detected ({token!r})")
 
-    # Description / subject describes an obviously non-human main subject.
     object_token = _contains(combined, _NON_HUMAN_SUBJECT_HINTS)
-    if object_token:
+    if object_token and not feminine_in_primary:
         result["woman_present"] = False
         reasons.append(f"primary subject is non-human ({object_token.strip()!r})")
 
-    # If no feminine term shows up anywhere in the description but the model
-    # claimed woman_present=True, the model is gaming the topic. Force False.
-    if result.get("woman_present") and not _contains(combined, _FEMININE_TERMS):
+    # Bidirectional cross-check on woman_present:
+    # - If the description has NO feminine cue, force False (model gamed topic).
+    # - If primary_subject IS a woman, override the model's lying False so
+    #   NSFW images with woman_present mistakenly cleared still route correctly.
+    if result.get("woman_present") and not feminine_in_description:
         result["woman_present"] = False
         reasons.append("woman_present=True but no feminine term in description")
+    elif (not result.get("woman_present")) and feminine_in_primary:
+        result["woman_present"] = True
 
     if not result.get("is_human_photograph", False):
-        result["woman_present"] = False
+        # Don't drop woman_present here if the primary_subject explicitly says
+        # so - keep the bidirectional override above intact.
+        if not feminine_in_primary:
+            result["woman_present"] = False
 
     photoreal = bool(result.get("photorealistic_style"))
     has_woman = bool(result.get("woman_present"))
