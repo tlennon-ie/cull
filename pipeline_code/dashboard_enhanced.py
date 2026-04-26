@@ -395,6 +395,7 @@ SETTINGS_KEYS: list[str] = [
     "DISCORD_AUTH_MODE",
     "VISION_OVR_MIN_SCORE",
     "VISION_REL_MIN_SCORE",
+    "BLUR_NSFW_THUMBS",
     "VISION_SCORE_NOTES",
     "PIPELINE_RECONCILE_SECONDS",
     "PIPELINE_BASE_DIR",
@@ -812,6 +813,17 @@ HTML_TEMPLATE = r"""<!doctype html>
   .prompt-snippet { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .link-btn { color:#818cf8; cursor:pointer; font-size:.75rem; }
   .link-btn:hover { color:#a5b4fc; text-decoration:underline; }
+  /* NSFW blur container - the eye button overlays so the user can reveal a single thumb. */
+  .nsfw-wrap { position:relative; display:inline-block; line-height:0; }
+  .nsfw-blur { filter: blur(18px) saturate(0.7); transition: filter .2s; }
+  .nsfw-blur:hover { filter: blur(14px) saturate(0.7); }
+  .nsfw-eye {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background: rgba(15,23,42,0.45); border-radius:6px; cursor:pointer; user-select:none;
+    color:#fbbf24; font-size:1rem; line-height:1;
+  }
+  .nsfw-eye:hover { background: rgba(15,23,42,0.65); color:#fde68a; }
+  .nsfw-eye svg { width:60%; height:60%; max-width:34px; max-height:34px; opacity:.95; }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -890,8 +902,16 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
             <template x-for="a in activity" :key="a.path">
               <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-2 flex gap-3 items-start">
-                <img :src="a.thumbnail" class="thumb-lg" loading="lazy" referrerpolicy="no-referrer"
-                     @click="openModalFromActivity(a)"/>
+                <span class="nsfw-wrap">
+                  <img :src="a.thumbnail" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
+                       loading="lazy" referrerpolicy="no-referrer"
+                       @click="shouldBlurNsfw(a) ? revealNsfw(a) : openModalFromActivity(a)"/>
+                  <span class="nsfw-eye" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                    </svg>
+                  </span>
+                </span>
                 <div class="min-w-0 text-xs">
                   <div class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-200" x-text="a.category"></div>
                   <div class="mt-1 font-mono truncate" x-text="a.name"></div>
@@ -1018,7 +1038,16 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
           <template x-for="a in activity" :key="a.path">
             <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-2 flex gap-2 items-start">
-              <img :src="a.thumbnail" class="thumb-lg" loading="lazy" @click="openModalFromActivity(a)"/>
+              <span class="nsfw-wrap">
+                <img :src="a.thumbnail" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
+                     loading="lazy"
+                     @click="shouldBlurNsfw(a) ? revealNsfw(a) : openModalFromActivity(a)"/>
+                <span class="nsfw-eye" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                  </svg>
+                </span>
+              </span>
               <div class="min-w-0 text-xs">
                 <div class="pill px-1.5 py-0.5 rounded bg-slate-800" x-text="a.category"></div>
                 <div class="mt-1 font-mono truncate" x-text="a.name"></div>
@@ -1069,9 +1098,19 @@ HTML_TEMPLATE = r"""<!doctype html>
         <tbody>
           <template x-for="h in history" :key="(h.image||'') + (h.timestamp||'')">
             <tr>
-              <td><img :src="h.thumbnail || ''" class="thumb" loading="lazy"
+              <td>
+                <span class="nsfw-wrap">
+                  <img :src="h.thumbnail || ''" class="thumb" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
+                       loading="lazy"
                        onerror="this.style.visibility='hidden'"
-                       @click="h.thumbnail && openModalFromHistory(h)"/></td>
+                       @click="h.thumbnail && (shouldBlurNsfw(h) ? revealNsfw(h) : openModalFromHistory(h))"/>
+                  <span class="nsfw-eye" x-show="shouldBlurNsfw(h)" @click.stop="revealNsfw(h)" title="Reveal NSFW">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                    </svg>
+                  </span>
+                </span>
+              </td>
               <td class="text-xs text-slate-400 font-mono" x-text="h.timestamp"></td>
               <td class="font-mono text-xs" x-text="h.image"></td>
               <td x-text="h.source"></td>
@@ -1211,6 +1250,15 @@ HTML_TEMPLATE = r"""<!doctype html>
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
             <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
           </label>
+          <label class="flex items-start gap-2 md:col-span-2">
+            <input type="checkbox" :checked="settings.BLUR_NSFW_THUMBS === 'true'"
+                   @change="settings.BLUR_NSFW_THUMBS = $event.target.checked ? 'true' : 'false'"
+                   class="mt-1"/>
+            <div>
+              <div class="text-xs text-slate-300">Blur NSFW thumbnails by default</div>
+              <div class="text-[10px] text-slate-500">A small eye icon on each NSFW image lets you reveal it temporarily; the setting persists per browser session for revealed items only.</div>
+            </div>
+          </label>
         </div>
       </div>
 
@@ -1314,8 +1362,17 @@ HTML_TEMPLATE = r"""<!doctype html>
         <button @click="closeModal()" class="shrink-0 px-3 py-1 text-sm bg-slate-800 hover:bg-slate-700 rounded">Close (Esc)</button>
       </div>
       <div class="grid lg:grid-cols-2 gap-4 overflow-hidden">
-        <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto">
-          <img :src="modal.imageUrl" class="max-w-full max-h-[75vh] object-contain"/>
+        <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto relative">
+          <img :src="modal.imageUrl"
+               class="max-w-full max-h-[75vh] object-contain"
+               :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          <span class="nsfw-eye" style="background:rgba(15,23,42,0.55);"
+                x-show="shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
+                @click="revealNsfw({ path: modal.imageUrl })" title="Reveal NSFW">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+          </span>
         </div>
         <div class="overflow-y-auto">
           <h4 class="text-xs uppercase tracking-wider text-slate-400 mb-2">Full prompt</h4>
@@ -1360,6 +1417,7 @@ function dashboard() {
       'groq':                   'Legacy single-threaded Groq worker',
     },
     queueFiles: [], history: [], activity: [], promptCache: {},
+    revealedNsfw: {},  // path -> true once the user clicks the eye
     lastRefresh: '...',
     modal: { open:false, imageUrl:'', prompt:'', name:'', source:'', category:'', summary:'' },
 
@@ -1500,6 +1558,24 @@ function dashboard() {
       });
     },
     closeModal() { this.modal.open = false; },
+
+    // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth - callers
+    // pass {category, path}, we decide based on the BLUR_NSFW_THUMBS setting
+    // and whether the user has clicked the eye for this path. revealNsfw()
+    // flips the per-path reveal so a single image is unblurred without
+    // disabling the global setting.
+    shouldBlurNsfw(item) {
+      if (!item) return false;
+      const cat = String(item.category || item.classification || '').toUpperCase();
+      if (cat !== 'NSFW') return false;
+      if ((this.settings.BLUR_NSFW_THUMBS || 'true') !== 'true') return false;
+      const key = item.path || item.thumbnail || item.image || '';
+      return !this.revealedNsfw[key];
+    },
+    revealNsfw(item) {
+      const key = item?.path || item?.thumbnail || item?.image || '';
+      if (key) this.revealedNsfw[key] = true;
+    },
 
     start() {
       this.refresh();

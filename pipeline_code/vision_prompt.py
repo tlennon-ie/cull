@@ -444,27 +444,39 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
 
 
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_DANGLING_THINK_OPEN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
 
 
 def _safe_parse_vision_json(raw: str | None) -> dict[str, Any] | None:
     """Extract a JSON object from a vision worker response.
 
-    Models occasionally return:
-      * an empty string (LMStudio sometimes does this on overload),
-      * markdown-fenced JSON despite being told not to,
-      * trailing prose around a JSON blob.
+    Tolerates:
+      * empty / whitespace strings (LMStudio overload),
+      * markdown-fenced JSON,
+      * trailing prose around a JSON blob,
+      * <think>...</think> reasoning blocks emitted by Qwen3-thinking-style
+        models. We strip both balanced and dangling-open think tags before
+        parsing - some thinkers run out of tokens before they emit the
+        closing </think>, leaving an unterminated reasoning block.
 
-    This helper tolerates all three. Returns the parsed dict, or None if the
-    response can't be salvaged - in which case the worker should log the raw
-    content and re-queue the image.
+    Returns the parsed dict, or None if the response can't be salvaged - in
+    which case the worker should log the raw content and re-queue the image.
     """
     if not raw or not raw.strip():
         return None
     text = raw.strip()
-    # Strip markdown fences first.
+    # Drop balanced <think>...</think> blocks first.
+    text = _THINK_BLOCK.sub("", text).strip()
+    # If a model ran out of tokens mid-think, kill the dangling block too.
+    if "<think>" in text and "</think>" not in text:
+        text = _DANGLING_THINK_OPEN.sub("", text).strip()
+    # Strip markdown fences if any wrapping survived.
     fenced = _FENCED_JSON.search(text)
     if fenced:
         text = fenced.group(1)
+    if not text:
+        return None
     # Direct parse.
     try:
         parsed = json.loads(text)
@@ -481,9 +493,28 @@ def _safe_parse_vision_json(raw: str | None) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def extract_message_text(message: dict[str, Any] | None) -> str:
+    """Pull a usable string out of an OpenAI-compatible message envelope.
+
+    Handles three thinking-model conventions:
+      1. content carries the full output (legacy behaviour),
+      2. reasoning is in `reasoning_content` and content has the final answer,
+      3. content is empty / null and the only thing populated is `reasoning_content`
+         (LM Studio's split-mode for Qwen3-VL-thinking; we still try to mine
+         a JSON object out of it).
+    """
+    if not message:
+        return ""
+    content = message.get("content") or ""
+    if content.strip():
+        return content
+    return message.get("reasoning_content") or ""
+
+
 __all__ = [
     "ScoreConfig",
     "build_classification_prompt",
     "apply_scores",
     "_safe_parse_vision_json",
+    "extract_message_text",
 ]

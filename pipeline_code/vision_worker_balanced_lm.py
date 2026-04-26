@@ -121,7 +121,7 @@ def vision_classify(image_path, source_name):
 
     b64 = base64.standard_b64encode(small).decode()
 
-    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json
+    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json, extract_message_text
     prompt_instruction = build_classification_prompt()
 
     try:
@@ -144,7 +144,12 @@ def vision_classify(image_path, source_name):
                     }
                 ],
                 "temperature": 0.1,
-                "max_tokens": 500,
+                # Thinking-style models (qwen3-vl-*-thinking, deepseek-r1, etc.)
+                # spend a chunk of tokens inside <think>...</think> before
+                # emitting the JSON answer. 500 was too tight - everything
+                # ended up inside the thinking block. 2000 gives plenty of
+                # headroom for both the reasoning and the JSON tail.
+                "max_tokens": 2000,
             },
             timeout=TIMEOUT,
         )
@@ -158,7 +163,8 @@ def vision_classify(image_path, source_name):
             processing_path.rename(image_path)
             return {"category": "RETRY"}
 
-        raw = response.json()["choices"][0]["message"]["content"]
+        message = response.json()["choices"][0]["message"]
+        raw = extract_message_text(message)
         parsed = _safe_parse_vision_json(raw)
         if parsed is None:
             preview = (raw or "")[:300].replace("\n", " ")

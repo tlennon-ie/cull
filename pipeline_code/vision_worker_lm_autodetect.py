@@ -144,7 +144,7 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
 
     b64 = base64.standard_b64encode(small).decode()
 
-    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json  # local import keeps module load-order safe
+    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json, extract_message_text  # local import keeps module load-order safe
     prompt_instruction = build_classification_prompt()
 
     try:
@@ -167,7 +167,9 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
                     }
                 ],
                 "temperature": 0.1,
-                "max_tokens": 500,
+                # Thinking-style models (qwen3-vl-*-thinking, deepseek-r1)
+                # need room for <think>...</think> + the JSON answer.
+                "max_tokens": 2000,
             },
             timeout=TIMEOUT,
         )
@@ -178,7 +180,8 @@ def vision_classify(image_path, source_name, model_name, lms_url=None):
             processing_path.rename(image_path)
             return {"category": "RETRY", "error": f"LMS API error {response.status_code}"}
 
-        raw = response.json()["choices"][0]["message"]["content"]
+        message = response.json()["choices"][0]["message"]
+        raw = extract_message_text(message)
         parsed = _safe_parse_vision_json(raw)
         if parsed is None:
             preview = (raw or "")[:300].replace("\n", " ")

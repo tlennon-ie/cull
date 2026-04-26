@@ -169,7 +169,7 @@ def vision_classify(image_path, source_name):
                     }
                 ],
                 "temperature": 0.1,
-                "max_tokens": 500,
+                "max_tokens": 2000,  # room for <think>...</think> + JSON
             },
             timeout=TIMEOUT,
         )
@@ -183,8 +183,9 @@ def vision_classify(image_path, source_name):
             processing_path.rename(image_path)
             return {"category": "RETRY"}
 
-        from vision_prompt import _safe_parse_vision_json
-        raw = response.json()["choices"][0]["message"]["content"]
+        from vision_prompt import _safe_parse_vision_json, extract_message_text
+        message = response.json()["choices"][0]["message"]
+        raw = extract_message_text(message)
         result = _safe_parse_vision_json(raw)
         if result is None:
             preview = (raw or "")[:300].replace("\n", " ")
