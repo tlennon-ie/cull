@@ -786,6 +786,546 @@ def api_activity():
     return jsonify(results)
 
 
+# ── Sorted-folder scan + cache (powers stats + gallery) ───────────────────────
+
+import time as _time
+import zipfile as _zipfile
+from collections import Counter as _Counter
+from dataclasses import dataclass as _dataclass, field as _field
+
+_STOPWORDS: frozenset[str] = frozenset({
+    "the", "and", "with", "for", "from", "this", "that", "are", "was", "were",
+    "have", "has", "had", "but", "not", "you", "your", "they", "their", "them",
+    "she", "her", "his", "him", "its", "our", "their", "all", "any", "some",
+    "one", "two", "more", "very", "much", "many", "most", "into", "over",
+    "under", "than", "then", "there", "where", "when", "what", "which", "who",
+    "how", "why", "out", "off", "out", "down", "back", "also", "just", "only",
+    "even", "still", "yet", "such", "like", "can", "could", "would", "should",
+    "may", "might", "will", "shall", "must", "about", "above", "below",
+    "between", "through", "during", "before", "after", "while", "though",
+    "because", "though", "since", "until", "without", "within", "across",
+    "around", "behind", "beyond", "instead", "rather", "really", "quite",
+    "hand", "front", "side", "scene", "view", "shot", "image", "photo",
+})
+
+_GALLERY_PAGE_LIMIT: int = 60
+_ZIP_HARD_LIMIT: int = 5000
+_STATS_CACHE_TTL: float = 60.0
+_RESOLUTION_BUCKETS: tuple[tuple[str, int], ...] = (
+    ("low", 768),
+    ("medium", 1280),
+    ("high", 2048),
+)
+
+
+@_dataclass
+class _SortedItem:
+    image_path: Path
+    meta_path: Path
+    txt_path: Path | None
+    category: str
+    source: str
+    mtime: float
+    payload: dict[str, Any]
+    prompt_text: str
+    width: int = 0
+    height: int = 0
+
+
+_sorted_cache: dict[str, Any] = {"items": [], "ts": 0.0, "signature": None}
+_sorted_cache_lock = threading.Lock()
+_dim_cache: dict[str, tuple[int, int]] = {}
+
+
+def _sorted_signature() -> tuple[int, float]:
+    if not PIPELINE_SORTED.exists():
+        return (0, 0.0)
+    paths = [p for p in PIPELINE_SORTED.glob("**/*.vision.json") if not _is_in_archive(p)]
+    if not paths:
+        return (0, 0.0)
+    return (len(paths), max(p.stat().st_mtime for p in paths))
+
+
+def _resolve_image_dims(path: Path) -> tuple[int, int]:
+    key = str(path)
+    cached = _dim_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with Image.open(path) as img:
+            dims = img.size
+    except (OSError, ValueError):
+        dims = (0, 0)
+    _dim_cache[key] = dims
+    return dims
+
+
+def _scan_sorted_items() -> list[_SortedItem]:
+    """One-shot scan of PIPELINE_SORTED returning every classified image with
+    its vision-json + .txt prompt body. Skips archived/dot-prefixed paths.
+    """
+    if not PIPELINE_SORTED.exists():
+        return []
+    items: list[_SortedItem] = []
+    for meta in PIPELINE_SORTED.glob("**/*.vision.json"):
+        if _is_in_archive(meta):
+            continue
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        stem = meta.name.replace(".vision.json", "")
+        img = next(
+            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
+            None,
+        )
+        if img is None or not img.exists():
+            continue
+        txt = meta.parent / f"{stem}.txt"
+        prompt_text = ""
+        if txt.exists():
+            try:
+                prompt_text = txt.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                prompt_text = ""
+        try:
+            mtime = meta.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        items.append(
+            _SortedItem(
+                image_path=img,
+                meta_path=meta,
+                txt_path=txt if txt.exists() else None,
+                category=meta.parent.parent.name,
+                source=meta.parent.name,
+                mtime=mtime,
+                payload=payload,
+                prompt_text=prompt_text,
+            )
+        )
+    return items
+
+
+def _get_sorted_items(force: bool = False) -> list[_SortedItem]:
+    """Cached scan; refreshes when the underlying folder signature changes
+    or when the TTL expires. Thread-safe."""
+    with _sorted_cache_lock:
+        now = _time.time()
+        sig = _sorted_signature()
+        if (
+            not force
+            and _sorted_cache["signature"] == sig
+            and (now - _sorted_cache["ts"]) < _STATS_CACHE_TTL
+        ):
+            return _sorted_cache["items"]
+        items = _scan_sorted_items()
+        _sorted_cache["items"] = items
+        _sorted_cache["ts"] = now
+        _sorted_cache["signature"] = sig
+        return items
+
+
+_TOKEN_RX = re.compile(r"[A-Za-z][A-Za-z'\-]{2,}")
+
+
+def _tokenize(text: str) -> list[str]:
+    return [w.lower() for w in _TOKEN_RX.findall(text or "")]
+
+
+def _is_content_word(word: str) -> bool:
+    return word not in _STOPWORDS and len(word) >= 3
+
+
+def _resolution_bucket(width: int, height: int) -> str:
+    if width <= 0 or height <= 0:
+        return "unknown"
+    longest = max(width, height)
+    for label, ceiling in _RESOLUTION_BUCKETS:
+        if longest <= ceiling:
+            return label
+    return "ultra"
+
+
+def _item_to_card(item: _SortedItem) -> dict[str, Any]:
+    """Compact JSON representation used by gallery + stats payloads."""
+    payload = item.payload
+    width, height = item.width, item.height
+    if width <= 0 or height <= 0:
+        width, height = _resolve_image_dims(item.image_path)
+        item.width, item.height = width, height
+    return {
+        "name": item.image_path.name,
+        "path": str(item.image_path),
+        "category": item.category,
+        "source": item.source,
+        "modified": datetime.fromtimestamp(item.mtime).isoformat() if item.mtime else None,
+        "thumbnail": f"/api/thumbnail?path={item.image_path}",
+        "prompt_url": f"/api/prompt?path={item.image_path}",
+        "ovr": payload.get("OVR_Quality_Score"),
+        "rel": payload.get("REL_Quality_Score"),
+        "quality": payload.get("quality_score"),
+        "nsfw": bool(payload.get("nsfw")),
+        "summary": payload.get("reason", ""),
+        "score_reason": payload.get("score_reason", ""),
+        "width": width,
+        "height": height,
+        "resolution_bucket": _resolution_bucket(width, height),
+        "prompt_excerpt": (item.prompt_text or "").strip()[:240],
+    }
+
+
+# ── API: stats ────────────────────────────────────────────────────────────────
+
+@app.route("/api/stats")
+def api_stats():
+    """Aggregates over every sorted image: keyword frequency, top thumbnails,
+    per-source platform analytics. Cached for 60s via _get_sorted_items.
+    """
+    items = _get_sorted_items()
+    non_discard = [it for it in items if it.category.upper() != "DISCARD"]
+
+    # Keyword frequency over non-DISCARD prompts.
+    keyword_counter: _Counter[str] = _Counter()
+    for it in non_discard:
+        keyword_counter.update(w for w in _tokenize(it.prompt_text) if _is_content_word(w))
+    top_keywords = [
+        {"term": term, "count": count}
+        for term, count in keyword_counter.most_common(50)
+    ]
+
+    # Top-10 thumbnails by three lenses. Only consider non-DISCARD so DISCARD
+    # entries with stale high scores can't pollute the leaderboards.
+    def _top_by(metric_keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        scored: list[tuple[float, _SortedItem]] = []
+        for it in non_discard:
+            vals = [it.payload.get(k) for k in metric_keys]
+            try:
+                numeric = [float(v) for v in vals if v is not None]
+            except (TypeError, ValueError):
+                continue
+            if not numeric:
+                continue
+            score = sum(numeric) / len(numeric)
+            scored.append((score, it))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [
+            {**_item_to_card(it), "metric_value": round(score, 1)}
+            for score, it in scored[:10]
+        ]
+
+    top_overall = _top_by(("OVR_Quality_Score", "REL_Quality_Score"))
+    top_quality = _top_by(("OVR_Quality_Score",))
+    top_relative = _top_by(("REL_Quality_Score",))
+
+    # Per-source platform analytics. NSFW% counts category=='NSFW'; discard%
+    # counts category=='DISCARD'. Quality/REL averages exclude DISCARD so a
+    # noisy reject pile doesn't drag the bar down.
+    by_source: dict[str, dict[str, Any]] = {}
+    for it in items:
+        bucket = by_source.setdefault(
+            it.source,
+            {"total": 0, "discard": 0, "nsfw": 0, "ovr_sum": 0.0, "ovr_n": 0,
+             "rel_sum": 0.0, "rel_n": 0},
+        )
+        bucket["total"] += 1
+        cat_upper = it.category.upper()
+        if cat_upper == "DISCARD":
+            bucket["discard"] += 1
+        if cat_upper == "NSFW":
+            bucket["nsfw"] += 1
+        if cat_upper != "DISCARD":
+            ovr = it.payload.get("OVR_Quality_Score")
+            rel = it.payload.get("REL_Quality_Score")
+            try:
+                if ovr is not None:
+                    bucket["ovr_sum"] += float(ovr)
+                    bucket["ovr_n"] += 1
+                if rel is not None:
+                    bucket["rel_sum"] += float(rel)
+                    bucket["rel_n"] += 1
+            except (TypeError, ValueError):
+                pass
+
+    sources = []
+    for name, b in by_source.items():
+        total = max(1, b["total"])
+        sources.append({
+            "source": name,
+            "total": b["total"],
+            "discard_pct": round(100.0 * b["discard"] / total, 1),
+            "nsfw_pct": round(100.0 * b["nsfw"] / total, 1),
+            "avg_ovr": round(b["ovr_sum"] / b["ovr_n"], 1) if b["ovr_n"] else None,
+            "avg_rel": round(b["rel_sum"] / b["rel_n"], 1) if b["rel_n"] else None,
+        })
+    sources.sort(key=lambda r: r["total"], reverse=True)
+
+    return jsonify({
+        "totals": {
+            "all": len(items),
+            "non_discard": len(non_discard),
+            "discard": len(items) - len(non_discard),
+        },
+        "keywords": top_keywords,
+        "top_overall": top_overall,
+        "top_quality": top_quality,
+        "top_relative": top_relative,
+        "sources": sources,
+        "cached_age": round(_time.time() - _sorted_cache["ts"], 1),
+    })
+
+
+# ── API: gallery (paginated + filtered) ───────────────────────────────────────
+
+def _parse_int(value: str | None, default: int = 0) -> int:
+    try:
+        return int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _filter_items(items: list[_SortedItem], args: Any) -> list[_SortedItem]:
+    """Apply gallery filters from query-string arguments."""
+    sources_filter = {s.strip() for s in (args.get("sources") or "").split(",") if s.strip()}
+    categories_filter = {c.strip() for c in (args.get("categories") or "").split(",") if c.strip()}
+    resolutions_filter = {r.strip() for r in (args.get("resolutions") or "").split(",") if r.strip()}
+
+    keyword = (args.get("q") or "").strip().lower()
+    nsfw_mode = (args.get("nsfw") or "any").lower()  # any | only | exclude
+
+    min_ovr = _parse_int(args.get("min_ovr"))
+    min_rel = _parse_int(args.get("min_rel"))
+    min_quality = _parse_int(args.get("min_quality"))
+
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+
+    def _date_to_ts(value: str, end_of_day: bool) -> float | None:
+        if not value:
+            return None
+        try:
+            base = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if end_of_day:
+            base = base.replace(hour=23, minute=59, second=59)
+        return base.timestamp()
+
+    from_ts = _date_to_ts(date_from, end_of_day=False)
+    to_ts = _date_to_ts(date_to, end_of_day=True)
+
+    out: list[_SortedItem] = []
+    for it in items:
+        if sources_filter and it.source not in sources_filter:
+            continue
+        if categories_filter and it.category not in categories_filter:
+            continue
+        is_nsfw = it.category.upper() == "NSFW" or bool(it.payload.get("nsfw"))
+        if nsfw_mode == "only" and not is_nsfw:
+            continue
+        if nsfw_mode == "exclude" and is_nsfw:
+            continue
+        if from_ts is not None and it.mtime < from_ts:
+            continue
+        if to_ts is not None and it.mtime > to_ts:
+            continue
+        if min_ovr:
+            try:
+                if float(it.payload.get("OVR_Quality_Score") or 0) < min_ovr:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if min_rel:
+            try:
+                if float(it.payload.get("REL_Quality_Score") or 0) < min_rel:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if min_quality:
+            try:
+                if float(it.payload.get("quality_score") or 0) < min_quality:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if resolutions_filter:
+            if it.width <= 0 or it.height <= 0:
+                w, h = _resolve_image_dims(it.image_path)
+                it.width, it.height = w, h
+            if _resolution_bucket(it.width, it.height) not in resolutions_filter:
+                continue
+        if keyword:
+            haystack = (it.prompt_text + "\n" + it.payload.get("description", "")
+                        + "\n" + it.payload.get("primary_subject", "")).lower()
+            if keyword not in haystack:
+                continue
+        out.append(it)
+    return out
+
+
+@app.route("/api/gallery")
+def api_gallery():
+    items = _get_sorted_items()
+    filtered = _filter_items(items, request.args)
+    sort_key = (request.args.get("sort") or "newest").lower()
+    if sort_key == "ovr":
+        filtered.sort(key=lambda it: float(it.payload.get("OVR_Quality_Score") or 0), reverse=True)
+    elif sort_key == "rel":
+        filtered.sort(key=lambda it: float(it.payload.get("REL_Quality_Score") or 0), reverse=True)
+    elif sort_key == "quality":
+        filtered.sort(key=lambda it: float(it.payload.get("quality_score") or 0), reverse=True)
+    else:
+        filtered.sort(key=lambda it: it.mtime, reverse=True)
+    page = max(1, _parse_int(request.args.get("page"), default=1))
+    page_size = max(1, min(240, _parse_int(request.args.get("page_size"), default=_GALLERY_PAGE_LIMIT)))
+    start = (page - 1) * page_size
+    page_items = filtered[start:start + page_size]
+    return jsonify({
+        "page": page,
+        "page_size": page_size,
+        "total": len(filtered),
+        "total_unfiltered": len(items),
+        "items": [_item_to_card(it) for it in page_items],
+        "available": {
+            "sources": sorted({it.source for it in items}),
+            "categories": sorted({it.category for it in items}),
+            "resolutions": [b[0] for b in _RESOLUTION_BUCKETS] + ["ultra", "unknown"],
+        },
+    })
+
+
+@app.route("/api/gallery/insights")
+def api_gallery_insights():
+    """N-gram insights computed only over the FILTERED set so they reflect
+    whatever the user is actively browsing."""
+    items = _get_sorted_items()
+    filtered = _filter_items(items, request.args)
+    non_discard = [it for it in filtered if it.category.upper() != "DISCARD"]
+
+    ngram_min = max(2, _parse_int(request.args.get("ngram_min"), default=3))
+    ngram_max = max(ngram_min, _parse_int(request.args.get("ngram_max"), default=5))
+
+    ngrams: _Counter[str] = _Counter()
+    high_quality_keywords: _Counter[str] = _Counter()
+    if non_discard:
+        ovr_values = [
+            float(it.payload.get("OVR_Quality_Score") or 0) for it in non_discard
+        ]
+        ovr_threshold = sorted(ovr_values, reverse=True)[max(0, len(ovr_values) // 4 - 1)] if ovr_values else 0
+    else:
+        ovr_threshold = 0
+
+    for it in non_discard:
+        tokens = _tokenize(it.prompt_text)
+        # N-grams: keep raw token sequences (preserve stopwords for fluency).
+        for n in range(ngram_min, ngram_max + 1):
+            if len(tokens) < n:
+                continue
+            for i in range(len(tokens) - n + 1):
+                window = tokens[i:i + n]
+                if sum(1 for w in window if _is_content_word(w)) < max(1, n // 2):
+                    continue  # drop windows that are mostly stopwords
+                ngrams[" ".join(window)] += 1
+        try:
+            ovr = float(it.payload.get("OVR_Quality_Score") or 0)
+        except (TypeError, ValueError):
+            ovr = 0.0
+        if ovr >= ovr_threshold:
+            high_quality_keywords.update(
+                w for w in tokens if _is_content_word(w)
+            )
+
+    return jsonify({
+        "ngrams": [
+            {"phrase": phrase, "count": count}
+            for phrase, count in ngrams.most_common(40)
+        ],
+        "top_quality_keywords": [
+            {"term": term, "count": count}
+            for term, count in high_quality_keywords.most_common(40)
+        ],
+        "ovr_quality_threshold": round(ovr_threshold, 1),
+        "considered": len(non_discard),
+    })
+
+
+# ── API: prompt save (overwrite, no backup per user spec) ─────────────────────
+
+@app.route("/api/prompt", methods=["POST"])
+def api_prompt_save():
+    data = request.get_json() or {}
+    raw = data.get("path") or ""
+    text = data.get("text")
+    if text is None:
+        return jsonify({"error": "missing 'text' field"}), 400
+    image_path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if image_path is None:
+        return jsonify({"error": "path outside pipeline roots"}), 400
+    txt_path = image_path.with_suffix(".txt")
+    try:
+        txt_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"error": f"write failed: {exc}"}), 500
+    # Invalidate the scan cache so the next /api/stats sees the new prompt.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True, "path": str(txt_path), "bytes": len(text)})
+
+
+# ── API: zip download of filtered gallery ─────────────────────────────────────
+
+@app.route("/api/gallery/download.zip")
+def api_gallery_download():
+    items = _get_sorted_items()
+    filtered = _filter_items(items, request.args)
+    if not filtered:
+        return Response("no items match the current filters", status=404, mimetype="text/plain")
+    if len(filtered) > _ZIP_HARD_LIMIT:
+        return Response(
+            f"filter selects {len(filtered)} items; cap is {_ZIP_HARD_LIMIT}. "
+            "Tighten filters and retry.",
+            status=413, mimetype="text/plain",
+        )
+
+    buffer = io.BytesIO()
+    seen_names: set[str] = set()
+    with _zipfile.ZipFile(buffer, mode="w", compression=_zipfile.ZIP_DEFLATED, compresslevel=4) as zf:
+        for it in filtered:
+            base = f"{it.category}/{it.source}/{it.image_path.stem}"
+            # Avoid name collisions across folders by suffixing with the
+            # parent path hash if the same stem already landed in the archive.
+            suffix = ""
+            attempt = 0
+            while f"{base}{suffix}{it.image_path.suffix}" in seen_names:
+                attempt += 1
+                suffix = f"_{attempt}"
+            stem = f"{base}{suffix}"
+            try:
+                zf.writestr(f"{stem}{it.image_path.suffix}", it.image_path.read_bytes())
+                seen_names.add(f"{stem}{it.image_path.suffix}")
+            except OSError:
+                continue
+            try:
+                zf.writestr(f"{stem}.vision.json",
+                            it.meta_path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+            if it.txt_path is not None:
+                try:
+                    zf.writestr(f"{stem}.txt", it.txt_path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+    buffer.seek(0)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"pipeline_gallery_{stamp}.zip",
+        max_age=0,
+    )
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -940,6 +1480,279 @@ HTML_TEMPLATE = r"""<!doctype html>
               </template>
             </div>
           </template>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATS -->
+    <section x-show="active === 'stats'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <div>
+            <h3 class="font-semibold">Pipeline analytics</h3>
+            <p class="text-xs text-slate-400">Aggregates over every sorted image (DISCARD excluded for keyword + leaderboards). Cached for 60s.</p>
+          </div>
+          <button @click="loadStats()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Refresh stats</button>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Total classified</div><div class="text-2xl font-mono mt-1" x-text="stats.totals?.all ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-emerald-300">Kept (non-DISCARD)</div><div class="text-2xl font-mono mt-1 text-emerald-200" x-text="stats.totals?.non_discard ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-rose-300">Discarded</div><div class="text-2xl font-mono mt-1 text-rose-200" x-text="stats.totals?.discard ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Cache age (s)</div><div class="text-2xl font-mono mt-1" x-text="stats.cached_age ?? 0"></div></div>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Top keywords across kept prompts</h3>
+        <div class="flex flex-wrap gap-2">
+          <template x-for="kw in stats.keywords" :key="kw.term">
+            <button @click="active='gallery'; insertGalleryQuery(kw.term)"
+              class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-indigo-600 hover:text-white border border-slate-700 transition"
+              :title="'Show in Gallery: ' + kw.term">
+              <span class="font-mono" x-text="kw.term"></span>
+              <span class="ml-1 text-slate-400" x-text="'(' + kw.count + ')'"></span>
+            </button>
+          </template>
+          <template x-if="(stats.keywords?.length ?? 0) === 0">
+            <span class="text-xs text-slate-500">No keywords yet - process images first.</span>
+          </template>
+        </div>
+      </div>
+
+      <template x-for="bucket in [
+          {key:'top_overall',  label:'Top 10 by overall (avg of OVR + REL)', metric:'metric_value'},
+          {key:'top_quality',  label:'Top 10 by craft quality (OVR)',          metric:'metric_value'},
+          {key:'top_relative', label:'Top 10 by topic relevance (REL)',        metric:'metric_value'},
+        ]" :key="bucket.key">
+        <div class="card rounded-xl p-5">
+          <h3 class="font-semibold mb-3" x-text="bucket.label"></h3>
+          <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-10 gap-3">
+            <template x-for="(c, idx) in (stats[bucket.key] || [])" :key="bucket.key + '_' + c.path">
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-center">
+                <span class="nsfw-wrap block">
+                  <img :src="c.thumbnail" class="thumb-lg mx-auto" :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
+                       loading="lazy"
+                       @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
+                  <span class="nsfw-eye" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                    </svg>
+                  </span>
+                </span>
+                <div class="mt-1 text-xs text-slate-400" x-text="'#' + (idx+1) + ' · ' + c.metric_value"></div>
+                <div class="text-xs font-mono truncate" x-text="c.source"></div>
+              </div>
+            </template>
+            <template x-if="(stats[bucket.key]?.length ?? 0) === 0">
+              <div class="col-span-full text-xs text-slate-500">No data yet.</div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Per-source platform analytics</h3>
+        <div class="scroll-box"><table>
+          <thead><tr>
+            <th>Source</th><th class="text-right">Total</th>
+            <th class="text-right">DISCARD %</th><th class="text-right">NSFW %</th>
+            <th class="text-right">Avg OVR</th><th class="text-right">Avg REL</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="s in stats.sources" :key="s.source">
+              <tr>
+                <td class="font-mono text-xs" x-text="s.source"></td>
+                <td class="text-right font-mono" x-text="s.total"></td>
+                <td class="text-right font-mono" :class="s.discard_pct >= 50 ? 'text-rose-300' : ''" x-text="s.discard_pct + '%'"></td>
+                <td class="text-right font-mono" x-text="s.nsfw_pct + '%'"></td>
+                <td class="text-right font-mono" x-text="s.avg_ovr ?? '-'"></td>
+                <td class="text-right font-mono" x-text="s.avg_rel ?? '-'"></td>
+              </tr>
+            </template>
+            <template x-if="(stats.sources?.length ?? 0) === 0">
+              <tr><td colspan="6" class="text-xs text-slate-500">No sources yet.</td></tr>
+            </template>
+          </tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- GALLERY -->
+    <section x-show="active === 'gallery'" class="space-y-4">
+      <div class="card rounded-xl p-4">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Search prompts / descriptions</label>
+            <input x-model="galleryFilters.q" @keydown.enter="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
+              placeholder="e.g. blonde hair, beach, neon"/>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Sort by</label>
+            <select x-model="galleryFilters.sort" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+              <option value="newest">Newest first</option>
+              <option value="ovr">OVR (craft)</option>
+              <option value="rel">REL (relevance)</option>
+              <option value="quality">quality_score</option>
+            </select>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">NSFW</label>
+            <select x-model="galleryFilters.nsfw" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+              <option value="any">Show all</option>
+              <option value="exclude">Hide NSFW</option>
+              <option value="only">Only NSFW</option>
+            </select>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Date from</label>
+            <input type="date" x-model="galleryFilters.dateFrom" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Date to</label>
+            <input type="date" x-model="galleryFilters.dateTo" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
+          </div>
+
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Min OVR</label>
+            <input type="number" min="0" max="100" x-model.number="galleryFilters.minOvr" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Min REL</label>
+            <input type="number" min="0" max="100" x-model.number="galleryFilters.minRel" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Min quality (1-10)</label>
+            <input type="number" min="0" max="10" x-model.number="galleryFilters.minQuality" @change="galleryReload()"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
+          </div>
+          <div class="lg:col-span-6 flex items-end gap-2">
+            <button @click="galleryReload()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Apply</button>
+            <button @click="galleryClearFilters()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Clear</button>
+            <button @click="galleryDownload()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm"
+              title="Stream a zip of the current filtered view (image + .txt + .vision.json)">Download view as ZIP</button>
+            <span class="text-xs text-slate-400 ml-auto">
+              <span x-text="gallery.total"></span> / <span x-text="gallery.total_unfiltered"></span> match
+            </span>
+          </div>
+
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Sources</label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="src in gallery.available?.sources ?? []" :key="src">
+                <button @click="toggleGalleryFilter('sources', src)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="galleryFilters.sources.includes(src) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="src"></button>
+              </template>
+            </div>
+          </div>
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Categories</label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="cat in gallery.available?.categories ?? []" :key="cat">
+                <button @click="toggleGalleryFilter('categories', cat)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="galleryFilters.categories.includes(cat) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="cat"></button>
+              </template>
+            </div>
+          </div>
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Resolution</label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="res in gallery.available?.resolutions ?? []" :key="res">
+                <button @click="toggleGalleryFilter('resolutions', res)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="galleryFilters.resolutions.includes(res) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="res"></button>
+              </template>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Results</h3>
+          <div class="flex items-center gap-2 text-xs">
+            <button @click="galleryPrev()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded" :disabled="gallery.page <= 1">Prev</button>
+            <span>Page <span x-text="gallery.page"></span> / <span x-text="Math.max(1, Math.ceil(gallery.total / gallery.pageSize))"></span></span>
+            <button @click="galleryNext()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Next</button>
+          </div>
+        </div>
+        <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+          <template x-for="c in gallery.items" :key="c.path">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col">
+              <span class="nsfw-wrap block">
+                <img :src="c.thumbnail" class="w-full aspect-square object-cover rounded"
+                     :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
+                     loading="lazy"
+                     @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
+                <span class="nsfw-eye" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                  </svg>
+                </span>
+              </span>
+              <div class="mt-1 flex items-center justify-between gap-1">
+                <span class="pill px-1.5 py-0.5 rounded bg-slate-800" x-text="c.category"></span>
+                <span class="text-slate-400" x-text="c.source"></span>
+              </div>
+              <div class="mt-1 grid grid-cols-3 gap-1 text-center">
+                <span class="bg-slate-800/60 rounded px-1" :title="'OVR ' + (c.ovr ?? '-')">O <span x-text="c.ovr ?? '-'"></span></span>
+                <span class="bg-slate-800/60 rounded px-1" :title="'REL ' + (c.rel ?? '-')">R <span x-text="c.rel ?? '-'"></span></span>
+                <span class="bg-slate-800/60 rounded px-1" :title="(c.width||'?') + 'x' + (c.height||'?')" x-text="c.resolution_bucket"></span>
+              </div>
+              <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
+              <span class="link-btn mt-1" @click="openModalFromCard(c)">Open</span>
+            </div>
+          </template>
+          <template x-if="!galleryLoading && (gallery.items?.length ?? 0) === 0">
+            <div class="col-span-full text-sm text-slate-500">No images match these filters.</div>
+          </template>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div class="card rounded-xl p-4">
+          <h3 class="font-semibold mb-2">Frequent phrases (3-5 word n-grams) in current view</h3>
+          <p class="text-xs text-slate-400 mb-2">Computed over the filtered, non-DISCARD subset.</p>
+          <div class="flex flex-wrap gap-1">
+            <template x-for="ng in galleryInsights.ngrams" :key="ng.phrase">
+              <button @click="insertGalleryQuery(ng.phrase)"
+                class="px-2 py-0.5 text-xs rounded bg-slate-800 hover:bg-indigo-600 hover:text-white border border-slate-700">
+                <span class="font-mono" x-text="ng.phrase"></span>
+                <span class="ml-1 text-slate-400" x-text="'(' + ng.count + ')'"></span>
+              </button>
+            </template>
+            <template x-if="(galleryInsights.ngrams?.length ?? 0) === 0">
+              <span class="text-xs text-slate-500">No phrases - try widening filters.</span>
+            </template>
+          </div>
+        </div>
+        <div class="card rounded-xl p-4">
+          <h3 class="font-semibold mb-2">Top keywords in highest-scoring quartile</h3>
+          <p class="text-xs text-slate-400 mb-2">
+            Threshold: OVR >= <span x-text="galleryInsights.ovr_quality_threshold ?? '-'"></span>
+            (over <span x-text="galleryInsights.considered ?? 0"></span> kept items in current filter).
+          </p>
+          <div class="flex flex-wrap gap-1">
+            <template x-for="kw in galleryInsights.top_quality_keywords" :key="'hq_' + kw.term">
+              <button @click="insertGalleryQuery(kw.term)"
+                class="px-2 py-0.5 text-xs rounded bg-slate-800 hover:bg-emerald-600 hover:text-white border border-slate-700">
+                <span class="font-mono" x-text="kw.term"></span>
+                <span class="ml-1 text-slate-400" x-text="'(' + kw.count + ')'"></span>
+              </button>
+            </template>
+          </div>
         </div>
       </div>
     </section>
@@ -1375,12 +2188,44 @@ HTML_TEMPLATE = r"""<!doctype html>
           </span>
         </div>
         <div class="overflow-y-auto">
-          <h4 class="text-xs uppercase tracking-wider text-slate-400 mb-2">Full prompt</h4>
-          <pre class="whitespace-pre-wrap text-sm font-mono text-slate-200" x-text="modal.prompt || '(empty)'"></pre>
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-xs uppercase tracking-wider text-slate-400">Full prompt</h4>
+            <div class="flex items-center gap-2 text-xs">
+              <span class="text-emerald-300" x-text="modal.savedFlash" x-show="modal.savedFlash"></span>
+              <template x-if="!modal.editing && modal.path">
+                <button @click="modal.editing = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Edit</button>
+              </template>
+              <template x-if="modal.editing">
+                <button @click="savePrompt()" :disabled="modal.saving" class="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded disabled:opacity-50">
+                  <span x-text="modal.saving ? 'Saving...' : 'Save (overwrite)'"></span>
+                </button>
+              </template>
+              <template x-if="modal.editing">
+                <button @click="cancelPromptEdit()" class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Cancel</button>
+              </template>
+            </div>
+          </div>
+          <template x-if="!modal.editing">
+            <pre class="whitespace-pre-wrap text-sm font-mono text-slate-200" x-text="modal.prompt || '(empty)'"></pre>
+          </template>
+          <template x-if="modal.editing">
+            <textarea x-model="modal.prompt" rows="14"
+              class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-slate-200"></textarea>
+          </template>
           <template x-if="modal.summary">
             <div class="mt-4">
               <h4 class="text-xs uppercase tracking-wider text-slate-400 mb-1">Vision summary</h4>
               <p class="text-sm" x-text="modal.summary"></p>
+            </div>
+          </template>
+          <template x-if="modal.meta">
+            <div class="mt-4 grid grid-cols-3 gap-2 text-xs">
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">OVR</div><div class="font-mono" x-text="modal.meta.ovr ?? '-'"></div></div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">REL</div><div class="font-mono" x-text="modal.meta.rel ?? '-'"></div></div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">quality</div><div class="font-mono" x-text="modal.meta.quality ?? '-'"></div></div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">Resolution</div><div class="font-mono" x-text="(modal.meta.width || '?') + 'x' + (modal.meta.height || '?')"></div></div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">NSFW</div><div class="font-mono" x-text="modal.meta.nsfw ? 'true' : 'false'"></div></div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2"><div class="text-slate-400">Score reason</div><div class="font-mono truncate" :title="modal.meta.score_reason" x-text="modal.meta.score_reason || '-'"></div></div>
             </div>
           </template>
         </div>
@@ -1396,6 +2241,8 @@ function dashboard() {
     active: 'overview',
     tabs: [
       {id:'overview', label:'Overview'},
+      {id:'stats',    label:'Stats'},
+      {id:'gallery',  label:'Gallery'},
       {id:'scrapers', label:'Scrapers'},
       {id:'vision',   label:'Vision'},
       {id:'queue',    label:'Queue'},
@@ -1419,7 +2266,24 @@ function dashboard() {
     queueFiles: [], history: [], activity: [], promptCache: {},
     revealedNsfw: {},  // path -> true once the user clicks the eye
     lastRefresh: '...',
-    modal: { open:false, imageUrl:'', prompt:'', name:'', source:'', category:'', summary:'' },
+    modal: { open:false, imageUrl:'', prompt:'', promptOriginal:'', editing:false,
+             saving:false, savedFlash:'', name:'', source:'', category:'', summary:'',
+             path:'', meta:null },
+    // Stats tab state
+    stats: { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] },
+    statsLoading: false,
+    // Gallery tab state
+    gallery: {
+      page: 1, pageSize: 60, total: 0, totalUnfiltered: 0, items: [],
+      available: { sources:[], categories:[], resolutions:[] },
+    },
+    galleryLoading: false,
+    galleryFilters: {
+      q: '', sources: [], categories: [], resolutions: [],
+      minOvr: 0, minRel: 0, minQuality: 0,
+      nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
+    },
+    galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
 
     async refresh() {
       const [s, scr, mods, q, h, a, vw, settings] = await Promise.all([
@@ -1527,11 +2391,19 @@ function dashboard() {
       this.refresh();
     },
 
-    async openModal({imageUrl, promptUrl, name, source, category, summary}) {
-      this.modal = { open:true, imageUrl, prompt:'Loading...', name: name||'', source: source||'', category: category||'', summary: summary||'' };
+    async openModal({imageUrl, promptUrl, name, source, category, summary, path, meta}) {
+      this.modal = {
+        open: true, imageUrl,
+        prompt: 'Loading...', promptOriginal: '',
+        editing: false, saving: false, savedFlash: '',
+        name: name || '', source: source || '', category: category || '',
+        summary: summary || '', path: path || '', meta: meta || null,
+      };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
-        this.modal.prompt = txt || '(empty)';
+        const value = txt || '';
+        this.modal.prompt = value || '(empty)';
+        this.modal.promptOriginal = value;
       } catch (e) { this.modal.prompt = '(failed to load prompt)'; }
     },
     upsize(url) { if (!url) return url; return url + (url.includes('?') ? '&' : '?') + 'size=1600'; },
@@ -1540,7 +2412,7 @@ function dashboard() {
       this.openModal({
         imageUrl: '/api/thumbnail?size=1600&path=' + encoded,
         promptUrl: '/api/prompt?path=' + encoded,
-        name: f.name, source: f.source,
+        name: f.name, source: f.source, path: f.path,
       });
     },
     openModalFromActivity(a) {
@@ -1548,6 +2420,7 @@ function dashboard() {
         imageUrl: this.upsize(a.thumbnail),
         promptUrl: a.prompt_url,
         name: a.name, source: a.source, category: a.category, summary: a.summary,
+        path: a.path,
       });
     },
     openModalFromHistory(h) {
@@ -1555,9 +2428,129 @@ function dashboard() {
         imageUrl: this.upsize(h.thumbnail),
         promptUrl: h.prompt_url,
         name: h.image, source: h.source, category: h.classification,
+        path: h.path,
       });
     },
-    closeModal() { this.modal.open = false; },
+    openModalFromCard(c) {
+      // Used by the new Stats/Gallery sections - card has full vision payload.
+      this.openModal({
+        imageUrl: this.upsize(c.thumbnail),
+        promptUrl: c.prompt_url,
+        name: c.name, source: c.source, category: c.category, summary: c.summary,
+        path: c.path, meta: c,
+      });
+    },
+    closeModal() { this.modal.open = false; this.modal.editing = false; },
+
+    // Edit-and-save the prompt that lives next to an image. Per spec we
+    // overwrite without backup, and we invalidate the stats cache server-side
+    // so keyword counts reflect the edit on the next refresh.
+    async savePrompt() {
+      if (!this.modal.path || this.modal.saving) return;
+      this.modal.saving = true;
+      try {
+        const r = await fetch('/api/prompt', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({path: this.modal.path, text: this.modal.prompt || ''})
+        });
+        const j = await r.json();
+        if (j.success) {
+          this.modal.promptOriginal = this.modal.prompt;
+          this.modal.editing = false;
+          this.modal.savedFlash = 'Saved.';
+          setTimeout(() => this.modal.savedFlash = '', 2500);
+        } else {
+          this.modal.savedFlash = 'Error: ' + (j.error || 'unknown');
+        }
+      } catch (e) {
+        this.modal.savedFlash = 'Network error';
+      } finally {
+        this.modal.saving = false;
+      }
+    },
+    cancelPromptEdit() {
+      this.modal.prompt = this.modal.promptOriginal;
+      this.modal.editing = false;
+    },
+
+    // ── Stats tab ────────────────────────────────────────────────────────
+    async loadStats() {
+      this.statsLoading = true;
+      try {
+        const r = await fetch('/api/stats').then(r=>r.json());
+        this.stats = r;
+      } catch (e) { /* fall through silently */ }
+      this.statsLoading = false;
+    },
+
+    // ── Gallery tab ──────────────────────────────────────────────────────
+    galleryQueryString(extra) {
+      const f = this.galleryFilters;
+      const params = new URLSearchParams();
+      if (f.q) params.set('q', f.q);
+      if (f.sources?.length) params.set('sources', f.sources.join(','));
+      if (f.categories?.length) params.set('categories', f.categories.join(','));
+      if (f.resolutions?.length) params.set('resolutions', f.resolutions.join(','));
+      if (f.minOvr) params.set('min_ovr', f.minOvr);
+      if (f.minRel) params.set('min_rel', f.minRel);
+      if (f.minQuality) params.set('min_quality', f.minQuality);
+      if (f.nsfw && f.nsfw !== 'any') params.set('nsfw', f.nsfw);
+      if (f.sort) params.set('sort', f.sort);
+      if (f.dateFrom) params.set('date_from', f.dateFrom);
+      if (f.dateTo) params.set('date_to', f.dateTo);
+      Object.entries(extra || {}).forEach(([k, v]) => {
+        if (v !== null && v !== undefined && v !== '') params.set(k, v);
+      });
+      return params.toString();
+    },
+    async loadGallery(page) {
+      if (page) this.gallery.page = page;
+      this.galleryLoading = true;
+      const qs = this.galleryQueryString({page: this.gallery.page, page_size: this.gallery.pageSize});
+      try {
+        const j = await fetch('/api/gallery?' + qs).then(r=>r.json());
+        this.gallery = { ...this.gallery, ...j };
+      } catch (e) { /* swallow */ }
+      this.galleryLoading = false;
+    },
+    async loadGalleryInsights() {
+      try {
+        const qs = this.galleryQueryString();
+        this.galleryInsights = await fetch('/api/gallery/insights?' + qs).then(r=>r.json());
+      } catch (e) { /* swallow */ }
+    },
+    galleryReload() {
+      this.gallery.page = 1;
+      this.loadGallery();
+      this.loadGalleryInsights();
+    },
+    toggleGalleryFilter(field, value) {
+      const list = this.galleryFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+      this.galleryReload();
+    },
+    galleryClearFilters() {
+      this.galleryFilters = {
+        q: '', sources: [], categories: [], resolutions: [],
+        minOvr: 0, minRel: 0, minQuality: 0,
+        nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
+      };
+      this.galleryReload();
+    },
+    galleryDownload() {
+      const qs = this.galleryQueryString();
+      window.open('/api/gallery/download.zip?' + qs, '_blank');
+    },
+    galleryPrev() { if (this.gallery.page > 1) this.loadGallery(this.gallery.page - 1); },
+    galleryNext() {
+      const totalPages = Math.max(1, Math.ceil(this.gallery.total / this.gallery.pageSize));
+      if (this.gallery.page < totalPages) this.loadGallery(this.gallery.page + 1);
+    },
+    insertGalleryQuery(term) {
+      this.galleryFilters.q = term;
+      this.galleryReload();
+    },
 
     // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth - callers
     // pass {category, path}, we decide based on the BLUR_NSFW_THUMBS setting
@@ -1580,6 +2573,17 @@ function dashboard() {
     start() {
       this.refresh();
       setInterval(() => this.refresh(), 5000);
+      // Lazy-load stats / gallery only when their tab is opened. Stats then
+      // auto-refreshes alongside the rest of the dashboard. Gallery stays
+      // user-driven because filter state shouldn't be clobbered on poll.
+      this.$watch('active', (tab) => {
+        if (tab === 'stats') this.loadStats();
+        if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
+          this.loadGallery();
+          this.loadGalleryInsights();
+        }
+      });
+      setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
     },
   };
 }
