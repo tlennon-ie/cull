@@ -130,29 +130,95 @@ _FEMININE_TERMS = (
 )
 
 
-def _contains(text: str, terms: tuple[str, ...]) -> str | None:
-    """Return the first matched term (lowercased) or None.
+# Words that turn a positive mention into a negation. We look for any of
+# these within ~60 chars before the matched term, not crossing a sentence
+# boundary, so phrases like "no UI elements, side-by-side panels, or text
+# overlays visible" don't count as positive matches for "side-by-side" /
+# "text overlay".
+_NEGATION_TOKENS = (
+    "no", "not", "without", "absent", "absence", "none", "no signs of",
+    "no visible", "without any", "free of", "lacks", "lacking", "missing",
+    "doesn't", "doesnt", "doesnt have", "does not", "do not", "don't",
+)
 
-    Each term is matched with WORD BOUNDARIES so "rock" doesn't fire on
-    "rocky terrain" and "her" doesn't fire on "weather". Multi-word terms
-    that already contain spaces or symbols (e.g. "side-by-side", "u/") are
-    matched as substrings since their non-letter characters give them an
-    implicit boundary.
+
+def _term_indices(haystack: str, term: str) -> list[int]:
+    """Find every occurrence of `term` in `haystack` (lowercased)."""
+    out: list[int] = []
+    if not term:
+        return out
+    if any(ch in term for ch in (" ", "-", "/", ".", ",")):
+        # Multi-word / punctuated term -> substring search.
+        start = 0
+        while True:
+            idx = haystack.find(term, start)
+            if idx == -1:
+                return out
+            out.append(idx)
+            start = idx + len(term)
+    # Word-boundary single-word match.
+    for m in re.finditer(rf"\b{re.escape(term)}\b", haystack):
+        out.append(m.start())
+    return out
+
+
+def _is_negated_at(haystack: str, idx: int, term_len: int, window: int = 60) -> bool:
+    """True if a negation token appears in the ~60 chars immediately before
+    `haystack[idx:idx+term_len]`, in the same sentence (no period/semicolon
+    separator between negation and term).
+    """
+    start = max(0, idx - window)
+    prefix = haystack[start:idx]
+    # Trim any prior sentence so negation in an earlier sentence doesn't bleed.
+    for sep in (".", ";"):
+        last = prefix.rfind(sep)
+        if last != -1:
+            prefix = prefix[last + 1:]
+    for token in _NEGATION_TOKENS:
+        if " " in token or "'" in token:
+            if token in prefix:
+                return True
+        else:
+            if re.search(rf"\b{re.escape(token)}\b", prefix):
+                return True
+    return False
+
+
+def _contains(text: str, terms: tuple[str, ...]) -> str | None:
+    """Return the first POSITIVE (non-negated) match or None.
+
+    Word-boundary matching for single-word terms, substring for multi-word
+    terms (their punctuation already provides boundaries). Skips matches
+    whose preceding context is a negation phrase ("no X", "without Y",
+    "no signs of Z") - that fixes self-contradicting model outputs that
+    say things like 'no side-by-side panels visible' yet still got
+    flagged because the substring 'side-by-side' was present.
     """
     haystack = (text or "").lower()
     for term in terms:
         t = term.lower()
         if not t:
             continue
-        # Multi-word / punctuation-bearing terms - keep substring match.
-        if any(ch in t for ch in (" ", "-", "/", ".", ",")):
-            if t in haystack:
+        for idx in _term_indices(haystack, t):
+            if not _is_negated_at(haystack, idx, len(t)):
                 return t
-            continue
-        # Single-word terms - require word boundaries on both sides.
-        if re.search(rf"\b{re.escape(t)}\b", haystack):
-            return t
     return None
+
+
+def _description_negates(text: str, terms: tuple[str, ...]) -> bool:
+    """True if any term appears, AND every appearance is in a negation
+    context. Used to override a model boolean that contradicts the model's
+    own description (e.g. is_composite_grid=true while description says
+    'no side-by-side panels visible')."""
+    haystack = (text or "").lower()
+    saw_any = False
+    for term in terms:
+        t = term.lower()
+        for idx in _term_indices(haystack, t):
+            saw_any = True
+            if not _is_negated_at(haystack, idx, len(t)):
+                return False  # there is a positive mention; not negation-only
+    return saw_any
 
 
 @dataclass(frozen=True)
@@ -320,31 +386,32 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
         result["photorealistic_style"] = False
         reasons.append(f"art_medium={art_medium}")
 
-    # ─── Container guards: screenshots, composite grids, text overlays ─
-    # The model can describe an embedded face inside a screenshot or one panel
-    # of a side-by-side and miss the surrounding chrome. We catch both via:
-    #   1) the model's own boolean flags (is_screenshot / is_composite_grid /
-    #      contains_text_overlay), and
-    #   2) keyword detection in the description, in case the flags weren't set
-    #      but the words leaked through anyway.
-    if result.get("is_screenshot"):
-        reasons.append("is_screenshot=true")
-    if result.get("is_composite_grid"):
-        reasons.append("is_composite_grid=true")
-    if result.get("contains_text_overlay"):
-        reasons.append("contains_text_overlay=true")
-
+    # ─── Description -> framing booleans (description is source of truth) ──
+    # Models in practice flip is_screenshot / is_composite_grid /
+    # contains_text_overlay carelessly while filling out the JSON. We treat
+    # the prose `description` as the source of truth because chain-of-thought
+    # forces the model to commit to the visible content there before the
+    # booleans. Each flag is rebuilt from the description:
+    #
+    #   POSITIVE mention (negation-aware)  -> flag = True
+    #   anything else                       -> flag = False
+    #
+    # If a model genuinely sees something the description omitted, that's a
+    # rare false negative we accept; the false positives we were paying for
+    # (lazy true flags discarded clean bikini photos) were the bigger cost.
     screenshot_token = _contains(combined, _SCREENSHOT_HINTS)
-    if screenshot_token:
-        result["is_screenshot"] = True
-        reasons.append(f"description mentions screenshot/UI ({screenshot_token.strip()!r})")
     grid_token = _contains(combined, _COMPOSITE_HINTS)
-    if grid_token:
-        result["is_composite_grid"] = True
-        reasons.append(f"description mentions composite/grid ({grid_token.strip()!r})")
     overlay_token = _contains(combined, _TEXT_OVERLAY_HINTS)
+
+    result["is_screenshot"] = bool(screenshot_token)
+    result["is_composite_grid"] = bool(grid_token)
+    result["contains_text_overlay"] = bool(overlay_token)
+
+    if screenshot_token:
+        reasons.append(f"description mentions screenshot/UI ({screenshot_token.strip()!r})")
+    if grid_token:
+        reasons.append(f"description mentions composite/grid ({grid_token.strip()!r})")
     if overlay_token:
-        result["contains_text_overlay"] = True
         reasons.append(f"description mentions overlay ({overlay_token.strip()!r})")
 
     if (result.get("is_screenshot") or result.get("is_composite_grid")
@@ -353,6 +420,16 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
         # fires consistently regardless of what the model returned.
         result["photorealistic_style"] = False
         result["woman_present"] = False
+    else:
+        # ─── Symmetric photoreal override ───────────────────────────────
+        # If art_medium is explicitly "photograph" and the model flagged
+        # is_human_photograph=true, photoreal MUST be true. Models sometimes
+        # flip this to false when they see e.g. heavy LoRA artefacts and
+        # mistake them for stylisation - we trust their own art_medium call.
+        if (art_medium == "photograph"
+                and result.get("is_human_photograph")
+                and not result.get("photorealistic_style")):
+            result["photorealistic_style"] = True
 
     # The model often calls a sculpture / mannequin / doll a 'photograph of a
     # real human'. The word it uses gives it away.
@@ -425,6 +502,13 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
         result["score_reason"] = "severe AI flaws + low quality_score"
     elif result.get("nsfw"):
         result["category"] = "NSFW"
+    elif result.get("category") == "DISCARD":
+        # Rescue: the model said DISCARD off the back of its own (now-corrected)
+        # contradictory booleans. All gates pass and it isn't NSFW, but we
+        # don't have enough signal to pick between InstagramInfluencer /
+        # Professional / Amateur, so park it in Unknown for admin review.
+        result["category"] = "Unknown"
+        result["score_reason"] = "rescued from DISCARD after boolean self-contradiction"
 
     # ─── Admin score thresholds (SFW only) ────────────────────────────────
     # Once the basic gates pass (photoreal + woman + real-human-photo), an
