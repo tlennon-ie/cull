@@ -143,7 +143,13 @@ def vision_classify(image_path, source_name):
          
     b64 = base64.b64encode(small).decode('utf-8')
 
-    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json
+    from vision_prompt import (
+        build_classification_prompt,
+        apply_scores,
+        _safe_parse_vision_json,
+        build_response_format,
+        extract_message_text,
+    )
     prompt_instruction = build_classification_prompt()
 
     try:
@@ -164,11 +170,22 @@ def vision_classify(image_path, source_name):
             ],
             model=MODEL_ID,
             temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"}
+            # Match the LM Studio workers - room for <think>...</think> +
+            # the JSON answer for thinking-style models.
+            max_tokens=2000,
+            # Full JSON-schema constrained output, same shape we send to
+            # LM Studio. Groq's OpenAI-compat endpoint accepts json_schema
+            # for Llama 3.3 / Llama 4 / DeepSeek-R1 etc. Falls back to
+            # json_object behaviour on models that don't support schema.
+            response_format=build_response_format(),
         )
 
-        raw = response.choices[0].message.content
+        # Groq SDK returns a pydantic model; convert to dict so the shared
+        # extractor can fall back to reasoning_content for thinking models
+        # (DeepSeek-R1 etc.) when content is empty.
+        msg = response.choices[0].message
+        msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+        raw = extract_message_text(msg_dict)
         parsed = _safe_parse_vision_json(raw)
         if parsed is None:
             preview = (raw or "")[:300].replace("\n", " ")
