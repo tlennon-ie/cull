@@ -86,27 +86,36 @@ _NON_HUMAN_SUBJECT_HINTS = (
 )
 
 # Substrings that betray a screenshot / phone UI / browser chrome instead
-# of a clean photograph of a person.
+# of a clean photograph of a person. Tokens here must indicate the WHOLE
+# image is a screen capture - not just that a screen/phone/monitor is
+# visible IN the frame (the phone-in-hand and monitor-in-background false
+# positives killed legitimate selfies).
 _SCREENSHOT_HINTS = (
-    "screenshot", "screen capture", "screen-capture", "phone screen",
-    "smartphone", "iphone", "android screen", " ios ", "status bar",
-    "battery icon", "wifi icon", "browser window", "browser chrome",
-    "address bar", "url bar", "tab bar", "navigation bar",
-    "reddit ui", "twitter ui", "instagram ui", " app interface ",
-    "u/", "r/", "post title", "upvote", "downvote", "comment thread",
-    "messaging app", "chat window", "menu bar", "system tray",
-    "screen ", "screen,", "screen.",
+    "screenshot", "screen capture", "screen-capture", "screencap",
+    "screen recording", "screen-recording",
+    "phone status bar", "android status bar", "ios status bar",
+    "browser window", "browser chrome", "address bar", "url bar",
+    "tab bar", "navigation bar",
+    "reddit ui", "twitter ui", "instagram ui", "app interface",
+    "post title", "upvote button", "downvote button", "comment thread",
+    "messaging app interface", "chat window interface",
+    "system tray", "taskbar",
 )
 
 # Substrings that say "this is a multi-panel comparison / collage", not a
 # single photograph.
 _COMPOSITE_HINTS = (
-    "side-by-side", "side by side", "split image", "comparison",
-    "comparison grid", "two panels", "three panels", "four panels",
-    "panel ", "multi-panel", "grid of images", "image grid", "collage",
+    "side-by-side", "side by side", "split image", "split-image",
+    "comparison grid", "comparison image", "comparison shot",
+    "two panels", "three panels", "four panels", "multi-panel",
+    "multiple panels", "panel a", "panel b", "left panel",
+    "right panel", "top panel", "bottom panel", "first panel",
+    "second panel", "third panel", "fourth panel",
+    "grid of images", "image grid", "photo grid", "collage",
     "diptych", "triptych", "before and after", "before/after",
-    "labelled panels", "labeled panels", "annotated image",
+    "labelled panels", "labeled panels", "annotated grid",
     "two versions", "three versions", "four versions",
+    "model a vs", "model b vs", "version a vs", "version b vs",
 )
 
 # Watermark / text-overlay keywords - branded captions, generation-tool
@@ -297,9 +306,15 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         "is_composite_grid / contains_text_overlay field to true and "
         "MENTION it in `description`. These images are NEVER valid "
         "influencer photographs and category MUST be DISCARD.\n"
-        "- An image is a SCREENSHOT if you can see system chrome around the "
-        "actual photo (status bar, battery, time, OS icons, app UI, post "
-        "metadata). Do not strip the chrome out of your description.\n"
+        "- An image is a SCREENSHOT only when the WHOLE FRAME is a screen "
+        "capture - i.e. the entire image IS the phone/desktop/browser "
+        "interface. Look for chrome surrounding the content: phone status "
+        "bar, battery/time, OS icons, browser address bar, app UI, post "
+        "metadata, comment threads. A normal photograph that happens to "
+        "CONTAIN a phone, a monitor, a TV, or a computer screen as objects "
+        "in the scene is NOT a screenshot. A woman holding a phone for a "
+        "selfie is NOT a screenshot. is_screenshot must be false unless "
+        "you'd describe the whole image as 'a screenshot of <app/site>'.\n"
         "- An image is a COMPOSITE/GRID if it contains 2+ separate images, "
         "even if they all show similar subjects. Hint: visible vertical or "
         "horizontal seams, repeated near-identical figures, distinct titles "
