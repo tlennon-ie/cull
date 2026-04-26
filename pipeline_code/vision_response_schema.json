@@ -108,9 +108,10 @@
             "Professional",
             "Amateur",
             "Unknown",
+            "Watermarked",
             "DISCARD"
           ],
-          "description": "Apply in order, first match wins: DISCARD if photorealistic_style=false OR woman_present=false OR art_medium != 'photograph' OR has_ai_flaws=true with quality<=4. NSFW if photorealistic woman + explicit nudity. InstagramInfluencer = photoreal woman, social-media aesthetic, no nudity. Professional = photoreal woman, studio/editorial polish. Amateur = photoreal woman, casual/selfie. Unknown = photoreal woman that doesn't fit above."
+          "description": "Apply in order, first match wins: DISCARD if photorealistic_style=false OR woman_present=false OR art_medium != 'photograph' OR has_ai_flaws=true with quality<=4. NSFW if photorealistic woman + explicit nudity. Watermarked if photoreal woman, all gates pass, but contains_text_overlay=true (the underlying photo is salvageable if the overlay is removed - route here instead of DISCARD). InstagramInfluencer = photoreal woman, social-media aesthetic, no nudity, no overlay. Professional = photoreal woman, studio/editorial polish, no overlay. Amateur = photoreal woman, casual/selfie, no overlay. Unknown = photoreal woman that doesn't fit above."
         },
         "reason": {
           "type": "string",

@@ -93,10 +93,9 @@ _NON_HUMAN_SUBJECT_HINTS = (
 _SCREENSHOT_HINTS = (
     "screenshot", "screen capture", "screen-capture", "screencap",
     "screen recording", "screen-recording",
-    "phone status bar", "android status bar", "ios status bar",
     "browser window", "browser chrome", "address bar", "url bar",
     "tab bar", "navigation bar",
-    "reddit ui", "twitter ui", "instagram ui", "app interface",
+    "reddit ui", "twitter ui", "instagram ui",
     "post title", "upvote button", "downvote button", "comment thread",
     "messaging app interface", "chat window interface",
     "system tray", "taskbar",
@@ -357,9 +356,13 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         "- DISCARD: photorealistic_style=false OR woman_present=false OR "
         "art_medium != 'photograph' OR has_ai_flaws=true with quality<=4.\n"
         "- NSFW: photorealistic woman AND explicit nudity/sexual content.\n"
-        "- InstagramInfluencer: photorealistic woman, social-media aesthetic, no nudity.\n"
-        "- Professional: photorealistic woman, studio/editorial polish, no nudity.\n"
-        "- Amateur: photorealistic woman, casual/selfie style.\n"
+        "- Watermarked: photorealistic woman, all other gates pass, BUT "
+        "contains_text_overlay=true (visible watermark, branded caption, "
+        "logo overlay, infographic text). The shot itself is salvageable "
+        "if the overlay is removed - so route here instead of DISCARD.\n"
+        "- InstagramInfluencer: photorealistic woman, social-media aesthetic, no nudity, no overlay.\n"
+        "- Professional: photorealistic woman, studio/editorial polish, no nudity, no overlay.\n"
+        "- Amateur: photorealistic woman, casual/selfie style, no overlay.\n"
         "- Unknown: photorealistic woman but doesn't fit categories above."
     )
 
@@ -429,10 +432,13 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     if overlay_token:
         reasons.append(f"description mentions overlay ({overlay_token.strip()!r})")
 
-    if (result.get("is_screenshot") or result.get("is_composite_grid")
-            or result.get("contains_text_overlay")):
-        # Force the photoreal/woman gates closed so the DISCARD path below
-        # fires consistently regardless of what the model returned.
+    # Screenshots and composite grids are unrecoverable - the image isn't
+    # a clean photograph. Force the gates closed so DISCARD fires below.
+    # Text overlays / watermarks are different: the underlying photo may
+    # still be a usable shot whose only flaw is a removable watermark, so
+    # we route those to "Watermarked" further down rather than destroying
+    # them here.
+    if result.get("is_screenshot") or result.get("is_composite_grid"):
         result["photorealistic_style"] = False
         result["woman_present"] = False
     else:
@@ -517,6 +523,15 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
         result["score_reason"] = "severe AI flaws + low quality_score"
     elif result.get("nsfw"):
         result["category"] = "NSFW"
+    elif result.get("contains_text_overlay") or overlay_token:
+        # Photo passes every quality gate but has a watermark / branded text
+        # overlay. The model might be wrong (real-world signage misread as a
+        # watermark), but in either case the underlying shot is salvageable -
+        # park it in Watermarked so the admin can review and potentially
+        # remove the overlay later instead of destroying the asset.
+        result["category"] = "Watermarked"
+        token = overlay_token or "model flagged overlay"
+        result["score_reason"] = f"watermark/overlay detected ({token!r})"
     elif result.get("category") == "DISCARD":
         # Rescue: the model said DISCARD off the back of its own (now-corrected)
         # contradictory booleans. All gates pass and it isn't NSFW, but we
@@ -661,7 +676,7 @@ def build_response_format() -> dict[str, Any]:
                     "category": {
                         "type": "string",
                         "enum": ["InstagramInfluencer", "NSFW", "Professional",
-                                 "Amateur", "Unknown", "DISCARD"],
+                                 "Amateur", "Unknown", "Watermarked", "DISCARD"],
                     },
                     "reason": {"type": "string", "minLength": 5, "maxLength": 300},
                 },

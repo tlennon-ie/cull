@@ -40,7 +40,7 @@ EMBED_HINTS = ("embed", "nomic", "bge")
 
 _fs_lock = threading.Lock()
 
-CATEGORIES = ["InstagramInfluencer", "NSFW", "Professional", "Amateur", "Unknown"]
+CATEGORIES = ["InstagramInfluencer", "NSFW", "Professional", "Amateur", "Unknown", "Watermarked"]
 for c in CATEGORIES:
     (SORTED_DIR / c).mkdir(parents=True, exist_ok=True)
 
