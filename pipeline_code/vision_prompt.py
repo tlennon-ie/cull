@@ -426,13 +426,19 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     elif result.get("nsfw"):
         result["category"] = "NSFW"
 
-    # ─── Admin score thresholds ──────────────────────────────────────────
-    if cfg.ovr_min > 0 and ovr < cfg.ovr_min:
-        result["category"] = "DISCARD"
-        result["score_reason"] = f"OVR {ovr} below min {cfg.ovr_min}"
-    if cfg.rel_min > 0 and rel < cfg.rel_min:
-        result["category"] = "DISCARD"
-        result["score_reason"] = f"REL {rel} below min {cfg.rel_min}"
+    # ─── Admin score thresholds (SFW only) ────────────────────────────────
+    # Once the basic gates pass (photoreal + woman + real-human-photo), an
+    # NSFW image should ALWAYS land in the NSFW folder regardless of OVR/REL.
+    # Models tend to penalise NSFW on the REL axis because it scores it as
+    # off-topic vs an "Influencer" prompt - that's a model bias, not a
+    # quality signal. Threshold-gating SFW only fixes that.
+    if result.get("category") != "NSFW":
+        if cfg.ovr_min > 0 and ovr < cfg.ovr_min:
+            result["category"] = "DISCARD"
+            result["score_reason"] = f"OVR {ovr} below min {cfg.ovr_min}"
+        if cfg.rel_min > 0 and rel < cfg.rel_min:
+            result["category"] = "DISCARD"
+            result["score_reason"] = f"REL {rel} below min {cfg.rel_min}"
 
     return result
 

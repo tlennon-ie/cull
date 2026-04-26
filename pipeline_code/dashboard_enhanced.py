@@ -1413,8 +1413,30 @@ function dashboard() {
       } catch (e) { this.promptCache[item.path] = ''; }
     },
 
-    async startPipeline() { await fetch('/api/pipeline/start', {method:'POST'}); this.refresh(); },
-    async stopPipeline()  { await fetch('/api/pipeline/stop',  {method:'POST'}); this.refresh(); },
+    // Pipeline lifecycle: POST returns the new state; we apply it optimistically
+    // so the UI flips immediately, then poll quickly for ~3s in case the backend
+    // takes a moment for the subprocess to settle (Windows spawn + supervisor
+    // print loop). Eliminates the "I clicked Start but the chip still says
+    // stopped" feeling.
+    async _settlePipelineState(showAs) {
+      if (!this.status.pipeline) this.status.pipeline = {};
+      this.status.pipeline.running = showAs;
+      // Quick burst: 6 polls at 500ms intervals so the UI reflects the
+      // real subprocess state within ~3s without waiting for the 5s tick.
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        await this.refresh();
+        if (Boolean(this.status.pipeline?.running) === showAs) break;
+      }
+    },
+    async startPipeline() {
+      await fetch('/api/pipeline/start', {method:'POST'});
+      this._settlePipelineState(true);
+    },
+    async stopPipeline() {
+      await fetch('/api/pipeline/stop', {method:'POST'});
+      this._settlePipelineState(false);
+    },
 
     async toggleScraper(name, enabled) {
       await fetch('/api/scrapers/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
