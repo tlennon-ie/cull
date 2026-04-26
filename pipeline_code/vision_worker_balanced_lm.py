@@ -121,7 +121,7 @@ def vision_classify(image_path, source_name):
 
     b64 = base64.standard_b64encode(small).decode()
 
-    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json, extract_message_text
+    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json, extract_message_text, build_response_format
     prompt_instruction = build_classification_prompt()
 
     try:
@@ -146,10 +146,13 @@ def vision_classify(image_path, source_name):
                 "temperature": 0.1,
                 # Thinking-style models (qwen3-vl-*-thinking, deepseek-r1, etc.)
                 # spend a chunk of tokens inside <think>...</think> before
-                # emitting the JSON answer. 500 was too tight - everything
-                # ended up inside the thinking block. 2000 gives plenty of
-                # headroom for both the reasoning and the JSON tail.
+                # emitting the JSON answer. 2000 leaves headroom for both the
+                # reasoning and the JSON tail.
                 "max_tokens": 2000,
+                # Force structured output - LM Studio constrains the decoder to
+                # only emit tokens that match our JSON schema. Eliminates
+                # `raw=''` / "<think>... no JSON" failure modes.
+                "response_format": build_response_format(),
             },
             timeout=TIMEOUT,
         )

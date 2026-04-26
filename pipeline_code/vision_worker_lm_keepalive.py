@@ -149,6 +149,9 @@ def vision_classify(image_path, source_name):
         "- Unknown: Photorealistic image of a woman that does not fit the above categories."
     )
 
+    # Lazy import keeps module-load order safe.
+    from vision_prompt import build_response_format as _build_response_format_lazy
+
     try:
         response = requests.post(
             f"{LMS_URL}/v1/chat/completions",
@@ -170,6 +173,8 @@ def vision_classify(image_path, source_name):
                 ],
                 "temperature": 0.1,
                 "max_tokens": 2000,  # room for <think>...</think> + JSON
+                # JSON-schema constrained output (LM Studio structured output).
+                "response_format": _build_response_format_lazy(),
             },
             timeout=TIMEOUT,
         )

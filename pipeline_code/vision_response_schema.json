@@ -1,0 +1,124 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "VisionClassification",
+    "strict": "true",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "description",
+        "primary_subject",
+        "is_screenshot",
+        "is_composite_grid",
+        "contains_text_overlay",
+        "is_human_photograph",
+        "art_medium",
+        "photorealistic_style",
+        "has_ai_flaws",
+        "woman_present",
+        "nsfw",
+        "OVR_Quality_Score",
+        "REL_Quality_Score",
+        "quality_score",
+        "category",
+        "reason"
+      ],
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "1-2 sentence literal description of the WHOLE image including any UI / labels / panels / watermarks / borders. Fill this BEFORE deciding anything else.",
+          "minLength": 10,
+          "maxLength": 1000
+        },
+        "primary_subject": {
+          "type": "string",
+          "description": "The main subject in plain words, e.g. 'wine glass on table', 'woman seated', 'group of monsters', 'screenshot of reddit post'.",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "is_screenshot": {
+          "type": "boolean",
+          "description": "TRUE if you see system chrome around the actual photo: phone status bar, battery icon, browser address bar, app interface (reddit/twitter/instagram), comment thread, post metadata."
+        },
+        "is_composite_grid": {
+          "type": "boolean",
+          "description": "TRUE if the image contains 2+ separate panels/images even if they all show similar subjects. Hints: visible seams, repeated near-identical figures, distinct titles per panel, labels like 'Model A vs Model B'."
+        },
+        "contains_text_overlay": {
+          "type": "boolean",
+          "description": "TRUE for substantial captions, watermarks, logos, branded title text, infographics, or memes overlaid on the image."
+        },
+        "is_human_photograph": {
+          "type": "boolean",
+          "description": "TRUE only for an actual camera-captured (or AI photoreal) image of a real-looking human subject. A photograph of a sculpture/bust/mannequin/doll is FALSE."
+        },
+        "art_medium": {
+          "type": "string",
+          "enum": [
+            "photograph",
+            "digital_painting",
+            "anime",
+            "3d_render",
+            "illustration",
+            "mixed",
+            "unclear"
+          ],
+          "description": "Use 'photograph' ONLY for real photos / AI photoreal renders. Anime, cel-shaded art, hand-drawn illustration, oil/watercolour painting, comic, manga, stylised 3D, concept art use the matching label - NEVER 'photograph'."
+        },
+        "photorealistic_style": {
+          "type": "boolean",
+          "description": "TRUE only when art_medium == 'photograph' AND the subject reads as a real-world scene/person. Brush strokes, line art, cel shading, painterly textures, exaggerated proportions, stylised lighting all force FALSE."
+        },
+        "has_ai_flaws": {
+          "type": "boolean",
+          "description": "TRUE only for SEVERE artefacts (malformed face, wrong finger count, melted limbs, warped text)."
+        },
+        "woman_present": {
+          "type": "boolean",
+          "description": "TRUE only if a real human female face or body is clearly visible as the primary or co-primary subject. Background pedestrians do NOT count. Sculpted/illustrated/animated figures do NOT count. DO NOT INFER a woman from the topic, caption, prompt, or context."
+        },
+        "nsfw": {
+          "type": "boolean",
+          "description": "TRUE only for explicit nudity or sexual content."
+        },
+        "OVR_Quality_Score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Absolute craft quality (topic-independent). Average of: composition, lighting, colour, focus & sharpness, exposure, subject/pose, emotion, technical execution, styling/production, originality. 0-19 broken; 60-74 above average; 90-95 top 1%; 96-100 once-in-a-generation."
+        },
+        "REL_Quality_Score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Closeness to the curation topic at its platonic best. If photorealistic_style or woman_present is FALSE, REL must be <= 30. Reserve 90+ for images indistinguishable from a top-tier real creator's portfolio in the topic genre."
+        },
+        "quality_score": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Legacy 1-10 quality score, kept for backward compatibility. Roughly 1/10th of OVR."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "InstagramInfluencer",
+            "NSFW",
+            "Professional",
+            "Amateur",
+            "Unknown",
+            "DISCARD"
+          ],
+          "description": "Apply in order, first match wins: DISCARD if photorealistic_style=false OR woman_present=false OR art_medium != 'photograph' OR has_ai_flaws=true with quality<=4. NSFW if photorealistic woman + explicit nudity. InstagramInfluencer = photoreal woman, social-media aesthetic, no nudity. Professional = photoreal woman, studio/editorial polish. Amateur = photoreal woman, casual/selfie. Unknown = photoreal woman that doesn't fit above."
+        },
+        "reason": {
+          "type": "string",
+          "description": "One short sentence explaining the category call.",
+          "minLength": 5,
+          "maxLength": 300
+        }
+      }
+    }
+  }
+}

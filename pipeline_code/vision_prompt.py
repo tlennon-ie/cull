@@ -511,10 +511,71 @@ def extract_message_text(message: dict[str, Any] | None) -> str:
     return message.get("reasoning_content") or ""
 
 
+def build_response_format() -> dict[str, Any]:
+    """OpenAI-compatible `response_format` for LM Studio's structured output.
+
+    Sent alongside the chat-completions request so the model is forced to emit
+    a valid JSON object matching our pipeline's schema. Eliminates the
+    "<think>...</think> only, no JSON" failure mode when paired with
+    high-reasoning models. See:
+        https://lmstudio.ai/docs/developer/openai-compat/structured-output
+
+    The same schema lives at pipeline_code/vision_response_schema.json so
+    you can paste it into LM Studio's chat panel directly.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "VisionClassification",
+            "strict": "true",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "description", "primary_subject",
+                    "is_screenshot", "is_composite_grid", "contains_text_overlay",
+                    "is_human_photograph", "art_medium",
+                    "photorealistic_style", "has_ai_flaws",
+                    "woman_present", "nsfw",
+                    "OVR_Quality_Score", "REL_Quality_Score", "quality_score",
+                    "category", "reason",
+                ],
+                "properties": {
+                    "description":          {"type": "string", "minLength": 10, "maxLength": 1000},
+                    "primary_subject":      {"type": "string", "minLength": 3, "maxLength": 200},
+                    "is_screenshot":        {"type": "boolean"},
+                    "is_composite_grid":    {"type": "boolean"},
+                    "contains_text_overlay": {"type": "boolean"},
+                    "is_human_photograph":  {"type": "boolean"},
+                    "art_medium": {
+                        "type": "string",
+                        "enum": ["photograph", "digital_painting", "anime", "3d_render",
+                                 "illustration", "mixed", "unclear"],
+                    },
+                    "photorealistic_style": {"type": "boolean"},
+                    "has_ai_flaws":         {"type": "boolean"},
+                    "woman_present":        {"type": "boolean"},
+                    "nsfw":                 {"type": "boolean"},
+                    "OVR_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
+                    "REL_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
+                    "quality_score":        {"type": "integer", "minimum": 1, "maximum": 10},
+                    "category": {
+                        "type": "string",
+                        "enum": ["InstagramInfluencer", "NSFW", "Professional",
+                                 "Amateur", "Unknown", "DISCARD"],
+                    },
+                    "reason": {"type": "string", "minLength": 5, "maxLength": 300},
+                },
+            },
+        },
+    }
+
+
 __all__ = [
     "ScoreConfig",
     "build_classification_prompt",
     "apply_scores",
+    "build_response_format",
     "_safe_parse_vision_json",
     "extract_message_text",
 ]
