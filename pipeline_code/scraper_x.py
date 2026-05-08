@@ -23,10 +23,11 @@ TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 QUEUE_DIR = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
-SEEN_FILE = BASE_DIR / f"seen_x_{SLUG}.json"
+# Import queue manager + dedup
+from queue_manager import save_to_queue as queue_save  # noqa: E402
+from seen_store import SeenStore  # noqa: E402
 
-# Import queue manager
-from queue_manager import save_to_queue as queue_save
+_SEEN_NAME = "x"
 
 
 def _parse_twitter_cookies(raw: str) -> list[dict]:
@@ -202,7 +203,7 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
         size_kb = result.stat().st_size // 1024
         print(f"    SAVED {result.name} ({size_kb}KB) | {prompt[:80] or '(no prompt)'}")
         # Persist dedup IDs immediately so a kill / restart can't lose them.
-        save_seen(seen)
+        seen.flush()
         return True
     else:
         seen.discard(dedup_key)
@@ -351,7 +352,7 @@ async def scrape_search(ctx, query: str, seen: set, saved_count: list):
         await scrape_tweet_page(ctx, tweet_id, author, seen, saved_count, f"x_search")
         await asyncio.sleep(0.5)
 
-    save_seen(seen)
+    seen.flush()
     print(f"  Search done. Total saved so far: {saved_count[0]}")
 
 
@@ -387,7 +388,7 @@ async def scrape_account(ctx, handle: str, seen: set, saved_count: list):
         await scrape_tweet_page(ctx, tweet_id, author, seen, saved_count, f"x_account_{handle}")
         await asyncio.sleep(0.5)
 
-    save_seen(seen)
+    seen.flush()
 
 
 # ── Scrape promptsref.com ───────────────────────────────────────────────────
@@ -489,7 +490,7 @@ async def scrape_promptsref(ctx, seen: set, saved_count: list):
         finally:
             await page.close()
 
-    save_seen(seen)
+    seen.flush()
 
 
 # ── Seen helpers ─────────────────────────────────────────────────────────────
@@ -534,42 +535,30 @@ def _scan_queue_for_x_keys() -> set[str]:
     return found
 
 
-def load_seen():
-    """Load dedup IDs from three independent sources so a missing seen file
-    or an interrupted prior run doesn't make us re-pull the same tweets:
-      1. The seen JSON itself (cheap, O(N))
-      2. `<sorted>/<slug>/**/twitter_x/*` filename scan (already-classified)
-      3. `<queue>/<slug>/twitter_x/*` filename scan (still pending)
+def _make_seen_store() -> SeenStore:
+    """Build the X.com SeenStore + adopt IDs already on disk so an interrupted
+    prior run doesn't make us re-pull the same tweets. Three sources fold in:
+      1. seen_x_<slug>.json itself (cheapest, native)
+      2. <sorted>/<slug>/**/twitter_x/*  (already-classified)
+      3. <queue>/<slug>/twitter_x/*     (still pending classification)
     """
-    seen: set[str] = set()
-    if SEEN_FILE.exists():
-        try:
-            seen |= set(json.loads(SEEN_FILE.read_text()))
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"  [seen] {SEEN_FILE.name} unreadable: {exc}", flush=True)
+    store = SeenStore(_SEEN_NAME, slug=SLUG, autoflush_every=25)
     sorted_keys = _scan_sorted_for_x_keys()
     queue_keys = _scan_queue_for_x_keys()
-    new_from_disk = (sorted_keys | queue_keys) - seen
+    new_from_disk = (sorted_keys | queue_keys) - store.snapshot()
     if new_from_disk:
         print(
             f"  [seen] +{len(new_from_disk)} ids recovered from disk "
             f"(sorted={len(sorted_keys)}, queue={len(queue_keys)})",
             flush=True,
         )
-    seen |= sorted_keys
-    seen |= queue_keys
-    return seen
-
-
-def save_seen(seen):
-    """Write incrementally so a kill mid-run doesn't lose our progress."""
-    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+    store.update(sorted_keys | queue_keys)
+    return store
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    seen = load_seen()
+    seen = _make_seen_store()
     print(f"=== X.com + promptsref Scraper ===")
     print(f"Loaded {len(seen)} already-seen IDs")
     saved_count = [0]
@@ -595,7 +584,7 @@ async def main():
 
         await browser.close()
 
-    save_seen(seen)
+    seen.flush()
     print(f"\n=== Done. Total saved: {saved_count[0]} ===")
 
 

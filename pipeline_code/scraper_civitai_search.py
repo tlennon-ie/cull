@@ -24,7 +24,11 @@ CIVITAI_DOMAIN = os.getenv("CIVITAI_DOMAIN", "civitai.com")
 if CIVITAI_DOMAIN not in {"civitai.com", "civitai.red"}:
     CIVITAI_DOMAIN = "civitai.com"
 SOURCE_KEY = "civitai_red" if CIVITAI_DOMAIN == "civitai.red" else "civitai"
-SEEN_FILE = BASE_DIR / f"seen_civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}_{SLUG}.json"
+
+from credentials import get_optional, get_required, MissingCredentialError  # noqa: E402
+from seen_store import MigrationSpec, SeenStore  # noqa: E402
+
+_SEEN_NAME = f"civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}"
 
 # civitai.red is a UI rebrand - there is no dedicated `search-new.civitai.red`
 # Meilisearch host. Both domains share civitai.com's search backend. Admins can
@@ -39,15 +43,11 @@ CDN_BASE   = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nk
 # Civitai.red runs on a separate auth backend, so the admin can supply a dedicated
 # key via CIVITAI_API_RED_KEY. Fall back to the .com key if only one is set.
 if CIVITAI_DOMAIN == "civitai.red":
-    TOKEN = os.getenv("CIVITAI_API_RED_KEY", "").strip() or os.getenv("CIVITAI_API_KEY", "").strip()
+    TOKEN = get_optional("CIVITAI_API_RED_KEY") or get_optional("CIVITAI_API_KEY")
+    if not TOKEN:
+        raise MissingCredentialError("CIVITAI_API_KEY", scraper="civitai-red")
 else:
-    TOKEN = os.getenv("CIVITAI_API_KEY", "").strip()
-
-if not TOKEN:
-    raise ValueError(
-        f"No API key available for Civitai domain '{CIVITAI_DOMAIN}'. "
-        f"Set CIVITAI_API_KEY (and optionally CIVITAI_API_RED_KEY) in .env."
-    )
+    TOKEN = get_required("CIVITAI_API_KEY", scraper="civitai-search")
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -84,7 +84,7 @@ FILTER_EXPRESSION = [
 MAX_PAGES = 40  # 50 * 40 = 2000 images
 LIMIT     = 50
 
-LEGACY_SEEN_FILE = BASE_DIR / f"seen_civitai_search_{SLUG}.json"
+_LEGACY_SEEN_FILE = BASE_DIR / f"seen_civitai_search_{SLUG}.json"
 SORTED_ROOT = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
 _SORTED_SLUG_DIR = SORTED_ROOT if SORTED_ROOT.name == SLUG else SORTED_ROOT / SLUG
 
@@ -93,8 +93,8 @@ def sorted_id_index() -> set[str]:
     """Scan <sorted>/<slug>/**/civitai*/*.jpg|*.png and extract civitai IDs.
 
     Sorted filenames look like `<cat>_civitai_<id>_<ts>_<rand>.<ext>`, so we
-    pull the number that follows 'civitai_'. This is a safety net for when the
-    seen file was lost or never written.
+    pull the number that follows 'civitai_'. Safety net for when the seen
+    file was lost or never written.
     """
     ids: set[str] = set()
     if not _SORTED_SLUG_DIR.exists():
@@ -113,28 +113,17 @@ def sorted_id_index() -> set[str]:
     return ids
 
 
-def load_seen():
-    """Merge per-domain seen + legacy (domain-less) seen so older dedup lists aren't lost.
-
-    Before the civitai.com / civitai.red split we stored one file per slug. That
-    legacy file still holds thousands of IDs that were already downloaded and
-    sorted; ignoring it would cause the scraper to re-queue them.
-    """
-    seen: set[str] = set()
-    for path in (LEGACY_SEEN_FILE, SEEN_FILE):
-        if path.exists():
-            try:
-                seen |= set(json.loads(path.read_text(encoding='utf-8')))
-            except (OSError, json.JSONDecodeError) as exc:
-                print(f"  [seen] skipping {path.name}: {exc}", flush=True)
+def _make_seen_store() -> SeenStore:
+    migrations = (
+        [MigrationSpec(seen_file=_LEGACY_SEEN_FILE)] if _LEGACY_SEEN_FILE.exists() else []
+    )
+    store = SeenStore(_SEEN_NAME, slug=SLUG, autoflush_every=25, migrations=migrations)
+    # Sorted-folder safety net: adopt every civitai_<id> already on disk.
     sorted_ids = sorted_id_index()
-    if sorted_ids:
-        print(f"  [seen] +{len(sorted_ids - seen)} ids recovered from sorted/ on disk", flush=True)
-        seen |= sorted_ids
-    return seen
-
-def save_seen(seen):
-    SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding='utf-8')
+    new = store.update(sorted_ids)
+    if new:
+        print(f"  [seen] +{new} ids recovered from sorted/ on disk", flush=True)
+    return store
 
 def build_search_payload(query: str, offset: int = 0):
     return {
@@ -278,7 +267,7 @@ def scrape_civitai_search(seen: set):
                 
                 time.sleep(0.1) # Polite delay
                 
-            save_seen(seen)
+            seen.flush()
             time.sleep(1) # Delay between pages
             
         except Exception as e:
@@ -288,5 +277,5 @@ def scrape_civitai_search(seen: set):
     print(f"=== Done. Saved {saved_count} images. ===")
 
 if __name__ == "__main__":
-    seen = load_seen()
+    seen = _make_seen_store()
     scrape_civitai_search(seen)

@@ -10,9 +10,6 @@ All paths resolved from .env (WORKSPACE_ROOT/.env). No hardcoded paths.
 """
 from __future__ import annotations
 
-import json
-import logging
-import os
 import shutil
 import tempfile
 from datetime import datetime
@@ -22,38 +19,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from queue_manager import save_to_queue  # noqa: E402
+from credentials import get_optional
+from paths import queue_dir, sorted_dir
+from pipeline_logging import get_logger
+from queue_manager import save_to_queue
+from seen_store import SeenStore
 
-logger = logging.getLogger("zff_local")
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = get_logger(__name__)
 
-from paths import base_dir as _base_dir  # noqa: E402
-
-SRC_DIR: Path = Path(os.environ.get("ZFORFREE_LOCAL_SRC", ""))
-BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", str(_base_dir())))
-SLUG: str = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
-QUEUE_DIR: Path = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue"))) / SLUG
-SORTED_DIR: Path = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted"))) / SLUG
-SEEN_FILE: Path = BASE_DIR / f"seen_zff_local_{SLUG}.json"
+SRC_DIR: Path = Path(get_optional("ZFORFREE_LOCAL_SRC"))
+SLUG: str = get_optional("PIPELINE_SLUG", "realistic_female_influencer")
+QUEUE_DIR: Path = queue_dir(SLUG)
+SORTED_DIR: Path = sorted_dir(SLUG)
 
 MIN_PROMPT_LENGTH: int = 40
 MIN_IMAGE_BYTES: int = 5000  # queue_manager rejects anything smaller; skip upstream
 IMAGE_SUFFIXES: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
-ENABLED: bool = os.environ.get("ZFORFREE_LOCAL_ENABLED", "true").lower() == "true"
-
-
-def load_seen() -> set[str]:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except json.JSONDecodeError:
-            logger.warning("seen file corrupt — starting fresh: %s", SEEN_FILE)
-    return set()
-
-
-def save_seen(seen: set[str]) -> None:
-    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+ENABLED: bool = get_optional("ZFORFREE_LOCAL_ENABLED", "true").lower() == "true"
 
 
 def already_sorted(stem: str) -> bool:
@@ -91,14 +73,9 @@ def iter_sources() -> list[Path]:
     return sorted(images)
 
 
-def process_one(img_path: Path, seen: set[str]) -> bool:
+def process_one(img_path: Path, seen: SeenStore) -> bool:
     stem = img_path.stem
-    if stem in seen:
-        return False
-    if already_sorted(stem):
-        seen.add(stem)
-        return False
-    if already_queued(stem):
+    if stem in seen or already_sorted(stem) or already_queued(stem):
         seen.add(stem)
         return False
 
@@ -111,7 +88,7 @@ def process_one(img_path: Path, seen: set[str]) -> bool:
     except OSError:
         return False
     if size < MIN_IMAGE_BYTES:
-        logger.debug("skip %s — too small (%d bytes)", img_path.name, size)
+        logger.debug("skip %s - too small (%d bytes)", img_path.name, size)
         seen.add(stem)
         return False
 
@@ -132,7 +109,7 @@ def process_one(img_path: Path, seen: set[str]) -> bool:
             "author": "zforfree",
             "timestamp": "",
             "queued_at": datetime.utcnow().isoformat(),
-            "pipeline_topic": os.environ.get("PIPELINE_TOPIC", ""),
+            "pipeline_topic": get_optional("PIPELINE_TOPIC"),
         }
         saved = save_to_queue("zforfree", tmp_path, prompt, metadata)
         if saved is None:
@@ -145,10 +122,10 @@ def process_one(img_path: Path, seen: set[str]) -> bool:
 
 def main() -> None:
     if not ENABLED:
-        logger.info("ZFORFREE_LOCAL_ENABLED=false — exiting")
+        logger.info("ZFORFREE_LOCAL_ENABLED=false - exiting")
         return
 
-    seen = load_seen()
+    seen = SeenStore("zff_local", slug=SLUG, autoflush_every=500)
     images = iter_sources()
     logger.info("found %d images in %s", len(images), SRC_DIR)
 
@@ -156,11 +133,8 @@ def main() -> None:
     for img_path in images:
         if process_one(img_path, seen):
             queued += 1
-            if queued % 500 == 0:
-                save_seen(seen)
-                logger.info("queued %d so far...", queued)
 
-    save_seen(seen)
+    seen.flush()
     logger.info("done. queued %d items from local zforfree", queued)
 
 

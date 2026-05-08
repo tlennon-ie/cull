@@ -27,6 +27,7 @@ ZFORFREE_WEB_ENABLED = os.environ.get("ZFORFREE_WEB_ENABLED", "false").lower() =
 
 # Import queue manager
 from queue_manager import save_to_queue as queue_save
+from seen_store import SeenStore
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
@@ -213,18 +214,15 @@ def _scan_disk_for_reddit_post_ids() -> set[str]:
     return found
 
 
-def scrape_reddit(seen: set) -> int:
-    seen_file = BASE_DIR / f"seen_reddit_{SLUG}.json"
-    if seen_file.exists():
-        try:
-            seen.update(json.loads(seen_file.read_text()))
-        except (OSError, json.JSONDecodeError):
-            pass
+def scrape_reddit(seen: "SeenStore") -> int:
+    """Reddit branch. ``seen`` is a SeenStore created in main(). Adopts any
+    post_ids found on disk (queue or sorted) before the first request so an
+    interrupted prior run doesn't re-pull the same posts."""
     disk_keys = _scan_disk_for_reddit_post_ids()
-    new_from_disk = disk_keys - seen
+    new_from_disk = disk_keys - seen.snapshot()
     if new_from_disk:
         print(f"  [seen-reddit] +{len(new_from_disk)} post_ids recovered from disk", flush=True)
-    seen |= disk_keys
+    seen.update(disk_keys)
 
     topic_cfg = _load_topic_config()
     queries = build_reddit_queries(TOPIC)
@@ -310,9 +308,7 @@ def scrape_reddit(seen: set) -> int:
                                 }, source="reddit")
                                 if ok:
                                     saved += 1
-                                    # Persist seen IDs every successful save so a kill
-                                    # mid-run can't make the next pass re-grab the same posts.
-                                    seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+                                    # SeenStore autoflush keeps the index durable.
                         except Exception as e:
                             pass
 
@@ -321,7 +317,7 @@ def scrape_reddit(seen: set) -> int:
             except Exception as e:
                 print(f"  [Reddit ERR] {query}/{sort}: {e}")
 
-        seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+        seen.flush()
 
     print(
         f"  Reddit done: saved={saved} dropped_offtopic={dropped_offtopic} "
@@ -350,11 +346,8 @@ def build_zff_queries(topic: str) -> list:
         queries += ["realistic man", "guy influencer", "male portrait"]
     return queries
 
-def scrape_zforfree(seen: set) -> int:
-    seen_file = BASE_DIR / f"seen_zff_{SLUG}.json"
-    if seen_file.exists():
-        seen.update(json.loads(seen_file.read_text()))
-
+def scrape_zforfree(seen: "SeenStore") -> int:
+    """ZFF.com web API branch. ``seen`` is a SeenStore created in main()."""
     queries = build_zff_queries(TOPIC)
     saved   = 0
 
@@ -451,7 +444,7 @@ def scrape_zforfree(seen: set) -> int:
 
                 time.sleep(0.05)
 
-            seen_file.write_text(json.dumps(list(seen)))
+            seen.flush()
             skip += 50
             if len(items) < 50:
                 break
@@ -476,13 +469,6 @@ def scrape_promptsref(seen: set) -> int:
     `[QUEUE-ERROR] Temp file too small` log spam.
     """
     saved = 0
-    seen_file = BASE_DIR / f"seen_promptsref_{SLUG}.json"
-    if seen_file.exists():
-        try:
-            seen.update(json.loads(seen_file.read_text()))
-        except (OSError, json.JSONDecodeError):
-            pass
-
     library = BASE_DIR / f"promptsref_library_{SLUG}.jsonl"
     library.parent.mkdir(parents=True, exist_ok=True)
 
@@ -546,9 +532,8 @@ def scrape_promptsref(seen: set) -> int:
                 with library.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 saved += 1
-                seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
-            seen_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+            seen.flush()
 
         except Exception as e:
             print(f"  [promptsref ERR] {page_url}: {e}")
@@ -564,9 +549,9 @@ if __name__ == "__main__":
     print(f"Topic: {TOPIC}", flush=True)
     print(f"Queue: {QUEUE_DIR}", flush=True)
 
-    seen_reddit      = set()
-    seen_zff         = set()
-    seen_promptsref  = set()
+    seen_reddit      = SeenStore("reddit", slug=SLUG, autoflush_every=10)
+    seen_zff         = SeenStore("zff", slug=SLUG, autoflush_every=25)
+    seen_promptsref  = SeenStore("promptsref", slug=SLUG, autoflush_every=10)
 
     total = 0
 
@@ -581,5 +566,9 @@ if __name__ == "__main__":
 
     print("\n[promptsref.com]", flush=True)
     total += scrape_promptsref(seen_promptsref)
+
+    seen_reddit.flush()
+    seen_zff.flush()
+    seen_promptsref.flush()
 
     print(f"\n=== Web scraper done. Total saved: {total} ===", flush=True)

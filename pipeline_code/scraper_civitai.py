@@ -23,8 +23,10 @@ SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 QUEUE_DIR = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
 _DOMAIN = os.environ.get("CIVITAI_DOMAIN", "civitai.com")
-SEEN_FILE = BASE_DIR / f"seen_civitai_{_DOMAIN.replace('.', '_')}_{SLUG}.json"
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+from seen_store import MigrationSpec, SeenStore  # noqa: E402
+_SEEN_NAME = f"civitai_{_DOMAIN.replace('.', '_')}"
 
 CDN_BASE  = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA")
 TRPC_BASE = os.environ.get("CIVITAI_TRPC_BASE", f"https://{_DOMAIN}/api/trpc")
@@ -58,21 +60,16 @@ MAX_PAGES = 40   # 50 items/page → up to 2000 images
 MIN_PROMPT = 15
 
 
-LEGACY_SEEN_FILE = BASE_DIR / f"seen_civitai_{SLUG}.json"
+_LEGACY_SEEN_FILE = BASE_DIR / f"seen_civitai_{SLUG}.json"
 
-def load_seen():
-    """Merge per-domain seen with the pre-split legacy file so we don't re-queue already-sorted IDs."""
-    seen: set[str] = set()
-    for path in (LEGACY_SEEN_FILE, SEEN_FILE):
-        if path.exists():
-            try:
-                seen |= set(json.loads(path.read_text(encoding='utf-8')))
-            except (OSError, json.JSONDecodeError) as exc:
-                print(f"  [seen] skipping {path.name}: {exc}", flush=True)
-    return seen
-
-def save_seen(seen):
-    SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding='utf-8')
+def _make_seen_store() -> SeenStore:
+    """Construct the per-domain SeenStore, merging in any pre-split legacy file."""
+    return SeenStore(
+        _SEEN_NAME,
+        slug=SLUG,
+        autoflush_every=25,
+        migrations=[MigrationSpec(seen_file=_LEGACY_SEEN_FILE)] if _LEGACY_SEEN_FILE.exists() else [],
+    )
 
 
 def trpc_get(endpoint: str, input_obj: dict) -> dict:
@@ -257,7 +254,7 @@ def scrape_pages(seen: set) -> int:
 
             time.sleep(0.3)  # polite rate limit per prompt fetch
 
-        save_seen(seen)
+        seen.flush()  # SeenStore atomic write between pages
 
         if not next_cursor:
             print("  No more pages.")
@@ -271,7 +268,7 @@ def scrape_pages(seen: set) -> int:
 
 
 def main():
-    seen = load_seen()
+    seen = _make_seen_store()
     print(f"Loaded {len(seen)} already-seen IDs")
     scrape_pages(seen)
 

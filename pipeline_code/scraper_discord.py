@@ -18,7 +18,9 @@ load_dotenv()
 #             can't be added to private servers).
 #   "auto"  - try `Bot <token>` first, fall back to raw on 401. Default.
 # DISCORD_AUTH_PREFIX (legacy) still works as a manual override.
-USER_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+from credentials import get_optional, warn_if_missing  # noqa: E402
+
+USER_TOKEN = get_optional("DISCORD_BOT_TOKEN")
 if not USER_TOKEN:
     print("[scraper_discord] WARNING: DISCORD_BOT_TOKEN not set in .env", flush=True)
 
@@ -47,10 +49,10 @@ BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 QUEUE_DIR  = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
-SEEN_FILE  = BASE_DIR / f"seen_discord_{SLUG}.json"
 
-# Import queue manager
-from queue_manager import save_to_queue
+# Import queue manager + dedup
+from queue_manager import save_to_queue  # noqa: E402
+from seen_store import SeenStore  # noqa: E402
 
 from topic_filter import load_config as _load_topic_config, passes as _topic_passes
 
@@ -58,14 +60,6 @@ MESSAGES_PER_CHANNEL = 400
 _TOPIC_CFG = _load_topic_config()
 MIN_PROMPT_LENGTH = _TOPIC_CFG.min_prompt_length
 DL_HEADERS = {"Authorization": _AUTH_HEADER}
-
-def load_seen():
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
-
-def save_seen(seen):
-    SEEN_FILE.write_text(json.dumps(list(seen)))
 
 def is_valid_prompt(text, context: str = "") -> bool:
     """Shared topic-aware filter. `context` is any surrounding text (channel,
@@ -217,7 +211,7 @@ def extract_prompt_from_yaml(yaml_bytes):
 
 def process_channel(ch):
     print(f"\n-> {ch['name']} ({ch['guild']})", flush=True)
-    seen = load_seen()
+    seen = SeenStore("discord", slug=SLUG, autoflush_every=25)
     messages = fetch_messages(ch["id"])
     print(f"   {len(messages)} messages fetched", flush=True)
     queued = 0
@@ -336,9 +330,9 @@ def process_channel(ch):
             queued += 1
 
         if queued % 20 == 0 and queued > 0:
-            save_seen(seen)
+            seen.flush()
 
-    save_seen(seen)
+    seen.flush()
     print(f"   Queued {queued} items from {ch['name']}", flush=True)
     return queued
 
