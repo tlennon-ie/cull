@@ -121,27 +121,19 @@ def vision_worker_list() -> list[str]:
 def _vision_spec(worker: str) -> AgentSpec | None:
     """Map a vision worker name to its script + env overrides.
 
-    `balanced-lm-secondary` maps to the same worker script as `balanced-lm`
-    but forces the primary LMStudio env vars to the SECONDARY values, so both
-    LMStudios can run in parallel on different labels.
+    Looks up the registry in ``vision_workers.py``. Unknown names return
+    ``None`` (the supervisor's `add()` filter then drops them silently).
     """
-    if worker == "lm-autodetect":
-        return AgentSpec(label=f"Vision-{worker}", script="vision_worker_lm_autodetect.py", loop_sleep=10)
-    if worker == "local":
-        return AgentSpec(label=f"Vision-{worker}", script="vision_worker.py", loop_sleep=10)
-    if worker == "balanced-lm-secondary":
-        return AgentSpec(
-            label="Vision-balanced-lm-secondary",
-            script="vision_worker_balanced_lm.py",
-            env_override={
-                "LMSTUDIO_PRIMARY_URL":     os.environ.get("LMSTUDIO_SECONDARY_URL", ""),
-                "LMSTUDIO_PRIMARY_MODEL":   os.environ.get("LMSTUDIO_SECONDARY_MODEL", ""),
-                "LMSTUDIO_PRIMARY_TIMEOUT": os.environ.get("LMSTUDIO_SECONDARY_TIMEOUT", "60"),
-            },
-            loop_sleep=10,
-        )
-    script = f"vision_worker_{worker.replace('-', '_')}.py"
-    return AgentSpec(label=f"Vision-{worker}", script=script, loop_sleep=10)
+    from vision_workers import WORKERS
+    spec = WORKERS.get(worker)
+    if spec is None:
+        return None
+    return AgentSpec(
+        label=f"Vision-{worker}",
+        script=spec.script,
+        env_override=spec.env_override(),
+        loop_sleep=10,
+    )
 
 
 def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:

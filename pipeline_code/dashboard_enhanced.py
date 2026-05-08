@@ -334,8 +334,6 @@ ALLOWED_VISION_WORKERS = [
     "balanced-lm",            # targets LMSTUDIO_PRIMARY_*
     "balanced-lm-secondary",  # same worker script, forced to LMSTUDIO_SECONDARY_* via env override
     "lm-autodetect",
-    "gemini",
-    "groq",
 ]
 
 _VISION_WORKER_DESCRIPTIONS = {
@@ -343,8 +341,6 @@ _VISION_WORKER_DESCRIPTIONS = {
     "balanced-lm":            "LMStudio PRIMARY endpoint",
     "balanced-lm-secondary":  "LMStudio SECONDARY endpoint (runs in parallel)",
     "lm-autodetect":          "LMStudio, auto-picks vision-capable model",
-    "gemini":                 "Gemini 2.5 Flash (cloud)",
-    "groq":                   "Legacy single-threaded Groq",
 }
 
 
@@ -412,8 +408,6 @@ SETTINGS_KEYS: list[str] = [
     "GROQ_API_KEY",
     "GROQ_API_KEYS",
     "GROQ_MODEL",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
     "LMSTUDIO_PRIMARY_TIMEOUT",
     "LMSTUDIO_SECONDARY_TIMEOUT",
     # Scraper credentials
@@ -432,7 +426,7 @@ SETTINGS_KEYS: list[str] = [
     "ZFORFREE_WEB_ENABLED",
 ]
 SECRET_KEYS: set[str] = {
-    "GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY",
+    "GROQ_API_KEY", "GROQ_API_KEYS",
     "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY",
     "TWITTER_COOKIES", "DISCORD_BOT_TOKEN", "DISCORD_CHANNELS_JSON",
     "REDDIT_CLIENT_SECRET",
@@ -526,7 +520,7 @@ def api_settings_post():
 def api_vision_test():
     """Verify the user's stored credentials hit a real backend.
 
-    Caller passes ``{"provider": "groq"|"gemini"|"lmstudio"}``. We do the
+    Caller passes ``{"provider": "groq"|"lmstudio"}``. We do the
     cheapest possible probe per provider and return ``{ok, message, latency_ms}``
     so the Settings UI can surface a working/broken indicator next to each
     credential field without forcing the user to start the whole pipeline.
@@ -571,17 +565,6 @@ def api_vision_test():
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
             return _done(True, "Groq key accepted")
-        if provider == "gemini":
-            key = os.environ.get("GEMINI_API_KEY", "")
-            if not key:
-                return _done(False, "no GEMINI_API_KEY configured", 400)
-            r = requests.get(
-                f"https://generativelanguage.googleapis.com/v1beta/models?key={key}",
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
-            return _done(True, "Gemini key accepted")
         return _done(False, f"unknown provider: {provider!r}", 400)
     except requests.RequestException as exc:
         return _done(False, f"connection error: {exc}")
@@ -2185,26 +2168,9 @@ HTML_TEMPLATE = r"""<!doctype html>
               x-text="providerTest.groq?.message"></span>
           </div>
 
-          <label class="block">
-            <span class="text-xs text-slate-400">GEMINI_API_KEY</span>
-            <input x-model="settings.GEMINI_API_KEY" type="password" placeholder="AIza..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">GEMINI_MODEL</span>
-            <input x-model="settings.GEMINI_MODEL" placeholder="gemini-2.5-flash"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
           <div class="md:col-span-2 flex items-center gap-3">
-            <button @click="testProvider('gemini')" :disabled="providerTest.gemini?.testing"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
-              <span x-text="providerTest.gemini?.testing ? 'Testing...' : 'Test Gemini'"></span>
-            </button>
-            <span class="text-xs" x-show="providerTest.gemini?.message"
-              :class="providerTest.gemini?.ok ? 'text-emerald-300' : 'text-rose-300'"
-              x-text="providerTest.gemini?.message"></span>
             <button @click="testProvider('lmstudio')" :disabled="providerTest.lmstudio?.testing"
-              class="ml-auto px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
+              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
               <span x-text="providerTest.lmstudio?.testing ? 'Testing...' : 'Test LM Studio'"></span>
             </button>
             <span class="text-xs" x-show="providerTest.lmstudio?.message"
@@ -2488,7 +2454,7 @@ function dashboard() {
       {id:'errors',   label:'Errors'},
       {id:'settings', label:'Settings'},
     ],
-    providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect','gemini'],
+    providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
@@ -2500,7 +2466,6 @@ function dashboard() {
       'balanced-lm':            'LMStudio PRIMARY endpoint',
       'balanced-lm-secondary':  'LMStudio SECONDARY endpoint (parallel with -primary)',
       'lm-autodetect':          'LMStudio, auto-picks the loaded vision model (VL)',
-      'gemini':                 'Google Gemini 2.5 Flash - paid cloud',
     },
     queueFiles: [], history: [], activity: [], promptCache: {},
     revealedNsfw: {},  // path -> true once the user clicks the eye

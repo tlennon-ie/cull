@@ -18,7 +18,6 @@ requests>=2.31
 
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
 groq>=0.11                        # Groq cloud worker
-google-generativeai>=0.8          # Gemini worker (optional, currently disabled)
 
 # ── Scrapers ─────────────────────────────────────────────────────────────
 playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install

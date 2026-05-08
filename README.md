@@ -44,7 +44,6 @@ The dashboard's **Vision** tab picks a worker; available options:
 | `lm-autodetect`   | LM Studio (local)     | Auto-pick whichever VL model is loaded         |
 | `balanced-lm-secondary` | LM Studio (2nd) | Parallel throughput across two LM Studio hosts |
 | `balanced-groq`   | Groq cloud            | Faster cold-start, handles NSFW                |
-| `gemini`          | Google Gemini 2.5 Flash | Optional fallback (disabled by default)      |
 
 LM Studio needs to be running with a vision-language model loaded (e.g. `qwen2.5-vl-7b`, `qwen3-vl-8b`, `gemma-3-27b`, `llava-*`).
 
@@ -62,7 +61,6 @@ pipeline_code/
 ├── vision_worker_balanced_groq.py
 ├── vision_worker_lm_autodetect.py
 ├── vision_worker_lm_keepalive.py
-├── vision_worker_gemini.py
 ├── scraper_civitai.py / scraper_civitai_search.py
 ├── scraper_discord.py
 ├── scraper_x.py
@@ -108,7 +106,6 @@ Required only for the providers you plan to use:
 
 - `GROQ_API_KEY` (for `balanced-groq`)
 - `LMSTUDIO_PRIMARY_URL` (for `balanced-lm` / `lm-autodetect`; defaults to `http://127.0.0.1:1234`)
-- `GEMINI_API_KEY` (for `gemini`)
 - `CIVITAI_API_KEY` (for the Civitai scrapers)
 - `TWITTER_COOKIES` (for X/Twitter)
 - `DISCORD_BOT_TOKEN` + `DISCORD_CHANNELS_JSON` (for Discord)
