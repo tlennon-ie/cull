@@ -2527,7 +2527,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
       <div class="card rounded-xl p-6">
         <h3 class="font-semibold mb-3">Brand</h3>
-        <p class="text-xs text-slate-400 mb-3">Replace the inline SVG mark with your generated logo by dropping <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">cull-mark.svg</code> into <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">docs/brand/</code> and updating the mark template in <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">dashboard_enhanced.py</code>.</p>
+        <p class="text-xs text-slate-400 mb-3">Logo variants live in <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">assets/</code> and are served from <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">/brand/&lt;filename&gt;</code>: <a href="/brand/logo.png" class="text-indigo-300 hover:underline">logo.png</a> for light surfaces, <a href="/brand/logo-transparent.png" class="text-indigo-300 hover:underline">logo-transparent.png</a> for flexible drops, <a href="/brand/logo-transparent-dark.png" class="text-indigo-300 hover:underline">logo-transparent-dark.png</a> for the dark dashboard. Wordmark is JetBrains Mono, all-lowercase.</p>
         <div class="grid grid-cols-5 gap-2 text-xs">
           <div><div class="h-12 rounded" style="background:#0F1115; border:1px solid #1f2937;"></div><div class="mt-1 text-slate-400">ink #0F1115</div></div>
           <div><div class="h-12 rounded" style="background:#F5F2EC;"></div><div class="mt-1 text-slate-400">surface #F5F2EC</div></div>

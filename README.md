@@ -98,7 +98,7 @@ Adding a new scraper source is similar — `SeenStore("name", slug=SLUG)` for de
 
 ## The dashboard
 
-Nine tabs, single-file Flask + Alpine.js, zero build step. Auto-refreshes every 5 seconds.
+Eleven tabs, single-file Flask + Alpine.js, zero build step. Auto-refreshes every 5 seconds.
 
 | | |
 |---|---|
@@ -106,6 +106,8 @@ Nine tabs, single-file Flask + Alpine.js, zero build step. Auto-refreshes every 
 | **Overview** — queue and sorted totals, recent classifications, queue-by-source | **Stats** — top keywords, three top-10 leaderboards, per-source DISCARD / NSFW / quality |
 | ![Gallery](docs/screenshots/gallery.png) | ![Scrapers](docs/screenshots/scrapers.png) |
 | **Gallery** — filterable grid, score / date / source / resolution / NSFW filters, ZIP export of the current view, n-gram insights, click-to-edit prompts | **Scrapers** — per-source on/off toggles, persists to `.env` |
+| ![About](docs/screenshots/about.png) | ![FAQ](docs/screenshots/faq.png) |
+| **About** — what cull is, repo + license, live counters, brand palette swatches | **FAQ** — pre-empts the GitHub issues (Why no Redis · Why force a JSON schema · What is "Watermarked" · How to add a scraper · How to switch LM Studio · Where data lives · Why "cull") |
 
 The Gallery detail modal lets you edit the prompt and save. The save overwrites the `.txt` next to the image with no backup, by design — versioning belongs in git, not in a thousand `.txt.bak` files.
 

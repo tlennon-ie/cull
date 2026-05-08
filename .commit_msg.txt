@@ -1,90 +1,36 @@
-brand: rename to cull, full visual identity rollout
+brand: refreshed dark logo with glow, all dashboard screenshots reshot
 
-Renames the project from "image-classification-pipeline" to "cull"
-across every text touchpoint, wires the logo into the dashboard +
-README, and adds two branded surfaces (FAQ tab, About tab) plus
-empty-state welcome cards. Origin remote updated to point at
-github.com/tlennon-ie/cull.
+* assets/logo-transparent-dark.png
+  Replaced with the new high-resolution variant the user generated
+  (2404x2404 RGBA with a subtle glow halo around the C). Compressed
+  in place via Pillow Octree at 128 colours so the glow gradient
+  survives without dithering artefacts. 508 KB -> 61 KB (88% reduction)
+  with the full resolution preserved - looks crisp at the 32px nav
+  size and at the 96px About-card size, and remains usable as a
+  high-fidelity social card export.
 
-Why "cull"
-----------
-Single-syllable verb that the audience already uses for this exact
-ritual (photographers cull, ML engineers cull). Lower trademark risk
-than the alternatives the strategy agent surveyed (Sieve, Pan, Sorted,
-Cradle), and the product's positioning is "automating taste" rather
-than "running a model" - cull names that workflow directly.
+* docs/screenshots/{overview,stats,gallery,scrapers,about,faq}.png
+  All six dashboard screenshots reshot against the cull-branded
+  build at 1440x900: page title now shows "cull", the funnel logo
+  (with glow) sits in the sidebar nav, FAQ + About tabs are visible,
+  the brand footer line ("cull · MIT · github.com/tlennon-ie/cull")
+  is at the bottom of every page. The Gallery + Stats screenshots
+  carry the same data as before (35 mock items via seed_demo_data.py)
+  so the visual continuity from the prior commit holds.
 
-Tagline: "The curation engine for AI image datasets."
+* pipeline_code/dashboard_enhanced.py
+  Updated the About-tab Brand card prose to point at the actual
+  assets/ folder + the live /brand/<filename> endpoint, with three
+  inline links to each PNG variant. The previous prose still
+  referenced docs/brand/ which doesn't exist - fixed to match
+  reality.
 
-Changes
--------
+* README.md
+  Dashboard preview table extended to a third row showing About +
+  FAQ. Tab count corrected from "Nine tabs" to "Eleven tabs"
+  (Overview, Stats, Gallery, Scrapers, Vision, Queue, Historical,
+  Errors, Settings, FAQ, About).
 
-README.md
-  Full rewrite to the trending-repo pattern (centred logo + H1 +
-  italic tagline, badge row, hero image, two-sentence "what it is",
-  "who it's for / not for", quick start, use cases, plug points,
-  dashboard preview, architecture map, configuration, FAQ, brand
-  assets). No emojis. No "powerful / seamless / leverages" filler.
-
-CLAUDE.md
-  Replaced the stale "Realistic Female Influencer Image Pipeline"
-  notes with an agent-oriented brief titled for cull. Conventions,
-  module map, run/test commands, anti-patterns, commit-history
-  pointers all retained.
-
-.claude/skills/cull-helper/SKILL.md
-  Renamed from pipeline-helper. Frontmatter description updated.
-  Skill folder name follows the brand.
-
-assets/
-  Three logo variants (logo.png light bg / logo-transparent.png /
-  logo-transparent-dark.png), all palette-quantized to <40 KB each
-  via Pillow with the brand colours pinned so the small mustard bead
-  survives compression. Total brand pack is ~100 KB.
-
-pipeline_code/dashboard_enhanced.py
-  - New /brand/<filename> route serves the three logo variants from
-    assets/ with a whitelist guard. No path traversal.
-  - <link rel="icon"> wired to the dark-transparent logo for favicons.
-  - <title> binds to "cull · <active tab>" via Alpine.
-  - JetBrains Mono webfont loaded from Google Fonts; .font-brand
-    helper exposes it. Brand palette helpers (.brand-keep, .brand-
-    discard, .bg-brand-keep, .bg-brand-discard) added.
-  - Sidebar nav swapped from "Pipeline" text header to logo + lower-
-    case "cull" wordmark, links to the About tab on click.
-  - Two new tabs: FAQ (seven questions including "Why cull?") and
-    About (logo, tagline, repo link, live stats trio, brand palette
-    swatches).
-  - Welcome card added to the Queue tab when nothing has been queued
-    or classified yet - logo + "Welcome to cull" + four primary action
-    buttons + a hint to run tools/seed_demo_data.py for a preview.
-  - Empty Gallery state replaced "No images match" with logo-led
-    illustration + seed-demo command callout.
-  - Brand footer line at the bottom of every tab: cull · MIT ·
-    github.com/tlennon-ie/cull.
-  - Removed the legacy gemini provider description (it was already
-    deleted from the workers list earlier).
-
-.env.example, paths.py, dashboard_enhanced.py, test_harness.py
-  Stale references to "Image Pipeline" / "ImagePipelineBot" /
-  "prompt-library" cleaned up. REDDIT_USER_AGENT default now
-  "cull/0.1".
-
-DOCUMENTATION_INDEX.md
-  Deleted - referenced docs that don't exist in the repo and was
-  full of session-internal cruft. README + CLAUDE.md + SKILL.md
-  cover the same ground.
-
-Origin remote
-  Local origin updated from .../image-classification-pipeline.git
-  to .../cull.git so push lands on the renamed repo.
-
-Smoke-tests
------------
-  - 25 modules import cleanly together.
-  - Dashboard test client returns 200 on /, /api/status,
-    /api/scrapers, /api/settings, /api/stats, /api/gallery.
-  - /brand/logo.png, /brand/logo-transparent.png, and
-    /brand/logo-transparent-dark.png all return valid PNGs.
-  - /brand/../../etc/passwd returns 404 (whitelist works).
-  - GET / contains 25 references to "cull" and a valid favicon link.
+Verified by re-shooting all screenshots after the dashboard restart
+picked up the prose change. Demo dashboard cleanly stopped after
+capture; data/ still gitignored.
