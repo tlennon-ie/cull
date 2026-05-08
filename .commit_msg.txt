@@ -1,0 +1,52 @@
+docs: README rewrite, launch scripts, mock screenshots, Claude skill
+
+Closes the four release-onboarding gaps flagged once the repo went public
+at github.com/tlennon-ie/image-classification-pipeline:
+
+* README placeholders replaced with the real clone URL. Quick start now
+  points at the new launch.sh / launch.bat as the primary path; manual
+  recipe kept as a fallback. Dashboard preview section added with four
+  screenshots (Overview, Stats, Gallery, Scrapers) and the exact command
+  to reproduce them locally from synthetic mock data. Settings tab
+  deliberately omitted from the gallery - its multiline textareas would
+  surface secrets.
+
+* launch.sh / launch.bat - one-command bootstrap per platform: detect
+  Python, create .venv, install requirements (hash-cached so re-runs are
+  instant), seed .env from .env.example, install Playwright Chromium once,
+  then exec the integrated launcher. Idempotent and CWD-independent.
+
+* tools/seed_demo_data.py - deterministic synthetic dataset generator
+  for screenshots / first-time previews. Downloads about 35 free
+  placeholder photos from picsum.photos (Lorem Picsum, Unsplash-licensed)
+  and writes the per-image triple (image, .txt prompt, .vision.json
+  metadata) under data/sorted/artistic_showcase/<category>/<source>/.
+  Categories follow the live taxonomy; subjects paint a generic artistic
+  curation scenario so reviewers never see the real influencer dataset.
+  --clean rebuilds in place; --dry-run prints what would be created.
+
+* docs/screenshots/{overview,stats,gallery,scrapers}.png captured at
+  1440x900 against the demo dataset on port 5050. The Scrapers shot
+  was re-captured after the first pass leaked LOCAL_IMPORT_DIR; the
+  second run uses sanitized env so it now reads "(LOCAL_IMPORT_DIR unset)".
+
+* CLAUDE.md rewrite - replaced the personal project notes with an
+  agent-oriented brief: what the repo is, the load-bearing conventions
+  (one source of truth per concern), where to look for each kind of
+  change, run / test commands, things to avoid, pointers to commit
+  history for the architectural why, and a link to the new skill bundle.
+
+* .claude/skills/pipeline-helper/SKILL.md - Claude-style skill with
+  YAML frontmatter that auto-loads when an agent works on this repo.
+  Codifies the invariants (structured output mandatory, atomic
+  .processing rename, path-traversal guards, print-vs-log policy),
+  step-by-step recipes for the common tasks (add scraper, add vision
+  provider, change taxonomy), the smoke-test command, and anti-patterns
+  to flag in code review.
+
+* README - new "Working with an AI coding agent" section pointing at
+  SKILL.md and CLAUDE.md so anyone using Claude Code / Cursor / Aider /
+  Codex on this repo gets the architecture brief without having to ask.
+
+Smoke-checked locally: bash -n on launch.sh, 35/35 demo items created
+from picsum, demo dashboard reads only mock data.

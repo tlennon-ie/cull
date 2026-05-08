@@ -1,340 +1,138 @@
-# CLAUDE.md — Image Pipeline Project
+# CLAUDE.md — Agent guide for the image-classification pipeline
 
-**Project:** Realistic Female Influencer Image Pipeline  
-**Purpose:** Multi-source web scraping → vision-based classification → organized asset library  
-**Tech Stack:** Python 3.8+, Flask, LMStudio (local AI), Redis/BullMQ (optional), Groq API (cloud), OpenAI-compat APIs  
-**Workspace:** `I:\AI\openclaw\workspace\`  
-**Main Orchestrator:** `.claude/agents/orchestrator.md`
+This file orients an AI coding agent (Claude Code, Cursor, Aider, etc.) to the
+repo. It complements [`README.md`](README.md), which is for human users.
 
----
-
-## 🎯 Pipeline Goals
-
-1. **Scrape** images from 7+ sources (Twitter, Reddit, Civitai, Discord, ZforFree, web)
-2. **Queue** images with metadata (source, timestamp, original URL, prompt)
-3. **Assess** images using local vision models (LMStudio Qwen/Gemma or cloud Groq)
-4. **Classify** into categories (Professional, Amateur, NSFW) + subcategories
-5. **Sort** to organized folders with complete metadata triple (image + .json + .txt)
-6. **Manage** via admin dashboard with error highlighting, worker controls, API switching
-7. **Track** historical logs: image → source → folder → classification → prompts generated
+If you're a human reading this: nothing here is required to use the project. Skip to the README.
 
 ---
 
-## 📁 Key Directories
+## What this repo is
 
-```
-I:\AI\openclaw\workspace/
-├── prompt-library/           ← Main pipeline code
-│  ├── queue/                 ← Images waiting to be processed
-│  │  ├── civitai/
-│  │  ├── twitter_x/
-│  │  ├── reddit/
-│  │  ├── discord_mj/
-│  │  ├── discord_ud/
-│  │  ├── zforfree/
-│  │  └── unknown/
-│  ├── sorted/                ← Classified & organized images
-│  │  └── realistic_female_influencer/
-│  │     ├── Professional/
-│  │     ├── Amateur/
-│  │     ├── NSFW/
-│  │     ├── Unknown/
-│  │     └── DISCARD/
-│  ├── run_pipeline.py        ← Main orchestrator (starts all scrapers + vision worker)
-│  ├── queue_manager.py       ← Queue APIs
-│  ├── vision_worker*.py      ← Vision assessment workers (Groq, LMStudio)
-│  ├── scraper_*.py           ← Individual scrapers (Twitter, Reddit, etc)
-│  └── logs_test/             ← Pipeline execution logs
-├── dashboard_enhanced.py      ← Admin dashboard (Flask web UI, http://localhost:5000)
-├── integrated_launcher.py     ← Starts pipeline + dashboard together
-├── claude/                    ← Agent framework (THIS FOLDER)
-│  ├── CLAUDE.md              ← This file
-│  ├── AGENTS.md              ← Cross-tool mirror
-│  ├── agents/                ← Sub-agent definitions
-│  └── skills/                ← Knowledge packages
-└── I:\AI\Scripts\zforfree\downloads/  ← External ZforFree image source
-```
+A Python pipeline that:
 
----
+1. **Scrapes** images + prompts from 7+ sources (Civitai, X/Twitter, Reddit,
+   Discord, ZForFree, generic local folders).
+2. **Queues** them on the local filesystem under `data/queue/<slug>/<source>/`.
+3. **Classifies** each image with a vision-language model (LM Studio or Groq)
+   using a strict JSON schema for structured output.
+4. **Sorts** results into category folders alongside the original `.txt` prompt
+   and a `.vision.json` audit record.
+5. **Surfaces** everything through a Flask + Alpine.js admin dashboard
+   (`http://localhost:5000`) — pipeline control, scraper toggles, gallery
+   browsing, prompt editing, ZIP export, per-source analytics.
 
-## 🔧 Tech Stack Details
+## Conventions you must follow
 
-### Vision Assessment
-- **LMStudio** (local, on-device)
-  - Models: Qwen-VL, Gemma-Vision
-  - Endpoint: `http://127.0.0.1:8000/v1/` (default) — **configurable via admin panel**
-  - Used when local processing preferred
-  
-- **Groq** (cloud, fast inference)
-  - API Key: `GROQ_API_KEY` env var
-  - Model: `mixtral-8x7b-32768`
-  - Used for faster processing
+These are load-bearing — breaking them will silently misroute images.
 
-### Queuing
-- **File-system based queue** (no Redis required)
-  - Queue depth: monitored per-source
-  - Dead letter queue: `queue/unknown/`
-  
-### Scraping Sources
-1. **Twitter/X** — `scraper_x.py` (OAuth token required)
-2. **Reddit** — `scraper_reddit.py` (PRAW, credentials in .env)
-3. **Civitai** — `scraper_civitai.py` & `scraper_civitai_search.py` (API key)
-4. **Discord** — `scraper_discord.py` (bot token, channel IDs)
-5. **ZforFree** — Images copied from `I:\AI\Scripts\zforfree\downloads`
-6. **Web** — `scraper_web.py` (direct URL)
+- **Categories** live in [`pipeline_code/categories.py`](pipeline_code/categories.py).
+  Three tuples: `CATEGORIES` (kept buckets), `TERMINAL_CATEGORIES` (DISCARD/CORRUPT),
+  `ALL_CATEGORIES` (everything). Never inline a category list anywhere else.
+- **Vision worker registry** lives in [`pipeline_code/vision_workers.py`](pipeline_code/vision_workers.py).
+  Adding a new provider: register a `WorkerSpec` here AND add it to
+  `dashboard_enhanced.ALLOWED_VISION_WORKERS`. The supervisor maps worker
+  name → script via this registry; mismatched names silently no-op.
+- **Vision worker base class:** [`pipeline_code/vision_worker_base.py`](pipeline_code/vision_worker_base.py).
+  Subclass `BaseVisionWorker` and implement `classify_image_bytes`. Don't
+  reimplement the resize / rename / save dance — the base owns it.
+- **Queue:** use `queue_manager.save_to_queue` / `get_next_image_round_robin`
+  (or the underlying `Queue` Protocol + `FSQueue`). Do NOT iterate the
+  filesystem yourself; the cache layer in `FSQueue` exists for a reason.
+- **Dedup:** every scraper uses `seen_store.SeenStore("name", slug=SLUG)`.
+  Adding a new scraper = one `SeenStore(...)` instance + `seen.add(id)` calls
+  and `seen.flush()` between batches. Don't roll your own JSON file.
+- **Credentials:** every scraper uses `credentials.get_required("KEY", scraper="name")`
+  for hard requirements and `get_optional` / `get_keylist` for soft ones.
+  `MissingCredentialError` is a `SystemExit` subclass so the supervisor's
+  cooldown applies on misconfigured scrapers.
+- **Logging:** library code uses `pipeline_logging.get_logger(__name__)`.
+  Subprocess workers (scrapers, vision workers) keep their `print(..., flush=True)`
+  calls because the supervisor captures and labels stdout cleanly — see
+  [`pipeline_logging.py`](pipeline_code/pipeline_logging.py) for the reasoning.
+- **Paths:** [`pipeline_code/paths.py`](pipeline_code/paths.py) is the single
+  source of truth. Default is `<repo>/data/`. Never hardcode an absolute path.
+- **Vision prompt + JSON schema:** [`pipeline_code/vision_prompt.py`](pipeline_code/vision_prompt.py)
+  exposes `build_classification_prompt` + `build_response_format` +
+  `apply_scores`. Every worker MUST send the schema in `response_format`
+  (or its provider equivalent) — empty/invalid JSON failure modes were
+  fixed by structured output, don't regress.
 
-### Dashboard
-- **Framework:** Flask + Flask-CORS
-- **Port:** 5000 (configurable)
-- **Features:**
-  - Real-time queue monitoring
-  - Queue file operations (delete, move, requeue)
-  - Vision worker control (enable/disable, throttle %, model switching)
-  - Scraper control (per-source start/stop)
-  - Error highlighting (RED for corrupted files)
-  - Historical logs (image → source → folder → classification)
-  - Corruption detection
-  - API switching (LMStudio IP/port/model, Groq key, etc)
+## Repository map (where to look first)
 
----
+| You want to… | Look at |
+|---|---|
+| Add a new scraper source | [`scraper_civitai.py`](pipeline_code/scraper_civitai.py) as a template, register in [`run_pipeline.py`](pipeline_code/run_pipeline.py) `compute_desired_agents` |
+| Add a new vision provider | Subclass [`BaseVisionWorker`](pipeline_code/vision_worker_base.py), register in [`vision_workers.py`](pipeline_code/vision_workers.py), update `ALLOWED_VISION_WORKERS` in [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) |
+| Change classification taxonomy | [`categories.py`](pipeline_code/categories.py) — affects JSON schema + worker mkdir + dashboard automatically |
+| Tune classification quality | [`vision_prompt.py`](pipeline_code/vision_prompt.py) — `build_classification_prompt` for the model-side instruction, `apply_scores` for post-hoc validation gates |
+| Add a dashboard endpoint | [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) — single-file Flask + giant `HTML_TEMPLATE` Alpine.js string |
+| Swap the queue backend | Implement the `Queue` Protocol from [`queue_manager.py`](pipeline_code/queue_manager.py); change `_default_queue` factory |
+| Configure a setting via UI | Add the env var name to `SETTINGS_KEYS` in [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) and add inputs in the Settings tab template |
 
-## 🚀 How to Run
-
-### Option 1: Integrated (Recommended)
-```bash
-python integrated_launcher.py
-# Starts BOTH pipeline + dashboard
-# Dashboard: http://localhost:5000
-```
-
-### Option 2: Separate Windows
-```bash
-# Window 1: Start pipeline
-cd prompt-library
-python run_pipeline.py --topic "Realistic Female Influencer"
-
-# Window 2: Start dashboard
-python dashboard_enhanced.py
-# Open http://localhost:5000
-```
-
-### Option 3: With Custom Vision Worker
-```bash
-# Use LMStudio (local) instead of Groq (cloud)
-cd prompt-library
-python run_pipeline.py --topic "Realistic Female Influencer" --vision-worker balanced-lm
-
-# With custom LMStudio endpoint
-python run_pipeline.py --topic "Realistic Female Influencer" --lmstudio-url http://192.168.1.100:8000
-```
-
----
-
-## 📊 Admin Dashboard Features
-
-### Real-Time Monitoring
-- Queue depth by source
-- Vision worker status
-- Scraper logs
-- Error log with timestamps
-- Throughput metrics
-
-### Admin Controls
-- **Pipeline:** Pause/Resume all processing
-- **Scrapers:** Enable/Disable per-source (toggle on/off)
-- **Vision Worker:** 
-  - Enable/Disable
-  - Throttle: 0-100%
-  - Switch model (Qwen, Gemma, etc)
-- **Queue:** 
-  - View corrupted files (RED highlighted)
-  - Delete/Move/Requeue files
-  - Bulk operations
-- **API Switching:**
-  - Change LMStudio endpoint (IP:port)
-  - Change LMStudio model
-  - Switch between Groq and LMStudio
-  - Add/remove sources
-
-### Historical Logs
-- Image file name → Source (civitai/twitter/etc) → Category folder (Professional/Amateur/NSFW) → Classification (via vision worker)
-- Prompt history: All prompts generated during assessment
-- Traceability: Where did this image come from? What classification was assigned? Why?
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-Create `.env` in workspace root:
+## Run / test commands
 
 ```bash
-# Vision Workers
-GROQ_API_KEY=your_groq_key_here
-LM_STUDIO_URL=http://127.0.0.1:8000
+# Bootstrap on first run (creates .venv, installs deps, copies .env)
+./launch.sh                      # macOS/Linux
+launch.bat                       # Windows
 
-# Scrapers
-TWITTER_API_KEY=your_twitter_api_key
-REDDIT_CLIENT_ID=your_reddit_client_id
-REDDIT_CLIENT_SECRET=your_reddit_secret
-CIVITAI_API_KEY=your_civitai_key
-DISCORD_BOT_TOKEN=your_discord_token
+# Run individual modules directly (after activating .venv)
+python pipeline_code/run_pipeline.py                  # supervisor only
+python pipeline_code/dashboard_enhanced.py            # dashboard only
+python pipeline_code/integrated_launcher.py           # both together
+python pipeline_code/scraper_civitai.py               # ad-hoc scraper run
+python tools/seed_demo_data.py                        # synthetic demo data for screenshots
 
-# Pipeline
-PIPELINE_TOPIC="Realistic Female Influencer"
-BATCH_SIZE=10
-WORKER_THREADS=4
+# Fast import sanity check across every active module
+python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; [importlib.import_module(m) for m in (
+  'paths','pipeline_logging','categories','vision_workers','vision_prompt',
+  'queue_manager','topic_filter','seen_store','credentials',
+  'feed_local_folder','feed_zforfree_local',
+  'scraper_civitai','scraper_civitai_search','scraper_x','scraper_discord','scraper_web',
+  'vision_worker_base','vision_worker_balanced_lm','vision_worker_balanced_groq',
+  'vision_worker_lm_autodetect','vision_worker_lm_keepalive','vision_worker',
+  'run_pipeline','integrated_launcher','dashboard_enhanced')]; print('OK')"
 ```
 
-### Dashboard Config
-Edit in `dashboard_enhanced.py` (top of file):
+## Things you should NOT do
 
-```python
-LMSTUDIO_URL = "http://127.0.0.1:8000"  # Change IP/port here
-GROQ_MODEL = "mixtral-8x7b-32768"
-FLASK_PORT = 5000
-```
+- Do not add a Gemini worker without porting to `google.genai` (the new SDK).
+  The previous attempt was deleted because it used the deprecated
+  `google.generativeai` package and never adopted structured output. See
+  the commit that removed `vision_worker_gemini.py`.
+- Do not write secrets into committed files. `.env` is gitignored;
+  `.env.example` is safe but every value there should be a placeholder.
+- Do not bypass `safe_inside()` in dashboard endpoints that accept user-
+  supplied paths. It's the only thing preventing path traversal.
+- Do not touch the atomic `.processing` rename in vision workers. It's the
+  cross-worker lock; replacing it with anything fancier reintroduces races.
+- Do not auto-pip-install dependencies at runtime. The Groq worker used to
+  do this and it broke CI; declare deps in `requirements.txt` instead.
 
----
+## Where the audit / refactor history lives
 
-## 🔌 Admin Panel: Switching LMStudio
+The architecture you see today landed in a series of commits whose bodies
+explain *why* each module looks the way it does. `git log --oneline pipeline_code/`
+shows them all; the most consequential are:
 
-**Use Case:** Change from local LMStudio to cloud Groq, or switch LMStudio IP/port, or change model
+- `c196f57` — release prep (dead code purged, README/requirements/LICENSE)
+- `1848f09` — vision-worker registry + Gemini removal
+- `9e14117` — Queue Protocol + FSQueue with mtime cache (R4)
+- `61fe5cd` — VisionWorker base + thin subclasses (R1)
+- `a7e0d88` — `seen_store.py` + `credentials.py` + scraper migration (R2)
 
-**Via Dashboard:**
-1. Open http://localhost:5000
-2. Go to "Admin" → "Vision Worker Config"
-3. Options:
-   - **Provider:** "LMStudio" or "Groq"
-   - **LMStudio Endpoint:** 127.0.0.1:8000 (change IP/port)
-   - **LMStudio Model:** Qwen-VL or Gemma-Vision (dropdown)
-   - **Groq API Key:** (for cloud option)
-4. Click "Apply & Restart Worker"
+Read those commit bodies before refactoring near them.
 
-**Via CLI:**
-```bash
-# Switch to local LMStudio at different IP
-python dashboard_enhanced.py --lmstudio-url http://192.168.1.50:8000 --lmstudio-model qwen-vl
+## Pointers for AI agents
 
-# Switch to Groq
-python dashboard_enhanced.py --vision-worker groq
-```
-
-**Via Code:**
-```python
-# In queue_manager.py or vision_worker.py
-config = {
-    "vision_provider": "lmstudio",  # or "groq"
-    "lmstudio_url": "http://192.168.1.50:8000",
-    "lmstudio_model": "qwen-vl",
-    "groq_api_key": os.getenv("GROQ_API_KEY")
-}
-```
-
----
-
-## 📋 Rules & Conventions
-
-### File Organization
-- **Images:** Always have 3 files per item: `.jpg` (or `.png`/`.webp`) + `.json` metadata + `.txt` text file
-- **Metadata triple:** Never separate them; when an image moves from queue → sorted, all 3 move together
-- **Naming:** `source_uniqueid_timestamp.jpg` (e.g., `civitai_abc123_1705000000.jpg`)
-
-### Queue Management
-- **Depth limit:** None (filesystem limited only)
-- **Retry policy:** Failed items go to `queue/unknown/` (dead letter queue)
-- **Cleanup:** Auto-remove orphaned metadata files weekly
-
-### Category Taxonomy
-```
-realistic_female_influencer/
-├── Professional/        ← High-quality, branded content
-├── Amateur/             ← User-generated, less polished
-├── NSFW/                ← Adult content (flagged for review)
-├── Unknown/             ← Classification uncertain
-└── DISCARD/             ← Corrupted, deleted, or rejected
-```
-
-### Vision Assessment Workflow
-1. **Input:** Image file + `.json` metadata (source, URL, timestamp)
-2. **Processing:** LMStudio/Groq vision model
-3. **Output:** 
-   - Classification (Professional/Amateur/NSFW)
-   - Confidence score
-   - Generated prompt/description
-   - Quality flags
-4. **Metadata update:** Append to `.json` file with timestamp
-
-### Error Handling
-- **Corrupted image:** RED highlight in dashboard, moved to DISCARD/
-- **Missing metadata:** Flag for reindex
-- **Failed assessment:** Retry up to 3x, then dead letter
-- **Scraper error:** Log, skip item, continue
-
----
-
-## 🛠️ Development Workflow
-
-1. **Add new scraper:**
-   - Create `scraper_newsource.py` in `prompt-library/`
-   - Implement `scrape()` and `save_to_queue()` functions
-   - Reference in `run_pipeline.py` launch sequence
-   - Test with `python scraper_newsource.py --test`
-
-2. **Modify vision assessment:**
-   - Edit prompt in `vision_worker.py` or `vision_worker_*.py`
-   - Test with single image: `python vision_worker.py --test-image queue/civitai/test.jpg`
-   - Deploy via dashboard restart
-
-3. **Change classification taxonomy:**
-   - Update folder structure in `sorted/realistic_female_influencer/`
-   - Update routing logic in `sorter.py`
-   - Run `python sorter.py --resort-all` to re-sort existing images
-
-4. **Debug pipeline issues:**
-   - Check logs: `prompt-library/logs_test/`
-   - View dashboard error log (red items)
-   - Run health check: `python pipeline_health_check.py`
-
----
-
-## 📞 Support & Debugging
-
-### Check Pipeline Status
-```bash
-# See what's running
-ps aux | grep python | grep pipeline
-
-# View recent errors
-tail -f prompt-library/logs_test/pipeline.log
-```
-
-### Dashboard Troubleshooting
-- **Dashboard won't start:** Check if port 5000 is in use: `netstat -ano | findstr :5000`
-- **Pipeline won't start:** Verify `run_pipeline.py` has execution permissions
-- **Vision worker fails:** Check LMStudio is running (http://127.0.0.1:8000/health)
-
-### Common Issues
-| Issue | Solution |
-|-------|----------|
-| "Cannot connect to LMStudio" | Ensure LMStudio running, check IP/port in config |
-| "Queue filling up, vision worker slow" | Reduce batch size, enable throttling in dashboard |
-| "Metadata files corrupted" | Run `cleanup_orphaned_metadata.py` |
-| "Images in wrong folders" | Run `sorter.py --resort-all` |
-
----
-
-## 📚 Related Files
-
-- **AGENTS.md** — Cross-tool agent definitions
-- **.claude/agents/orchestrator.md** — Main coordinator agent
-- **.claude/agents/vision-captioner.md** — Vision assessment agent
-- **.claude/agents/sorter.md** — Category routing agent
-- **.claude/skills/lmstudio-vision/** — LMStudio integration guide
-- **.claude/skills/metadata-schema/** — Metadata structure
-- **prompt-library/README.md** — Pipeline code documentation
-
----
-
-Last Updated: 2026-04-19  
-Maintained by: [You]
+- **Skill bundle:** [`.claude/skills/pipeline-helper/`](.claude/skills/pipeline-helper/SKILL.md) — load this when working on the pipeline.
+- **Project guidelines:** the conventions section above is the load-bearing
+  list. Re-read it before opening a PR.
+- **Task scope:** small, focused changes. The architect's audit recommended
+  five refactors (R1-R5); they're all done. New work should follow the
+  established seams (registry, Protocol, base class) rather than introducing
+  new top-level abstractions.
+- **Testing:** there is no formal test suite yet. Use the import sanity check
+  above as your CI smoke test. If you add a new module, make sure it imports
+  cleanly with the others.

@@ -2,12 +2,15 @@
 
 Multi-source image scraping → vision-model classification → organised asset library, with a Flask admin dashboard.
 
-The pipeline pulls images from configurable sources (Civitai, X/Twitter, Reddit, Discord, local folders), runs them through a local or cloud vision model (LM Studio, Groq, or Gemini), and sorts them into category folders alongside the original prompt and a JSON record of the classification.
+The pipeline pulls images from configurable sources (Civitai, X/Twitter, Reddit, Discord, local folders), runs them through a local or cloud vision model (LM Studio or Groq), and sorts them into category folders alongside the original prompt and a JSON record of the classification.
+
+**Repo:** [`github.com/tlennon-ie/image-classification-pipeline`](https://github.com/tlennon-ie/image-classification-pipeline)
+**License:** MIT
 
 ## Features
 
 - **7+ scraper sources** — Civitai (.com + .red), X/Twitter, Reddit, Discord, ZForFree, web, generic local folder. Each toggleable from the dashboard.
-- **Multiple vision backends** — LM Studio (local, with auto-detect), Groq cloud, Gemini, with structured-output enforcement so every backend returns the same JSON shape.
+- **Multiple vision backends** — LM Studio (local, with auto-detect), Groq cloud. JSON-schema constrained output so every backend returns the same shape.
 - **Topic-aware filtering** — keyword + banned-word lists configurable per topic; every scraper respects them.
 - **Live admin dashboard** at `http://localhost:5000` — start/stop pipeline, toggle scrapers/workers, browse the gallery, edit prompts, view stats and per-source analytics, export filtered ZIPs.
 - **File-system queue** with atomic-rename locking — no Redis needed, but still safe for parallel workers.
@@ -15,9 +18,31 @@ The pipeline pulls images from configurable sources (Civitai, X/Twitter, Reddit,
 
 ## Quick start
 
+The fastest path: clone, run the launcher, point a browser at `http://localhost:5000`.
+
+### Linux / macOS
+
 ```bash
-git clone <your-fork>
-cd <repo>
+git clone https://github.com/tlennon-ie/image-classification-pipeline.git
+cd image-classification-pipeline
+./launch.sh
+```
+
+### Windows
+
+```bat
+git clone https://github.com/tlennon-ie/image-classification-pipeline.git
+cd image-classification-pipeline
+launch.bat
+```
+
+The launcher creates a virtual environment on first run (`.venv/`), installs dependencies from `requirements.txt`, copies `.env.example` to `.env` if you don't have one yet, then starts the dashboard.
+
+### Manual setup (if you prefer)
+
+```bash
+git clone https://github.com/tlennon-ie/image-classification-pipeline.git
+cd image-classification-pipeline
 
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -25,14 +50,47 @@ pip install -r requirements.txt
 python -m playwright install chromium   # only if using the X/Twitter or web scrapers
 
 cp .env.example .env
-# Edit .env: fill in any API keys you want to use, leave the rest blank.
+# Edit .env: fill in API keys for the providers you'll use, leave the rest blank.
 
 python pipeline_code/integrated_launcher.py
-# Opens dashboard at http://localhost:5000
+# Dashboard at http://localhost:5000
 # Click "Start pipeline" once you've configured at least one scraper + vision worker.
 ```
 
 By default the pipeline writes everything under `./data/` (queue, sorted, logs). Set `PIPELINE_BASE_DIR` in `.env` to put it elsewhere.
+
+## Dashboard preview
+
+The screenshots below are illustrative — they're rendered against a synthetic
+"artistic showcase" dataset seeded by [`tools/seed_demo_data.py`](tools/seed_demo_data.py).
+You can reproduce them on your own machine:
+
+```bash
+python tools/seed_demo_data.py            # downloads ~35 placeholder photos from picsum.photos
+PIPELINE_TOPIC="Artistic Showcase" PIPELINE_SLUG=artistic_showcase \
+  PIPELINE_BASE_DIR="$(pwd)/data" \
+  PIPELINE_QUEUE="$(pwd)/data/queue/artistic_showcase" \
+  PIPELINE_SORTED="$(pwd)/data/sorted/artistic_showcase" \
+  FLASK_PORT=5050 \
+  python pipeline_code/dashboard_enhanced.py
+# then open http://localhost:5050
+```
+
+### Overview tab — at-a-glance pipeline state + recent activity
+
+![Overview tab](docs/screenshots/overview.png)
+
+### Stats tab — keyword frequencies, top-10 leaderboards by metric, per-source analytics
+
+![Stats tab](docs/screenshots/stats.png)
+
+### Gallery tab — filterable grid, n-gram insights, ZIP export of the current view
+
+![Gallery tab](docs/screenshots/gallery.png)
+
+### Scrapers tab — one toggle per source, persists to `.env`
+
+![Scrapers tab](docs/screenshots/scrapers.png)
 
 ## Vision providers
 
@@ -131,6 +189,17 @@ The default topic is `Realistic Female Influencer`, with categories `InstagramIn
 ## Contributing
 
 Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first — there's an active refactor planned to formalise the scraper and worker interfaces.
+
+### Working with an AI coding agent
+
+This repo ships with a Claude-style skill for AI agents at
+[`.claude/skills/pipeline-helper/SKILL.md`](.claude/skills/pipeline-helper/SKILL.md)
+and a high-level architecture brief at [`CLAUDE.md`](CLAUDE.md). Point Claude
+Code, Cursor, Aider, Codex, or any agent that respects those files at the repo
+and they'll know the load-bearing seams (categories module, vision-worker
+registry, queue protocol, seen-store, credentials helpers) before touching
+anything. The skill spells out which file to edit for each common task —
+adding a scraper, adding a vision provider, changing thresholds, etc.
 
 ## License
 
