@@ -11,10 +11,10 @@ If you're a human reading this: nothing here is required to use the project. Ski
 
 cull is a single-machine curation engine for AI-generated images:
 
-1. **Scrapes** images + their generation prompts from 7+ sources (Civitai, X/Twitter, Reddit, Discord, ZForFree, generic local folders).
+1. **Scrapes** images + their generation prompts from 7+ dedicated sources (Civitai, X/Twitter, Reddit, Discord, ZForFree, generic local folders) plus any URL gallery-dl knows ([scraper_gallery_dl.py](pipeline_code/scraper_gallery_dl.py) — Pixiv, DeviantArt, the booru family, ArtStation, Tumblr, FurAffinity / e621, Imgur, Flickr, …).
 2. **Queues** them on the local filesystem under `data/queue/<slug>/<source>/`.
-3. **Classifies** each image with a vision-language model (LM Studio or Groq) using a strict JSON schema for structured output.
-4. **Sorts** results into category folders alongside the original `.txt` prompt and a `.vision.json` audit record.
+3. **Classifies** each image with a vision-language model (LM Studio or Groq) using a strict JSON schema for structured output. The same call optionally emits a training-ready caption (SD prompt / Booru tags / natural language) — see `CaptionConfig` in [vision_prompt.py](pipeline_code/vision_prompt.py).
+4. **Sorts** results into category folders alongside the (possibly auto-generated) `.txt` prompt and a `.vision.json` audit record.
 5. **Surfaces** everything through a Flask + Alpine.js admin dashboard
    (`http://localhost:5000`) — pipeline control, scraper toggles, gallery
    browsing, prompt editing, ZIP export, per-source analytics.
@@ -34,6 +34,9 @@ These are load-bearing — breaking them will silently misroute images.
 - **Logging:** library code uses `pipeline_logging.get_logger(__name__)`. Subprocess workers (scrapers, vision workers) keep their `print(..., flush=True)` calls because the supervisor captures and labels stdout cleanly — see [`pipeline_logging.py`](pipeline_code/pipeline_logging.py) for the reasoning.
 - **Paths:** [`pipeline_code/paths.py`](pipeline_code/paths.py) is the single source of truth. Default is `<repo>/data/`. Never hardcode an absolute path.
 - **Vision prompt + JSON schema:** [`pipeline_code/vision_prompt.py`](pipeline_code/vision_prompt.py) exposes `build_classification_prompt` + `build_response_format` + `apply_scores`. Every worker MUST send the schema in `response_format` (or its provider equivalent) — empty/invalid JSON failure modes were fixed by structured output, don't regress.
+- **Auto-captioning:** the schema's `caption` field is ALWAYS required (strict-mode JSON schemas can't have conditional fields). When `AUTO_CAPTION_ENABLED=false`, the prompt instructs the model to return an empty string. When `true`, the prompt swaps in style-specific instructions (`sd_prompt` / `booru_tags` / `natural_language`) and `vision_worker_base._finalise` writes the caption to `<image>.txt`. Existing source-side prompts are preserved unless `AUTO_CAPTION_OVERWRITE=true`.
+- **Prompt-required gate:** the `REQUIRE_PROMPT` env var (default `true`) governs whether scrapers reject images that have no prompt / a too-short prompt. The single source of truth for the gate logic is [`topic_filter.prompt_optional()`](pipeline_code/topic_filter.py); every scraper checks it before applying its own length floor. If you add a scraper, follow the pattern.
+- **gallery-dl backend:** [`scraper_gallery_dl.py`](pipeline_code/scraper_gallery_dl.py) wraps the gallery-dl Python API and is registered in `run_pipeline.compute_desired_agents` only when `GALLERY_DL_ENABLED=true` AND `GALLERY_DL_URLS` is non-empty. Per-image dedup uses gallery-dl's SQLite archive (`<base>/gallery_dl_archive_<slug>.sqlite3`) plus a regular `SeenStore` so analytics stay consistent. Captions are mined from `description` / `caption` / `selftext` / `content` / `title` / `tags` (in that order) of the metadata postprocessor JSON.
 
 ## Repository map (where to look first)
 
@@ -67,6 +70,7 @@ python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; [i
   'queue_manager','topic_filter','seen_store','credentials',
   'feed_local_folder','feed_zforfree_local',
   'scraper_civitai','scraper_civitai_search','scraper_x','scraper_discord','scraper_web',
+  'scraper_gallery_dl',
   'vision_worker_base','vision_worker_balanced_lm','vision_worker_balanced_groq',
   'vision_worker_lm_autodetect','vision_worker_lm_keepalive','vision_worker',
   'run_pipeline','integrated_launcher','dashboard_enhanced')]; print('OK')"

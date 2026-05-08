@@ -24,6 +24,7 @@ from paths import queue_dir, sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import save_to_queue
 from seen_store import SeenStore
+from topic_filter import prompt_optional
 
 logger = get_logger(__name__)
 
@@ -80,7 +81,8 @@ def process_one(img_path: Path, seen: SeenStore) -> bool:
         return False
 
     txt_path = img_path.with_suffix(".txt")
-    if not txt_path.exists():
+    txt_exists = txt_path.exists()
+    if not txt_exists and not prompt_optional():
         return False
 
     try:
@@ -92,8 +94,11 @@ def process_one(img_path: Path, seen: SeenStore) -> bool:
         seen.add(stem)
         return False
 
-    prompt = txt_path.read_text(encoding="utf-8", errors="replace").strip()
-    if len(prompt) < MIN_PROMPT_LENGTH:
+    prompt = (
+        txt_path.read_text(encoding="utf-8", errors="replace").strip()
+        if txt_exists else ""
+    )
+    if len(prompt) < MIN_PROMPT_LENGTH and not prompt_optional():
         seen.add(stem)
         return False
 

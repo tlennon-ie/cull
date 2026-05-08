@@ -22,6 +22,7 @@ groq>=0.11                        # Groq cloud worker
 # ── Scrapers ─────────────────────────────────────────────────────────────
 playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install
 schedule>=1.2                     # vision_worker_lm_keepalive.py
+gallery-dl>=1.27                  # generic URL scraper (Pixiv/DeviantArt/booru/X/Reddit/Tumblr/...)
 
 # ── Optional dev tools (uncomment for development) ───────────────────────
 # pytest>=8.0

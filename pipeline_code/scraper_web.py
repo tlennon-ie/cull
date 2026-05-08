@@ -15,7 +15,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+from topic_filter import load_config as _load_topic_config, passes as _topic_passes, prompt_optional
 from paths import base_dir
 
 BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
@@ -419,7 +419,7 @@ def scrape_zforfree(seen: "SeenStore") -> int:
                 dedup_key = f"zff_{iid}" if iid else f"zff_{url_hash(img_url)}"
                 if dedup_key in seen or not img_url:
                     continue
-                if len(prompt) < 30:
+                if len(prompt) < 30 and not prompt_optional():
                     continue
 
                 seen.add(dedup_key)

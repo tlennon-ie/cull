@@ -16,10 +16,11 @@
 
 ## What it is
 
-cull is a single-machine curation engine for AI-generated images. It pulls from seven sources, runs each image through a vision model under a strict 16-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
+cull is a single-machine curation engine for AI-generated images. It pulls from seven dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
 
-- Pulls from 7+ sources, dedupes, queues, and runs vision in one process tree.
+- Pulls from 7+ dedicated sources plus any URL gallery-dl knows (Pixiv, DeviantArt, the booru family, ArtStation, Tumblr, Newgrounds, FurAffinity / e621, Imgur, Flickr, …). Dedupes, queues, and runs vision in one process tree.
 - Forces every backend (LM Studio, Groq, anything OpenAI-compatible) into the same JSON schema so output never drifts.
+- Auto-captions images that arrive without a prompt — SD/Flux prompt, Booru tags, or natural language, your pick — using the same vision call that classifies them.
 - Keeps the prompt next to every image. Nothing goes through a database you don't own.
 
 ## Who it's for
@@ -27,11 +28,6 @@ cull is a single-machine curation engine for AI-generated images. It pulls from 
 - ML engineers building image datasets for LoRA / fine-tunes who want to automate the cull instead of doing it by eye.
 - Solo devs maintaining a personal scrape archive across multiple sources who keep losing duplicates.
 - Photographers and artists running a triage pass over hundreds of generated drafts to surface the ten worth keeping.
-
-## Who it's not for
-
-- Production-scale workloads (>100k images/day) — use a real queue.
-- Anyone who wants a hosted SaaS — this is single-machine on purpose.
 
 ## Quick start
 
@@ -76,6 +72,8 @@ Every image keeps its `.txt` prompt and gains a `.vision.json` audit record. The
 
 **Building a tagged personal library.** Edit prompts inline from the gallery modal — overwrites the `.txt` next to the image, invalidates the keyword cache, refreshes stats. Filter by score, date, source, resolution. Click any chip to jump straight to a filtered view.
 
+**Ingesting prompt-less archives.** Toggle off the prompt requirement, paste a list of gallery-dl URLs (or point `LOCAL_IMPORT_DIR` at a folder of bare JPEGs), and turn on auto-captioning in the Vision tab. Every image that lands in the queue gets a SD-prompt / Booru-tags / natural-language `.txt` written by the same LLM call that classifies it — so you can train a LoRA on a years-old archive without curating prompts by hand.
+
 ## Plug it
 
 Adding a new vision provider is a 30-line subclass:
@@ -95,6 +93,8 @@ class AnthropicWorker(BaseVisionWorker):
 ```
 
 Adding a new scraper source is similar — `SeenStore("name", slug=SLUG)` for dedup, `credentials.get_required("KEY", scraper="name")` for keys, `queue_manager.save_to_queue(source, tmp_path, prompt, meta)` for output. See [`CLAUDE.md`](CLAUDE.md) for the full contract or [`.claude/skills/cull-helper/SKILL.md`](.claude/skills/cull-helper/SKILL.md) if your AI agent should write the code.
+
+For URL-based sources, you don't need to write a scraper at all — paste the URL into the **gallery-dl** scraper card in Settings (Pixiv, DeviantArt, Danbooru, e621, ArtStation, Tumblr, Newgrounds, FurAffinity, X, Reddit, Imgur, Flickr — [340+ sites supported](https://github.com/mikf/gallery-dl#supported-sites)). gallery-dl's metadata postprocessor extracts `description` / `caption` / `selftext` / `tags` and cull writes that as the image's `.txt` automatically. Cookies file required for sites gated behind login (Pixiv, X, Patreon).
 
 ## The dashboard
 
@@ -143,6 +143,21 @@ Quality thresholds:
 - `VISION_REL_MIN_SCORE` — minimum topic-relevance score (0-100). Same threshold semantics.
 
 Neither applies to images classified as NSFW — those land in the `NSFW/` bucket regardless of score.
+
+Prompt-less ingest + auto-captioning (Vision tab toggles, also `.env` keys):
+
+- `REQUIRE_PROMPT` — `true` (default) keeps the existing `MIN_PROMPT_LENGTH` gate; set `false` to let scrapers queue images that have no prompt at all (gallery-dl, local folders, etc.).
+- `AUTO_CAPTION_ENABLED` — when `true`, the vision worker emits a training-ready caption in the same call that classifies the image. The caption gets written to the image's `.txt`.
+- `AUTO_CAPTION_STYLE` — one of `sd_prompt` (default, comma-separated SD/Flux prompt), `booru_tags` (lowercase_underscored), or `natural_language` (1-3 sentences).
+- `AUTO_CAPTION_OVERWRITE` — `false` (default) preserves an existing source-side prompt; `true` regenerates `.txt` for every image regardless.
+
+gallery-dl scraper:
+
+- `GALLERY_DL_ENABLED` — toggle for the URL-based scraper backed by [gallery-dl](https://github.com/mikf/gallery-dl).
+- `GALLERY_DL_URLS` — newline or comma separated URLs (Pixiv profiles, booru tag pages, DeviantArt galleries, etc.).
+- `GALLERY_DL_LIMIT_PER_URL` — cap per URL (default 50).
+- `GALLERY_DL_COOKIES_FILE` — Netscape `cookies.txt` path; required for login-walled sites.
+- `GALLERY_DL_CONFIG_PATH` — optional extra gallery-dl JSON config layered on top of cull's defaults.
 
 ## FAQ
 

@@ -75,6 +75,7 @@ _STATIC_SCRAPERS: list[dict[str, str]] = [
     {"name": "Civitai-Red", "description": "Civitai (civitai.red)"},
     {"name": "Web",         "description": "Reddit / ZforFree.com / promptsref"},
     {"name": "ZFF-Local",   "description": "ZforFree local folder (legacy)"},
+    {"name": "Gallery-DL",  "description": "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in Settings."},
 ]
 
 
@@ -387,6 +388,7 @@ SETTINGS_KEYS: list[str] = [
     "TOPIC_GENERATION_HINTS",
     "REDDIT_SUBREDDITS",
     "MIN_PROMPT_LENGTH",
+    "REQUIRE_PROMPT",
     "X_ACCOUNTS",
     # Vision quality + UX
     "VISION_OVR_MIN_SCORE",
@@ -394,6 +396,10 @@ SETTINGS_KEYS: list[str] = [
     "BLUR_NSFW_THUMBS",
     "VISION_SCORE_NOTES",
     "PIPELINE_RECONCILE_SECONDS",
+    # Auto-captioning
+    "AUTO_CAPTION_ENABLED",
+    "AUTO_CAPTION_STYLE",
+    "AUTO_CAPTION_OVERWRITE",
     # Storage paths
     "PIPELINE_BASE_DIR",
     "PIPELINE_QUEUE",
@@ -424,6 +430,12 @@ SETTINGS_KEYS: list[str] = [
     # ZForFree feeders
     "ZFORFREE_LOCAL_ENABLED",
     "ZFORFREE_WEB_ENABLED",
+    # gallery-dl scraper
+    "GALLERY_DL_ENABLED",
+    "GALLERY_DL_URLS",
+    "GALLERY_DL_LIMIT_PER_URL",
+    "GALLERY_DL_COOKIES_FILE",
+    "GALLERY_DL_CONFIG_PATH",
 ]
 SECRET_KEYS: set[str] = {
     "GROQ_API_KEY", "GROQ_API_KEYS",
@@ -1983,6 +1995,70 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
 
+      <!-- Auto-captioning + prompt-required toggles. Writes AUTO_CAPTION_*
+           and REQUIRE_PROMPT to .env via /api/settings; the supervisor
+           soft-restarts the vision worker pool the next reconcile tick. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Auto-captioning</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          When enabled, the vision worker writes a training-ready caption to
+          <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">&lt;image&gt;.txt</code>
+          alongside the existing <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">.vision.json</code>.
+          The same LLM call that classifies the image also returns the caption,
+          so there's no extra request. Captions never overwrite an existing
+          source-side prompt unless the overwrite toggle is also on.
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <div>
+            <label class="flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" :checked="settings.AUTO_CAPTION_ENABLED === 'true'"
+                     @change="settings.AUTO_CAPTION_ENABLED = $event.target.checked ? 'true' : 'false'; saveSettings()"
+                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                       checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                       checked:before:translate-x-5"/>
+              <span class="text-sm">Enable auto-captioning</span>
+            </label>
+            <label class="flex items-center gap-3 cursor-pointer mt-3">
+              <input type="checkbox" :checked="settings.AUTO_CAPTION_OVERWRITE === 'true'"
+                     :disabled="settings.AUTO_CAPTION_ENABLED !== 'true'"
+                     @change="settings.AUTO_CAPTION_OVERWRITE = $event.target.checked ? 'true' : 'false'; saveSettings()"
+                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                       checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                       checked:before:translate-x-5"/>
+              <span class="text-sm">Overwrite any existing captions found</span>
+            </label>
+            <label class="flex items-center gap-3 cursor-pointer mt-3">
+              <input type="checkbox" :checked="settings.REQUIRE_PROMPT === 'false'"
+                     @change="settings.REQUIRE_PROMPT = $event.target.checked ? 'false' : 'true'; saveSettings()"
+                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                       checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                       checked:before:translate-x-5"/>
+              <span class="text-sm">Allow scrapers to ingest images without a prompt
+                <span class="block text-xs text-slate-500">(off = current behaviour: require MIN_PROMPT_LENGTH chars)</span>
+              </span>
+            </label>
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Caption style</label>
+            <select x-model="settings.AUTO_CAPTION_STYLE" @change="saveSettings()"
+                    :disabled="settings.AUTO_CAPTION_ENABLED !== 'true'"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 disabled:opacity-50">
+              <option value="sd_prompt">SD / Flux prompt (comma-separated descriptive phrases)</option>
+              <option value="booru_tags">Booru tags (lowercase_underscored, comma-separated)</option>
+              <option value="natural_language">Natural-language description (1-3 sentences)</option>
+            </select>
+            <p class="text-xs text-slate-500 mt-2">
+              Pick the style your downstream trainer expects. SD/Flux for general
+              photo LoRAs, booru tags for anime LoRAs, natural-language for
+              CLIP/BLIP-style image-text models.
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">LMStudio endpoints</h3>
         <div class="grid md:grid-cols-2 gap-6">
@@ -2427,6 +2503,49 @@ HTML_TEMPLATE = r"""<!doctype html>
           </label>
         </div>
       </div>
+
+      <!-- gallery-dl scraper config. URLs is a textarea; everything else is
+           an env var the supervisor picks up live. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">gallery-dl scraper</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          gallery-dl handles 340+ sites - <strong>Pixiv, DeviantArt, Danbooru/Gelbooru/e621, ArtStation, Tumblr, Newgrounds, FurAffinity, X, Reddit, Imgur, Flickr</strong>, and many more. Paste one or more URLs (newline or comma separated), enable the toggle, and the supervisor spawns a Gallery-DL agent that downloads, dedupes, and routes each image through the same vision pipeline as the rest. Cookies file is required for Pixiv / X / login-walled sites - export <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">cookies.txt</code> from your browser. Captions are mined from each site's metadata (description / caption / selftext / tags) and written as the image's <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">.txt</code> automatically.
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Enabled</span>
+            <select x-model="settings.GALLERY_DL_ENABLED"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Images per URL (limit)</span>
+            <input x-model="settings.GALLERY_DL_LIMIT_PER_URL" type="number" min="1" max="5000" placeholder="50"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+            <span class="text-[10px] text-slate-500">Capped via gallery-dl <code>image-range</code>; default 50.</span>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
+            <textarea x-model="settings.GALLERY_DL_URLS" rows="5"
+                      placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait&#10;https://www.deviantart.com/SOMEONE/gallery"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
+            <input x-model="settings.GALLERY_DL_COOKIES_FILE" placeholder="e.g. C:\\Users\\you\\cookies.txt"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            <span class="text-[10px] text-slate-500">Optional. Required for Pixiv, X, and any private gallery. Use the &quot;Get cookies.txt LOCALLY&quot; browser extension.</span>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Custom gallery-dl config path (advanced)</span>
+            <input x-model="settings.GALLERY_DL_CONFIG_PATH" placeholder="e.g. C:\\Users\\you\\gallery-dl\\config.json"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            <span class="text-[10px] text-slate-500">Optional. Loaded on top of cull's defaults so power users can tune per-extractor settings.</span>
+          </label>
+        </div>
+      </div>
     </section>
 
     <!-- ERRORS -->
@@ -2698,7 +2817,8 @@ function dashboard() {
         queue:     (need('queue')  ? j('/api/queue/files?limit=60') : null),
         history:   (need('logs')   ? j('/api/logs/history?limit=200') : null),
         activity:  (need('overview') || tab === 'vision' ? j('/api/activity?limit=12') : null),
-        settings:  (need('settings') ? j('/api/settings') : null),
+        // Vision tab also needs settings for the auto-caption toggles.
+        settings:  (need('settings') || tab === 'vision' ? j('/api/settings') : null),
       };
       const keys = Object.keys(tasks);
       const results = await Promise.allSettled(Object.values(tasks).map(p => p ?? Promise.resolve(null)));

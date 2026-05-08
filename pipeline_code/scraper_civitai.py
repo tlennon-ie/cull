@@ -26,6 +26,7 @@ _DOMAIN = os.environ.get("CIVITAI_DOMAIN", "civitai.com")
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 from seen_store import MigrationSpec, SeenStore  # noqa: E402
+from topic_filter import prompt_optional  # noqa: E402
 _SEEN_NAME = f"civitai_{_DOMAIN.replace('.', '_')}"
 
 CDN_BASE  = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA")
@@ -127,11 +128,11 @@ def get_prompt(image_id: int) -> str | None:
     if not prompt:
         # print(f"    [{image_id}] Empty prompt field (keys: {list(meta.keys())})")
         return None
-        
-    if len(prompt) < MIN_PROMPT:
+
+    if len(prompt) < MIN_PROMPT and not prompt_optional():
         print(f"    [{image_id}] Prompt too short: {len(prompt)}")
         return None
-        
+
     return prompt
 
 
@@ -207,9 +208,11 @@ def scrape_pages(seen: set) -> int:
             if not image_id or not uuid or str(image_id) in seen:
                 continue
 
-            # Fetch prompt (one API call per image)
-            prompt = get_prompt(image_id)
-            if not prompt:
+            # Fetch prompt (one API call per image). When REQUIRE_PROMPT=false
+            # we still queue the image; the vision worker's auto-caption step
+            # (if enabled) writes a .txt later.
+            prompt = get_prompt(image_id) or ""
+            if not prompt and not prompt_optional():
                 print(f"    [{image_id}] no prompt — skip")
                 continue
 
@@ -234,7 +237,8 @@ def scrape_pages(seen: set) -> int:
                     print(f"    [{image_id}] download failed — skip")
                     continue
 
-            txt_path.write_text(prompt, encoding="utf-8")
+            if prompt:
+                txt_path.write_text(prompt, encoding="utf-8")
             meta_path.write_text(json.dumps({
                 "message_id":     stem,
                 "image_url":      img_url,

@@ -61,6 +61,10 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR", "LOCAL_IMPORT_NAME",
     "LOCAL_IMPORT_MIGRATE_FROM", "TWITTER_COOKIES",
     "DISCORD_BOT_TOKEN", "DISCORD_AUTH_MODE",
+    "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
+    "GALLERY_DL_LIMIT_PER_URL",
+    "REQUIRE_PROMPT",
+    "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
 
 
@@ -170,6 +174,16 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
     if os.environ.get("LOCAL_IMPORT_ENABLED", "false").lower() == "true":
         local_name = (os.environ.get("LOCAL_IMPORT_NAME", "local") or "local").strip() or "local"
         add(AgentSpec(label=f"Local-{local_name}", script="feed_local_folder.py", loop_sleep=3600))
+
+    # gallery-dl URL-based scraper (Pixiv, DeviantArt, booru sites, ArtStation,
+    # Tumblr, Newgrounds, X, Reddit, Imgur, Flickr — anything gallery-dl knows).
+    # Only desired when both the toggle is on AND at least one URL is configured;
+    # otherwise the supervisor would respawn an empty agent every loop_sleep.
+    if (
+        os.environ.get("GALLERY_DL_ENABLED", "false").lower() == "true"
+        and (os.environ.get("GALLERY_DL_URLS", "") or "").strip()
+    ):
+        add(AgentSpec(label="Gallery-DL", script="scraper_gallery_dl.py", loop_sleep=1800))
 
     # Vision workers (the Vision-* labels are also filterable via SCRAPER_DISABLED
     # so admins can force everything off with one bulk call.)

@@ -131,6 +131,17 @@ def load_config() -> TopicConfig:
     )
 
 
+def prompt_optional() -> bool:
+    """Whether scrapers may queue images without a usable prompt.
+
+    Driven by `REQUIRE_PROMPT` (default ``"true"``). When set to ``"false"``,
+    scrapers ingest images regardless of prompt length / generation hints,
+    and the vision worker's auto-caption step (when enabled) fills in a
+    `.txt` afterwards.
+    """
+    return os.environ.get("REQUIRE_PROMPT", "true").strip().lower() == "false"
+
+
 def passes(
     context: str,
     prompt: str,
@@ -140,16 +151,17 @@ def passes(
     """Return (ok, reason). `context` is title+body/source text, `prompt` is the image prompt.
 
     A post passes when:
-      1. `prompt` is at least MIN_PROMPT_LENGTH chars.
+      1. `prompt` is at least MIN_PROMPT_LENGTH chars (skipped if REQUIRE_PROMPT=false).
       2. No banned phrase appears in either context or prompt.
       3. At least one required keyword appears in (context + prompt).
-      4. At least one generation hint appears in prompt (if hints configured).
+      4. At least one generation hint appears in prompt (skipped if REQUIRE_PROMPT=false).
     """
     cfg = cfg or load_config()
     prompt = (prompt or "").strip()
     haystack = f"{context or ''}\n{prompt}"
+    require_prompt = not prompt_optional()
 
-    if len(prompt) < cfg.min_prompt_length:
+    if require_prompt and len(prompt) < cfg.min_prompt_length:
         return False, f"prompt too short ({len(prompt)} < {cfg.min_prompt_length})"
 
     if cfg.banned_re and cfg.banned_re.search(haystack):
@@ -158,7 +170,7 @@ def passes(
     if cfg.required_re and not cfg.required_re.search(haystack):
         return False, "missing required keyword"
 
-    if cfg.generation_re and not cfg.generation_re.search(prompt):
+    if require_prompt and cfg.generation_re and not cfg.generation_re.search(prompt):
         return False, "no generation-style keywords in prompt"
 
     return True, "ok"
@@ -171,4 +183,4 @@ def log_rejection(source: str, reason: str, preview: str, *, quiet: bool = False
     logger.debug("[%s] drop (%s): %s", source, reason, clipped)
 
 
-__all__ = ["TopicConfig", "load_config", "passes", "log_rejection"]
+__all__ = ["TopicConfig", "load_config", "passes", "log_rejection", "prompt_optional"]

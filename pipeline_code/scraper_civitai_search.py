@@ -27,6 +27,7 @@ SOURCE_KEY = "civitai_red" if CIVITAI_DOMAIN == "civitai.red" else "civitai"
 
 from credentials import get_optional, get_required, MissingCredentialError  # noqa: E402
 from seen_store import MigrationSpec, SeenStore  # noqa: E402
+from topic_filter import prompt_optional  # noqa: E402
 
 _SEEN_NAME = f"civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}"
 
@@ -225,7 +226,7 @@ def scrape_civitai_search(seen: set):
                 prompt = clean_prompt(prompt)
                 
                 # Fallback for empty prompts (check ComfyUI data inside meta if available)
-                if not prompt or len(prompt) < 15:
+                if (not prompt or len(prompt) < 15) and not prompt_optional():
                     # Search hits might not have full Comfy JSON, but check just in case
                     # Often search index prompts are truncated or missing if workflow-only
                     continue

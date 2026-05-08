@@ -58,6 +58,7 @@ from paths import sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import get_next_image_round_robin
 from vision_prompt import (
+    CaptionConfig,
     _safe_parse_vision_json,
     apply_scores,
     build_classification_prompt,
@@ -268,6 +269,22 @@ class BaseVisionWorker(ABC):
                 )
         except FileNotFoundError:
             return _Outcome.SKIPPED
+
+        # Auto-caption: write the model's caption to .txt when enabled. The
+        # source-side prompt (if any) was just moved to `final_txt`; we only
+        # overwrite it when the admin has explicitly opted in. This is the
+        # contract surfaced in the dashboard's Vision tab.
+        caption_cfg = CaptionConfig.from_env()
+        if caption_cfg.enabled:
+            raw_caption = (result.get("caption") or "").strip()
+            if raw_caption:
+                had_source_prompt = bool(ctx.prompt_text.strip())
+                if not had_source_prompt or caption_cfg.overwrite:
+                    try:
+                        final_txt.write_text(raw_caption, encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning("caption write failed for %s: %s",
+                                       final_img.name, exc)
 
         final_meta.write_text(
             json.dumps(result, indent=2, ensure_ascii=False),

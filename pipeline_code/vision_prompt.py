@@ -256,7 +256,63 @@ class ScoreConfig:
         )
 
 
-def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
+# ── Auto-captioning ─────────────────────────────────────────────────────────
+# When AUTO_CAPTION_ENABLED=true the vision call is asked to ALSO emit a
+# `caption` string suitable for downstream LoRA / fine-tune training. Style
+# choice is user-configurable so the same pipeline can produce SD prompts
+# for Flux LoRAs, Booru tags for anime LoRAs, or natural-language captions
+# for general image-text models.
+CAPTION_STYLES: tuple[str, ...] = ("sd_prompt", "booru_tags", "natural_language")
+
+_CAPTION_STYLE_INSTRUCTIONS: dict[str, str] = {
+    "sd_prompt": (
+        "Stable Diffusion / Flux style prompt. Comma-separated descriptive "
+        "phrases. Lead with the subject, then composition, lighting, lens / "
+        "camera cues, style modifiers, and quality tags. Example: "
+        "'photo of a young woman with brown hair, soft window light, "
+        "shallow depth of field, professional headshot, 35mm lens, "
+        "photorealistic, high detail'."
+    ),
+    "booru_tags": (
+        "Booru-style tags. Lowercase, underscored, comma-separated. Cover "
+        "subject count, hair, clothing, pose, expression, setting, medium. "
+        "Example: '1girl, solo, brown_hair, long_hair, smile, "
+        "looking_at_viewer, indoors, soft_lighting, photo_(medium)'."
+    ),
+    "natural_language": (
+        "Natural-language description. 1-3 plain sentences describing what "
+        "the image contains, the composition, and the mood. Example: "
+        "'A young woman with brown hair smiles softly at the camera in a "
+        "warmly-lit indoor space. The shot is a tight headshot with shallow "
+        "depth of field, suggesting a 35mm portrait lens.'"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class CaptionConfig:
+    enabled: bool
+    style: str  # one of CAPTION_STYLES
+    overwrite: bool
+
+    @classmethod
+    def from_env(cls) -> "CaptionConfig":
+        enabled = os.environ.get("AUTO_CAPTION_ENABLED", "false").strip().lower() == "true"
+        style = os.environ.get("AUTO_CAPTION_STYLE", "sd_prompt").strip().lower()
+        if style not in CAPTION_STYLES:
+            style = "sd_prompt"
+        overwrite = os.environ.get("AUTO_CAPTION_OVERWRITE", "false").strip().lower() == "true"
+        return cls(enabled=enabled, style=style, overwrite=overwrite)
+
+
+def caption_style_instruction(style: str) -> str:
+    return _CAPTION_STYLE_INSTRUCTIONS.get(style, _CAPTION_STYLE_INSTRUCTIONS["sd_prompt"])
+
+
+def build_classification_prompt(
+    cfg: ScoreConfig | None = None,
+    caption_cfg: CaptionConfig | None = None,
+) -> str:
     """User-message text every vision worker sends alongside the image.
 
     Structured to fight three failure modes seen in production:
@@ -264,9 +320,34 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
       2. Topic context bleeding into woman_present (e.g. wineglass + topic
          'Female Influencer' -> model invents a woman).
       3. Vague "could be a woman" hallucinations.
+
+    When ``caption_cfg.enabled`` is true the model is also asked to emit a
+    `caption` string in the configured style (SD-prompt / Booru / natural).
+    The schema always reserves the field for strict-mode consistency; when
+    captioning is off the model is told to return an empty string.
     """
     cfg = cfg or ScoreConfig.from_env()
+    caption_cfg = caption_cfg or CaptionConfig.from_env()
     notes = f"\nAdmin scoring notes (apply to REL only): {cfg.notes}\n" if cfg.notes else ""
+    if caption_cfg.enabled:
+        caption_field_doc = (
+            f'  "caption": "auto-generated training caption per the AUTO-CAPTION block ({caption_cfg.style})"'
+        )
+        caption_block = (
+            "\nAUTO-CAPTION REQUIREMENTS (always fill `caption` when this "
+            "block is present):\n"
+            f"  Style: {caption_cfg.style}\n"
+            f"  {caption_style_instruction(caption_cfg.style)}\n"
+            "  Describe THIS image objectively for downstream training. Do "
+            "NOT mention the curation topic. Do NOT invent details that are "
+            "not visible in the pixels. If the image is unsuitable / "
+            "DISCARDed, still emit a caption describing what is visible.\n"
+        )
+    else:
+        caption_field_doc = '  "caption": ""'
+        caption_block = (
+            "\nAUTO-CAPTION: disabled. Return `caption` as an empty string.\n"
+        )
     return (
         "You are a strict, literal image auditor. You will be told the topic "
         "an admin is curating, but the topic ONLY informs REL_Quality_Score. "
@@ -290,7 +371,8 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         '  "REL_Quality_Score": 0-100,\n'
         '  "quality_score": 1-10,\n'
         f'  "category": "{category_pipe_string()}",\n'
-        '  "reason": "One short sentence explaining the call."\n'
+        '  "reason": "One short sentence explaining the call.",\n'
+        f'{caption_field_doc}\n'
         "}\n\n"
         "STRICT JUDGEMENT RULES (no exceptions):\n"
         "- Fill `description` and `primary_subject` FIRST, from the pixels only. "
@@ -366,6 +448,7 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         "- Professional: photorealistic woman, studio/editorial polish, no nudity, no overlay.\n"
         "- Amateur: photorealistic woman, casual/selfie style, no overlay.\n"
         "- Unknown: photorealistic woman but doesn't fit categories above."
+        + caption_block
     )
 
 
@@ -654,7 +737,7 @@ def build_response_format() -> dict[str, Any]:
                     "photorealistic_style", "has_ai_flaws",
                     "woman_present", "nsfw",
                     "OVR_Quality_Score", "REL_Quality_Score", "quality_score",
-                    "category", "reason",
+                    "category", "reason", "caption",
                 ],
                 "properties": {
                     "description":          {"type": "string", "minLength": 10, "maxLength": 1000},
@@ -680,6 +763,7 @@ def build_response_format() -> dict[str, Any]:
                         "enum": list(SCHEMA_CATEGORIES),
                     },
                     "reason": {"type": "string", "minLength": 5, "maxLength": 300},
+                    "caption": {"type": "string", "minLength": 0, "maxLength": 2000},
                 },
             },
         },
@@ -688,6 +772,9 @@ def build_response_format() -> dict[str, Any]:
 
 __all__ = [
     "ScoreConfig",
+    "CaptionConfig",
+    "CAPTION_STYLES",
+    "caption_style_instruction",
     "build_classification_prompt",
     "apply_scores",
     "build_response_format",
