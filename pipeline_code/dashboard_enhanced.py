@@ -621,8 +621,6 @@ def api_queue_action():
         for sibling in path.parent.glob(f"{path.stem}.*"):
             sibling.unlink(missing_ok=True)
         return jsonify({"success": True, "action": "delete"})
-    if action == "requeue":
-        return jsonify({"success": True, "action": "requeue"})
     if action == "move":
         if not target:
             return jsonify({"error": "target required"}), 400
@@ -1492,7 +1490,14 @@ HTML_TEMPLATE = r"""<!doctype html>
             <h3 class="font-semibold">Pipeline analytics</h3>
             <p class="text-xs text-slate-400">Aggregates over every sorted image (DISCARD excluded for keyword + leaderboards). Cached for 60s.</p>
           </div>
-          <button @click="loadStats()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Refresh stats</button>
+          <button @click="loadStats()" :disabled="statsLoading"
+            class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-60">
+            <span x-show="!statsLoading">Refresh stats</span>
+            <span x-show="statsLoading">Scanning...</span>
+          </button>
+        </div>
+        <div x-show="statsLoading && (stats.totals?.all ?? 0) === 0" class="mt-3 text-sm text-slate-400">
+          Scanning sorted folder for the first time. This can take 30-60 seconds for large libraries; subsequent loads are cached for 60s.
         </div>
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2">
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Total classified</div><div class="text-2xl font-mono mt-1" x-text="stats.totals?.all ?? 0"></div></div>
@@ -1891,7 +1896,6 @@ HTML_TEMPLATE = r"""<!doctype html>
                 </template>
               </td>
               <td class="text-right space-x-1 whitespace-nowrap">
-                <button @click="queueAction(f.path, 'requeue')" class="px-2 py-1 bg-indigo-600/70 hover:bg-indigo-500 rounded text-xs">Requeue</button>
                 <button @click="queueAction(f.path, 'delete')" class="px-2 py-1 bg-rose-600/70 hover:bg-rose-500 rounded text-xs">Delete</button>
               </td>
             </tr>
@@ -2439,7 +2443,15 @@ function dashboard() {
         path: c.path, meta: c,
       });
     },
-    closeModal() { this.modal.open = false; this.modal.editing = false; },
+    closeModal() {
+      // Warn on unsaved prompt edits before discarding the modal.
+      if (this.modal.editing && this.modal.prompt !== this.modal.promptOriginal) {
+        if (!window.confirm('You have unsaved prompt edits. Discard them?')) return;
+      }
+      this.modal.open = false;
+      this.modal.editing = false;
+      this.modal.savedFlash = '';
+    },
 
     // Edit-and-save the prompt that lives next to an image. Per spec we
     // overwrite without backup, and we invalidate the stats cache server-side
