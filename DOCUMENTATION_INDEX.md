@@ -78,8 +78,8 @@ All credentials moved from hardcoded → .env (git-ignored)
 ### Your Configuration
 ```env
 # LMStudio
-LMSTUDIO_PRIMARY_URL=http://100.75.25.43:1234
-LMSTUDIO_SECONDARY_URL=http://100.95.148.26:1234
+LMSTUDIO_PRIMARY_URL=http://127.0.0.1:1234
+LMSTUDIO_SECONDARY_URL=
 
 # Discord (7 channels configured)
 DISCORD_BOT_TOKEN=your_token_here

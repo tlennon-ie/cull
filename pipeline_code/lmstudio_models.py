@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PRIMARY_URL = os.getenv("LMSTUDIO_PRIMARY_URL", "http://100.75.25.43:1234")
-SECONDARY_URL = os.getenv("LMSTUDIO_SECONDARY_URL", "http://100.95.148.26:1234")
+PRIMARY_URL = os.getenv("LMSTUDIO_PRIMARY_URL", "http://127.0.0.1:1234")
+SECONDARY_URL = os.getenv("LMSTUDIO_SECONDARY_URL", "")
 TIMEOUT = 5
 
 def fetch_models(url):

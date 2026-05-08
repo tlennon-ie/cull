@@ -1,0 +1,30 @@
+# Image-classification pipeline runtime dependencies.
+# Install with: pip install -r requirements.txt
+#
+# Python 3.10+ recommended (uses union-type syntax `int | None` etc).
+
+# ── Web dashboard ────────────────────────────────────────────────────────
+Flask>=3.0
+Flask-Cors>=4.0
+
+# ── Image handling ───────────────────────────────────────────────────────
+Pillow>=10.0
+
+# ── Environment loading ──────────────────────────────────────────────────
+python-dotenv>=1.0
+
+# ── HTTP clients ─────────────────────────────────────────────────────────
+requests>=2.31
+
+# ── Vision provider SDKs (only the ones you'll use need to be installed) ──
+groq>=0.11                        # Groq cloud worker
+google-generativeai>=0.8          # Gemini worker (optional, currently disabled)
+
+# ── Scrapers ─────────────────────────────────────────────────────────────
+playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install
+schedule>=1.2                     # vision_worker_lm_keepalive.py
+
+# ── Optional dev tools (uncomment for development) ───────────────────────
+# pytest>=8.0
+# black>=24.0
+# ruff>=0.5

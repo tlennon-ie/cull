@@ -67,10 +67,10 @@ Never hardcode paths — always resolve from `.env`.
 ### LMStudio (local / LAN, primary + secondary)
 Endpoints are read from `claude\.env`:
 ```
-LMSTUDIO_PRIMARY_URL=http://100.75.25.43:1234
+LMSTUDIO_PRIMARY_URL=http://127.0.0.1:1234
 LMSTUDIO_PRIMARY_MODEL=qwen3.5-9b-uncensored-hauhaucs-aggressive
 LMSTUDIO_PRIMARY_TIMEOUT=120
-LMSTUDIO_SECONDARY_URL=http://100.95.148.26:1234
+LMSTUDIO_SECONDARY_URL=
 LMSTUDIO_SECONDARY_MODEL=qwen3.5-9b-uncensored-hauhaucs-aggressive
 LMSTUDIO_SECONDARY_TIMEOUT=60
 ```
@@ -161,8 +161,8 @@ This feeds the dashboard historical logs view.
 ```
 VISION_PROVIDER=lmstudio         # or groq / gemini
 PIPELINE_VISION_WORKER=balanced-groq  # worker script selector
-LMSTUDIO_PRIMARY_URL=http://100.75.25.43:1234
-LMSTUDIO_SECONDARY_URL=http://100.95.148.26:1234
+LMSTUDIO_PRIMARY_URL=http://127.0.0.1:1234
+LMSTUDIO_SECONDARY_URL=
 LMSTUDIO_PRIMARY_MODEL=qwen3.5-9b-uncensored-hauhaucs-aggressive
 GROQ_API_KEY=...
 GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct

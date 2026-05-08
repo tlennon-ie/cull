@@ -27,8 +27,10 @@ from queue_manager import save_to_queue  # noqa: E402
 logger = logging.getLogger("zff_local")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-SRC_DIR: Path = Path(os.environ.get("ZFORFREE_LOCAL_SRC", r"I:\AI\Scripts\zforfree\downloads"))
-BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", r"I:\AI\openclaw\workspace\prompt-library"))
+from paths import base_dir as _base_dir  # noqa: E402
+
+SRC_DIR: Path = Path(os.environ.get("ZFORFREE_LOCAL_SRC", ""))
+BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", str(_base_dir())))
 SLUG: str = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 QUEUE_DIR: Path = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue"))) / SLUG
 SORTED_DIR: Path = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted"))) / SLUG

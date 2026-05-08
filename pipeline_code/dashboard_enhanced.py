@@ -2250,7 +2250,7 @@ function dashboard() {
       {id:'errors',   label:'Errors'},
       {id:'settings', label:'Settings'},
     ],
-    providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect','groq','gemini'],
+    providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect','gemini'],
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
@@ -2261,7 +2261,6 @@ function dashboard() {
       'balanced-lm-secondary':  'LMStudio SECONDARY endpoint (parallel with -primary)',
       'lm-autodetect':          'LMStudio, auto-picks the loaded vision model (VL)',
       'gemini':                 'Google Gemini 2.5 Flash - paid cloud',
-      'groq':                   'Legacy single-threaded Groq worker',
     },
     queueFiles: [], history: [], activity: [], promptCache: {},
     revealedNsfw: {},  // path -> true once the user clicks the eye

@@ -15,8 +15,8 @@ SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 QUEUE_DIR  = Path(os.environ.get("PIPELINE_QUEUE",  str(BASE_DIR / "queue" / SLUG)))
 SORTED_DIR = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted" / SLUG)))
 
-LMS_URL          = "http://127.0.0.1:1234"
-LMS_MODEL        = "qwen3-vl-8b-thinking-abliterated"
+LMS_URL          = os.environ.get("LMSTUDIO_PRIMARY_URL", "http://127.0.0.1:1234")
+LMS_MODEL        = os.environ.get("LMSTUDIO_PRIMARY_MODEL", "qwen3-vl-8b-thinking-abliterated")
 TIMEOUT          = 600
 MAX_SIZE         = 512
 POLL_INTERVAL    = 2

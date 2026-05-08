@@ -26,7 +26,7 @@ SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
 _RAW_SORTED = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
 SORTED_DIR = _RAW_SORTED if _RAW_SORTED.name == SLUG else _RAW_SORTED / SLUG
 
-LMS_URL          = os.environ.get("LMSTUDIO_PRIMARY_URL", "http://100.75.25.43:1234")
+LMS_URL          = os.environ.get("LMSTUDIO_PRIMARY_URL", "http://127.0.0.1:1234")
 LMS_MODEL        = os.environ.get("LMSTUDIO_PRIMARY_MODEL", "qwen3.5-9b-uncensored-hauhaucs-aggressive")
 TIMEOUT          = 600
 MAX_SIZE         = 512

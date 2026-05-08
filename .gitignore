@@ -39,8 +39,12 @@ logs_test/
 # ─── Pipeline local state (large / machine-specific) ───────────────────────
 queue/
 sorted/
+data/
 seen_*.json
 dashboard_state.json
+# Worker mid-flight lock files - if left behind by a crash they're recovered
+# by the supervisor's stale-processing sweep, but never committed.
+*.processing
 
 # ─── Temp / archive ────────────────────────────────────────────────────────
 archive/

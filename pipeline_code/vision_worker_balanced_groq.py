@@ -42,11 +42,12 @@ for c in CATEGORIES:
 
 try:
     from groq import Groq
-except ImportError:
-    print("Installing groq...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "groq"])
-    from groq import Groq
+except ImportError as exc:
+    raise SystemExit(
+        "groq SDK is not installed. Install pipeline dependencies first:\n"
+        "    pip install -r requirements.txt\n"
+        "(or `pip install groq` for just this worker)."
+    ) from exc
 
 class KeyManager:
     def __init__(self, keys):

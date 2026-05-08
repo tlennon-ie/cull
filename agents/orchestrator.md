@@ -131,9 +131,9 @@ Edits write back to `I:\AI\openclaw\workspace\claude\.env`.
 
 ### Via Environment (excerpt of `claude\.env`)
 ```
-LMSTUDIO_PRIMARY_URL=http://100.75.25.43:1234
+LMSTUDIO_PRIMARY_URL=http://127.0.0.1:1234
 LMSTUDIO_PRIMARY_MODEL=qwen3.5-9b-uncensored-hauhaucs-aggressive
-LMSTUDIO_SECONDARY_URL=http://100.95.148.26:1234
+LMSTUDIO_SECONDARY_URL=
 GROQ_API_KEY=<key>
 GEMINI_API_KEY=<key>
 PIPELINE_VISION_WORKER=balanced-groq

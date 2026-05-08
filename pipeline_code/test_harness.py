@@ -203,9 +203,9 @@ print("="*65)
 
 working = []
 if test_results["primary"]["status"].startswith("✅"):
-    working.append("✅ Primary LMStudio (100.75.25.43:1234)")
+    working.append(f"✅ Primary LMStudio ({test_results['primary']['url']})")
 if test_results["secondary"]["status"].startswith("✅"):
-    working.append("✅ Secondary LMStudio (100.95.148.26:1234)")
+    working.append(f"✅ Secondary LMStudio ({test_results['secondary']['url']})")
 if discord_ok:
     working.append("✅ Discord bot token configured")
 if civitai_ok:
@@ -222,9 +222,9 @@ print("="*65)
 
 needs_fix = []
 if not test_results["primary"]["status"].startswith("✅"):
-    needs_fix.append("❌ Primary LMStudio not reachable (check 100.75.25.43:1234)")
+    needs_fix.append(f"❌ Primary LMStudio not reachable (check {test_results['primary']['url']})")
 if not test_results["secondary"]["status"].startswith("✅"):
-    needs_fix.append("❌ Secondary LMStudio not reachable (check 100.95.148.26:1234)")
+    needs_fix.append(f"❌ Secondary LMStudio not reachable (check {test_results['secondary']['url']})")
 if not discord_ok:
     needs_fix.append("❌ Discord bot token missing or invalid")
 if not civitai_ok:
