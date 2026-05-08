@@ -1,52 +1,90 @@
-docs: README rewrite, launch scripts, mock screenshots, Claude skill
+brand: rename to cull, full visual identity rollout
 
-Closes the four release-onboarding gaps flagged once the repo went public
-at github.com/tlennon-ie/image-classification-pipeline:
+Renames the project from "image-classification-pipeline" to "cull"
+across every text touchpoint, wires the logo into the dashboard +
+README, and adds two branded surfaces (FAQ tab, About tab) plus
+empty-state welcome cards. Origin remote updated to point at
+github.com/tlennon-ie/cull.
 
-* README placeholders replaced with the real clone URL. Quick start now
-  points at the new launch.sh / launch.bat as the primary path; manual
-  recipe kept as a fallback. Dashboard preview section added with four
-  screenshots (Overview, Stats, Gallery, Scrapers) and the exact command
-  to reproduce them locally from synthetic mock data. Settings tab
-  deliberately omitted from the gallery - its multiline textareas would
-  surface secrets.
+Why "cull"
+----------
+Single-syllable verb that the audience already uses for this exact
+ritual (photographers cull, ML engineers cull). Lower trademark risk
+than the alternatives the strategy agent surveyed (Sieve, Pan, Sorted,
+Cradle), and the product's positioning is "automating taste" rather
+than "running a model" - cull names that workflow directly.
 
-* launch.sh / launch.bat - one-command bootstrap per platform: detect
-  Python, create .venv, install requirements (hash-cached so re-runs are
-  instant), seed .env from .env.example, install Playwright Chromium once,
-  then exec the integrated launcher. Idempotent and CWD-independent.
+Tagline: "The curation engine for AI image datasets."
 
-* tools/seed_demo_data.py - deterministic synthetic dataset generator
-  for screenshots / first-time previews. Downloads about 35 free
-  placeholder photos from picsum.photos (Lorem Picsum, Unsplash-licensed)
-  and writes the per-image triple (image, .txt prompt, .vision.json
-  metadata) under data/sorted/artistic_showcase/<category>/<source>/.
-  Categories follow the live taxonomy; subjects paint a generic artistic
-  curation scenario so reviewers never see the real influencer dataset.
-  --clean rebuilds in place; --dry-run prints what would be created.
+Changes
+-------
 
-* docs/screenshots/{overview,stats,gallery,scrapers}.png captured at
-  1440x900 against the demo dataset on port 5050. The Scrapers shot
-  was re-captured after the first pass leaked LOCAL_IMPORT_DIR; the
-  second run uses sanitized env so it now reads "(LOCAL_IMPORT_DIR unset)".
+README.md
+  Full rewrite to the trending-repo pattern (centred logo + H1 +
+  italic tagline, badge row, hero image, two-sentence "what it is",
+  "who it's for / not for", quick start, use cases, plug points,
+  dashboard preview, architecture map, configuration, FAQ, brand
+  assets). No emojis. No "powerful / seamless / leverages" filler.
 
-* CLAUDE.md rewrite - replaced the personal project notes with an
-  agent-oriented brief: what the repo is, the load-bearing conventions
-  (one source of truth per concern), where to look for each kind of
-  change, run / test commands, things to avoid, pointers to commit
-  history for the architectural why, and a link to the new skill bundle.
+CLAUDE.md
+  Replaced the stale "Realistic Female Influencer Image Pipeline"
+  notes with an agent-oriented brief titled for cull. Conventions,
+  module map, run/test commands, anti-patterns, commit-history
+  pointers all retained.
 
-* .claude/skills/pipeline-helper/SKILL.md - Claude-style skill with
-  YAML frontmatter that auto-loads when an agent works on this repo.
-  Codifies the invariants (structured output mandatory, atomic
-  .processing rename, path-traversal guards, print-vs-log policy),
-  step-by-step recipes for the common tasks (add scraper, add vision
-  provider, change taxonomy), the smoke-test command, and anti-patterns
-  to flag in code review.
+.claude/skills/cull-helper/SKILL.md
+  Renamed from pipeline-helper. Frontmatter description updated.
+  Skill folder name follows the brand.
 
-* README - new "Working with an AI coding agent" section pointing at
-  SKILL.md and CLAUDE.md so anyone using Claude Code / Cursor / Aider /
-  Codex on this repo gets the architecture brief without having to ask.
+assets/
+  Three logo variants (logo.png light bg / logo-transparent.png /
+  logo-transparent-dark.png), all palette-quantized to <40 KB each
+  via Pillow with the brand colours pinned so the small mustard bead
+  survives compression. Total brand pack is ~100 KB.
 
-Smoke-checked locally: bash -n on launch.sh, 35/35 demo items created
-from picsum, demo dashboard reads only mock data.
+pipeline_code/dashboard_enhanced.py
+  - New /brand/<filename> route serves the three logo variants from
+    assets/ with a whitelist guard. No path traversal.
+  - <link rel="icon"> wired to the dark-transparent logo for favicons.
+  - <title> binds to "cull · <active tab>" via Alpine.
+  - JetBrains Mono webfont loaded from Google Fonts; .font-brand
+    helper exposes it. Brand palette helpers (.brand-keep, .brand-
+    discard, .bg-brand-keep, .bg-brand-discard) added.
+  - Sidebar nav swapped from "Pipeline" text header to logo + lower-
+    case "cull" wordmark, links to the About tab on click.
+  - Two new tabs: FAQ (seven questions including "Why cull?") and
+    About (logo, tagline, repo link, live stats trio, brand palette
+    swatches).
+  - Welcome card added to the Queue tab when nothing has been queued
+    or classified yet - logo + "Welcome to cull" + four primary action
+    buttons + a hint to run tools/seed_demo_data.py for a preview.
+  - Empty Gallery state replaced "No images match" with logo-led
+    illustration + seed-demo command callout.
+  - Brand footer line at the bottom of every tab: cull · MIT ·
+    github.com/tlennon-ie/cull.
+  - Removed the legacy gemini provider description (it was already
+    deleted from the workers list earlier).
+
+.env.example, paths.py, dashboard_enhanced.py, test_harness.py
+  Stale references to "Image Pipeline" / "ImagePipelineBot" /
+  "prompt-library" cleaned up. REDDIT_USER_AGENT default now
+  "cull/0.1".
+
+DOCUMENTATION_INDEX.md
+  Deleted - referenced docs that don't exist in the repo and was
+  full of session-internal cruft. README + CLAUDE.md + SKILL.md
+  cover the same ground.
+
+Origin remote
+  Local origin updated from .../image-classification-pipeline.git
+  to .../cull.git so push lands on the renamed repo.
+
+Smoke-tests
+-----------
+  - 25 modules import cleanly together.
+  - Dashboard test client returns 200 on /, /api/status,
+    /api/scrapers, /api/settings, /api/stats, /api/gallery.
+  - /brand/logo.png, /brand/logo-transparent.png, and
+    /brand/logo-transparent-dark.png all return valid PNGs.
+  - /brand/../../etc/passwd returns 404 (whitelist works).
+  - GET / contains 25 references to "cull" and a valid favicon link.

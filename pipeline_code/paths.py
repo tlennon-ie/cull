@@ -1,8 +1,8 @@
 """Single source of truth for filesystem paths.
 
 Computes repo-relative defaults so a fresh clone runs without editing `.env`.
-Every hardcoded `I:\\AI\\openclaw\\workspace\\prompt-library` default elsewhere
-is gone — this module replaces them.
+Every hardcoded absolute-path default elsewhere is gone - this module
+replaces them.
 
 Admin overrides flow from the dashboard Settings tab → writes to `.env` →
 these helpers re-read them each call, so updates take effect on pipeline restart.

@@ -1,205 +1,182 @@
-# Image Classification Pipeline
+<p align="center">
+  <img src="assets/logo.png" alt="cull" width="180">
+</p>
 
-Multi-source image scraping → vision-model classification → organised asset library, with a Flask admin dashboard.
+<h1 align="center">cull</h1>
+<p align="center"><em>The curation engine for AI image datasets.</em></p>
 
-The pipeline pulls images from configurable sources (Civitai, X/Twitter, Reddit, Discord, local folders), runs them through a local or cloud vision model (LM Studio or Groq), and sorts them into category folders alongside the original prompt and a JSON record of the classification.
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1f1f1f.svg"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-1f1f1f.svg"></a>
+  <a href="#quick-start"><img alt="Cross-platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-1f1f1f.svg"></a>
+  <a href="#the-dashboard"><img alt="Dashboard included" src="https://img.shields.io/badge/dashboard-flask%20%2B%20alpine-1f1f1f.svg"></a>
+</p>
 
-**Repo:** [`github.com/tlennon-ie/image-classification-pipeline`](https://github.com/tlennon-ie/image-classification-pipeline)
-**License:** MIT
+![cull dashboard preview — gallery, stats, scrapers](docs/screenshots/gallery.png)
 
-## Features
+## What it is
 
-- **7+ scraper sources** — Civitai (.com + .red), X/Twitter, Reddit, Discord, ZForFree, web, generic local folder. Each toggleable from the dashboard.
-- **Multiple vision backends** — LM Studio (local, with auto-detect), Groq cloud. JSON-schema constrained output so every backend returns the same shape.
-- **Topic-aware filtering** — keyword + banned-word lists configurable per topic; every scraper respects them.
-- **Live admin dashboard** at `http://localhost:5000` — start/stop pipeline, toggle scrapers/workers, browse the gallery, edit prompts, view stats and per-source analytics, export filtered ZIPs.
-- **File-system queue** with atomic-rename locking — no Redis needed, but still safe for parallel workers.
-- **Per-image audit trail** — every classified image keeps its `.txt` prompt and `.vision.json` (raw model output + post-hoc scoring) next to it.
+cull is a single-machine curation engine for AI-generated images. It pulls from seven sources, runs each image through a vision model under a strict 16-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
+
+- Pulls from 7+ sources, dedupes, queues, and runs vision in one process tree.
+- Forces every backend (LM Studio, Groq, anything OpenAI-compatible) into the same JSON schema so output never drifts.
+- Keeps the prompt next to every image. Nothing goes through a database you don't own.
+
+## Who it's for
+
+- ML engineers building image datasets for LoRA / fine-tunes who want to automate the cull instead of doing it by eye.
+- Solo devs maintaining a personal scrape archive across multiple sources who keep losing duplicates.
+- Photographers and artists running a triage pass over hundreds of generated drafts to surface the ten worth keeping.
+
+## Who it's not for
+
+- Production-scale workloads (>100k images/day) — use a real queue.
+- Anyone who wants a hosted SaaS — this is single-machine on purpose.
 
 ## Quick start
 
-The fastest path: clone, run the launcher, point a browser at `http://localhost:5000`.
-
-### Linux / macOS
-
 ```bash
-git clone https://github.com/tlennon-ie/image-classification-pipeline.git
-cd image-classification-pipeline
-./launch.sh
+git clone https://github.com/tlennon-ie/cull.git
+cd cull
+./launch.sh        # Linux / macOS
+# launch.bat       # Windows
 ```
 
-### Windows
+The launcher creates a `.venv/`, installs dependencies, copies `.env.example` to `.env` if you don't have one, then opens the dashboard at <http://localhost:5000>. Idempotent — re-running is instant.
 
-```bat
-git clone https://github.com/tlennon-ie/image-classification-pipeline.git
-cd image-classification-pipeline
-launch.bat
-```
-
-The launcher creates a virtual environment on first run (`.venv/`), installs dependencies from `requirements.txt`, copies `.env.example` to `.env` if you don't have one yet, then starts the dashboard.
-
-### Manual setup (if you prefer)
+Want to see the dashboard with mock data before configuring scrapers?
 
 ```bash
-git clone https://github.com/tlennon-ie/image-classification-pipeline.git
-cd image-classification-pipeline
-
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python -m playwright install chromium   # only if using the X/Twitter or web scrapers
-
-cp .env.example .env
-# Edit .env: fill in API keys for the providers you'll use, leave the rest blank.
-
-python pipeline_code/integrated_launcher.py
-# Dashboard at http://localhost:5000
-# Click "Start pipeline" once you've configured at least one scraper + vision worker.
-```
-
-By default the pipeline writes everything under `./data/` (queue, sorted, logs). Set `PIPELINE_BASE_DIR` in `.env` to put it elsewhere.
-
-## Dashboard preview
-
-The screenshots below are illustrative — they're rendered against a synthetic
-"artistic showcase" dataset seeded by [`tools/seed_demo_data.py`](tools/seed_demo_data.py).
-You can reproduce them on your own machine:
-
-```bash
-python tools/seed_demo_data.py            # downloads ~35 placeholder photos from picsum.photos
+python tools/seed_demo_data.py
 PIPELINE_TOPIC="Artistic Showcase" PIPELINE_SLUG=artistic_showcase \
-  PIPELINE_BASE_DIR="$(pwd)/data" \
-  PIPELINE_QUEUE="$(pwd)/data/queue/artistic_showcase" \
-  PIPELINE_SORTED="$(pwd)/data/sorted/artistic_showcase" \
-  FLASK_PORT=5050 \
+  PIPELINE_BASE_DIR="$(pwd)/data" FLASK_PORT=5050 \
   python pipeline_code/dashboard_enhanced.py
-# then open http://localhost:5050
+# open http://localhost:5050
 ```
 
-### Overview tab — at-a-glance pipeline state + recent activity
-
-![Overview tab](docs/screenshots/overview.png)
-
-### Stats tab — keyword frequencies, top-10 leaderboards by metric, per-source analytics
-
-![Stats tab](docs/screenshots/stats.png)
-
-### Gallery tab — filterable grid, n-gram insights, ZIP export of the current view
-
-![Gallery tab](docs/screenshots/gallery.png)
-
-### Scrapers tab — one toggle per source, persists to `.env`
-
-![Scrapers tab](docs/screenshots/scrapers.png)
-
-## Vision providers
-
-The dashboard's **Vision** tab picks a worker; available options:
-
-| Worker            | Endpoint              | Best for                                       |
-|-------------------|-----------------------|------------------------------------------------|
-| `balanced-lm`     | LM Studio (local)     | Privacy, no API costs, fastest if GPU is local |
-| `lm-autodetect`   | LM Studio (local)     | Auto-pick whichever VL model is loaded         |
-| `balanced-lm-secondary` | LM Studio (2nd) | Parallel throughput across two LM Studio hosts |
-| `balanced-groq`   | Groq cloud            | Faster cold-start, handles NSFW                |
-
-LM Studio needs to be running with a vision-language model loaded (e.g. `qwen2.5-vl-7b`, `qwen3-vl-8b`, `gemma-3-27b`, `llava-*`).
-
-## Repository layout
+## How it works
 
 ```
-pipeline_code/
-├── run_pipeline.py            ← Supervisor: spawns scrapers + workers
-├── integrated_launcher.py     ← Boots dashboard + pipeline together
-├── dashboard_enhanced.py      ← Flask + Alpine.js admin UI (single file)
-├── queue_manager.py           ← Atomic-rename queue, round-robin source picker
-├── paths.py                   ← Single source of truth for filesystem paths
-├── vision_prompt.py           ← Classification prompt + JSON schema + post-hoc scoring
-├── vision_worker_balanced_lm.py
-├── vision_worker_balanced_groq.py
-├── vision_worker_lm_autodetect.py
-├── vision_worker_lm_keepalive.py
-├── scraper_civitai.py / scraper_civitai_search.py
-├── scraper_discord.py
-├── scraper_x.py
-├── scraper_web.py
-├── feed_local_folder.py / feed_zforfree_local.py
-└── topic_filter.py            ← Keyword/topic gating shared by every scraper
-
-data/                          ← Created on first run; ignored by git
-├── queue/<slug>/<source>/     ← Images waiting to be classified
-├── sorted/<slug>/<category>/<source>/  ← Classified output
-└── logs/                      ← Pipeline + per-process logs
+sources                queue                 vision worker            sorted
+──────                 ─────                 ─────────────            ──────
+civitai      ──┐
+twitter/x    ──┤      data/queue/<src>/      base64 + JSON schema     data/sorted/<cat>/<src>/
+reddit       ──┼─►    atomic .processing  ─► strict 16-field output ─► image + .txt + .vision.json
+discord      ──┤      lock per file          OVR + REL scoring
+local folder ──┘                             post-hoc validation
 ```
 
-Per-image triple in `sorted/<slug>/<category>/<source>/`:
+Every image keeps its `.txt` prompt and gains a `.vision.json` audit record. The supervisor crash-recovers stuck `.processing` files on restart. The atomic-rename is the cross-worker lock — losers of the race short-circuit cleanly.
 
+## Use cases
+
+**Curating LoRA training data.** Point the Civitai + X scrapers at your topic, set OVR/REL minimums in the dashboard, let the keepers land in `Professional/` and `InstagramInfluencer/`. ZIP-export the filtered view straight into your trainer.
+
+**Deduping a scraped archive across sources.** The seven scrapers share dedup state through a per-source `seen_*.json`. Add a `LOCAL_IMPORT_DIR` and the same image showing up on civitai and a twitter repost gets caught by content hash, not filename.
+
+**Building a tagged personal library.** Edit prompts inline from the gallery modal — overwrites the `.txt` next to the image, invalidates the keyword cache, refreshes stats. Filter by score, date, source, resolution. Click any chip to jump straight to a filtered view.
+
+## Plug it
+
+Adding a new vision provider is a 30-line subclass:
+
+```python
+# vision_worker_anthropic.py
+from vision_worker_base import BaseVisionWorker, build_response_format, run_subclass
+
+class AnthropicWorker(BaseVisionWorker):
+    name = "anthropic-claude"
+    parallel_workers = 4
+
+    def classify_image_bytes(self, b64_jpeg, prompt_instruction):
+        # call Anthropic with the image + prompt + response_format=build_response_format()
+        # return the parsed JSON dict, or None to trigger RETRY
+        ...
 ```
-photo_msg-id_timestamp_nnn.jpg          ← image
-photo_msg-id_timestamp_nnn.txt          ← prompt that generated it
-photo_msg-id_timestamp_nnn.vision.json  ← model output + post-hoc scoring
-```
 
-## Dashboard tour
+Adding a new scraper source is similar — `SeenStore("name", slug=SLUG)` for dedup, `credentials.get_required("KEY", scraper="name")` for keys, `queue_manager.save_to_queue(source, tmp_path, prompt, meta)` for output. See [`CLAUDE.md`](CLAUDE.md) for the full contract or [`.claude/skills/cull-helper/SKILL.md`](.claude/skills/cull-helper/SKILL.md) if your AI agent should write the code.
 
-| Tab          | What's there                                                                  |
-|--------------|-------------------------------------------------------------------------------|
-| **Overview** | Queue/sorted totals, recent classifications, queue-by-source                  |
-| **Stats**    | Top keywords, top-10 thumbnails by overall/quality/relevance, source analytics |
-| **Gallery**  | Filterable grid (search, score, NSFW, date, source, category, resolution); ZIP export |
-| **Scrapers** | Per-source on/off toggles                                                     |
-| **Vision**   | Vision worker selection, throttle, LM Studio endpoint+model picker            |
-| **Queue**    | Newest 60 queued items with thumbnails + prompts                              |
-| **Historical** | Full classification history (newest 200), filterable                        |
-| **Errors**   | Recent error log lines                                                        |
-| **Settings** | Edit `.env`-backed values without touching the file                           |
+## The dashboard
 
-The **Gallery** detail modal lets you edit the prompt and save (overwrites the `.txt` next to the image; no backup is kept).
+Nine tabs, single-file Flask + Alpine.js, zero build step. Auto-refreshes every 5 seconds.
+
+| | |
+|---|---|
+| ![Overview](docs/screenshots/overview.png) | ![Stats](docs/screenshots/stats.png) |
+| **Overview** — queue and sorted totals, recent classifications, queue-by-source | **Stats** — top keywords, three top-10 leaderboards, per-source DISCARD / NSFW / quality |
+| ![Gallery](docs/screenshots/gallery.png) | ![Scrapers](docs/screenshots/scrapers.png) |
+| **Gallery** — filterable grid, score / date / source / resolution / NSFW filters, ZIP export of the current view, n-gram insights, click-to-edit prompts | **Scrapers** — per-source on/off toggles, persists to `.env` |
+
+The Gallery detail modal lets you edit the prompt and save. The save overwrites the `.txt` next to the image with no backup, by design — versioning belongs in git, not in a thousand `.txt.bak` files.
+
+## Architecture in one screen
+
+| Concern | Single source of truth |
+|---|---|
+| Categories | [`pipeline_code/categories.py`](pipeline_code/categories.py) |
+| Vision worker registration | [`pipeline_code/vision_workers.py`](pipeline_code/vision_workers.py) |
+| Vision worker scaffolding | [`pipeline_code/vision_worker_base.py`](pipeline_code/vision_worker_base.py) |
+| Filesystem paths | [`pipeline_code/paths.py`](pipeline_code/paths.py) |
+| Queue (Protocol + FSQueue impl) | [`pipeline_code/queue_manager.py`](pipeline_code/queue_manager.py) |
+| Per-source dedup | [`pipeline_code/seen_store.py`](pipeline_code/seen_store.py) |
+| Credential resolution | [`pipeline_code/credentials.py`](pipeline_code/credentials.py) |
+| Logging | [`pipeline_code/pipeline_logging.py`](pipeline_code/pipeline_logging.py) |
+| Classification prompt + JSON schema | [`pipeline_code/vision_prompt.py`](pipeline_code/vision_prompt.py) |
+
+Every concern has exactly one canonical module. Adding categories, vision providers, or scrapers means editing one file.
 
 ## Configuration
 
-All settings live in `.env`. The file is gitignored. Every variable is optional unless your enabled scrapers/workers require it. See `.env.example` for the full list with defaults.
+Settings live in `.env`. The dashboard's Settings tab edits the same file from the browser, so you don't need to leave the UI to add a key. Required only for the providers you'll use:
 
-Required only for the providers you plan to use:
-
-- `GROQ_API_KEY` (for `balanced-groq`)
-- `LMSTUDIO_PRIMARY_URL` (for `balanced-lm` / `lm-autodetect`; defaults to `http://127.0.0.1:1234`)
-- `CIVITAI_API_KEY` (for the Civitai scrapers)
-- `TWITTER_COOKIES` (for X/Twitter)
-- `DISCORD_BOT_TOKEN` + `DISCORD_CHANNELS_JSON` (for Discord)
+- `GROQ_API_KEY` — for the `balanced-groq` worker (cloud, fast, handles NSFW)
+- `LMSTUDIO_PRIMARY_URL` — for `balanced-lm` / `lm-autodetect` (defaults to `http://127.0.0.1:1234`)
+- `CIVITAI_API_KEY` — for the Civitai scrapers
+- `TWITTER_COOKIES` — for X/Twitter (cookie-based, no OAuth)
+- `DISCORD_BOT_TOKEN` + `DISCORD_CHANNELS_JSON` — for Discord
 
 Quality thresholds:
 
-- `VISION_OVR_MIN_SCORE` — minimum craft-quality score (0-100) below which images go to DISCARD
-- `VISION_REL_MIN_SCORE` — minimum topic-relevance score (0-100); same threshold semantics
+- `VISION_OVR_MIN_SCORE` — minimum craft-quality score (0-100) below which images go to DISCARD.
+- `VISION_REL_MIN_SCORE` — minimum topic-relevance score (0-100). Same threshold semantics.
 
-These don't apply to NSFW (which is always routed to its own folder when detected).
+Neither applies to images classified as NSFW — those land in the `NSFW/` bucket regardless of score.
 
-## Topic + categories
+## FAQ
 
-The default topic is `Realistic Female Influencer`, with categories `InstagramInfluencer / NSFW / Professional / Amateur / Unknown / Watermarked / DISCARD`. Change `PIPELINE_TOPIC` in `.env` to retarget; topic-derived keyword lists in `topic_filter.py` adapt automatically. Note: the post-hoc validation tokens in `vision_prompt.py` are still tuned for human-subject photography — for non-human topics you'll want to edit those.
+**Why no Redis?** Because the filesystem is already a queue. `image.jpg.processing` is the lock; `os.rename` is atomic on every platform that matters; the supervisor's stale-processing sweep recovers from crashes on restart. cull runs on a Raspberry Pi if you want it to.
 
-## Architecture notes
+**Why force a JSON schema on every backend?** Because vision models love to reply with `<think>...</think>` blocks, markdown fences, or "I'd be happy to help!" prefixes that break regex parsers. The schema constraint moves the problem one layer down — the model literally cannot emit invalid output. Adding a new backend is reduced to the API call shape.
 
-- **No Redis required.** The queue is the filesystem; `<image>.processing` is the lock. A worker that crashes mid-flight is recovered by the supervisor's stale-`.processing` sweep on restart.
-- **Structured output everywhere.** Every vision worker sends a `response_format` JSON schema with each request, so backends can't return free-form text. See `pipeline_code/vision_response_schema.json`.
-- **Per-source dedup.** Each scraper keeps its own `seen_<source>_<slug>.json` index of already-fetched IDs.
-- **Live `.env` reload.** Editing settings in the dashboard or restarting the pipeline picks up new env values; some structural changes (queue path, topic) require a full restart.
+**What is the "Watermarked" category?** A photo that passes every other gate (photoreal, real human, scores above threshold, not NSFW) but the model flagged a watermark. The shot is salvageable if you remove the overlay; the bucket exists so you don't lose those to DISCARD.
+
+**How do I add a new scraper?** Copy `pipeline_code/scraper_civitai.py`, swap the API specifics, register in `run_pipeline.compute_desired_agents`, add a row in `_STATIC_SCRAPERS` so it shows up as a toggle. The `SeenStore` and `credentials` helpers handle dedup and key resolution.
+
+**How do I switch LM Studio endpoints without restarting?** You can't fully — endpoint config is read at worker spawn. But you can hot-swap the loaded *model* via the dashboard's Vision tab without touching the supervisor.
+
+**Where does my data live?** `data/` next to the repo by default (`data/queue/<slug>/<source>/`, `data/sorted/<slug>/<category>/<source>/`). Set `PIPELINE_BASE_DIR` in `.env` to put it on a different disk. The path lives in one module, [`paths.py`](pipeline_code/paths.py).
+
+**Why "cull"?** Because that's the verb. Photographers cull. Editors cull. ML engineers cull. The product automates a workflow that already had a name.
 
 ## Contributing
 
-Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first — there's an active refactor planned to formalise the scraper and worker interfaces.
+Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first.
 
 ### Working with an AI coding agent
 
-This repo ships with a Claude-style skill for AI agents at
-[`.claude/skills/pipeline-helper/SKILL.md`](.claude/skills/pipeline-helper/SKILL.md)
-and a high-level architecture brief at [`CLAUDE.md`](CLAUDE.md). Point Claude
-Code, Cursor, Aider, Codex, or any agent that respects those files at the repo
-and they'll know the load-bearing seams (categories module, vision-worker
-registry, queue protocol, seen-store, credentials helpers) before touching
-anything. The skill spells out which file to edit for each common task —
-adding a scraper, adding a vision provider, changing thresholds, etc.
+This repo ships a Claude-style skill for AI coding agents at [`.claude/skills/cull-helper/SKILL.md`](.claude/skills/cull-helper/SKILL.md) and a high-level architecture brief at [`CLAUDE.md`](CLAUDE.md). Point Claude Code, Cursor, Aider, Codex, or any agent that respects those files at the repo and they'll know the load-bearing seams (categories, vision-worker registry, queue protocol, seen-store, credentials helpers) before touching anything.
+
+## Brand assets
+
+Three variants in [`assets/`](assets/), all 600×600 PNG:
+
+| File | Background | Use for |
+|---|---|---|
+| [`logo.png`](assets/logo.png) | warm off-white `#F5F2EC` | README, GitHub social card, light surfaces |
+| [`logo-transparent.png`](assets/logo.png) | transparent w/ paper backdrop | flexible drop on light/medium surfaces |
+| [`logo-transparent-dark.png`](assets/logo-transparent-dark.png) | fully transparent | dark UI, dashboard nav, favicon |
+
+Palette: ink `#0F1115` · surface `#F5F2EC` · keep accent `#E8B73A` · discard `#C8553D` · subtle `#7A8088`. Wordmark in JetBrains Mono, all-lowercase. The dashboard exposes the live brand pack at `/brand/<filename>` so you can hot-reload variants without touching the HTML.
 
 ## License
 

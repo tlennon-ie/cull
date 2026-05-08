@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline Dashboard - realtime monitoring + admin controls.
+cull dashboard - realtime monitoring + admin controls.
 
 Dashboard starts STANDALONE (does not auto-launch the pipeline).
 The pipeline is started/stopped from the UI via /api/pipeline/start|stop.
@@ -709,6 +709,33 @@ def api_queue_action():
     return jsonify({"error": "unknown action"}), 400
 
 
+# ── Brand assets ──────────────────────────────────────────────────────────────
+
+# Whitelist - only these filenames are served from /brand/<name>. Keeps the
+# endpoint from devolving into an arbitrary static-file server. Add new
+# allowed assets here when extending the brand pack.
+_BRAND_ASSETS: frozenset[str] = frozenset({
+    "logo.png",
+    "logo-transparent.png",
+    "logo-transparent-dark.png",
+})
+
+
+@app.route("/brand/<filename>")
+def brand_asset(filename: str):
+    """Serve cull's brand assets (logos / wordmarks) from the repo's
+    ``assets/`` folder. Used by the dashboard nav, About tab, welcome card,
+    favicon, and empty states. Whitelist-gated; no path traversal possible.
+    """
+    if filename not in _BRAND_ASSETS:
+        abort(404)
+    from paths import REPO_ROOT
+    asset_path = REPO_ROOT / "assets" / filename
+    if not asset_path.exists():
+        abort(404)
+    return send_file(asset_path, mimetype="image/png", max_age=86400)
+
+
 @app.route("/api/thumbnail")
 def api_thumbnail():
     raw = request.args.get("path", "")
@@ -1408,11 +1435,26 @@ HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Pipeline Dashboard</title>
+<title x-text="'cull · ' + (tabs.find(t => t.id === active)?.label || 'overview')">cull</title>
+<link rel="icon" type="image/png" href="/brand/logo-transparent-dark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
 <style>
+  /* Brand palette
+     ink     #0F1115   surface  #F5F2EC   keep-accent  #E8B73A
+     discard #C8553D   subtle   #7A8088
+     The dashboard runs dark, so ink/surface flip vs print. Yellow remains
+     the "kept" signal everywhere; rust red is reserved for DISCARD. */
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .font-brand { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .brand-ink { color: #0F1115; }
+  .brand-keep { color: #E8B73A; }
+  .brand-discard { color: #C8553D; }
+  .bg-brand-keep { background-color: #E8B73A; }
+  .bg-brand-discard { background-color: #C8553D; }
   .card { background: rgba(15,23,42,0.78); border:1px solid rgba(51,65,85,0.5); backdrop-filter: blur(8px); }
   .pill { font-size:.65rem; letter-spacing:.05em; text-transform:uppercase; }
   table { width:100%; font-size:.85rem; }
@@ -1455,8 +1497,16 @@ HTML_TEMPLATE = r"""<!doctype html>
   <aside :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'"
     class="fixed lg:static inset-y-0 left-0 z-30 w-56 shrink-0 border-r border-slate-800 bg-slate-900/95 lg:bg-slate-900/60 p-4 space-y-1 transform transition-transform">
     <div class="mb-4">
-      <h1 class="text-lg font-bold">Pipeline</h1>
-      <p class="text-xs text-slate-400" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
+      <!-- Brand lockup: inline SVG funnel mark + JetBrains Mono lowercase wordmark.
+           One bead falling through, rendered in brand mustard. Keeps the dashboard
+           branded before the user has dropped real logo SVGs into docs/brand/. -->
+      <a href="#" @click.prevent="active = 'about'"
+         class="flex items-center gap-2 hover:opacity-80 transition" aria-label="About cull">
+        <img src="/brand/logo-transparent-dark.png" alt="" width="32" height="32"
+             class="shrink-0"/>
+        <span class="font-brand text-2xl font-medium tracking-tight">cull</span>
+      </a>
+      <p class="text-xs text-slate-400 mt-1" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
       <div class="mt-2">
         <span class="pill px-2 py-0.5 rounded"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
@@ -1815,7 +1865,16 @@ HTML_TEMPLATE = r"""<!doctype html>
             </div>
           </template>
           <template x-if="!galleryLoading && (gallery.items?.length ?? 0) === 0">
-            <div class="col-span-full text-sm text-slate-500">No images match these filters.</div>
+            <div class="col-span-full text-center py-10">
+              <img src="/brand/logo-transparent-dark.png" alt="" width="56" height="56"
+                   class="mx-auto opacity-60"/>
+              <div class="mt-3 text-sm text-slate-300">Nothing kept yet for this filter.</div>
+              <div class="text-xs text-slate-500 mt-1">
+                Start a scraper, or run
+                <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">python tools/seed_demo_data.py</code>
+                from the repo root to populate a synthetic preview.
+              </div>
+            </div>
           </template>
         </div>
       </div>
@@ -1972,7 +2031,35 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
 
     <!-- QUEUE -->
-    <section x-show="active === 'queue'" class="card rounded-xl p-5">
+    <section x-show="active === 'queue'" class="space-y-4">
+      <!-- First-run welcome card: shown only when nothing has been queued OR
+           classified yet. Keeps the empty state from looking like a bug. -->
+      <template x-if="(status.queue?.total ?? 0) === 0 && (status.sorted?.total ?? 0) === 0">
+        <div class="card rounded-xl p-6">
+          <div class="flex items-start gap-4">
+            <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64"
+                 class="shrink-0"/>
+            <div class="flex-1">
+              <h3 class="font-brand text-2xl font-medium tracking-tight">Welcome to cull</h3>
+              <p class="text-sm text-slate-300 mt-1 mb-4">
+                cull is a curation engine for AI image datasets. Configure a scraper and a vision worker to begin,
+                or seed a synthetic dataset to see what the dashboard looks like with data in it.
+              </p>
+              <div class="flex flex-wrap gap-2">
+                <button @click="active = 'scrapers'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure scrapers</button>
+                <button @click="active = 'vision'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure vision worker</button>
+                <button @click="active = 'settings'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Open settings</button>
+                <button @click="active = 'about'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">About cull</button>
+              </div>
+              <p class="text-xs text-slate-500 mt-4">
+                Want a demo first? Run <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code> from the repo root.
+              </p>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div class="card rounded-xl p-5">
       <h3 class="font-semibold mb-3">Queue (newest 60)</h3>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Name</th><th>Source</th><th>Size</th><th>Prompt</th><th></th></tr></thead>
@@ -1999,6 +2086,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </template>
         </tbody>
       </table></div>
+      </div>
     </section>
 
     <!-- LOGS -->
@@ -2223,7 +2311,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">REDDIT_USER_AGENT</span>
-            <input x-model="settings.REDDIT_USER_AGENT" placeholder="ImagePipelineBot/1.0"
+            <input x-model="settings.REDDIT_USER_AGENT" placeholder="cull/0.1"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
         </div>
@@ -2357,6 +2445,108 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
+    <!-- FAQ ───────────────────────────────────────────────────────────── -->
+    <section x-show="active === 'faq'" class="space-y-4">
+      <div class="card rounded-xl p-6">
+        <h3 class="font-semibold text-lg mb-1">Frequently asked questions</h3>
+        <p class="text-xs text-slate-400 mb-5">Pre-empts the GitHub issues. Browse the source if you want the long answer.</p>
+
+        <div class="space-y-5 text-sm leading-relaxed">
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">Why no Redis?</div>
+            <p class="text-slate-300">Because the filesystem is already a queue. <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">image.jpg.processing</code> is the lock; <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">os.rename</code> is atomic on every platform that matters; the supervisor's stale-processing sweep recovers from crashes on restart. cull runs on a Raspberry Pi if you want it to.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">Why force a JSON schema on every backend?</div>
+            <p class="text-slate-300">Because vision models love to reply with <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">&lt;think&gt;...&lt;/think&gt;</code> blocks, markdown fences, or "I'd be happy to help!" prefixes that break regex parsers. The schema constraint moves the problem one layer down — the model literally cannot emit invalid output. Adding a new backend reduces to the API call shape.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">What is the <span class="brand-keep">Watermarked</span> bucket?</div>
+            <p class="text-slate-300">A photo that passes every other gate (photoreal, real human, scores above threshold, not NSFW) but the model flagged a watermark. The shot is salvageable if you remove the overlay; the bucket exists so you don't lose those to <span class="brand-discard">DISCARD</span>.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">How do I add a new scraper?</div>
+            <p class="text-slate-300">Copy <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">pipeline_code/scraper_civitai.py</code>, swap the API specifics, register in <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">run_pipeline.compute_desired_agents</code>, add a row to <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">_STATIC_SCRAPERS</code> in the dashboard so it shows up as a toggle. <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">SeenStore</code> and <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">credentials.get_required</code> handle dedup and key resolution.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">How do I switch LM Studio endpoints without restarting?</div>
+            <p class="text-slate-300">You can't fully — endpoint config is read at worker spawn. But you can hot-swap the loaded <em>model</em> via the Vision tab without touching the supervisor.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">Where does my data live?</div>
+            <p class="text-slate-300"><code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">data/</code> next to the repo by default (<code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">data/queue/&lt;slug&gt;/&lt;source&gt;/</code>, <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">data/sorted/&lt;slug&gt;/&lt;category&gt;/&lt;source&gt;/</code>). Set <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">PIPELINE_BASE_DIR</code> in <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">.env</code> to put it on a different disk. The path lives in one module, <code class="font-brand text-xs bg-slate-800 px-1.5 py-0.5 rounded">paths.py</code>.</p>
+          </div>
+          <div>
+            <div class="font-semibold text-slate-100 mb-1">Why "cull"?</div>
+            <p class="text-slate-300">Because that's the verb. Photographers cull. Editors cull. ML engineers cull. The product automates a workflow that already had a name.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ABOUT ─────────────────────────────────────────────────────────── -->
+    <section x-show="active === 'about'" class="space-y-4">
+      <div class="card rounded-xl p-6">
+        <div class="flex items-center gap-4 mb-4">
+          <img src="/brand/logo-transparent-dark.png" alt="cull" width="96" height="96"
+               class="shrink-0"/>
+          <div>
+            <div class="font-brand text-3xl font-medium tracking-tight">cull</div>
+            <p class="text-sm text-slate-300 mt-1">The curation engine for AI image datasets.</p>
+          </div>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-4 text-sm">
+          <div>
+            <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">What it is</div>
+            <p class="text-slate-300">A single-machine pipeline that pulls AI-generated images from seven sources, classifies each one under a strict 16-field JSON schema, and drops the keepers into category folders next to the prompt that made them. No Redis. No database. No Docker required.</p>
+          </div>
+          <div>
+            <div class="text-xs uppercase tracking-wider text-slate-400 mb-2">License + repo</div>
+            <p class="text-slate-300">MIT. <a href="https://github.com/tlennon-ie/cull" class="text-indigo-300 hover:underline">github.com/tlennon-ie/cull</a></p>
+            <div class="text-xs uppercase tracking-wider text-slate-400 mt-3 mb-2">Architecture brief</div>
+            <p class="text-slate-300">For AI agents working on the codebase: <a href="https://github.com/tlennon-ie/cull/blob/main/CLAUDE.md" class="text-indigo-300 hover:underline">CLAUDE.md</a> + <a href="https://github.com/tlennon-ie/cull/blob/main/.claude/skills/cull-helper/SKILL.md" class="text-indigo-300 hover:underline">.claude/skills/cull-helper/</a>.</p>
+          </div>
+        </div>
+
+        <div class="mt-5 pt-5 border-t border-slate-800 grid grid-cols-3 gap-3 text-center">
+          <div>
+            <div class="text-xs text-slate-400">Total classified</div>
+            <div class="text-xl font-mono mt-1" x-text="status.sorted?.total ?? 0"></div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400">In queue</div>
+            <div class="text-xl font-mono mt-1" x-text="status.queue?.total ?? 0"></div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400">Active vision worker</div>
+            <div class="text-xs font-brand mt-2" x-text="status.pipeline?.vision_worker || '-'"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-6">
+        <h3 class="font-semibold mb-3">Brand</h3>
+        <p class="text-xs text-slate-400 mb-3">Replace the inline SVG mark with your generated logo by dropping <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">cull-mark.svg</code> into <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">docs/brand/</code> and updating the mark template in <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">dashboard_enhanced.py</code>.</p>
+        <div class="grid grid-cols-5 gap-2 text-xs">
+          <div><div class="h-12 rounded" style="background:#0F1115; border:1px solid #1f2937;"></div><div class="mt-1 text-slate-400">ink #0F1115</div></div>
+          <div><div class="h-12 rounded" style="background:#F5F2EC;"></div><div class="mt-1 text-slate-400">surface #F5F2EC</div></div>
+          <div><div class="h-12 rounded" style="background:#E8B73A;"></div><div class="mt-1 text-slate-400">keep #E8B73A</div></div>
+          <div><div class="h-12 rounded" style="background:#C8553D;"></div><div class="mt-1 text-slate-400">discard #C8553D</div></div>
+          <div><div class="h-12 rounded" style="background:#7A8088;"></div><div class="mt-1 text-slate-400">subtle #7A8088</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Brand footer: cheap reinforcement, no chrome. -->
+    <footer class="mt-8 pt-6 border-t border-slate-800/60 text-center text-xs text-slate-500">
+      <span class="font-brand">cull</span>
+      <span class="mx-2">·</span>
+      MIT
+      <span class="mx-2">·</span>
+      <a href="https://github.com/tlennon-ie/cull" class="hover:text-slate-300">github.com/tlennon-ie/cull</a>
+    </footer>
+
   </main>
 
   <!-- DETAIL MODAL -->
@@ -2453,6 +2643,8 @@ function dashboard() {
       {id:'logs',     label:'Historical'},
       {id:'errors',   label:'Errors'},
       {id:'settings', label:'Settings'},
+      {id:'faq',      label:'FAQ'},
+      {id:'about',    label:'About'},
     ],
     providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',

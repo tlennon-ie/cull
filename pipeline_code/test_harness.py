@@ -259,7 +259,7 @@ To run the full pipeline test:
 
 3. Monitor progress:
    - Dashboard: http://localhost:5000
-   - Logs: I:\\AI\\openclaw\\workspace\\prompt-library\\logs_test
+   - Logs: {LOG_DIR}
 
 4. Check results:
    - Queue: {PIPELINE_QUEUE}
