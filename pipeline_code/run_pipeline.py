@@ -395,7 +395,8 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
     queue_dir = queue_root if queue_root.name == slug else queue_root / slug
     sorted_dir = sorted_root if sorted_root.name == slug else sorted_root / slug
     queue_dir.mkdir(parents=True, exist_ok=True)
-    for cat in ("InstagramInfluencer", "NSFW", "Professional", "Amateur", "Unknown", "CORRUPT", "DISCARD"):
+    from categories import ALL_CATEGORIES
+    for cat in ALL_CATEGORIES:
         (sorted_dir / cat).mkdir(parents=True, exist_ok=True)
 
     log_dir = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs_test")))

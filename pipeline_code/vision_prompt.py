@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from categories import SCHEMA_CATEGORIES, category_pipe_string
+
 # Ten-criteria rubric used by competition judges / art directors.
 _OVR_CRITERIA = (
     "1. Composition - rule of thirds, leading lines, balance, negative space.",
@@ -287,7 +289,7 @@ def build_classification_prompt(cfg: ScoreConfig | None = None) -> str:
         '  "OVR_Quality_Score": 0-100,\n'
         '  "REL_Quality_Score": 0-100,\n'
         '  "quality_score": 1-10,\n'
-        '  "category": "InstagramInfluencer|NSFW|Professional|Amateur|Unknown|DISCARD",\n'
+        f'  "category": "{category_pipe_string()}",\n'
         '  "reason": "One short sentence explaining the call."\n'
         "}\n\n"
         "STRICT JUDGEMENT RULES (no exceptions):\n"
@@ -675,8 +677,7 @@ def build_response_format() -> dict[str, Any]:
                     "quality_score":        {"type": "integer", "minimum": 1, "maximum": 10},
                     "category": {
                         "type": "string",
-                        "enum": ["InstagramInfluencer", "NSFW", "Professional",
-                                 "Amateur", "Unknown", "Watermarked", "DISCARD"],
+                        "enum": list(SCHEMA_CATEGORIES),
                     },
                     "reason": {"type": "string", "minLength": 5, "maxLength": 300},
                 },

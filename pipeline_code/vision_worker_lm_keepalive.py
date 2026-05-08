@@ -37,7 +37,7 @@ KEEPALIVE_INTERVAL = 15  # Send keepalive every 15 seconds
 
 _fs_lock = threading.Lock()
 
-CATEGORIES = ["InstagramInfluencer", "NSFW", "Professional", "Amateur", "Unknown", "Watermarked"]
+from categories import CATEGORIES  # noqa: E402
 for c in CATEGORIES:
     (SORTED_DIR / c).mkdir(parents=True, exist_ok=True)
 

@@ -383,6 +383,7 @@ def api_vision_workers_toggle():
 
 
 SETTINGS_KEYS: list[str] = [
+    # Topic + categorisation
     "PIPELINE_TOPIC",
     "PIPELINE_SLUG",
     "TOPIC_KEYWORDS_EXTRA",
@@ -391,13 +392,13 @@ SETTINGS_KEYS: list[str] = [
     "REDDIT_SUBREDDITS",
     "MIN_PROMPT_LENGTH",
     "X_ACCOUNTS",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_AUTH_MODE",
+    # Vision quality + UX
     "VISION_OVR_MIN_SCORE",
     "VISION_REL_MIN_SCORE",
     "BLUR_NSFW_THUMBS",
     "VISION_SCORE_NOTES",
     "PIPELINE_RECONCILE_SECONDS",
+    # Storage paths
     "PIPELINE_BASE_DIR",
     "PIPELINE_QUEUE",
     "PIPELINE_SORTED",
@@ -407,7 +408,35 @@ SETTINGS_KEYS: list[str] = [
     "LOCAL_IMPORT_NAME",
     "LOCAL_IMPORT_ENABLED",
     "LOCAL_IMPORT_MIGRATE_FROM",
+    # Vision provider credentials
+    "GROQ_API_KEY",
+    "GROQ_API_KEYS",
+    "GROQ_MODEL",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "LMSTUDIO_PRIMARY_TIMEOUT",
+    "LMSTUDIO_SECONDARY_TIMEOUT",
+    # Scraper credentials
+    "CIVITAI_API_KEY",
+    "CIVITAI_API_RED_KEY",
+    "CIVITAI_DOMAINS",
+    "TWITTER_COOKIES",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_AUTH_MODE",
+    "DISCORD_CHANNELS_JSON",
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "REDDIT_USER_AGENT",
+    # ZForFree feeders
+    "ZFORFREE_LOCAL_ENABLED",
+    "ZFORFREE_WEB_ENABLED",
 ]
+SECRET_KEYS: set[str] = {
+    "GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY",
+    "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY",
+    "TWITTER_COOKIES", "DISCORD_BOT_TOKEN", "DISCORD_CHANNELS_JSON",
+    "REDDIT_CLIENT_SECRET",
+}
 PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
                        "LOG_DIR", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"}
 
@@ -491,6 +520,71 @@ def api_settings_post():
         update_env(key, value)
 
     return jsonify({"success": True, "applied": changes, "restart_required": True})
+
+
+@app.route("/api/vision/test", methods=["POST"])
+def api_vision_test():
+    """Verify the user's stored credentials hit a real backend.
+
+    Caller passes ``{"provider": "groq"|"gemini"|"lmstudio"}``. We do the
+    cheapest possible probe per provider and return ``{ok, message, latency_ms}``
+    so the Settings UI can surface a working/broken indicator next to each
+    credential field without forcing the user to start the whole pipeline.
+    """
+    import time as _t
+    data = request.get_json() or {}
+    provider = (data.get("provider") or "").strip().lower()
+    started = _t.time()
+
+    def _done(ok: bool, message: str, status: int = 200) -> Any:
+        return jsonify({
+            "ok": ok, "message": message,
+            "latency_ms": int((_t.time() - started) * 1000),
+            "provider": provider,
+        }), status
+
+    try:
+        import requests
+        if provider == "lmstudio":
+            url = (data.get("url") or os.environ.get("LMSTUDIO_PRIMARY_URL", "")).rstrip("/")
+            if not url:
+                return _done(False, "no LMSTUDIO_PRIMARY_URL configured", 400)
+            r = requests.get(f"{url}/v1/models", timeout=5)
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            payload = r.json()
+            n = len(payload.get("data") or [])
+            return _done(True, f"connected, {n} model(s) loaded")
+        if provider == "groq":
+            key = os.environ.get("GROQ_API_KEY", "") or (
+                os.environ.get("GROQ_API_KEYS", "").split(",")[0].strip()
+            )
+            if not key:
+                return _done(False, "no GROQ_API_KEY configured", 400)
+            r = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=10,
+            )
+            if r.status_code == 401:
+                return _done(False, "401 Unauthorized - key invalid")
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            return _done(True, "Groq key accepted")
+        if provider == "gemini":
+            key = os.environ.get("GEMINI_API_KEY", "")
+            if not key:
+                return _done(False, "no GEMINI_API_KEY configured", 400)
+            r = requests.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={key}",
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            return _done(True, "Gemini key accepted")
+        return _done(False, f"unknown provider: {provider!r}", 400)
+    except requests.RequestException as exc:
+        return _done(False, f"connection error: {exc}")
 
 
 @app.route("/api/vision/provider", methods=["POST"])
@@ -1367,7 +1461,16 @@ HTML_TEMPLATE = r"""<!doctype html>
 <body class="min-h-screen bg-slate-950 text-slate-100">
 <div x-data="dashboard()" x-init="start()" class="flex min-h-screen">
 
-  <aside class="w-56 shrink-0 border-r border-slate-800 bg-slate-900/60 p-4 space-y-1">
+  <!-- Mobile hamburger - hidden on lg+ where the sidebar is always visible. -->
+  <button @click="sidebarOpen = !sidebarOpen" aria-label="Toggle navigation"
+    class="lg:hidden fixed top-3 left-3 z-40 bg-slate-800 hover:bg-slate-700 rounded p-2">
+    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M3 6h18M3 12h18M3 18h18" stroke-linecap="round"/>
+    </svg>
+  </button>
+
+  <aside :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'"
+    class="fixed lg:static inset-y-0 left-0 z-30 w-56 shrink-0 border-r border-slate-800 bg-slate-900/95 lg:bg-slate-900/60 p-4 space-y-1 transform transition-transform">
     <div class="mb-4">
       <h1 class="text-lg font-bold">Pipeline</h1>
       <p class="text-xs text-slate-400" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
@@ -1378,7 +1481,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </div>
     <template x-for="tab in tabs" :key="tab.id">
-      <button @click="active = tab.id"
+      <button @click="active = tab.id; sidebarOpen = false"
         class="w-full text-left px-3 py-2 rounded text-sm transition"
         :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
         x-text="tab.label"></button>
@@ -1386,11 +1489,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="pt-6 text-xs text-slate-500" x-text="'Refreshed: ' + lastRefresh"></div>
   </aside>
 
+  <!-- Backdrop when sidebar is open on mobile. -->
+  <div x-show="sidebarOpen" x-cloak class="lg:hidden fixed inset-0 z-20 bg-black/50"
+    @click="sidebarOpen = false"></div>
+
   <main class="flex-1 p-6 space-y-6 overflow-y-auto">
     <header class="flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-bold capitalize" x-text="tabs.find(t => t.id === active)?.label"></h2>
-        <p class="text-sm text-slate-400">Realtime operations console - auto-refresh every 5 s</p>
+        <h2 class="text-2xl font-bold" x-text="tabs.find(t => t.id === active)?.label"></h2>
+        <p class="text-sm text-slate-400">
+          <span x-show="active !== 'gallery'">Realtime operations console - auto-refresh every 5 s</span>
+          <span x-show="active === 'gallery'">Filter, browse, edit, and export the sorted library</span>
+        </p>
       </div>
       <div class="flex gap-2">
         <template x-if="!status.pipeline?.running">
@@ -1441,10 +1551,10 @@ HTML_TEMPLATE = r"""<!doctype html>
             <template x-for="a in activity" :key="a.path">
               <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-2 flex gap-3 items-start">
                 <span class="nsfw-wrap">
-                  <img :src="a.thumbnail" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
+                  <img :src="a.thumbnail" :alt="a.name + ' - ' + a.category" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
                        loading="lazy" referrerpolicy="no-referrer"
                        @click="shouldBlurNsfw(a) ? revealNsfw(a) : openModalFromActivity(a)"/>
-                  <span class="nsfw-eye" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
+                  <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                     </svg>
@@ -1535,10 +1645,10 @@ HTML_TEMPLATE = r"""<!doctype html>
             <template x-for="(c, idx) in (stats[bucket.key] || [])" :key="bucket.key + '_' + c.path">
               <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-center">
                 <span class="nsfw-wrap block">
-                  <img :src="c.thumbnail" class="thumb-lg mx-auto" :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
+                  <img :src="c.thumbnail" :alt="c.name" class="thumb-lg mx-auto" :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
                        loading="lazy"
                        @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
-                  <span class="nsfw-eye" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                  <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                     </svg>
@@ -1594,7 +1704,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Sort by</label>
-            <select x-model="galleryFilters.sort" @change="galleryReload()"
+            <select x-model="galleryFilters.sort" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
               <option value="newest">Newest first</option>
               <option value="ovr">OVR (craft)</option>
@@ -1604,7 +1714,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">NSFW</label>
-            <select x-model="galleryFilters.nsfw" @change="galleryReload()"
+            <select x-model="galleryFilters.nsfw" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
               <option value="any">Show all</option>
               <option value="exclude">Hide NSFW</option>
@@ -1613,28 +1723,28 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Date from</label>
-            <input type="date" x-model="galleryFilters.dateFrom" @change="galleryReload()"
+            <input type="date" x-model="galleryFilters.dateFrom" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Date to</label>
-            <input type="date" x-model="galleryFilters.dateTo" @change="galleryReload()"
+            <input type="date" x-model="galleryFilters.dateTo" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
           </div>
 
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Min OVR</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minOvr" @change="galleryReload()"
+            <input type="number" min="0" max="100" x-model.number="galleryFilters.minOvr" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Min REL</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minRel" @change="galleryReload()"
+            <input type="number" min="0" max="100" x-model.number="galleryFilters.minRel" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
           </div>
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Min quality (1-10)</label>
-            <input type="number" min="0" max="10" x-model.number="galleryFilters.minQuality" @change="galleryReload()"
+            <input type="number" min="0" max="10" x-model.number="galleryFilters.minQuality" @change.debounce.300ms="galleryReload()"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
           </div>
           <div class="lg:col-span-6 flex items-end gap-2">
@@ -1687,9 +1797,10 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold">Results</h3>
           <div class="flex items-center gap-2 text-xs">
-            <button @click="galleryPrev()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded" :disabled="gallery.page <= 1">Prev</button>
+            <button @click="galleryPrev()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50" :disabled="gallery.page <= 1">Prev</button>
             <span>Page <span x-text="gallery.page"></span> / <span x-text="Math.max(1, Math.ceil(gallery.total / gallery.pageSize))"></span></span>
-            <button @click="galleryNext()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Next</button>
+            <button @click="galleryNext()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50"
+              :disabled="gallery.page >= Math.max(1, Math.ceil(gallery.total / gallery.pageSize))">Next</button>
           </div>
         </div>
         <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
@@ -1697,11 +1808,11 @@ HTML_TEMPLATE = r"""<!doctype html>
           <template x-for="c in gallery.items" :key="c.path">
             <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col">
               <span class="nsfw-wrap block">
-                <img :src="c.thumbnail" class="w-full aspect-square object-cover rounded"
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
                      loading="lazy"
                      @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
-                <span class="nsfw-eye" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image" x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                   </svg>
@@ -1783,7 +1894,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             </div>
             <label class="inline-flex items-center cursor-pointer gap-2">
               <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-              <input type="checkbox" :checked="s.enabled" @change="toggleScraper(s.name, $event.target.checked)"
+              <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
                 class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
                   checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
                   before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
@@ -1813,7 +1924,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 </div>
                 <label class="inline-flex items-center cursor-pointer gap-2">
                   <span class="text-xs" x-text="w.enabled ? 'On' : 'Off'"></span>
-                  <input type="checkbox" :checked="w.enabled" @change="toggleVisionWorker(w.name, $event.target.checked)"
+                  <input type="checkbox" :checked="w.enabled" :aria-label="'Toggle worker ' + w.name" @change="toggleVisionWorker(w.name, $event.target.checked)"
                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
                       checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
@@ -1857,10 +1968,10 @@ HTML_TEMPLATE = r"""<!doctype html>
           <template x-for="a in activity" :key="a.path">
             <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-2 flex gap-2 items-start">
               <span class="nsfw-wrap">
-                <img :src="a.thumbnail" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
+                <img :src="a.thumbnail" :alt="a.name + ' - ' + a.category" class="thumb-lg" :class="{ 'nsfw-blur': shouldBlurNsfw(a) }"
                      loading="lazy"
                      @click="shouldBlurNsfw(a) ? revealNsfw(a) : openModalFromActivity(a)"/>
-                <span class="nsfw-eye" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
+                <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image" x-show="shouldBlurNsfw(a)" @click.stop="revealNsfw(a)" title="Reveal NSFW">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                   </svg>
@@ -1885,7 +1996,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <tbody>
           <template x-for="f in queueFiles" :key="f.path">
             <tr :class="f.corrupt ? 'bg-rose-900/25' : ''">
-              <td><img :src="f.thumbnail" class="thumb" loading="lazy" @click="openModalFromFile(f)"/></td>
+              <td><img :src="f.thumbnail" :alt="f.name" class="thumb" loading="lazy" @click="openModalFromFile(f)"/></td>
               <td class="font-mono text-xs" x-text="f.name"></td>
               <td x-text="f.source"></td>
               <td class="font-mono text-xs" x-text="(f.size/1024).toFixed(1) + ' KB'"></td>
@@ -1917,11 +2028,11 @@ HTML_TEMPLATE = r"""<!doctype html>
             <tr>
               <td>
                 <span class="nsfw-wrap">
-                  <img :src="h.thumbnail || ''" class="thumb" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
+                  <img :src="h.thumbnail || ''" :alt="h.image" class="thumb" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
                        loading="lazy"
                        onerror="this.style.visibility='hidden'"
                        @click="h.thumbnail && (shouldBlurNsfw(h) ? revealNsfw(h) : openModalFromHistory(h))"/>
-                  <span class="nsfw-eye" x-show="shouldBlurNsfw(h)" @click.stop="revealNsfw(h)" title="Reveal NSFW">
+                  <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image" x-show="shouldBlurNsfw(h)" @click.stop="revealNsfw(h)" title="Reveal NSFW">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
                     </svg>
@@ -1947,7 +2058,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
 
     <!-- SETTINGS -->
-    <section x-show="active === 'settings'" class="space-y-4">
+    <section x-show="active === 'settings'" class="space-y-4"
+      @input="markSettingsDirty()" @change="markSettingsDirty()">
       <div class="card rounded-xl p-5">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
@@ -1960,7 +2072,10 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
         </div>
         <template x-if="settingsBanner">
-          <div class="bg-indigo-950/60 border border-indigo-700 text-indigo-200 text-xs px-3 py-2 rounded mb-3" x-text="settingsBanner"></div>
+          <div class="border text-xs px-3 py-2 rounded mb-3"
+            :class="settingsBannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
+                                     : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+            x-text="settingsBanner"></div>
         </template>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
@@ -1995,7 +2110,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <label class="block">
             <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
             <input x-model="settings.MIN_PROMPT_LENGTH" type="number" min="0"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.MIN_PROMPT_LENGTH ? 'border-rose-600' : ''"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
@@ -2037,6 +2152,118 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
 
       <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Vision provider credentials</h3>
+        <p class="text-xs text-slate-400 mb-3">
+          You only need keys for the providers you select on the <strong>Vision</strong> tab.
+          Click <em>Test</em> after saving to confirm the credential works without starting the pipeline.
+        </p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">GROQ_API_KEY (single key)</span>
+            <input x-model="settings.GROQ_API_KEY" type="password" placeholder="gsk_..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"
+              :class="settingsErrors.GROQ_API_KEY ? 'border-rose-600' : ''"/>
+            <span x-show="settingsErrors.GROQ_API_KEY" class="text-xs text-rose-300 mt-1 block" x-text="settingsErrors.GROQ_API_KEY"></span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GROQ_API_KEYS (comma-sep, rotated round-robin)</span>
+            <input x-model="settings.GROQ_API_KEYS" type="password" placeholder="gsk_one,gsk_two,gsk_three"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GROQ_MODEL</span>
+            <input x-model="settings.GROQ_MODEL" placeholder="meta-llama/llama-4-scout-17b-16e-instruct"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <div class="flex items-end">
+            <button @click="testProvider('groq')" :disabled="providerTest.groq?.testing"
+              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
+              <span x-text="providerTest.groq?.testing ? 'Testing...' : 'Test Groq'"></span>
+            </button>
+            <span class="ml-3 text-xs" x-show="providerTest.groq?.message"
+              :class="providerTest.groq?.ok ? 'text-emerald-300' : 'text-rose-300'"
+              x-text="providerTest.groq?.message"></span>
+          </div>
+
+          <label class="block">
+            <span class="text-xs text-slate-400">GEMINI_API_KEY</span>
+            <input x-model="settings.GEMINI_API_KEY" type="password" placeholder="AIza..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GEMINI_MODEL</span>
+            <input x-model="settings.GEMINI_MODEL" placeholder="gemini-2.5-flash"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <div class="md:col-span-2 flex items-center gap-3">
+            <button @click="testProvider('gemini')" :disabled="providerTest.gemini?.testing"
+              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
+              <span x-text="providerTest.gemini?.testing ? 'Testing...' : 'Test Gemini'"></span>
+            </button>
+            <span class="text-xs" x-show="providerTest.gemini?.message"
+              :class="providerTest.gemini?.ok ? 'text-emerald-300' : 'text-rose-300'"
+              x-text="providerTest.gemini?.message"></span>
+            <button @click="testProvider('lmstudio')" :disabled="providerTest.lmstudio?.testing"
+              class="ml-auto px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
+              <span x-text="providerTest.lmstudio?.testing ? 'Testing...' : 'Test LM Studio'"></span>
+            </button>
+            <span class="text-xs" x-show="providerTest.lmstudio?.message"
+              :class="providerTest.lmstudio?.ok ? 'text-emerald-300' : 'text-rose-300'"
+              x-text="providerTest.lmstudio?.message"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Scraper credentials</h3>
+        <p class="text-xs text-slate-400 mb-3">Required only for the scrapers you've enabled on the <strong>Scrapers</strong> tab.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">CIVITAI_API_KEY (civitai.com)</span>
+            <input x-model="settings.CIVITAI_API_KEY" type="password"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY (civitai.red)</span>
+            <input x-model="settings.CIVITAI_API_RED_KEY" type="password"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">CIVITAI_DOMAINS (comma-sep)</span>
+            <input x-model="settings.CIVITAI_DOMAINS" placeholder="civitai.com,civitai.red"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">TWITTER_COOKIES (full cookie string from a logged-in browser)</span>
+            <textarea x-model="settings.TWITTER_COOKIES" rows="2"
+              placeholder="auth_token=...; ct0=...; twid=..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">DISCORD_CHANNELS_JSON</span>
+            <textarea x-model="settings.DISCORD_CHANNELS_JSON" rows="3"
+              placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_ID (optional)</span>
+            <input x-model="settings.REDDIT_CLIENT_ID"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_SECRET (optional)</span>
+            <input x-model="settings.REDDIT_CLIENT_SECRET" type="password"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">REDDIT_USER_AGENT</span>
+            <input x-model="settings.REDDIT_USER_AGENT" placeholder="ImagePipelineBot/1.0"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Vision quality scoring</h3>
         <p class="text-xs text-slate-400 mb-3">
           Every classification now emits two 0-100 scores. <code>OVR_Quality_Score</code> judges absolute
@@ -2048,12 +2275,12 @@ HTML_TEMPLATE = r"""<!doctype html>
           <label class="block">
             <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
             <input x-model="settings.VISION_OVR_MIN_SCORE" type="number" min="0" max="100"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.VISION_OVR_MIN_SCORE ? 'border-rose-600' : ''"/>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
             <input x-model="settings.VISION_REL_MIN_SCORE" type="number" min="0" max="100"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.VISION_REL_MIN_SCORE ? 'border-rose-600' : ''"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Scoring notes (appended to rubric - nudge the model toward your taste)</span>
@@ -2064,7 +2291,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <label class="block">
             <span class="text-xs text-slate-400">Supervisor reconcile interval (seconds)</span>
             <input x-model="settings.PIPELINE_RECONCILE_SECONDS" type="number" min="1" max="3600"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.PIPELINE_RECONCILE_SECONDS ? 'border-rose-600' : ''"/>
             <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
           </label>
           <label class="flex items-start gap-2 md:col-span-2">
@@ -2167,20 +2394,22 @@ HTML_TEMPLATE = r"""<!doctype html>
   </main>
 
   <!-- DETAIL MODAL -->
-  <div x-show="modal.open" x-cloak @keydown.escape.window="closeModal()"
+  <div x-show="modal.open" x-cloak role="dialog" aria-modal="true" aria-labelledby="modalName"
+       @keydown.escape.window="closeModal()"
        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"
        @click.self="closeModal()">
     <div class="card rounded-xl p-5 max-w-5xl w-full max-h-[90vh] overflow-hidden flex flex-col">
       <div class="flex items-start justify-between gap-4 mb-3">
         <div class="min-w-0">
           <div class="text-xs text-slate-400" x-text="modal.source + (modal.category ? ' · ' + modal.category : '')"></div>
-          <div class="font-mono text-sm truncate" x-text="modal.name"></div>
+          <div id="modalName" class="font-mono text-sm truncate" x-text="modal.name"></div>
         </div>
-        <button @click="closeModal()" class="shrink-0 px-3 py-1 text-sm bg-slate-800 hover:bg-slate-700 rounded">Close (Esc)</button>
+        <button @click="closeModal()" x-ref="modalClose"
+          class="shrink-0 px-3 py-1 text-sm bg-slate-800 hover:bg-slate-700 rounded">Close (Esc)</button>
       </div>
       <div class="grid lg:grid-cols-2 gap-4 overflow-hidden">
         <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto relative">
-          <img :src="modal.imageUrl"
+          <img :src="modal.imageUrl" :alt="modal.name"
                class="max-w-full max-h-[75vh] object-contain"
                :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
           <span class="nsfw-eye" style="background:rgba(15,23,42,0.55);"
@@ -2200,7 +2429,9 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <button @click="modal.editing = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Edit</button>
               </template>
               <template x-if="modal.editing">
-                <button @click="savePrompt()" :disabled="modal.saving" class="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 rounded disabled:opacity-50">
+                <button @click="savePrompt()" :disabled="modal.saving"
+                  class="px-2 py-1 bg-amber-600 hover:bg-amber-500 rounded disabled:opacity-50"
+                  title="Overwrites the .txt file with no backup">
                   <span x-text="modal.saving ? 'Saving...' : 'Save (overwrite)'"></span>
                 </button>
               </template>
@@ -2210,7 +2441,9 @@ HTML_TEMPLATE = r"""<!doctype html>
             </div>
           </div>
           <template x-if="!modal.editing">
-            <pre class="whitespace-pre-wrap text-sm font-mono text-slate-200" x-text="modal.prompt || '(empty)'"></pre>
+            <pre class="whitespace-pre-wrap text-sm font-mono"
+              :class="modal.prompt ? 'text-slate-200' : 'text-slate-500 italic'"
+              x-text="modal.prompt || '(no prompt saved for this image)'"></pre>
           </template>
           <template x-if="modal.editing">
             <textarea x-model="modal.prompt" rows="14"
@@ -2243,6 +2476,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 function dashboard() {
   return {
     active: 'overview',
+    sidebarOpen: false,
     tabs: [
       {id:'overview', label:'Overview'},
       {id:'stats',    label:'Stats'},
@@ -2258,7 +2492,9 @@ function dashboard() {
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
-    settings: {}, settingsBanner: '',
+    settings: {}, settingsBanner: '', settingsBannerOk: true,
+    settingsDirty: false, settingsErrors: {},
+    providerTest: {},
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':            'LMStudio PRIMARY endpoint',
@@ -2287,45 +2523,98 @@ function dashboard() {
       nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
+    modalReturnFocus: null,
 
     async refresh() {
-      const [s, scr, mods, q, h, a, vw, settings] = await Promise.all([
-        fetch('/api/status').then(r=>r.json()),
-        fetch('/api/scrapers').then(r=>r.json()),
-        fetch('/api/lmstudio/models').then(r=>r.json()),
-        fetch('/api/queue/files?limit=60').then(r=>r.json()),
-        fetch('/api/logs/history?limit=200').then(r=>r.json()),
-        fetch('/api/activity?limit=12').then(r=>r.json()),
-        fetch('/api/vision/workers').then(r=>r.json()),
-        fetch('/api/settings').then(r=>r.json()),
-      ]);
-      this.status = s;
-      this.scrapers = scr;
-      this.models = mods;
-      this.queueFiles = q;
-      this.history = h;
-      this.activity = a;
-      this.visionWorkers = vw;
-      // Only overwrite settings if the user isn't mid-edit (empty settings object).
-      if (Object.keys(this.settings).length === 0) this.settings = settings;
-      this.provider = s.pipeline?.vision_worker || this.provider;
-      this.throttle = s.pipeline?.throttle ?? this.throttle;
+      // Per-tab gating: only fetch what the active tab needs. Always pull
+      // /api/status (it powers the sidebar pill) and /api/scrapers + workers
+      // (cheap, used in multiple tabs). Skip the heavy 200-row history poll
+      // unless the user is on the Historical or Overview tab.
+      const tab = this.active;
+      const need = (id) => tab === id || tab === 'overview';
+      const j = (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status));
+      const tasks = {
+        status:    j('/api/status'),
+        scrapers:  j('/api/scrapers'),
+        workers:   j('/api/vision/workers'),
+        models:    (need('vision') ? j('/api/lmstudio/models') : null),
+        queue:     (need('queue')  ? j('/api/queue/files?limit=60') : null),
+        history:   (need('logs')   ? j('/api/logs/history?limit=200') : null),
+        activity:  (need('overview') || tab === 'vision' ? j('/api/activity?limit=12') : null),
+        settings:  (need('settings') ? j('/api/settings') : null),
+      };
+      const keys = Object.keys(tasks);
+      const results = await Promise.allSettled(Object.values(tasks).map(p => p ?? Promise.resolve(null)));
+      const out = {};
+      results.forEach((r, i) => { out[keys[i]] = r.status === 'fulfilled' ? r.value : null; });
+      if (out.status)    this.status = out.status;
+      if (out.scrapers)  this.scrapers = out.scrapers;
+      if (out.workers)   this.visionWorkers = out.workers;
+      if (out.models)    this.models = out.models;
+      if (out.queue)     this.queueFiles = out.queue;
+      if (out.history)   this.history = out.history;
+      if (out.activity)  this.activity = out.activity;
+      // Only seed settings on first load OR when the user explicitly hits Reload.
+      if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
+        this.settings = out.settings;
+      }
+      this.provider = this.status.pipeline?.vision_worker || this.provider;
+      this.throttle = this.status.pipeline?.throttle ?? this.throttle;
       this.lastRefresh = new Date().toLocaleTimeString();
     },
     async saveSettings() {
       this.settingsBanner = 'Saving...';
-      const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(this.settings)});
-      const j = await r.json();
-      if (j.success) {
-        this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
-        setTimeout(() => this.settingsBanner = '', 6000);
-      } else {
-        this.settingsBanner = 'Errors: ' + JSON.stringify(j.errors);
+      this.settingsBannerOk = true;
+      this.settingsErrors = {};
+      try {
+        const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(this.settings)});
+        const j = await r.json();
+        if (j.success) {
+          this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
+          this.settingsBannerOk = true;
+          this.settingsDirty = false;
+          setTimeout(() => this.settingsBanner = '', 6000);
+        } else {
+          // Render per-field errors next to inputs; banner just summarises.
+          this.settingsErrors = j.errors || {};
+          const fields = Object.keys(this.settingsErrors);
+          this.settingsBanner = fields.length
+            ? `Validation failed: ${fields.join(', ')}`
+            : 'Save failed.';
+          this.settingsBannerOk = false;
+        }
+      } catch (e) {
+        this.settingsBanner = 'Network error - see console.';
+        this.settingsBannerOk = false;
       }
       this.refresh();
     },
-    reloadSettings() { this.settings = {}; this.refresh(); },
+    markSettingsDirty() { this.settingsDirty = true; },
+    async testProvider(name) {
+      this.providerTest[name] = { testing: true, message: 'Connecting...', ok: null };
+      try {
+        const r = await fetch('/api/vision/test', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({provider: name}),
+        });
+        const j = await r.json();
+        this.providerTest[name] = {
+          testing: false,
+          ok: j.ok,
+          message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`,
+        };
+      } catch (e) {
+        this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
+      }
+    },
+    reloadSettings() {
+      if (this.settingsDirty && !window.confirm('Discard your unsaved settings changes?')) return;
+      this.settings = {};
+      this.settingsDirty = false;
+      this.settingsErrors = {};
+      this.refresh();
+    },
     async toggleVisionWorker(name, enabled) {
       await fetch('/api/vision/workers/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})}); this.refresh();
@@ -2395,6 +2684,8 @@ function dashboard() {
     },
 
     async openModal({imageUrl, promptUrl, name, source, category, summary, path, meta}) {
+      // Remember the trigger so we can restore focus on close (a11y).
+      this.modalReturnFocus = document.activeElement;
       this.modal = {
         open: true, imageUrl,
         prompt: 'Loading...', promptOriginal: '',
@@ -2451,6 +2742,11 @@ function dashboard() {
       this.modal.open = false;
       this.modal.editing = false;
       this.modal.savedFlash = '';
+      // Restore focus to whatever opened the modal (a11y).
+      if (this.modalReturnFocus && this.modalReturnFocus.focus) {
+        try { this.modalReturnFocus.focus(); } catch (_) { /* element gone */ }
+        this.modalReturnFocus = null;
+      }
     },
 
     // Edit-and-save the prompt that lives next to an image. Per spec we
@@ -2464,6 +2760,13 @@ function dashboard() {
           method: 'POST', headers: {'Content-Type':'application/json'},
           body: JSON.stringify({path: this.modal.path, text: this.modal.prompt || ''})
         });
+        if (!r.ok) {
+          // Surface non-200s explicitly - r.json() on a 5xx HTML page throws.
+          let detail = '';
+          try { detail = (await r.json())?.error || ''; } catch (_) { detail = await r.text(); }
+          this.modal.savedFlash = `Error ${r.status}: ${detail || 'save failed'}`;
+          return;
+        }
         const j = await r.json();
         if (j.success) {
           this.modal.promptOriginal = this.modal.prompt;
@@ -2474,7 +2777,8 @@ function dashboard() {
           this.modal.savedFlash = 'Error: ' + (j.error || 'unknown');
         }
       } catch (e) {
-        this.modal.savedFlash = 'Network error';
+        this.modal.savedFlash = 'Network error - check console';
+        console.error('savePrompt failed', e);
       } finally {
         this.modal.saving = false;
       }

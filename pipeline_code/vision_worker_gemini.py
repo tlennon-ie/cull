@@ -30,7 +30,7 @@ POLL_INTERVAL    = 0.5
 
 _fs_lock = threading.Lock()
 
-CATEGORIES = ["InstagramInfluencer", "NSFW", "Professional", "Amateur", "Unknown"]
+from categories import CATEGORIES  # noqa: E402  # closes Watermarked-missing drift
 for c in CATEGORIES:
     (SORTED_DIR / c).mkdir(parents=True, exist_ok=True)
 
