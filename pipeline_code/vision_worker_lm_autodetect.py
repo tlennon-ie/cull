@@ -1,272 +1,180 @@
 #!/usr/bin/env python3
-"""
-vision_worker_balanced_lm_autodetect.py - Auto-detect and use whatever model is in LMStudio
+"""LM Studio vision worker that auto-picks whichever VL model is loaded.
 
-Uses first available loaded model, falls back gracefully if none loaded
+Probes ``LMSTUDIO_PRIMARY_URL`` and ``LMSTUDIO_SECONDARY_URL`` at startup,
+selects the first endpoint with a vision-capable model (qwen-vl / gemma-3 /
+llava / minicpm-v / etc.), and uses that pair for the rest of its life.
+Never picks a text-only model - the worker needs multimodal to classify
+images.
 """
-import os, re, json, time, base64, io, threading, random
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from PIL import Image
+from __future__ import annotations
+
+import os
 import sys
+from pathlib import Path
+from typing import Any
+
 import requests
 
-# Import queue manager
 sys.path.insert(0, str(Path(__file__).parent))
-from queue_manager import get_next_image_round_robin
 
-# Config
 from dotenv import load_dotenv
-from paths import base_dir
+
+from pipeline_logging import get_logger
+from vision_worker_base import (
+    BaseVisionWorker,
+    build_response_format,
+    extract_message_text,
+    _safe_parse_vision_json,
+    run_subclass,
+)
+
 load_dotenv()
 
-BASE_DIR   = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
-SLUG       = os.environ.get("PIPELINE_SLUG", "realistic_female_influencer")
-_RAW_SORTED = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
-SORTED_DIR = _RAW_SORTED if _RAW_SORTED.name == SLUG else _RAW_SORTED / SLUG
+logger = get_logger(__name__)
 
-LMS_URL          = os.environ.get("LMSTUDIO_PRIMARY_URL", "http://127.0.0.1:1234")
-LMS_URL_SECONDARY = os.environ.get("LMSTUDIO_SECONDARY_URL", "")
-TIMEOUT          = 600
-MAX_SIZE         = 512
-POLL_INTERVAL    = 2
-PARALLEL_WORKERS = 4
-
-# Vision-capable model name hints (case-insensitive). Used to pick a VL model
-# when an LMStudio instance has multiple models loaded.
-VISION_HINTS = ("vl", "vision", "visual", "llava", "gemma-3", "qwen3-vl", "qwen2.5-vl",
-                "qwen2-vl", "moondream", "minicpm-v", "pixtral")
+VISION_HINTS = (
+    "vl", "vision", "visual", "llava", "gemma-3", "qwen3-vl",
+    "qwen2.5-vl", "qwen2-vl", "moondream", "minicpm-v", "pixtral",
+)
 EMBED_HINTS = ("embed", "nomic", "bge")
 
-_fs_lock = threading.Lock()
 
-from categories import CATEGORIES  # noqa: E402
-for c in CATEGORIES:
-    (SORTED_DIR / c).mkdir(parents=True, exist_ok=True)
+class LMAutodetectWorker(BaseVisionWorker):
+    name = "lm-autodetect"
+    parallel_workers = 4
+    request_timeout = 600
 
-def _pick_vision_model(models: list[str]) -> str | None:
-    """Return the best vision candidate from a list of model IDs, or None."""
-    if not models:
-        return None
-    non_embed = [m for m in models if not any(h in m.lower() for h in EMBED_HINTS)]
-    vision = [m for m in non_embed if any(h in m.lower() for h in VISION_HINTS)]
-    return vision[0] if vision else None
+    def __init__(self) -> None:
+        super().__init__()
+        self.primary_url: str = os.environ.get("LMSTUDIO_PRIMARY_URL", "").rstrip("/")
+        self.secondary_url: str = os.environ.get("LMSTUDIO_SECONDARY_URL", "").rstrip("/")
+        # These get set by setup() once an endpoint is discovered.
+        self.lms_url: str = ""
+        self.model_id: str = ""
 
+    # ── Discovery ─────────────────────────────────────────────────────────
 
-def _models_on(base_url: str) -> list[str]:
-    try:
-        resp = requests.get(f"{base_url.rstrip('/')}/v1/models", timeout=5)
-        if resp.status_code == 200:
-            return [item.get("id", "") for item in resp.json().get("data", []) if item.get("id")]
-    except requests.RequestException:
-        pass
-    return []
-
-
-def discover_endpoint() -> tuple[str, str] | tuple[None, None]:
-    """Return (base_url, model_id) for whichever LMStudio instance has a vision model.
-
-    Strategy: probe both endpoints, prefer an instance with a vision-capable model
-    (qwen-vl, gemma-3, llava, etc.). Never picks a text-only model - the worker
-    needs multimodal to classify images.
-    """
-    endpoints: list[tuple[str, str, list[str]]] = []
-    for label, url in (("primary", LMS_URL), ("secondary", LMS_URL_SECONDARY)):
-        if not url:
-            continue
-        models = _models_on(url)
+    @staticmethod
+    def _pick_vision_model(models: list[str]) -> str | None:
         if not models:
-            print(f"  [autodetect] {label} ({url}) unreachable or empty", flush=True)
-            continue
-        endpoints.append((label, url, models))
+            return None
+        non_embed = [m for m in models if not any(h in m.lower() for h in EMBED_HINTS)]
+        vision = [m for m in non_embed if any(h in m.lower() for h in VISION_HINTS)]
+        return vision[0] if vision else None
 
-    # Prefer any instance that actually has a vision-capable model.
-    for label, url, models in endpoints:
-        picked = _pick_vision_model(models)
-        if picked:
-            print(f"  [autodetect] {label} -> {picked} (all: {models})", flush=True)
-            return url, picked
+    @staticmethod
+    def _models_on(base_url: str) -> list[str]:
+        try:
+            resp = requests.get(f"{base_url.rstrip('/')}/v1/models", timeout=5)
+            if resp.status_code == 200:
+                return [
+                    item.get("id", "")
+                    for item in resp.json().get("data", [])
+                    if item.get("id")
+                ]
+        except requests.RequestException:
+            pass
+        return []
 
-    for label, _url, models in endpoints:
-        print(f"  [autodetect] {label} has no vision-capable model loaded: {models}", flush=True)
-    return None, None
+    def _discover(self) -> tuple[str, str] | tuple[str, str]:
+        """Pick the first endpoint with a VL model. Returns ('','') if none."""
+        candidates: list[tuple[str, str, list[str]]] = []
+        for label, url in (("primary", self.primary_url), ("secondary", self.secondary_url)):
+            if not url:
+                continue
+            models = self._models_on(url)
+            if not models:
+                logger.warning("autodetect: %s (%s) unreachable or empty", label, url)
+                continue
+            candidates.append((label, url, models))
 
-def resize_bytes(data, max_size=MAX_SIZE):
-    try:
-        if not data: return None
-        img = Image.open(io.BytesIO(data))
-        img.load()
-        img = img.convert("RGB")
-        w, h = img.size
-        if max(w, h) > max_size:
-            scale = max_size / max(w, h)
-            img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
-    except Exception as e:
-        return None
+        for label, url, models in candidates:
+            picked = self._pick_vision_model(models)
+            if picked:
+                logger.info("autodetect: %s -> %s (all: %s)", label, picked, models)
+                return url, picked
 
-def vision_classify(image_path, source_name, model_name, lms_url=None):
-    """Classify image using LM Studio with autodetected model"""
-    lms_url = lms_url or LMS_URL
-    processing_path = Path(str(image_path) + ".processing")
-    try:
-        image_path.rename(processing_path)
-    except FileNotFoundError:
-        return "SKIPPED"
-    except Exception as e:
-        print(f"  [ERR] Failed to rename {image_path}: {e}", flush=True)
-        return "SKIPPED"
+        for label, _url, models in candidates:
+            logger.warning("autodetect: %s has no VL model loaded: %s", label, models)
+        return "", ""
 
-    stem = image_path.stem
-    txt_path = image_path.parent / f"{stem}.txt"
-    if not txt_path.exists():
-        txt_path = image_path.parent / f"{image_path.name}.txt"
-    meta_path = image_path.parent / f"{stem}.meta.json"
+    # ── Hooks ─────────────────────────────────────────────────────────────
 
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-        prompt_text = txt_path.read_text(encoding="utf-8").strip() if txt_path.exists() else ""
-    except FileNotFoundError:
-        return "SKIPPED"
+    def setup(self) -> None:
+        url, model = self._discover()
+        if not model:
+            raise SystemExit(
+                "no LM Studio instance with a vision-capable model found. Load "
+                "qwen2.5-vl-7b / qwen3-vl-8b / gemma-3-* / llava-* on at least "
+                "one of LMSTUDIO_PRIMARY_URL / LMSTUDIO_SECONDARY_URL and retry."
+            )
+        self.lms_url = url
+        self.model_id = model
 
-    msg_id_key = meta.get("message_id", stem)
+    def banner(self) -> None:
+        logger.info("=== Vision Worker (LM Studio %s) ===", self.name)
+        logger.info("  Primary URL:   %s", self.primary_url or "(unset)")
+        logger.info("  Secondary URL: %s", self.secondary_url or "(unset)")
+        logger.info("  Workers:       %d", self.parallel_workers)
 
-    img_bytes = processing_path.read_bytes()
-    if not img_bytes:
-        processing_path.unlink(missing_ok=True)
-        return {"category": "SKIPPED"}
-
-    small = resize_bytes(img_bytes)
-    if small is None:
-        return {"category": "DISCARD", "reason": "Image corrupt/invalid format/truncated"}
-
-    b64 = base64.standard_b64encode(small).decode()
-
-    from vision_prompt import build_classification_prompt, apply_scores, _safe_parse_vision_json, extract_message_text, build_response_format  # local import keeps module load-order safe
-    prompt_instruction = build_classification_prompt()
-
-    try:
-        response = requests.post(
-            f"{lms_url.rstrip('/')}/v1/chat/completions",
-            json={
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_instruction},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64}",
+    def classify_image_bytes(
+        self,
+        b64_jpeg: str,
+        prompt_instruction: str,
+    ) -> dict[str, Any] | None:
+        try:
+            response = requests.post(
+                f"{self.lms_url}/v1/chat/completions",
+                json={
+                    "model": self.model_id,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_instruction},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{b64_jpeg}",
+                                    },
                                 },
-                            },
-                        ],
-                    }
-                ],
-                "temperature": 0.1,
-                # Thinking-style models (qwen3-vl-*-thinking, deepseek-r1)
-                # need room for <think>...</think> + the JSON answer.
-                "max_tokens": 2000,
-                # JSON-schema constrained output (LM Studio structured output).
-                "response_format": build_response_format(),
-            },
-            timeout=TIMEOUT,
-        )
+                            ],
+                        }
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                    "response_format": build_response_format(),
+                },
+                timeout=self.request_timeout,
+            )
+        except requests.RequestException as exc:
+            logger.warning("LM Studio request failed: %s", exc)
+            return None
 
         if response.status_code != 200:
-            # Dump the full response body once so VL-vs-text model mismatches etc. are diagnosable.
-            print(f"  [LMS Error {response.status_code}] {response.text[:600].replace(chr(10),' ')}", flush=True)
-            processing_path.rename(image_path)
-            return {"category": "RETRY", "error": f"LMS API error {response.status_code}"}
+            preview = response.text[:600].replace("\n", " ")
+            logger.warning(
+                "LM Studio HTTP %d: %s", response.status_code, preview,
+            )
+            return None
 
         message = response.json()["choices"][0]["message"]
         raw = extract_message_text(message)
         parsed = _safe_parse_vision_json(raw)
         if parsed is None:
             preview = (raw or "")[:300].replace("\n", " ")
-            print(f"  [Error] empty/invalid JSON from {model_name}; raw={preview!r}", flush=True)
-            try:
-                processing_path.rename(image_path)
-            except OSError:
-                pass
-            return {"category": "RETRY"}
-        result = apply_scores(parsed)
+            logger.warning(
+                "empty/invalid JSON from %s@%s; raw=%r",
+                self.model_id, self.lms_url, preview,
+            )
+            return None
+        return parsed
 
-        final_category = result.get("category", "Unknown")
-
-        # Save to sorted folder with source-based subfolder
-        dest_dir = SORTED_DIR / final_category / source_name
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        safe_name = f"{final_category.lower()}_{msg_id_key}_{int(time.time())}_{random.randint(100,999)}"
-        ext = image_path.suffix
-        final_img = dest_dir / f"{safe_name}{ext}"
-        final_txt = dest_dir / f"{safe_name}.txt"
-        final_meta = dest_dir / f"{safe_name}.vision.json"
-
-        try:
-            import shutil
-            shutil.move(str(processing_path), str(final_img))
-            if txt_path.exists():
-                shutil.move(str(txt_path), str(final_txt))
-        except FileNotFoundError:
-            return "SKIPPED"
-
-        final_meta.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-        ovr = result.get("OVR_Quality_Score", 0)
-        rel = result.get("REL_Quality_Score", 0)
-        print(f"[{final_category}] OVR:{ovr} REL:{rel} | {image_path.name}", flush=True)
-        return final_category
-
-    except Exception as e:
-        err_str = str(e)
-        print(f"  [Error] {err_str[:100]}", flush=True)
-        try:
-            processing_path.rename(image_path)
-        except:
-            pass
-        return {"category": "RETRY"}
 
 def run_vision_worker() -> None:
-    print("=== Vision Worker (LMStudio Auto-Detect) ===", flush=True)
+    run_subclass(LMAutodetectWorker)
 
-    lms_url, model_name = discover_endpoint()
-    if not model_name:
-        print("  [ERROR] No LMStudio instance with a vision-capable model found.", flush=True)
-        print(f"  [ERROR] Primary URL:   {LMS_URL}", flush=True)
-        print(f"  [ERROR] Secondary URL: {LMS_URL_SECONDARY or '(not set)'}", flush=True)
-        print("  [ERROR] Load a VL model (e.g. qwen3-vl-8b, qwen2.5-vl-7b, gemma-3-*)", flush=True)
-        return
-
-    print(f"  Endpoint: {lms_url}", flush=True)
-    print(f"  Model:    {model_name}", flush=True)
-    print(f"  Workers:  {PARALLEL_WORKERS}", flush=True)
-
-    processed = 0
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
-        try:
-            while True:
-                source_name, img_path = get_next_image_round_robin()
-                if img_path is None:
-                    time.sleep(POLL_INTERVAL)
-                    continue
-
-                if not img_path.exists():
-                    continue
-
-                future = pool.submit(vision_classify, img_path, source_name, model_name, lms_url)
-                result = future.result(timeout=300)
-
-                if result not in ("SKIPPED", "RETRY"):
-                    processed += 1
-                    if processed % 10 == 0:
-                        print(f"  [Progress] Processed: {processed}", flush=True)
-
-        except KeyboardInterrupt:
-            print("\n[Stopped] Vision worker stopped", flush=True)
 
 if __name__ == "__main__":
     run_vision_worker()
