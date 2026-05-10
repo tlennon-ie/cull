@@ -94,7 +94,11 @@ class BaseVisionWorker(ABC):
 
     def __init__(self) -> None:
         self.sorted_dir: Path = sorted_dir()
-        for category in CATEGORIES:
+        # Pre-create the active taxonomy's folders so the first write doesn't
+        # race against mkdir. _finalise also mkdirs lazily so a category added
+        # while the worker is mid-run still routes correctly.
+        from categories import get_categories  # lazy: pick up edits made between imports
+        for category in get_categories():
             (self.sorted_dir / category).mkdir(parents=True, exist_ok=True)
         # Subclasses can stash backend-specific state here in setup().
         self._processed_count: int = 0

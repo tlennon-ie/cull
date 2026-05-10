@@ -217,6 +217,7 @@ class Supervisor:
         # dashboard writes new values the mtime changes, which we detect here
         # and use to trigger a soft restart so every child picks up fresh env.
         self._env_mtime: float = self._current_env_mtime()
+        self._categories_mtime: float = self._current_categories_mtime()
         self._struct_snapshot: dict[str, str] = _structural_env_snapshot()
         self._queue_dir: Path | None = None  # set by run_topic before start()
 
@@ -224,6 +225,17 @@ class Supervisor:
     def _current_env_mtime() -> float:
         try:
             return ENV_PATH.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    @staticmethod
+    def _current_categories_mtime() -> float:
+        """mtime of the user's categories file. Soft-restart workers when it
+        changes so the JSON-schema enum + per-category prompt hints land in
+        every child's process."""
+        from categories import ACTIVE_PATH
+        try:
+            return ACTIVE_PATH.stat().st_mtime
         except OSError:
             return 0.0
 
@@ -313,6 +325,14 @@ class Supervisor:
                 # are handled by the normal reconcile loop below; no restart needed.
                 print("  [env-reload] toggle change picked up (no soft-restart needed)", flush=True)
 
+        # Categories file edits also force a soft restart so workers pick up
+        # the new schema + prompt at their next spawn.
+        cats_mtime = self._current_categories_mtime()
+        if cats_mtime and cats_mtime != self._categories_mtime:
+            self._categories_mtime = cats_mtime
+            structural_changed = True
+            print("  [env-reload] categories file changed; soft-restarting children", flush=True)
+
         desired = compute_desired_agents(self.topic)
         self._desired_snapshot = desired
 
@@ -373,7 +393,8 @@ class Supervisor:
                 time.sleep(env_poll_interval)
                 now = time.monotonic()
                 env_bumped = self._current_env_mtime() != self._env_mtime
-                if env_bumped or (now - last_full) >= RECONCILE_SECONDS:
+                cats_bumped = self._current_categories_mtime() != self._categories_mtime
+                if env_bumped or cats_bumped or (now - last_full) >= RECONCILE_SECONDS:
                     self.reconcile()
                     last_full = now
         except KeyboardInterrupt:
@@ -401,8 +422,12 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
     queue_dir = queue_root if queue_root.name == slug else queue_root / slug
     sorted_dir = sorted_root if sorted_root.name == slug else sorted_root / slug
     queue_dir.mkdir(parents=True, exist_ok=True)
-    from categories import ALL_CATEGORIES
-    for cat in ALL_CATEGORIES:
+    # Pre-create category folders so the first vision-worker write doesn't
+    # race against mkdir. Read live so user-edited taxonomy is picked up at
+    # supervisor (re)start. Workers also mkdir lazily in _finalise as a
+    # belt-and-braces guard against new categories added mid-run.
+    from categories import get_all_categories
+    for cat in get_all_categories():
         (sorted_dir / cat).mkdir(parents=True, exist_ok=True)
 
     log_dir = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs_test")))

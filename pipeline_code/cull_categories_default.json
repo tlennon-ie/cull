@@ -1,0 +1,105 @@
+{
+  "default": "portrait_curation",
+  "presets": {
+    "portrait_curation": {
+      "label": "Portrait curation (default)",
+      "description": "Six-bucket taxonomy tuned for influencer / model photography. Keeps the strict photoreal + real-human gates that ship by default.",
+      "global_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every binary judgement consistent with that description. Your description and labels MUST agree - if your description says 'boulder smashing a car' you cannot then say woman_present=true.\n- BEFORE describing the subject, scan the WHOLE frame for: phone or browser UI elements, side-by-side panels or comparison grids, large text overlays / watermarks. If you see any of these, set the matching is_screenshot / is_composite_grid / contains_text_overlay field to true and MENTION it in `description`. These images are NEVER valid influencer photographs and category MUST be DISCARD.\n- An image is a SCREENSHOT only when the WHOLE FRAME is a screen capture. A normal photograph that happens to CONTAIN a phone, monitor, or screen as objects in the scene is NOT a screenshot.\n- An image is a COMPOSITE/GRID if it contains 2+ separate images, even if they all show similar subjects.\n- art_medium = `photograph` ONLY for an actual camera-captured (or AI-generated photoreal) image of a real-looking subject. Anime, cel-shaded art, hand-drawn illustration, oil/watercolour painting, comic, manga, stylised 3D, concept art -> the matching label, NEVER `photograph`.\n- A photograph of a STATUE, BUST, MANNEQUIN, DOLL, or SCULPTURE is NOT a photograph of a real human. is_human_photograph is FALSE in those cases, and woman_present is FALSE even if the sculpture depicts a female form.\n- photorealistic_style = TRUE ONLY when art_medium = `photograph` AND the subject reads as a real-world scene/person. Visible brush strokes, line art, cel shading, painterly textures, exaggerated proportions, or stylised lighting all force FALSE.\n- woman_present = TRUE ONLY if a real human female face or body is clearly visible as the primary OR co-primary subject of the image. Background pedestrians do NOT count. Sculpted/illustrated/animated figures do NOT count. DO NOT INFER a woman from the topic, caption, prompt, or context.\n- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face, wrong finger count, melted limbs, warped text).\n- nsfw = TRUE only for explicit nudity or sexual content.",
+      "categories": [
+        {
+          "name": "InstagramInfluencer",
+          "hint": "photorealistic woman, social-media aesthetic, no nudity, no overlay"
+        },
+        {
+          "name": "NSFW",
+          "hint": "photorealistic woman AND explicit nudity/sexual content"
+        },
+        {
+          "name": "Professional",
+          "hint": "photorealistic woman, studio/editorial polish, no nudity, no overlay"
+        },
+        {
+          "name": "Amateur",
+          "hint": "photorealistic woman, casual/selfie style, no overlay"
+        },
+        {
+          "name": "Unknown",
+          "hint": "photorealistic woman but doesn't fit categories above"
+        },
+        {
+          "name": "Watermarked",
+          "hint": "photorealistic woman, all other gates pass, BUT contains_text_overlay=true (visible watermark, branded caption, logo overlay, infographic text). The shot itself is salvageable if the overlay is removed - so route here instead of DISCARD"
+        }
+      ]
+    },
+    "lora_basic": {
+      "label": "LoRA dataset (3-bucket triage)",
+      "description": "Minimal triage for LoRA / fine-tune dataset prep. Keep the obvious wins, send the rest to Borderline for human review. Drops the woman-specific gates so it works for any topic.",
+      "global_rules": "STRICT JUDGEMENT RULES:\n- Describe the pixels literally first; pick a category second. The description and labels must agree.\n- art_medium = `photograph` ONLY for camera-captured (or AI photoreal) images. Anime / illustration / 3D render / digital painting -> their respective label.\n- has_ai_flaws = TRUE only for severe artefacts (malformed faces, wrong finger count, warped text, melted limbs).\n- A SCREENSHOT is the WHOLE frame being a screen capture. A photo that contains a phone/monitor as a scene object is not a screenshot.\n- A COMPOSITE/GRID is 2+ separate images stitched together.\n- nsfw = TRUE only for explicit nudity or sexual content.\n- The curation topic only informs REL_Quality_Score; do NOT use it to invent details that aren't in the pixels.",
+      "categories": [
+        {
+          "name": "Keep",
+          "hint": "strong example of the curation topic, no severe AI flaws, no overlay/watermark, OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+        },
+        {
+          "name": "Borderline",
+          "hint": "on-topic and usable but average quality, or one minor issue (mild AI flaws, soft focus). Bucket for human review"
+        },
+        {
+          "name": "OffTopic",
+          "hint": "unrelated to the curation topic regardless of quality (REL_Quality_Score < 30)"
+        }
+      ]
+    },
+    "art_style": {
+      "label": "By art medium",
+      "description": "Sort an archive by what kind of image it is, not by quality. Useful for splitting a mixed dataset (photos + anime + 3D renders) into per-style training sets.",
+      "global_rules": "STRICT JUDGEMENT RULES:\n- Describe the pixels literally first; pick a category second.\n- art_medium is the source of truth for routing. Choose ONE of: photograph, digital_painting, anime, 3d_render, illustration, mixed, unclear.\n- A photo that has been heavily filtered (Instagram-style preset, soft glow) is still a photograph.\n- AI photoreal that is genuinely indistinguishable from camera output is `photograph`.\n- nsfw = TRUE only for explicit nudity or sexual content.\n- The curation topic only informs REL_Quality_Score; do NOT use it to invent details that aren't in the pixels.",
+      "categories": [
+        {
+          "name": "Photograph",
+          "hint": "art_medium=photograph and photorealistic_style=true; real-world or photoreal AI subject"
+        },
+        {
+          "name": "Anime",
+          "hint": "anime / manga / cel-shaded aesthetic; visible line art, oversized eyes, flat colour fills, exaggerated proportions"
+        },
+        {
+          "name": "DigitalPainting",
+          "hint": "painterly textures, brush strokes visible, art_medium=digital_painting"
+        },
+        {
+          "name": "Render3D",
+          "hint": "3D-rendered look, CGI lighting, art_medium=3d_render"
+        },
+        {
+          "name": "Illustration",
+          "hint": "vector / flat / line-art illustration, including comics and infographics"
+        },
+        {
+          "name": "Mixed",
+          "hint": "deliberately mixed-media composition, or doesn't clearly fit one of the buckets above"
+        }
+      ]
+    },
+    "quality_only": {
+      "label": "By quality only",
+      "description": "Topic-agnostic quality triage. Routes purely on OVR_Quality_Score. Useful for filtering a personal archive without imposing a taxonomy.",
+      "global_rules": "STRICT JUDGEMENT RULES:\n- Describe the pixels literally first; pick a category second.\n- Route on OVR_Quality_Score only. The curation topic informs REL_Quality_Score but does not affect category here.\n- has_ai_flaws = TRUE only for severe artefacts.\n- nsfw = TRUE only for explicit nudity or sexual content.",
+      "categories": [
+        {
+          "name": "Top",
+          "hint": "OVR_Quality_Score >= 80, no severe AI flaws, no overlay"
+        },
+        {
+          "name": "Mid",
+          "hint": "OVR_Quality_Score 60-79"
+        },
+        {
+          "name": "Low",
+          "hint": "OVR_Quality_Score 40-59 OR mild AI flaws"
+        }
+      ]
+    }
+  }
+}

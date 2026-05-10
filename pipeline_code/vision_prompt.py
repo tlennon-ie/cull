@@ -29,7 +29,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from categories import SCHEMA_CATEGORIES, category_pipe_string
+from categories import (
+    SCHEMA_CATEGORIES,
+    category_pipe_string,
+    get_category_hints,
+    get_global_rules,
+    get_schema_categories,
+)
 
 # Ten-criteria rubric used by competition judges / art directors.
 _OVR_CRITERIA = (
@@ -348,6 +354,22 @@ def build_classification_prompt(
         caption_block = (
             "\nAUTO-CAPTION: disabled. Return `caption` as an empty string.\n"
         )
+    # Per-taxonomy bits: rules + bullet list rebuilt every call so the user can
+    # edit them in the dashboard without restarting workers.
+    global_rules = get_global_rules().rstrip()
+    if global_rules and not global_rules.endswith("\n"):
+        global_rules = global_rules + "\n"
+    category_bullets = "\n".join(
+        f"- {name}: {hint}" for name, hint in get_category_hints()
+    )
+    if category_bullets:
+        category_bullets += "\n"
+    # DISCARD is always last-resort; spell it out so the model knows it's an
+    # explicit option even though it's not in the user-edited list.
+    category_bullets += (
+        "- DISCARD: image fails the gates above OR doesn't fit any keep bucket."
+    )
+
     return (
         "You are a strict, literal image auditor. You will be told the topic "
         "an admin is curating, but the topic ONLY informs REL_Quality_Score. "
@@ -374,80 +396,16 @@ def build_classification_prompt(
         '  "reason": "One short sentence explaining the call.",\n'
         f'{caption_field_doc}\n'
         "}\n\n"
-        "STRICT JUDGEMENT RULES (no exceptions):\n"
-        "- Fill `description` and `primary_subject` FIRST, from the pixels only. "
-        "Then make every binary judgement consistent with that description. "
-        "Your description and labels MUST agree - if your description says "
-        "'boulder smashing a car' you cannot then say woman_present=true.\n"
-        "- BEFORE describing the subject, scan the WHOLE frame for: phone or "
-        "browser UI elements (status bar, battery icon, app chrome, reddit/"
-        "twitter/instagram interface, comment threads, address bars), "
-        "side-by-side panels or comparison grids (multiple distinct images "
-        "separated by borders or labels), and large text overlays / "
-        "watermarks (e.g. 'Flux 9B', '1GIRL GARDENS', subtitle text, brand "
-        "logos). If you see any of these, set the matching is_screenshot / "
-        "is_composite_grid / contains_text_overlay field to true and "
-        "MENTION it in `description`. These images are NEVER valid "
-        "influencer photographs and category MUST be DISCARD.\n"
-        "- An image is a SCREENSHOT only when the WHOLE FRAME is a screen "
-        "capture - i.e. the entire image IS the phone/desktop/browser "
-        "interface. Look for chrome surrounding the content: phone status "
-        "bar, battery/time, OS icons, browser address bar, app UI, post "
-        "metadata, comment threads. A normal photograph that happens to "
-        "CONTAIN a phone, a monitor, a TV, or a computer screen as objects "
-        "in the scene is NOT a screenshot. A woman holding a phone for a "
-        "selfie is NOT a screenshot. is_screenshot must be false unless "
-        "you'd describe the whole image as 'a screenshot of <app/site>'.\n"
-        "- An image is a COMPOSITE/GRID if it contains 2+ separate images, "
-        "even if they all show similar subjects. Hint: visible vertical or "
-        "horizontal seams, repeated near-identical figures, distinct titles "
-        "above each panel, or labels like 'Model A vs Model B'.\n"
-        "- art_medium = `photograph` ONLY for an actual camera-captured (or "
-        "AI-generated *photoreal*) image of a real-looking subject. Anime, "
-        "cel-shaded art, hand-drawn illustration, oil/watercolour painting, "
-        "comic, manga, stylised 3D, concept art -> the matching label, "
-        "NEVER `photograph`. SIGNALS that mean NOT a photograph: cel-shaded "
-        "skin, oversized eyes, hand-drawn outlines, flat colour fills, "
-        "exaggerated saturated hair, painterly brush textures, 2D-render "
-        "look, anime/manga aesthetic. If you see ANY of these, art_medium "
-        "is one of {anime, illustration, digital_painting} and "
-        "photorealistic_style MUST be false.\n"
-        "- A photograph of a STATUE, BUST, MANNEQUIN, DOLL, or SCULPTURE is "
-        "NOT a photograph of a real human. is_human_photograph is FALSE in "
-        "those cases, and woman_present is FALSE even if the sculpture "
-        "depicts a female form.\n"
-        "- photorealistic_style = TRUE ONLY when art_medium = `photograph` "
-        "AND the subject reads as a real-world scene/person. Visible brush "
-        "strokes, line art, cel shading, painterly textures, exaggerated "
-        "proportions, or stylised lighting all force FALSE.\n"
-        "- woman_present = TRUE ONLY if a real human female face or body is "
-        "clearly visible as the primary OR co-primary subject of the image. "
-        "Background pedestrians do NOT count. Sculpted/illustrated/animated "
-        "figures do NOT count. DO NOT INFER a woman from the topic, caption, "
-        "prompt, or context.\n"
-        "- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face, "
-        "wrong finger count, melted limbs, warped text).\n"
-        "- nsfw = TRUE only for explicit nudity or sexual content.\n\n"
+        f"{global_rules}\n"
         "OVR_Quality_Score rubric - ten criteria, weighted equally, average them:\n"
         + "\n".join(f"  {c}" for c in _OVR_CRITERIA) + "\n\n"
         "REL_Quality_Score: how close the image sits to the *platonic ideal* "
-        "of the curation topic. If photorealistic_style or woman_present is "
-        "false, REL must be <= 30. Reserve 90+ for images indistinguishable "
+        "of the curation topic. Reserve 90+ for images indistinguishable "
         "from a top-tier real creator's portfolio in that genre.\n\n"
         f"{_RUBRIC_ANCHOR}\n"
         f"{notes}\n"
         "CATEGORY ASSIGNMENT (apply in order, first match wins):\n"
-        "- DISCARD: photorealistic_style=false OR woman_present=false OR "
-        "art_medium != 'photograph' OR has_ai_flaws=true with quality<=4.\n"
-        "- NSFW: photorealistic woman AND explicit nudity/sexual content.\n"
-        "- Watermarked: photorealistic woman, all other gates pass, BUT "
-        "contains_text_overlay=true (visible watermark, branded caption, "
-        "logo overlay, infographic text). The shot itself is salvageable "
-        "if the overlay is removed - so route here instead of DISCARD.\n"
-        "- InstagramInfluencer: photorealistic woman, social-media aesthetic, no nudity, no overlay.\n"
-        "- Professional: photorealistic woman, studio/editorial polish, no nudity, no overlay.\n"
-        "- Amateur: photorealistic woman, casual/selfie style, no overlay.\n"
-        "- Unknown: photorealistic woman but doesn't fit categories above."
+        f"{category_bullets}"
         + caption_block
     )
 
@@ -587,7 +545,22 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     has_woman = bool(result.get("woman_present"))
     is_human_photo = bool(result.get("is_human_photograph"))
 
-    if not photoreal or not has_woman or not is_human_photo:
+    # The portrait-curation default taxonomy demands all three gates; other
+    # taxonomies (art-style sorting, quality-only, generic LoRA triage) don't
+    # care about woman_present or photoreal. We only enforce the photoreal +
+    # woman + real-human gates when the user's active taxonomy includes the
+    # portrait-style category names that depend on them.
+    active_categories = set(get_schema_categories())
+    portrait_mode = (
+        "InstagramInfluencer" in active_categories
+        or "Professional" in active_categories
+        or "Amateur" in active_categories
+    )
+    nsfw_routing = "NSFW" in active_categories
+    watermark_routing = "Watermarked" in active_categories
+    unknown_routing = "Unknown" in active_categories
+
+    if portrait_mode and (not photoreal or not has_woman or not is_human_photo):
         result["category"] = "DISCARD"
         if not photoreal:
             reasons.append("not photorealistic")
@@ -606,9 +579,9 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
     elif result.get("has_ai_flaws") and int(result.get("quality_score", 0) or 0) <= 4:
         result["category"] = "DISCARD"
         result["score_reason"] = "severe AI flaws + low quality_score"
-    elif result.get("nsfw"):
+    elif nsfw_routing and result.get("nsfw"):
         result["category"] = "NSFW"
-    elif result.get("contains_text_overlay") or overlay_token:
+    elif watermark_routing and (result.get("contains_text_overlay") or overlay_token):
         # Photo passes every quality gate but has a watermark / branded text
         # overlay. The model might be wrong (real-world signage misread as a
         # watermark), but in either case the underlying shot is salvageable -
@@ -617,13 +590,23 @@ def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict
         result["category"] = "Watermarked"
         token = overlay_token or "model flagged overlay"
         result["score_reason"] = f"watermark/overlay detected ({token!r})"
-    elif result.get("category") == "DISCARD":
+    elif result.get("category") == "DISCARD" and unknown_routing and portrait_mode:
         # Rescue: the model said DISCARD off the back of its own (now-corrected)
         # contradictory booleans. All gates pass and it isn't NSFW, but we
         # don't have enough signal to pick between InstagramInfluencer /
         # Professional / Amateur, so park it in Unknown for admin review.
         result["category"] = "Unknown"
         result["score_reason"] = "rescued from DISCARD after boolean self-contradiction"
+
+    # If the model returned a category that isn't in the active taxonomy
+    # (e.g. user removed it after the worker spawned), force DISCARD so the
+    # finalise step doesn't try to mkdir an unknown bucket.
+    final_cat = result.get("category")
+    if final_cat not in active_categories and final_cat != "DISCARD":
+        result["category"] = "DISCARD"
+        result["score_reason"] = (result.get("score_reason") or "") + (
+            f"; model picked {final_cat!r} which is not in the active taxonomy"
+        )
 
     # ─── Admin score thresholds (SFW only) ────────────────────────────────
     # Once the basic gates pass (photoreal + woman + real-human-photo), an
@@ -760,7 +743,7 @@ def build_response_format() -> dict[str, Any]:
                     "quality_score":        {"type": "integer", "minimum": 1, "maximum": 10},
                     "category": {
                         "type": "string",
-                        "enum": list(SCHEMA_CATEGORIES),
+                        "enum": list(get_schema_categories()),
                     },
                     "reason": {"type": "string", "minLength": 5, "maxLength": 300},
                     "caption": {"type": "string", "minLength": 0, "maxLength": 2000},

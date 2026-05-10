@@ -353,6 +353,92 @@ def api_pipeline_stop():
         return jsonify({"success": True, "lmstudio_unload": unload_payload})
 
 
+# ── API: categories (user-editable taxonomy) ──────────────────────────────────
+
+import categories as _categories_mod
+
+_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+_MAX_CATEGORIES = 12
+
+
+def _validate_categories_payload(payload: Any) -> tuple[dict[str, Any] | None, str]:
+    """Return (clean_payload, error). On error, payload is None."""
+    if not isinstance(payload, dict):
+        return None, "payload must be an object"
+    cats = payload.get("categories")
+    if not isinstance(cats, list) or not cats:
+        return None, "categories must be a non-empty list"
+    if len(cats) > _MAX_CATEGORIES:
+        return None, f"max {_MAX_CATEGORIES} categories"
+    seen: set[str] = set()
+    cleaned: list[dict[str, str]] = []
+    for entry in cats:
+        if not isinstance(entry, dict):
+            return None, "each category must be an object with name + hint"
+        name = (entry.get("name") or "").strip()
+        hint = (entry.get("hint") or "").strip()
+        if not _CAT_NAME_RE.match(name):
+            return None, f"invalid category name {name!r} (letters/digits/_ only, must start with letter, max 32 chars)"
+        if name in {"DISCARD", "CORRUPT"}:
+            return None, f"{name!r} is reserved for the system"
+        if name in seen:
+            return None, f"duplicate category name {name!r}"
+        seen.add(name)
+        cleaned.append({"name": name, "hint": hint})
+    rules = payload.get("global_rules") or ""
+    if not isinstance(rules, str):
+        return None, "global_rules must be a string"
+    if len(rules) > 8000:
+        return None, "global_rules too long (max 8000 chars)"
+    preset = (payload.get("preset") or "custom").strip() or "custom"
+    return {"preset": preset, "categories": cleaned, "global_rules": rules}, ""
+
+
+@app.route("/api/categories")
+def api_categories_get():
+    return jsonify({
+        "active": _categories_mod.get_active(),
+        "presets": _categories_mod.get_presets()["presets"],
+        "default_preset": _categories_mod.get_presets().get("default"),
+        "system_terminal": list(_categories_mod.SYSTEM_TERMINAL),
+    })
+
+
+@app.route("/api/categories", methods=["POST"])
+def api_categories_set():
+    payload = request.get_json() or {}
+    cleaned, err = _validate_categories_payload(payload)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    # If user is removing a category that already has sorted images, warn
+    # unless they sent ?force=1.
+    force = request.args.get("force") == "1"
+    new_names = {c["name"] for c in cleaned["categories"]}
+    current_names = set(_categories_mod.get_categories())
+    removed = current_names - new_names
+    if removed and not force and PIPELINE_SORTED.exists():
+        legacy: dict[str, int] = {}
+        for cat in removed:
+            count = 0
+            for topic_dir in PIPELINE_SORTED.iterdir():
+                cat_dir = topic_dir / cat
+                if cat_dir.is_dir():
+                    count += sum(1 for _ in cat_dir.rglob("*.jpg")) + sum(1 for _ in cat_dir.rglob("*.png"))
+            if count:
+                legacy[cat] = count
+        if legacy:
+            return jsonify({
+                "ok": False,
+                "error": "removing_populated_categories",
+                "legacy": legacy,
+                "hint": "These categories still have sorted images. Requeue them first via tools/requeue_sorted.py, or POST again with ?force=1 to remove anyway (folders stay on disk).",
+            }), 409
+
+    _categories_mod.set_active(cleaned)
+    return jsonify({"ok": True, "active": cleaned})
+
+
 @app.route("/api/lmstudio/unload", methods=["POST"])
 def api_lmstudio_unload():
     """Manually unload every loaded LM Studio model. Always callable."""
@@ -2469,6 +2555,91 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
 
+      <!-- Categories: user-editable taxonomy. Lives in data/cull_categories.json,
+           not .env, so the supervisor watches its mtime separately. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <h3 class="font-semibold">Categories</h3>
+            <p class="text-xs text-slate-400">
+              The classification taxonomy: keep-buckets, per-bucket prompt hints, and the global judgement rules
+              that get injected into every vision call. Saved to <code>data/cull_categories.json</code>;
+              workers soft-restart automatically on save. <code>DISCARD</code> and <code>CORRUPT</code> are reserved.
+            </p>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button @click="loadCategories()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
+            <button @click="saveCategories()" :disabled="cats.saving"
+                    class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
+              <span x-text="cats.saving ? 'Saving...' : 'Save categories'"></span>
+            </button>
+          </div>
+        </div>
+        <div x-show="cats.banner" x-cloak
+             class="border text-xs px-3 py-2 rounded mb-3"
+             :class="cats.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
+                                   : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+             x-text="cats.banner"></div>
+
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          <label class="text-xs text-slate-400">Load preset:</label>
+          <select x-model="cats.presetSelect"
+                  class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+            <template x-for="(preset, key) in cats.presets" :key="key">
+              <option :value="key" x-text="preset.label || key"></option>
+            </template>
+          </select>
+          <button @click="applyPreset()"
+                  class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">
+            Apply preset (replaces current edits)
+          </button>
+          <span class="text-[11px] text-slate-500 ml-auto" x-text="'Active preset: ' + (cats.draft.preset || 'custom')"></span>
+        </div>
+
+        <div class="space-y-2 mb-4">
+          <template x-for="(cat, idx) in cats.draft.categories" :key="idx">
+            <div class="flex items-start gap-2 bg-slate-900/40 border border-slate-800 rounded p-2">
+              <div class="flex flex-col gap-1 shrink-0">
+                <button @click="moveCategory(idx, -1)" :disabled="idx === 0"
+                        class="px-1.5 py-0.5 text-[10px] bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-30"
+                        title="Move up">↑</button>
+                <button @click="moveCategory(idx, 1)" :disabled="idx === cats.draft.categories.length - 1"
+                        class="px-1.5 py-0.5 text-[10px] bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-30"
+                        title="Move down">↓</button>
+              </div>
+              <div class="flex-1 grid md:grid-cols-3 gap-2">
+                <label class="block">
+                  <span class="text-[10px] text-slate-500 uppercase tracking-wider">Name</span>
+                  <input x-model="cat.name" placeholder="CategoryName"
+                         class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 mt-0.5 font-mono text-xs"/>
+                </label>
+                <label class="block md:col-span-2">
+                  <span class="text-[10px] text-slate-500 uppercase tracking-wider">Hint (injected into the prompt)</span>
+                  <textarea x-model="cat.hint" rows="2"
+                            placeholder="when should the model pick this category?"
+                            class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 mt-0.5 text-xs leading-snug"></textarea>
+                </label>
+              </div>
+              <button @click="removeCategory(idx)"
+                      class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded shrink-0"
+                      title="Remove this category">✕</button>
+            </div>
+          </template>
+          <button @click="addCategory()"
+                  :disabled="cats.draft.categories.length >= 12"
+                  class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">
+            + Add category <span class="text-slate-500" x-text="'(' + cats.draft.categories.length + '/12)'"></span>
+          </button>
+        </div>
+
+        <label class="block">
+          <span class="text-xs text-slate-400">Global judgement rules (prepended to CATEGORY ASSIGNMENT in the prompt)</span>
+          <textarea x-model="cats.draft.global_rules" rows="6"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-[11px] leading-snug"></textarea>
+          <span class="text-[10px] text-slate-500">Free-text. Used verbatim by every vision worker. Keep portrait-specific gates here when using the default taxonomy; relax them when sorting by art-style or quality only.</span>
+        </label>
+      </div>
+
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Discord access</h3>
         <p class="text-xs text-slate-400 mb-3">
@@ -2993,6 +3164,12 @@ function dashboard() {
     settings: {}, settingsBanner: '', settingsBannerOk: true,
     settingsDirty: false, settingsErrors: {},
     providerTest: {},
+    cats: {
+      draft: { preset: 'portrait_curation', categories: [], global_rules: '' },
+      presets: {},
+      presetSelect: 'portrait_curation',
+      banner: '', bannerOk: true, saving: false, loaded: false,
+    },
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
     workerDescriptions: {
@@ -3107,6 +3284,77 @@ function dashboard() {
       } catch (e) {
         this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
       }
+    },
+    async loadCategories() {
+      try {
+        const r = await fetch('/api/categories');
+        const j = await r.json();
+        this.cats.presets = j.presets || {};
+        this.cats.draft = JSON.parse(JSON.stringify(j.active || { preset: 'custom', categories: [], global_rules: '' }));
+        this.cats.presetSelect = this.cats.draft.preset in this.cats.presets ? this.cats.draft.preset : (j.default_preset || Object.keys(this.cats.presets)[0] || 'portrait_curation');
+        this.cats.loaded = true;
+        this.cats.banner = '';
+      } catch (e) {
+        this.cats.banner = 'Failed to load categories: ' + e.message;
+        this.cats.bannerOk = false;
+      }
+    },
+    applyPreset() {
+      const preset = this.cats.presets[this.cats.presetSelect];
+      if (!preset) return;
+      if (this.cats.draft.categories.length && !confirm('Replace current categories + rules with the "' + (preset.label || this.cats.presetSelect) + '" preset?')) return;
+      this.cats.draft = {
+        preset: this.cats.presetSelect,
+        categories: JSON.parse(JSON.stringify(preset.categories || [])),
+        global_rules: preset.global_rules || '',
+      };
+    },
+    addCategory() {
+      if (this.cats.draft.categories.length >= 12) return;
+      this.cats.draft.categories.push({ name: '', hint: '' });
+    },
+    removeCategory(idx) {
+      this.cats.draft.categories.splice(idx, 1);
+    },
+    moveCategory(idx, delta) {
+      const target = idx + delta;
+      if (target < 0 || target >= this.cats.draft.categories.length) return;
+      const list = this.cats.draft.categories;
+      [list[idx], list[target]] = [list[target], list[idx]];
+    },
+    async saveCategories(force) {
+      this.cats.saving = true;
+      this.cats.banner = '';
+      const url = '/api/categories' + (force ? '?force=1' : '');
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(this.cats.draft),
+        });
+        const j = await r.json();
+        if (r.ok && j.ok) {
+          this.cats.banner = 'Saved. Workers will soft-restart on the next reconcile tick (~1s).';
+          this.cats.bannerOk = true;
+          this.cats.draft = JSON.parse(JSON.stringify(j.active));
+          setTimeout(() => this.cats.banner = '', 6000);
+        } else if (r.status === 409 && j.error === 'removing_populated_categories') {
+          const list = Object.entries(j.legacy).map(([k, v]) => `${k} (${v})`).join(', ');
+          if (confirm(`These categories still have sorted images: ${list}.\n\nRequeue them via tools/requeue_sorted.py first if you want them reclassified.\n\nProceed anyway? Folders stay on disk.`)) {
+            await this.saveCategories(true);
+            return;
+          }
+          this.cats.banner = 'Save cancelled — populated categories not removed.';
+          this.cats.bannerOk = false;
+        } else {
+          this.cats.banner = 'Save failed: ' + (j.error || 'unknown error');
+          this.cats.bannerOk = false;
+        }
+      } catch (e) {
+        this.cats.banner = 'Network error: ' + e.message;
+        this.cats.bannerOk = false;
+      }
+      this.cats.saving = false;
     },
     async unloadLmStudio() {
       this.lmstudioUnload = { busy: true, ok: null, message: 'Unloading...' };
@@ -3451,6 +3699,7 @@ function dashboard() {
           this.loadGallery();
           this.loadGalleryInsights();
         }
+        if (tab === 'settings' && !this.cats.loaded) this.loadCategories();
       });
       setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
       // Self-update: check on load, then every 30 minutes. The endpoint is
