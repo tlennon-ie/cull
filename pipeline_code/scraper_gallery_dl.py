@@ -1,9 +1,12 @@
 """scraper_gallery_dl.py - Generic URL scraper backed by gallery-dl.
 
-Wraps the `gallery-dl` library (https://github.com/mikf/gallery-dl) so cull
+Wraps the `gallery-dl` library (https://codeberg.org/mikf/gallery-dl) so cull
 can pull images from any of its 340+ supported sites (Pixiv, DeviantArt, the
 booru family, ArtStation, Tumblr, Newgrounds, FurAffinity / e621, Imgur,
 Flickr, Reddit, X, etc.) without writing per-site code.
+
+Pinned to a specific tag in `requirements.txt` (currently v1.32.1). gallery-dl
+is maintained by Mike Fährmann (@mikf) — see README's Acknowledgements section.
 
 Configuration (all read from .env, all editable from the dashboard):
 

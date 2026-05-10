@@ -22,7 +22,11 @@ groq>=0.11                        # Groq cloud worker
 # ── Scrapers ─────────────────────────────────────────────────────────────
 playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install
 schedule>=1.2                     # vision_worker_lm_keepalive.py
-gallery-dl>=1.27                  # generic URL scraper (Pixiv/DeviantArt/booru/X/Reddit/Tumblr/...)
+# gallery-dl now lives on Codeberg (mikf moved his canonical mirror in 2024).
+# Pinned to a specific tag so cull's behaviour doesn't drift when upstream
+# breaks an extractor. Bump deliberately after smoke-testing the relevant
+# scrapers.
+gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.1
 
 # ── Optional dev tools (uncomment for development) ───────────────────────
 # pytest>=8.0
