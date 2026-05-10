@@ -276,6 +276,7 @@ def api_status():
         },
         "errors": errors,
         "error_count": len(errors),
+        "indexer": _index_status_payload(),
     })
 
 
@@ -1698,6 +1699,32 @@ HTML_TEMPLATE = r"""<!doctype html>
 <body class="min-h-screen bg-slate-950 text-slate-100">
 <div x-data="dashboard()" x-init="start()" class="flex min-h-screen">
 
+  <!-- Indexer cold-scan toast — bottom-left, fires once on first run when
+       the SQLite index is being populated for the first time. -->
+  <div x-show="indexerToast.show" x-cloak x-transition.opacity
+       class="fixed bottom-4 left-4 z-50 max-w-sm bg-slate-900 border border-amber-700 rounded-lg shadow-2xl p-4 text-sm">
+    <div class="flex items-start gap-3">
+      <svg class="w-5 h-5 mt-0.5 text-amber-400 animate-spin shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" stroke-linecap="round"/>
+      </svg>
+      <div class="flex-1">
+        <div class="font-semibold mb-1">First-time indexing</div>
+        <div class="text-xs text-slate-300 mb-2">
+          cull is building its SQLite index from the existing
+          <span x-show="indexer.queue_total + indexer.sorted_total === 0">queue + sorted folders</span>
+          dataset for the first time. This is a one-time cost — subsequent
+          launches read from <code class="text-amber-300">data/cull_index.sqlite3</code>
+          and start instantly.
+        </div>
+        <div class="text-xs text-slate-400 font-mono mb-3"
+             x-text="(indexer.files_seen || 0).toLocaleString() + ' files scanned · ' + (indexer.files_added || 0).toLocaleString() + ' rows committed'">
+        </div>
+        <button @click="indexerToast.show = false; indexerToast.dismissed = true"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs">Dismiss</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Update toast — bottom-right, rendered only when a newer commit exists on origin/main.
        Dismissal is keyed on remote SHA so a new release re-toasts. -->
   <div x-show="update.available" x-cloak x-transition.opacity
@@ -1761,6 +1788,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         x-text="tab.label"></button>
     </template>
     <div class="pt-6 text-xs text-slate-500" x-text="'Refreshed: ' + lastRefresh"></div>
+    <!-- Indexer status: shown only while a scan is running OR while there are
+         indexed rows but no successful scan timestamp yet (initial bootstrap).
+         The dashboard polls /api/status every 5 s; the indexer payload is
+         baked into that response so we don't add a third poll. -->
+    <div x-show="indexer.in_progress" x-cloak
+         class="mt-2 flex items-center gap-2 text-[11px] text-amber-300">
+      <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" stroke-linecap="round"/>
+      </svg>
+      <span x-text="'Indexing ' + (indexer.files_seen || 0).toLocaleString() + ' files'"></span>
+    </div>
+    <div x-show="!indexer.in_progress && indexer.last_scan_at" x-cloak
+         class="mt-2 text-[11px] text-slate-500"
+         x-text="'Indexed ' + ((indexer.queue_total || 0) + (indexer.sorted_total || 0)).toLocaleString() + ' images'">
+    </div>
   </aside>
 
   <!-- Backdrop when sidebar is open on mobile. -->
@@ -3113,6 +3155,8 @@ function dashboard() {
     },
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
+    indexer: { in_progress: false, files_seen: 0, files_added: 0, queue_total: 0, sorted_total: 0, last_scan_at: null, scan_started_at: null },
+    indexerToast: { show: false, dismissed: false },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':            'LMStudio PRIMARY endpoint',
@@ -3172,6 +3216,18 @@ function dashboard() {
       if (out.queue)     this.queueFiles = out.queue;
       if (out.history)   this.history = out.history;
       if (out.activity)  this.activity = out.activity;
+      // Indexer state rides on /api/status so we don't add a third poll.
+      if (out.status && out.status.indexer) {
+        this.indexer = out.status.indexer;
+        // Show the cold-scan toast once: when in_progress flips on AND no
+        // prior successful scan timestamp exists. Stays dismissed for the
+        // session so it doesn't pop again on refresh.
+        if (this.indexer.in_progress && !this.indexer.last_scan_at && !this.indexerToast.dismissed) {
+          this.indexerToast.show = true;
+        } else if (!this.indexer.in_progress) {
+          this.indexerToast.show = false;
+        }
+      }
       // Only seed settings on first load OR when the user explicitly hits Reload.
       if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
         this.settings = out.settings;
@@ -3746,16 +3802,37 @@ def _start_indexer_thread() -> None:
     )
 
 
-@app.route("/api/index/status")
-def api_index_status():
-    """Surface the indexer's progress so the UI can show 'still indexing X
-    images' rather than appearing stuck on first start."""
-    return jsonify({
+def _index_status_payload() -> dict[str, Any]:
+    """Snapshot of the indexer's state for the UI.
+
+    Reads scan_meta keys that scan() updates as it runs. ``in_progress``
+    flips to true when a scan starts, false when it ends (including on
+    failure). ``files_seen`` / ``files_added`` climb live during a cold
+    backfill so the UI can display 'scanning 12,345 files...' instead of
+    appearing frozen.
+    """
+    in_progress_raw = index_store.get_meta("scan_in_progress")
+    last_report_raw = index_store.get_meta("last_scan_report")
+    try:
+        last_report = json.loads(last_report_raw) if last_report_raw else None
+    except json.JSONDecodeError:
+        last_report = None
+    started_at = index_store.get_meta("scan_started_at")
+    return {
         "queue_total": index_store.total("queue"),
         "sorted_total": index_store.total("sorted"),
-        "last_scan_at": index_store.get_meta("last_scan_at"),
-        "last_scan_report": index_store.get_meta("last_scan_report"),
-    })
+        "in_progress": in_progress_raw == "1",
+        "files_seen": int(index_store.get_meta("scan_files_seen") or 0),
+        "files_added": int(index_store.get_meta("scan_files_added") or 0),
+        "scan_started_at": float(started_at) if started_at else None,
+        "last_scan_at": float(index_store.get_meta("last_scan_at") or 0) or None,
+        "last_scan_report": last_report,
+    }
+
+
+@app.route("/api/index/status")
+def api_index_status():
+    return jsonify(_index_status_payload())
 
 
 if __name__ == "__main__":

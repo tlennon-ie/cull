@@ -535,80 +535,134 @@ class ScanReport:
     duration_seconds: float = 0.0
 
 
-def scan(*, queue_root: Path, sorted_root: Path) -> ScanReport:
-    """Single-pass index update. Idempotent and safe to run repeatedly."""
+# Commit pending rows to SQLite every BATCH_SIZE upserts so observers (the
+# dashboard, the user) see counts climb during the scan instead of waiting
+# for the entire walk to finish in memory. Also emit a console line every
+# PROGRESS_LOG_INTERVAL files so a user watching the launcher terminal can
+# see the cold backfill making progress.
+_BATCH_SIZE = 500
+_PROGRESS_LOG_INTERVAL = 1000
+
+
+def scan(
+    *,
+    queue_root: Path,
+    sorted_root: Path,
+    progress_callback: Any = None,
+    log_progress: bool = True,
+) -> ScanReport:
+    """Single-pass index update. Idempotent, streams commits during the walk.
+
+    progress_callback(files_seen, files_added) is invoked every BATCH_SIZE
+    new rows and at end of scan. Pass None to disable; the indexer thread
+    uses it to update scan_meta keys for the API.
+    """
     start = time.monotonic()
     report = ScanReport()
     existing = existing_paths()
     seen: set[str] = set()
-    upserts: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    files_seen = 0
+    files_added = 0
+    last_log = 0
 
-    if sorted_root.exists():
-        for image_path in sorted_root.glob("**/*"):
-            if not _is_image(image_path) or _is_in_archive(image_path):
-                continue
+    set_meta("scan_in_progress", "1")
+    set_meta("scan_started_at", str(time.time()))
+    set_meta("scan_files_seen", "0")
+    set_meta("scan_files_added", "0")
+
+    def _flush() -> None:
+        if not pending:
+            return
+        upsert_many(pending)
+        pending.clear()
+
+    def _maybe_progress() -> None:
+        nonlocal last_log
+        set_meta("scan_files_seen", str(files_seen))
+        set_meta("scan_files_added", str(files_added))
+        if progress_callback:
             try:
-                if not image_path.is_file():
-                    continue
-            except OSError:
-                continue
-            key = str(image_path)
-            seen.add(key)
-            try:
-                mtime = image_path.stat().st_mtime
-            except OSError:
-                continue
-            cached_mtime = existing.get(key)
-            if cached_mtime is not None and cached_mtime >= mtime - 1e-6:
-                continue  # unchanged
-            row = _row_for_sorted(image_path, sorted_root)
-            if row is None:
-                continue
-            upserts.append(row)
-            if cached_mtime is None:
+                progress_callback(files_seen, files_added)
+            except Exception:
+                pass
+        if log_progress and files_seen - last_log >= _PROGRESS_LOG_INTERVAL:
+            print(
+                f"[indexer] scanned {files_seen:>7} files, "
+                f"{files_added:>6} new/changed rows committed",
+                flush=True,
+            )
+            last_log = files_seen
+
+    def _ingest(image_path: Path, row_builder: Any, kind: str) -> None:
+        nonlocal files_seen, files_added
+        try:
+            if not image_path.is_file():
+                return
+        except OSError:
+            return
+        key = str(image_path)
+        seen.add(key)
+        files_seen += 1
+        try:
+            mtime = image_path.stat().st_mtime
+        except OSError:
+            return
+        cached_mtime = existing.get(key)
+        if cached_mtime is not None and cached_mtime >= mtime - 1e-6:
+            return  # unchanged — skip the expensive row build
+        row = row_builder(image_path)
+        if row is None:
+            return
+        pending.append(row)
+        files_added += 1
+        if cached_mtime is None:
+            if kind == "sorted":
                 report.sorted_added += 1
             else:
-                report.sorted_updated += 1
-
-    if queue_root.exists():
-        for image_path in queue_root.glob("**/*"):
-            if not _is_image(image_path) or _is_in_archive(image_path):
-                continue
-            try:
-                if not image_path.is_file():
-                    continue
-            except OSError:
-                continue
-            # Skip in-flight files (workers rename to <stem>.processing during classification).
-            if image_path.suffix == ".processing":
-                continue
-            key = str(image_path)
-            seen.add(key)
-            try:
-                mtime = image_path.stat().st_mtime
-            except OSError:
-                continue
-            cached_mtime = existing.get(key)
-            if cached_mtime is not None and cached_mtime >= mtime - 1e-6:
-                continue
-            row = _row_for_queue(image_path, queue_root)
-            if row is None:
-                continue
-            upserts.append(row)
-            if cached_mtime is None:
                 report.queue_added += 1
+        else:
+            if kind == "sorted":
+                report.sorted_updated += 1
             else:
                 report.queue_updated += 1
+        if len(pending) >= _BATCH_SIZE:
+            _flush()
+            _maybe_progress()
 
-    # Bulk write in batches of 500 to keep transactions snappy.
-    BATCH = 500
-    for i in range(0, len(upserts), BATCH):
-        upsert_many(upserts[i:i + BATCH])
+    try:
+        if sorted_root.exists():
+            for image_path in sorted_root.glob("**/*"):
+                if not _is_image(image_path) or _is_in_archive(image_path):
+                    continue
+                _ingest(
+                    image_path,
+                    lambda p: _row_for_sorted(p, sorted_root),
+                    "sorted",
+                )
 
-    # Anything in the index that wasn't seen on disk has been deleted/moved.
-    stale = [p for p in existing if p not in seen]
-    report.deleted = delete_paths(stale)
+        if queue_root.exists():
+            for image_path in queue_root.glob("**/*"):
+                if not _is_image(image_path) or _is_in_archive(image_path):
+                    continue
+                if image_path.suffix == ".processing":
+                    continue  # in-flight; vision worker owns it
+                _ingest(
+                    image_path,
+                    lambda p: _row_for_queue(p, queue_root),
+                    "queue",
+                )
 
+        _flush()
+
+        # Anything in the index that wasn't seen on disk has been deleted/moved.
+        stale = [p for p in existing if p not in seen]
+        report.deleted = delete_paths(stale)
+    finally:
+        # Always release the in-progress flag, even if the walk crashed.
+        set_meta("scan_in_progress", "0")
+
+    report.duration_seconds = time.monotonic() - start
     set_meta("last_scan_at", str(time.time()))
     set_meta("last_scan_report", json.dumps({
         "sorted_added": report.sorted_added,
@@ -616,8 +670,17 @@ def scan(*, queue_root: Path, sorted_root: Path) -> ScanReport:
         "queue_added": report.queue_added,
         "queue_updated": report.queue_updated,
         "deleted": report.deleted,
+        "duration_seconds": round(report.duration_seconds, 1),
+        "files_seen": files_seen,
     }))
-    report.duration_seconds = time.monotonic() - start
+    if log_progress:
+        print(
+            f"[indexer] scan complete: +{report.sorted_added} sorted, "
+            f"+{report.queue_added} queue, ~{report.sorted_updated + report.queue_updated} updated, "
+            f"-{report.deleted} removed in {report.duration_seconds:.1f}s",
+            flush=True,
+        )
+    _maybe_progress()
     return report
 
 
@@ -639,24 +702,40 @@ def start_background_indexer(
         return _indexer_thread
 
     def _loop() -> None:
-        # Initial backfill — likely the slow run on first start.
-        try:
-            r = scan(queue_root=queue_root, sorted_root=sorted_root)
-            logger.info(
-                "indexer initial scan: +%d sorted, +%d queue, ~%d updated, -%d removed in %.1fs",
-                r.sorted_added, r.queue_added,
-                r.sorted_updated + r.queue_updated, r.deleted, r.duration_seconds,
+        # Initial backfill — likely the slow run on first start. The console
+        # progress lines come out of scan() itself; here we just bracket them.
+        existing_total = total("queue") + total("sorted")
+        if existing_total == 0:
+            print(
+                "[indexer] cold backfill starting — scanning the queue + sorted "
+                "trees for the first time. Stats and gallery will populate as "
+                "rows commit; you can watch progress at /api/index/status.",
+                flush=True,
             )
+        else:
+            print(
+                f"[indexer] resuming with {existing_total:,} rows already indexed; "
+                f"checking for new / changed files",
+                flush=True,
+            )
+        try:
+            scan(queue_root=queue_root, sorted_root=sorted_root)
         except Exception as exc:
+            print(f"[indexer] initial scan FAILED: {exc}", flush=True)
             logger.warning("indexer initial scan failed: %s", exc)
 
         while not _indexer_stop.wait(interval_seconds):
             try:
-                r = scan(queue_root=queue_root, sorted_root=sorted_root)
+                r = scan(queue_root=queue_root, sorted_root=sorted_root, log_progress=False)
+                # Quiet by default on incremental ticks — only print when
+                # something actually changed, otherwise the launcher log
+                # would fill with no-op lines every 30s.
                 if r.sorted_added or r.queue_added or r.deleted:
-                    logger.info(
-                        "indexer tick: +%d sorted, +%d queue, -%d removed in %.1fs",
-                        r.sorted_added, r.queue_added, r.deleted, r.duration_seconds,
+                    print(
+                        f"[indexer] tick: +{r.sorted_added} sorted, "
+                        f"+{r.queue_added} queue, -{r.deleted} removed "
+                        f"in {r.duration_seconds:.1f}s",
+                        flush=True,
                     )
             except Exception as exc:
                 logger.warning("indexer tick failed: %s", exc)
