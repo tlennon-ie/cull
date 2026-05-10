@@ -109,6 +109,22 @@ except ImportError:
         return []
 
 from lmstudio_admin import unload_all as _lmstudio_unload_all
+import index_store
+import thumb_cache
+
+# Configure the SQLite index + thumbnail cache against PIPELINE_BASE_DIR
+# (resolved from PIPELINE_QUEUE/PIPELINE_SORTED's parent if not set explicitly).
+_DATA_ROOT: Path = Path(os.environ.get(
+    "PIPELINE_BASE_DIR",
+    str(PIPELINE_QUEUE.parent if PIPELINE_QUEUE.exists() else Path.cwd() / "data"),
+))
+_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+index_store.configure(_DATA_ROOT / index_store.DB_FILENAME)
+thumb_cache.configure(_DATA_ROOT / "thumb_cache")
+try:
+    _INDEXER_INTERVAL = max(5.0, float(os.environ.get("INDEX_REFRESH_SECONDS", "30")))
+except ValueError:
+    _INDEXER_INTERVAL = 30.0
 
 
 app = Flask(__name__)
@@ -147,62 +163,69 @@ def get_env(key: str, default: str = "") -> str:
 # ── stats helpers ──────────────────────────────────────────────────────────────
 
 def get_queue_stats() -> dict[str, int]:
-    stats: dict[str, int] = {}
-    if not PIPELINE_QUEUE.exists():
-        return stats
-    for source_dir in PIPELINE_QUEUE.glob("*/*"):
-        if source_dir.is_dir():
-            count = len(list(source_dir.glob("*.jpg"))) + len(list(source_dir.glob("*.png")))
-            if count:
-                stats[f"{source_dir.parent.name}/{source_dir.name}"] = count
-    return stats
+    """{<topic>/<source>: count} — served from the SQLite index."""
+    return index_store.count_queue_by_topic_source()
 
 
 def get_sorted_stats() -> dict[str, dict[str, int]]:
-    stats: dict[str, dict[str, int]] = {}
-    if not PIPELINE_SORTED.exists():
-        return stats
-    for topic_dir in PIPELINE_SORTED.iterdir():
-        if not topic_dir.is_dir():
-            continue
-        topic_stats: dict[str, int] = {}
-        for category_dir in topic_dir.iterdir():
-            if category_dir.is_dir():
-                count = len(list(category_dir.glob("**/*.jpg"))) + len(list(category_dir.glob("**/*.png")))
-                if count:
-                    topic_stats[category_dir.name] = count
-        if topic_stats:
-            stats[topic_dir.name] = topic_stats
-    return stats
+    """{topic: {category: count}} — served from the SQLite index."""
+    return index_store.count_sorted_by_topic_category()
+
+
+# Error logs are re-read incrementally: track each log file's last (size, mtime)
+# and only re-parse when either changes. Old code re-read every log file in
+# full on every /api/status (every 5s). Cache survives the lifetime of the
+# dashboard process; on startup it does one cold read.
+_ERROR_LOG_CACHE_LOCK = threading.Lock()
+_ERROR_LOG_CACHE: dict[str, dict[str, Any]] = {}  # path -> {mtime, size, errors}
+
+
+def _scan_log_for_errors(path: Path) -> list[dict[str, str]]:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    mtime_iso = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+    errors: list[dict[str, str]] = []
+    for line in content.splitlines():
+        if any(tag in line for tag in ("ERROR", "CRITICAL", "FAILED")):
+            errors.append({
+                "file": path.name,
+                "message": line[:600],
+                "timestamp": mtime_iso,
+            })
+    return list(reversed(errors))
 
 
 def get_error_logs(limit: int = 500) -> list[dict[str, str]]:
     """Collect ERROR/CRITICAL/FAILED lines from the 5 most recent log files.
 
-    Returns newest-first (by log file mtime, then reversed line order within each
-    file) so the dashboard's Errors tab always shows the latest failures at top.
+    Cached per log file by (mtime, size); a file that hasn't changed since
+    the last call is served from the in-memory cache instead of re-reading
+    from disk.
     """
-    errors: list[dict[str, str]] = []
     if not LOG_DIR.exists():
-        return errors
-    for log_file in sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]:
-        try:
-            content = log_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        mtime_iso = datetime.fromtimestamp(log_file.stat().st_mtime).isoformat()
-        file_errors: list[dict[str, str]] = []
-        for line in content.splitlines():
-            if any(tag in line for tag in ("ERROR", "CRITICAL", "FAILED")):
-                file_errors.append({
-                    "file": log_file.name,
-                    "message": line[:600],
-                    "timestamp": mtime_iso,
-                })
-        errors.extend(reversed(file_errors))
-        if len(errors) >= limit:
-            break
-    return errors[:limit]
+        return []
+    log_files = sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    out: list[dict[str, str]] = []
+    with _ERROR_LOG_CACHE_LOCK:
+        for log_file in log_files:
+            key = str(log_file)
+            try:
+                stat = log_file.stat()
+                signature = (stat.st_mtime, stat.st_size)
+            except OSError:
+                continue
+            cached = _ERROR_LOG_CACHE.get(key)
+            if cached and cached.get("signature") == signature:
+                out.extend(cached["errors"])
+            else:
+                fresh = _scan_log_for_errors(log_file)
+                _ERROR_LOG_CACHE[key] = {"signature": signature, "errors": fresh}
+                out.extend(fresh)
+            if len(out) >= limit:
+                break
+    return out[:limit]
 
 
 def disabled_set() -> set[str]:
@@ -908,49 +931,29 @@ def api_set_model():
 
 # ── API: queue / thumbnails / prompts ─────────────────────────────────────────
 
-def _recent_queue_files(limit: int = 60) -> list[Path]:
-    """List newest queue images. Race-tolerant: vision workers can move files
-    out from under us between glob and stat - we just drop those entries."""
-    if not PIPELINE_QUEUE.exists():
-        return []
-    files: list[Path] = []
-    for pattern in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
-        files.extend(PIPELINE_QUEUE.glob(f"**/{pattern}"))
-
-    def _safe_mtime(p: Path) -> float:
-        try:
-            return p.stat().st_mtime
-        except OSError:
-            return -1.0  # bubble missing files to the bottom
-
-    files.sort(key=_safe_mtime, reverse=True)
-    return files[:limit]
-
 
 @app.route("/api/queue/files")
 def api_queue_files():
+    """Newest queued images, served from the SQLite index.
+
+    The old version globbed the entire queue tree on every request. Index-
+    backed listing is sub-millisecond regardless of queue depth.
+    """
     limit = int(request.args.get("limit", 60))
     results: list[dict[str, Any]] = []
-    for path in _recent_queue_files(limit):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue  # vision worker grabbed it mid-listing - skip
-        prompt_path = path.with_suffix(".txt")
-        prompt = ""
-        if prompt_path.exists():
-            try:
-                prompt = prompt_path.read_text(encoding="utf-8", errors="replace")[:300]
-            except OSError:
-                prompt = ""
+    for item in index_store.list_recent_queue(limit=limit):
+        path = Path(item.path)
+        if not path.exists():
+            continue  # indexer hasn't caught up to a worker that just moved it
+        prompt = (item.prompt or "")[:300]
         results.append({
-            "path": str(path),
+            "path": item.path,
             "name": path.name,
-            "source": path.parent.name,
-            "size": stat.st_size,
-            "corrupt": stat.st_size < 5000,
-            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "thumbnail": f"/api/thumbnail?path={path}",
+            "source": item.source,
+            "size": item.size,
+            "corrupt": item.size < 5000,
+            "modified": datetime.fromtimestamp(item.mtime).isoformat(),
+            "thumbnail": f"/api/thumbnail?path={item.path}",
             "prompt": prompt,
         })
     return jsonify(results)
@@ -1009,6 +1012,13 @@ def brand_asset(filename: str):
 
 @app.route("/api/thumbnail")
 def api_thumbnail():
+    """Serve a JPEG thumbnail from the disk cache.
+
+    First request for a (path, size) pair generates with PIL and writes
+    to data/thumb_cache/<sha>/<sha>_<size>.jpg. Subsequent requests serve
+    the file directly. send_file sets Last-Modified + ETag headers so
+    browsers 304 on F5.
+    """
     raw = request.args.get("path", "")
     try:
         size = max(64, min(2400, int(request.args.get("size", 240))))
@@ -1018,17 +1028,18 @@ def api_thumbnail():
     if path is None or not path.exists():
         abort(404)
     try:
-        img = Image.open(path)
-        img.thumbnail((size, size))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=82)
-        buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg", max_age=60)
+        cache_file = thumb_cache.get_or_create(path, size)
+    except FileNotFoundError:
+        abort(404)
     except Exception as exc:
         logger.debug("thumbnail fail: %s", exc)
         abort(404)
+    return send_file(
+        cache_file,
+        mimetype="image/jpeg",
+        max_age=86400,           # 1 day; the file path is content-hashed so it never goes stale.
+        conditional=True,        # respect If-Modified-Since / If-None-Match for 304s.
+    )
 
 
 @app.route("/api/prompt")
@@ -1050,56 +1061,37 @@ def api_prompt():
 def api_logs_history():
     """Historical log of every classification, newest first.
 
-    Source of truth is <PIPELINE_SORTED>/**/<stem>.vision.json files (one per
-    sorted image). The old sorter.jsonl path is honored too if it exists, but
-    the vision-json scan is always authoritative - it never goes stale.
+    Served from the SQLite index, filterable by source/category. Pagination
+    is via ?limit=. Pre-index versions globbed PIPELINE_SORTED on every call.
     """
     source = request.args.get("source")
     category = request.args.get("category")
     limit = int(request.args.get("limit", 200))
 
-    if not PIPELINE_SORTED.exists():
-        return jsonify([])
-
-    meta_files = [
-        p for p in PIPELINE_SORTED.glob("**/*.vision.json")
-        if not _is_in_archive(p)
-    ]
-    meta_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    items, _total = index_store.list_sorted(
+        sources=[source] if source else None,
+        categories=[category] if category else None,
+        sort="newest",
+        limit=limit,
+        offset=0,
+    )
 
     out: list[dict[str, Any]] = []
-    for meta in meta_files[:limit * 2]:  # over-fetch; we may filter
-        try:
-            payload = json.loads(meta.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        stem = meta.name.replace(".vision.json", "")
-        img_candidate = next(
-            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
-            None,
-        )
-        if img_candidate is None or not img_candidate.exists():
-            continue
-        # meta.parent = .../sorted/<slug>/<Category>/<source>
-        category_name = meta.parent.parent.name
-        source_name = meta.parent.name
-        if source and source_name != source:
-            continue
-        if category and category_name != category:
+    for item in items:
+        path = Path(item.path)
+        if not path.exists():
             continue
         out.append({
-            "timestamp": datetime.fromtimestamp(meta.stat().st_mtime).isoformat(),
-            "image": img_candidate.name,
-            "source": source_name,
-            "classification": category_name,
-            "quality": payload.get("quality_score"),
-            "summary": payload.get("reason", ""),
-            "thumbnail": f"/api/thumbnail?path={img_candidate}",
-            "prompt_url": f"/api/prompt?path={img_candidate}",
-            "path": str(img_candidate),
+            "timestamp": datetime.fromtimestamp(item.mtime).isoformat(),
+            "image": path.name,
+            "source": item.source,
+            "classification": item.category,
+            "quality": item.quality,
+            "summary": (item.vision_json or {}).get("reason", "") if item.vision_json else "",
+            "thumbnail": f"/api/thumbnail?path={item.path}",
+            "prompt_url": f"/api/prompt?path={item.path}",
+            "path": item.path,
         })
-        if len(out) >= limit:
-            break
     return jsonify(out)
 
 
@@ -1117,44 +1109,22 @@ def _is_in_archive(path: Path) -> bool:
 
 @app.route("/api/activity")
 def api_activity():
-    """Newest classified items from <PIPELINE_SORTED> so the UI can show what just got processed."""
+    """Newest classified items, served from the SQLite index."""
     limit = int(request.args.get("limit", 12))
-    if not PIPELINE_SORTED.exists():
-        return jsonify([])
-    meta_files: list[Path] = [
-        p for p in PIPELINE_SORTED.glob("**/*.vision.json")
-        if not _is_in_archive(p)
-    ]
-    meta_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     results: list[dict[str, Any]] = []
-    for meta in meta_files:
-        if len(results) >= limit:
-            break
-        try:
-            payload = json.loads(meta.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        stem = meta.name.replace(".vision.json", "")
-        # Restrict the alongside-the-meta lookup to actual image files - the
-        # naive `glob(stem.*)` matched the .vision.json itself when the
-        # image had been archived elsewhere, then the dashboard tried to
-        # render JSON as a thumbnail.
-        img_candidate = next(
-            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
-            None,
-        )
-        if img_candidate is None or not img_candidate.exists():
-            continue
+    for item in index_store.list_recent_sorted(limit=limit):
+        if not Path(item.path).exists():
+            continue  # indexer hasn't caught up to a deletion / move
         results.append({
-            "name": img_candidate.name,
-            "path": str(img_candidate),
-            "category": meta.parent.parent.name,
-            "source": meta.parent.name,
-            "modified": datetime.fromtimestamp(meta.stat().st_mtime).isoformat(),
-            "thumbnail": f"/api/thumbnail?path={img_candidate}",
-            "prompt_url": f"/api/prompt?path={img_candidate}",
-            "summary": payload.get("reason", ""),
-            "quality": payload.get("quality_score"),
+            "name": Path(item.path).name,
+            "path": item.path,
+            "category": item.category,
+            "source": item.source,
+            "modified": datetime.fromtimestamp(item.mtime).isoformat(),
+            "thumbnail": f"/api/thumbnail?path={item.path}",
+            "prompt_url": f"/api/prompt?path={item.path}",
+            "summary": (item.vision_json or {}).get("reason", "") if item.vision_json else "",
+            "quality": item.quality,
         })
     return jsonify(results)
 
@@ -1210,16 +1180,9 @@ _sorted_cache_lock = threading.Lock()
 _dim_cache: dict[str, tuple[int, int]] = {}
 
 
-def _sorted_signature() -> tuple[int, float]:
-    if not PIPELINE_SORTED.exists():
-        return (0, 0.0)
-    paths = [p for p in PIPELINE_SORTED.glob("**/*.vision.json") if not _is_in_archive(p)]
-    if not paths:
-        return (0, 0.0)
-    return (len(paths), max(p.stat().st_mtime for p in paths))
-
-
 def _resolve_image_dims(path: Path) -> tuple[int, int]:
+    """Fallback dim resolver. Most rows have width/height stored in the index;
+    this only fires for legacy data missing them."""
     key = str(path)
     cached = _dim_cache.get(key)
     if cached is not None:
@@ -1233,69 +1196,47 @@ def _resolve_image_dims(path: Path) -> tuple[int, int]:
     return dims
 
 
-def _scan_sorted_items() -> list[_SortedItem]:
-    """One-shot scan of PIPELINE_SORTED returning every classified image with
-    its vision-json + .txt prompt body. Skips archived/dot-prefixed paths.
-    """
-    if not PIPELINE_SORTED.exists():
-        return []
-    items: list[_SortedItem] = []
-    for meta in PIPELINE_SORTED.glob("**/*.vision.json"):
-        if _is_in_archive(meta):
-            continue
-        try:
-            payload = json.loads(meta.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        stem = meta.name.replace(".vision.json", "")
-        img = next(
-            (p for p in meta.parent.glob(f"{stem}.*") if _is_image(p)),
-            None,
-        )
-        if img is None or not img.exists():
-            continue
-        txt = meta.parent / f"{stem}.txt"
-        prompt_text = ""
-        if txt.exists():
-            try:
-                prompt_text = txt.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                prompt_text = ""
-        try:
-            mtime = meta.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-        items.append(
-            _SortedItem(
-                image_path=img,
-                meta_path=meta,
-                txt_path=txt if txt.exists() else None,
-                category=meta.parent.parent.name,
-                source=meta.parent.name,
-                mtime=mtime,
-                payload=payload,
-                prompt_text=prompt_text,
-            )
-        )
-    return items
+def _index_row_to_item(row: index_store.IndexedImage) -> _SortedItem:
+    """Convert an IndexedImage from the SQLite index into the legacy
+    _SortedItem shape every downstream helper still consumes (filters,
+    keyword analytics, item_to_card, ZIP downloads)."""
+    image_path = Path(row.path)
+    return _SortedItem(
+        image_path=image_path,
+        meta_path=image_path.with_name(image_path.stem + ".vision.json"),
+        txt_path=image_path.with_suffix(".txt") if (row.prompt or "") else None,
+        category=row.category or "",
+        source=row.source,
+        mtime=row.mtime,
+        payload=row.vision_json or {},
+        prompt_text=row.prompt or "",
+        width=row.width or 0,
+        height=row.height or 0,
+    )
 
 
 def _get_sorted_items(force: bool = False) -> list[_SortedItem]:
-    """Cached scan; refreshes when the underlying folder signature changes
-    or when the TTL expires. Thread-safe."""
+    """Return every sorted image as a legacy _SortedItem.
+
+    Backed by the SQLite index — the filesystem scan that this used to do
+    has been replaced by the background indexer. We still cache the
+    materialised _SortedItem list for `_STATS_CACHE_TTL` seconds because
+    constructing 100k Python objects per /api/stats call would dominate
+    the request time, and stats is the one place we actually need them all.
+    Filter / paginated callers (gallery, history, activity) hit the index
+    directly via index_store.list_sorted instead.
+    """
     with _sorted_cache_lock:
         now = _time.time()
-        sig = _sorted_signature()
-        if (
-            not force
-            and _sorted_cache["signature"] == sig
-            and (now - _sorted_cache["ts"]) < _STATS_CACHE_TTL
-        ):
+        if not force and _sorted_cache["items"] and (now - _sorted_cache["ts"]) < _STATS_CACHE_TTL:
             return _sorted_cache["items"]
-        items = _scan_sorted_items()
+        rows, _total = index_store.list_sorted(
+            sort="newest", limit=1_000_000, offset=0,
+        )
+        items = [_index_row_to_item(r) for r in rows]
         _sorted_cache["items"] = items
         _sorted_cache["ts"] = now
-        _sorted_cache["signature"] = sig
+        _sorted_cache["signature"] = (len(items), now)
         return items
 
 
@@ -3794,9 +3735,33 @@ def _start_idle_unload_thread() -> None:
     thread.start()
 
 
+def _start_indexer_thread() -> None:
+    """Spawn the background SQLite indexer. First scan can take a while
+    on a 100k-image dataset; subsequent ticks are incremental."""
+    print(f"[indexer] starting (refresh every {int(_INDEXER_INTERVAL)}s)", flush=True)
+    index_store.start_background_indexer(
+        queue_root=PIPELINE_QUEUE,
+        sorted_root=PIPELINE_SORTED,
+        interval_seconds=_INDEXER_INTERVAL,
+    )
+
+
+@app.route("/api/index/status")
+def api_index_status():
+    """Surface the indexer's progress so the UI can show 'still indexing X
+    images' rather than appearing stuck on first start."""
+    return jsonify({
+        "queue_total": index_store.total("queue"),
+        "sorted_total": index_store.total("sorted"),
+        "last_scan_at": index_store.get_meta("last_scan_at"),
+        "last_scan_report": index_store.get_meta("last_scan_report"),
+    })
+
+
 if __name__ == "__main__":
     print(f"Dashboard: http://localhost:{FLASK_PORT}", flush=True)
     print(f"Settings: {ENV_PATH}", flush=True)
     print("Pipeline is NOT auto-started. Use the Start button in the UI.", flush=True)
     _start_idle_unload_thread()
+    _start_indexer_thread()
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
