@@ -108,6 +108,8 @@ except ImportError:
     def get_recommended_models() -> list[Any]:
         return []
 
+from lmstudio_admin import unload_all as _lmstudio_unload_all
+
 
 app = Flask(__name__)
 CORS(app)
@@ -309,6 +311,21 @@ def api_pipeline_start():
             return jsonify({"error": str(exc)}), 500
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _any_lmstudio_worker_active() -> bool:
+    workers = _active_vision_workers()
+    return any(w.startswith("balanced-lm") or w == "lm-autodetect" or w == "lm-keepalive"
+               for w in workers)
+
+
 @app.route("/api/pipeline/stop", methods=["POST"])
 def api_pipeline_stop():
     global _pipeline_proc
@@ -327,7 +344,161 @@ def api_pipeline_stop():
             proc.kill()
         _pipeline_proc = None
         update_env("DASHBOARD_PAUSED", "true")
-        return jsonify({"success": True})
+
+        unload_payload: dict[str, Any] | None = None
+        if _env_bool("LMSTUDIO_UNLOAD_ON_STOP", True) and _any_lmstudio_worker_active():
+            result = _lmstudio_unload_all()
+            unload_payload = {"ok": result.ok, "detail": result.detail, "method": result.method}
+            logger.info("LM Studio unload on stop: %s", unload_payload)
+        return jsonify({"success": True, "lmstudio_unload": unload_payload})
+
+
+@app.route("/api/lmstudio/unload", methods=["POST"])
+def api_lmstudio_unload():
+    """Manually unload every loaded LM Studio model. Always callable."""
+    result = _lmstudio_unload_all()
+    return jsonify({
+        "ok": result.ok,
+        "detail": result.detail,
+        "method": result.method,
+    }), (200 if result.ok else 502)
+
+
+# ── API: self-update ──────────────────────────────────────────────────────────
+#
+# Pulls origin/main and relaunches via update.bat / update.sh. Toast in the
+# dashboard polls /api/update/check; clicking [Update] hits /api/update/run.
+
+REPO_ROOT: Path = ENV_PATH.parent
+_UPDATE_CHECK_CACHE: dict[str, Any] = {"at": 0.0, "payload": None}
+_UPDATE_CHECK_TTL_SECONDS = 300  # 5 minutes
+
+
+def _git(*args: str, timeout: int = 15) -> tuple[int, str, str]:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+@app.route("/api/update/check")
+def api_update_check():
+    """Return whether origin/main is ahead of the local checkout."""
+    import time as _t
+    now = _t.time()
+    cached = _UPDATE_CHECK_CACHE.get("payload")
+    if cached and now - _UPDATE_CHECK_CACHE.get("at", 0.0) < _UPDATE_CHECK_TTL_SECONDS:
+        return jsonify(cached)
+
+    if not (REPO_ROOT / ".git").exists():
+        payload = {"ok": False, "error": "not a git checkout"}
+        _UPDATE_CHECK_CACHE.update({"at": now, "payload": payload})
+        return jsonify(payload)
+
+    try:
+        # Fetch is the slow part; cache results so we don't hit GitHub every page-load.
+        rc_fetch, _out, err_fetch = _git("fetch", "origin", "main", "--quiet")
+        if rc_fetch != 0:
+            payload = {"ok": False, "error": f"git fetch failed: {err_fetch[:200]}"}
+            _UPDATE_CHECK_CACHE.update({"at": now, "payload": payload})
+            return jsonify(payload)
+
+        _, local_sha, _ = _git("rev-parse", "HEAD")
+        _, remote_sha, _ = _git("rev-parse", "origin/main")
+        if not local_sha or not remote_sha:
+            return jsonify({"ok": False, "error": "rev-parse failed"})
+
+        rc_count, behind_str, _ = _git("rev-list", "--count", f"{local_sha}..{remote_sha}")
+        try:
+            behind = int(behind_str) if rc_count == 0 else 0
+        except ValueError:
+            behind = 0
+
+        remote_subject = ""
+        if behind > 0:
+            _, remote_subject, _ = _git("log", "-1", "--pretty=%s", remote_sha)
+
+        # Check for dirty tree — we won't run an update if it's dirty, so flag it.
+        _, dirty_out, _ = _git("status", "--porcelain")
+        payload = {
+            "ok": True,
+            "behind": behind,
+            "local_sha": local_sha[:12],
+            "remote_sha": remote_sha[:12],
+            "remote_subject": remote_subject,
+            "dirty": bool(dirty_out),
+        }
+        _UPDATE_CHECK_CACHE.update({"at": now, "payload": payload})
+        return jsonify(payload)
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "git timed out"})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "git not on PATH"})
+
+
+@app.route("/api/update/run", methods=["POST"])
+def api_update_run():
+    """Spawn the update script detached and return immediately.
+
+    The script pulls + reinstalls deps + relaunches. The dashboard process
+    exits to release port 5000 so the relaunch can bind it; the user just
+    needs to refresh once the new process boots.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return jsonify({"ok": False, "error": "not a git checkout"}), 400
+
+    # Block on a dirty tree so we don't clobber unstaged work.
+    try:
+        _, dirty_out, _ = _git("status", "--porcelain")
+        if dirty_out:
+            return jsonify({"ok": False, "error": "uncommitted changes present"}), 409
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return jsonify({"ok": False, "error": f"git unavailable: {exc}"}), 500
+
+    if sys.platform == "win32":
+        script = REPO_ROOT / "update.bat"
+        if not script.exists():
+            return jsonify({"ok": False, "error": "update.bat missing"}), 500
+        # `start /B` would inherit our console; using DETACHED_PROCESS gives the
+        # child its own session so it survives our exit.
+        DETACHED_PROCESS = 0x00000008
+        subprocess.Popen(
+            ["cmd", "/c", str(script)],
+            cwd=str(REPO_ROOT),
+            creationflags=DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    else:
+        script = REPO_ROOT / "update.sh"
+        if not script.exists():
+            return jsonify({"ok": False, "error": "update.sh missing"}), 500
+        # Make sure the script is executable (fresh clones may not have +x set).
+        try:
+            os.chmod(script, 0o755)
+        except OSError:
+            pass
+        subprocess.Popen(
+            ["/bin/bash", str(script)],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    # Give the script a couple of seconds to start before we exit.
+    def _delayed_exit() -> None:
+        import time as _t
+        _t.sleep(2)
+        os._exit(0)
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+
+    return jsonify({"ok": True, "message": "Update started — dashboard will restart."})
 
 
 ALLOWED_VISION_WORKERS = [
@@ -416,6 +587,8 @@ SETTINGS_KEYS: list[str] = [
     "GROQ_MODEL",
     "LMSTUDIO_PRIMARY_TIMEOUT",
     "LMSTUDIO_SECONDARY_TIMEOUT",
+    "LMSTUDIO_UNLOAD_ON_STOP",
+    "LMSTUDIO_IDLE_UNLOAD_MINUTES",
     # Scraper credentials
     "CIVITAI_API_KEY",
     "CIVITAI_API_RED_KEY",
@@ -1498,6 +1671,35 @@ HTML_TEMPLATE = r"""<!doctype html>
 <body class="min-h-screen bg-slate-950 text-slate-100">
 <div x-data="dashboard()" x-init="start()" class="flex min-h-screen">
 
+  <!-- Update toast — bottom-right, rendered only when a newer commit exists on origin/main.
+       Dismissal is keyed on remote SHA so a new release re-toasts. -->
+  <div x-show="update.available" x-cloak x-transition.opacity
+       class="fixed bottom-4 right-4 z-50 max-w-sm bg-slate-900 border border-slate-700 rounded-lg shadow-2xl p-4 text-sm">
+    <div class="flex items-start gap-3">
+      <div class="text-amber-400 mt-0.5">⬆</div>
+      <div class="flex-1">
+        <div class="font-semibold mb-1">
+          Update available
+          <span class="text-xs font-normal text-slate-400" x-text="update.behind + ' commit' + (update.behind === 1 ? '' : 's') + ' behind origin/main'"></span>
+        </div>
+        <div class="text-xs text-slate-300 mb-2 truncate" :title="update.remote_subject" x-text="update.remote_subject || ''"></div>
+        <div class="text-xs text-slate-500 mb-3 font-mono" x-text="'→ ' + update.remote_sha"></div>
+        <div x-show="update.error" class="text-xs text-rose-300 mb-2" x-text="update.error"></div>
+        <div class="flex gap-2">
+          <button @click="runUpdate()" :disabled="update.running"
+            class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded text-xs disabled:opacity-60">
+            <span x-text="update.running ? 'Updating…' : 'Update'"></span>
+          </button>
+          <button @click="dismissUpdate()" :disabled="update.running"
+            class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs">Later</button>
+        </div>
+        <div x-show="update.running" class="text-xs text-slate-400 mt-2">
+          Pulling, reinstalling deps if needed, and relaunching. Dashboard will restart — refresh in a moment.
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Mobile hamburger - hidden on lg+ where the sidebar is always visible. -->
   <button @click="sidebarOpen = !sidebarOpen" aria-label="Toggle navigation"
     class="lg:hidden fixed top-3 left-3 z-40 bg-slate-800 hover:bg-slate-700 rounded p-2">
@@ -2340,7 +2542,26 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span class="text-xs" x-show="providerTest.lmstudio?.message"
               :class="providerTest.lmstudio?.ok ? 'text-emerald-300' : 'text-rose-300'"
               x-text="providerTest.lmstudio?.message"></span>
+            <button @click="unloadLmStudio()" :disabled="lmstudioUnload.busy"
+              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm"
+              title="Free VRAM by unloading every model in LM Studio. Safe to call any time — JIT load fires on the next image.">
+              <span x-text="lmstudioUnload.busy ? 'Unloading...' : 'Unload LM Studio'"></span>
+            </button>
+            <span class="text-xs" x-show="lmstudioUnload.message"
+              :class="lmstudioUnload.ok ? 'text-emerald-300' : 'text-rose-300'"
+              x-text="lmstudioUnload.message"></span>
           </div>
+
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">LMSTUDIO_UNLOAD_ON_STOP — unload models when the pipeline stops (true/false)</span>
+            <input x-model="settings.LMSTUDIO_UNLOAD_ON_STOP" placeholder="true"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">LMSTUDIO_IDLE_UNLOAD_MINUTES — auto-unload after this many idle minutes (0 = off, ignored when lm-keepalive is active)</span>
+            <input x-model="settings.LMSTUDIO_IDLE_UNLOAD_MINUTES" type="number" min="0" placeholder="10"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
         </div>
       </div>
 
@@ -2772,6 +2993,8 @@ function dashboard() {
     settings: {}, settingsBanner: '', settingsBannerOk: true,
     settingsDirty: false, settingsErrors: {},
     providerTest: {},
+    lmstudioUnload: { busy: false, ok: null, message: '' },
+    update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':            'LMStudio PRIMARY endpoint',
@@ -2883,6 +3106,60 @@ function dashboard() {
         };
       } catch (e) {
         this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
+      }
+    },
+    async unloadLmStudio() {
+      this.lmstudioUnload = { busy: true, ok: null, message: 'Unloading...' };
+      try {
+        const r = await fetch('/api/lmstudio/unload', { method: 'POST' });
+        const j = await r.json();
+        this.lmstudioUnload = {
+          busy: false, ok: j.ok,
+          message: (j.ok ? '✓ ' : '✗ ') + (j.detail || 'unknown'),
+        };
+      } catch (e) {
+        this.lmstudioUnload = { busy: false, ok: false, message: '✗ network error' };
+      }
+    },
+    async checkUpdate() {
+      try {
+        const r = await fetch('/api/update/check');
+        const j = await r.json();
+        if (!j.ok) { this.update.error = j.error || ''; return; }
+        const dismissed = localStorage.getItem('cull_update_dismissed_sha') || '';
+        this.update = {
+          available: j.behind > 0 && j.remote_sha !== dismissed,
+          behind: j.behind || 0,
+          remote_sha: j.remote_sha || '',
+          remote_subject: j.remote_subject || '',
+          dismissed_sha: dismissed,
+          running: false,
+          error: '',
+        };
+      } catch (e) {
+        // Silent — updater is best-effort.
+      }
+    },
+    dismissUpdate() {
+      if (this.update.remote_sha) {
+        localStorage.setItem('cull_update_dismissed_sha', this.update.remote_sha);
+      }
+      this.update.available = false;
+    },
+    async runUpdate() {
+      if (!confirm('cull will pull the latest version, reinstall dependencies if needed, and restart. Continue?')) return;
+      this.update.running = true;
+      try {
+        const r = await fetch('/api/update/run', { method: 'POST' });
+        const j = await r.json();
+        if (!j.ok) {
+          this.update.error = j.error || 'Update failed.';
+          this.update.running = false;
+        }
+        // On success the dashboard process will exit imminently; the update
+        // script restarts it. The user just needs to refresh.
+      } catch (e) {
+        // Connection drop is expected once the dashboard restarts.
       }
     },
     reloadSettings() {
@@ -3176,6 +3453,10 @@ function dashboard() {
         }
       });
       setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
+      // Self-update: check on load, then every 30 minutes. The endpoint is
+      // server-side cached for 5 minutes so polls are cheap.
+      this.checkUpdate();
+      setInterval(() => this.checkUpdate(), 30 * 60 * 1000);
     },
   };
 }
@@ -3190,8 +3471,83 @@ def dashboard():
     return render_template_string(HTML_TEMPLATE)
 
 
+# ── Idle LM Studio unloader ───────────────────────────────────────────────────
+#
+# When the queue stays empty for LMSTUDIO_IDLE_UNLOAD_MINUTES and an LM Studio
+# worker is active, unload the model to free VRAM. The next image triggers
+# JIT-load on LM Studio's side automatically. Disabled when:
+#   * minutes <= 0
+#   * pipeline not running
+#   * lm-keepalive worker is in PIPELINE_VISION_WORKERS (user explicitly wants
+#     the model resident — pinging every 15s would defeat us anyway)
+
+import time as _time
+
+_IDLE_POLL_SECONDS = 60
+
+
+def _idle_unload_loop() -> None:
+    last_idle_at: float | None = None
+    already_unloaded = False
+    while True:
+        try:
+            _time.sleep(_IDLE_POLL_SECONDS)
+            try:
+                idle_minutes = int(os.environ.get("LMSTUDIO_IDLE_UNLOAD_MINUTES", "0").strip() or "0")
+            except ValueError:
+                idle_minutes = 0
+            if idle_minutes <= 0:
+                last_idle_at = None
+                already_unloaded = False
+                continue
+
+            queue_total = sum(get_queue_stats().values())
+            if queue_total > 0:
+                last_idle_at = None
+                already_unloaded = False
+                continue
+
+            if not pipeline_running():
+                # Pipeline stopped — stop hook handles unload; don't double-fire.
+                last_idle_at = None
+                continue
+
+            workers = _active_vision_workers()
+            uses_lmstudio = any(
+                w.startswith("balanced-lm") or w == "lm-autodetect" for w in workers
+            )
+            if not uses_lmstudio:
+                continue
+            if "lm-keepalive" in workers:
+                continue  # explicit keep-loaded mode
+
+            now = _time.monotonic()
+            if last_idle_at is None:
+                last_idle_at = now
+                continue
+            if already_unloaded:
+                continue
+            if now - last_idle_at < idle_minutes * 60:
+                continue
+
+            result = _lmstudio_unload_all()
+            already_unloaded = True
+            logger.info(
+                "idle unload after %d min: ok=%s method=%s detail=%s",
+                idle_minutes, result.ok, result.method, result.detail,
+            )
+        except Exception as exc:  # never let the watcher die
+            logger.warning("idle-unload watcher hiccup: %s", exc)
+
+
+def _start_idle_unload_thread() -> None:
+    thread = threading.Thread(target=_idle_unload_loop, name="lmstudio-idle-unload", daemon=True)
+    thread.start()
+
+
 if __name__ == "__main__":
     print(f"Dashboard: http://localhost:{FLASK_PORT}", flush=True)
     print(f"Settings: {ENV_PATH}", flush=True)
     print("Pipeline is NOT auto-started. Use the Start button in the UI.", flush=True)
+    _start_idle_unload_thread()
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
