@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Architecture brief & conventions
+    url: https://github.com/tlennon-ie/cull/blob/main/CLAUDE.md
+    about: Read this before filing a structural / refactor proposal — it explains cull's load-bearing seams.
+  - name: README
+    url: https://github.com/tlennon-ie/cull/blob/main/README.md
+    about: Quick-start, use cases, and how the dashboard works.
+  - name: AI agent skill bundle
+    url: https://github.com/tlennon-ie/cull/tree/main/.claude
+    about: Claude Code / Cursor / Aider skills + sub-agents that know cull's architecture.

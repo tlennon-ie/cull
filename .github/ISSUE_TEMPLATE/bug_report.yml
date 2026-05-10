@@ -1,0 +1,144 @@
+name: Bug report
+description: Something in cull is broken or behaving unexpectedly.
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Before submitting, please check that you're on the latest commit
+        of `main` (the dashboard's update toast will tell you if you aren't) and that you've
+        scanned existing issues so we don't duplicate work.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph on what went wrong.
+      placeholder: e.g. "The Civitai scraper exits within 5 seconds and never queues anything."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: How do you trigger this from a fresh clone (or close to it)?
+      placeholder: |
+        1. `git clone https://github.com/tlennon-ie/cull && cd cull`
+        2. Edit `.env`: `CIVITAI_DOMAINS=civitai.com,civitai.red`, valid `CIVITAI_API_KEY`
+        3. `./launch.sh` (or `launch.bat` on Windows)
+        4. Open dashboard, hit Start
+        5. Watch supervisor log — Civitai-Com exits with code 0 every 60 seconds
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Affected layer
+      description: Which part of cull is the bug in? Pick the closest.
+      options:
+        - Dashboard / Flask UI
+        - Supervisor / pipeline lifecycle (run_pipeline.py)
+        - Scraper (civitai / x / discord / web / gallery-dl / local folder)
+        - Vision worker (LM Studio / Groq / autodetect / keepalive)
+        - Auto-captioning / vision prompt / JSON schema
+        - Queue / FSQueue / dedup
+        - Categories / sorting / requeue
+        - Self-updater
+        - LM Studio unloader
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: component_name
+    attributes:
+      label: Specific component (if known)
+      description: e.g. `scraper_civitai_search.py`, `balanced-lm`, `vision_prompt.apply_scores`. Skip if unsure.
+      placeholder: e.g. balanced-groq
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - WSL
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      description: Output of `python --version` from inside the project's `.venv`.
+      placeholder: e.g. 3.11.7
+    validations:
+      required: true
+
+  - type: input
+    id: cull_commit
+    attributes:
+      label: cull commit
+      description: Output of `git rev-parse --short HEAD`.
+      placeholder: e.g. c459963
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      description: |
+        Paste the relevant lines from `data/logs/pipeline_<slug>.log` (or the dashboard Errors tab).
+        Each line is prefixed with `[<agent-label>]` — keep that prefix so we can see which child raised it.
+      render: text
+      placeholder: |
+        [Civitai-Com] Loading model from local checkpoint...
+        [Civitai-Com] CIVITAI_API_KEY missing
+        [Civitai-Com] Process exited with code 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Relevant `.env` settings (secrets redacted)
+      description: |
+        Only the keys related to the bug. Replace API keys / tokens / cookies with `REDACTED`.
+      render: dotenv
+      placeholder: |
+        CIVITAI_DOMAINS=civitai.com,civitai.red
+        CIVITAI_API_KEY=REDACTED
+        PIPELINE_VISION_WORKERS=balanced-lm,balanced-groq
+        VISION_OVR_MIN_SCORE=60
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context, screenshots, or hypotheses
+      description: Optional. Dashboard screenshots, suspected root cause, recent changes you made, anything else.
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have redacted secrets (`*_API_KEY`, `*_COOKIES`, `*_TOKEN`) from logs and env above.
+          required: true
+        - label: I am running cull on the latest commit of `main` (or have stated otherwise above).
+          required: true
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true

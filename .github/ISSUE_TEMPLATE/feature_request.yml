@@ -1,0 +1,81 @@
+name: Feature request
+description: Suggest a new capability, source, vision provider, or workflow improvement for cull.
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the existing issues and the roadmap section in the README.
+        cull tries to stay small and load-bearing — see [`CLAUDE.md`](../blob/main/CLAUDE.md) for
+        the architectural seams. Suggestions that fit those seams (registry, Protocol, base class)
+        are easiest to land.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The pain
+      description: What are you trying to do that cull makes hard or impossible today?
+      placeholder: |
+        e.g. "I want to scrape from Bluesky, but cull only supports the seven dedicated scrapers
+        plus gallery-dl, and Bluesky isn't in either set."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should cull do? Be concrete — naming env vars, modules, or UI elements helps.
+      placeholder: |
+        e.g. "Add `scraper_bluesky.py` that authenticates with `BLUESKY_APP_PASSWORD`, polls a
+        list of handles from `BLUESKY_HANDLES`, and queues images via `queue_manager.save_to_queue`.
+        Register it in `run_pipeline.compute_desired_agents` and add a row to `_STATIC_SCRAPERS`
+        in `dashboard_enhanced.py`."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer of cull does this touch?
+      multiple: true
+      options:
+        - New scraper / image source
+        - New vision provider / worker
+        - Categories / classification taxonomy
+        - Vision prompt / JSON schema / scoring
+        - Auto-captioning
+        - Dashboard UI
+        - Settings / .env keys
+        - Queue / dedup / FSQueue
+        - Supervisor / pipeline lifecycle
+        - Self-updater / launcher
+        - Tools / requeue / export
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, similar tools, or designs you rejected and why.
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Are you willing to contribute this?
+      options:
+        - "Yes, I want to send a PR"
+        - "Yes, with guidance / a starting pointer"
+        - "No, just suggesting"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context, mockups, links
+      description: Optional. Screenshots, related projects, API docs for a new source, etc.
