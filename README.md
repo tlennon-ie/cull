@@ -34,11 +34,21 @@ cull is a single-machine curation engine for AI-generated images. It pulls from 
 ```bash
 git clone https://github.com/tlennon-ie/cull.git
 cd cull
-./launch.sh        # Linux / macOS
+./launch.sh        # Linux / macOS — installs and boots in one go
 # launch.bat       # Windows
 ```
 
-The launcher creates a `.venv/`, installs dependencies, copies `.env.example` to `.env` if you don't have one, then opens the dashboard at <http://localhost:5000>. Idempotent — re-running is instant.
+The launcher creates a `.venv/`, installs dependencies (including `gallery-dl` from Codeberg, so a working `git` CLI is required), copies `.env.example` to `.env` if you don't have one, then opens the dashboard at <http://localhost:5000>. Idempotent — re-running is instant.
+
+Prefer to install once and boot separately (CI, Docker layers, or just a habit)?
+
+```bash
+./install.sh                                   # Linux / macOS
+install.bat                                    # Windows cmd
+powershell -ExecutionPolicy Bypass -File .\install.ps1   # Windows PowerShell
+```
+
+`install.*` does the same setup work as `launch.*` and stops without booting the dashboard. Run `launch.*` (or `python pipeline_code/integrated_launcher.py` from inside the venv) when you're ready.
 
 Want to see the dashboard with mock data before configuring scrapers?
 
