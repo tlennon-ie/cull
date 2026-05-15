@@ -3248,6 +3248,7 @@ function dashboard() {
           this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
           this.settingsBannerOk = true;
           this.settingsDirty = false;
+          this.settings = {};  // Force reload from server on next refresh
           setTimeout(() => this.settingsBanner = '', 6000);
         } else {
           // Render per-field errors next to inputs; banner just summarises.
