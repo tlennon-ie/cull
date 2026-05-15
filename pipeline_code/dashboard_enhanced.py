@@ -137,23 +137,45 @@ _pipeline_lock = threading.Lock()
 # ── .env helpers ───────────────────────────────────────────────────────────────
 
 def update_env(key: str, value: str) -> None:
+    print(f"[update_env] CALLED with key={key}, value={value[:50]}{'...' if len(value) > 50 else ''}")
+    print(f"[update_env] ENV_PATH={ENV_PATH}, exists={ENV_PATH.exists()}, writable={os.access(ENV_PATH, os.W_OK) if ENV_PATH.exists() else 'N/A'}")
+    
     if not ENV_PATH.exists():
         logger.error(".env not found at %s", ENV_PATH)
+        print(f"[update_env] ERROR: ENV_PATH does not exist!")
         return
+    
     pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
     text = ENV_PATH.read_text(encoding="utf-8")
     line = f"{key}={value}"
+    
     # `re.sub` interprets backslashes in the replacement string as regex
     # escapes (\1, \A, \g<1> etc.). Windows paths like `I:\AI\openclaw` would
     # therefore raise PatternError ("bad escape \A"). Using a lambda short-
     # circuits replacement-string parsing and lets us insert the value as a
     # literal.
-    if pattern.search(text):
+    found = pattern.search(text)
+    print(f"[update_env] Pattern search found existing key: {found is not None}")
+    
+    if found:
+        old_line = found.group(0)
         text = pattern.sub(lambda _match: line, text)
+        print(f"[update_env] Replaced old_line: {old_line[:60]}")
     else:
         text = text.rstrip() + f"\n{line}\n"
-    ENV_PATH.write_text(text, encoding="utf-8")
+        print(f"[update_env] Appended new line (key not found in .env)")
+    
+    print(f"[update_env] Writing to {ENV_PATH}...")
+    try:
+        ENV_PATH.write_text(text, encoding="utf-8")
+        print(f"[update_env] ✓ File write successful")
+    except Exception as e:
+        print(f"[update_env] ✗ File write FAILED: {e}")
+        logger.error("Failed to write .env: %s", e)
+        raise
+    
     os.environ[key] = value
+    print(f"[update_env] ✓ os.environ[{key}] updated")
 
 
 def get_env(key: str, default: str = "") -> str:
@@ -742,6 +764,9 @@ def api_settings_get():
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_post():
+    print(f"[api_settings_post] REQUEST RECEIVED")
+    print(f"[api_settings_post] ENV_PATH={ENV_PATH}, exists={ENV_PATH.exists()}")
+    
     data = request.get_json() or {}
     errors: dict[str, str] = {}
     changes: dict[str, str] = {}

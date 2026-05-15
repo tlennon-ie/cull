@@ -69,9 +69,23 @@ processes: list[tuple[str, subprocess.Popen]] = []
 
 def start_dashboard() -> subprocess.Popen | None:
     try:
-        kwargs = {"cwd": str(PIPELINE_CODE_DIR)}
+        # Set up environment for dashboard subprocess
+        env = os.environ.copy()
+        
+        # Ensure WORKSPACE_ROOT is set so the dashboard finds .env at the correct location
+        if "WORKSPACE_ROOT" not in env:
+            env["WORKSPACE_ROOT"] = str(PIPELINE_CODE_DIR.parent)
+            logger.info("Set WORKSPACE_ROOT=%s for dashboard subprocess", env["WORKSPACE_ROOT"])
+        
+        # Ensure PIPELINE_CODE_DIR is set
+        if "PIPELINE_CODE_DIR" not in env:
+            env["PIPELINE_CODE_DIR"] = str(PIPELINE_CODE_DIR)
+            logger.info("Set PIPELINE_CODE_DIR=%s for dashboard subprocess", env["PIPELINE_CODE_DIR"])
+        
+        kwargs = {"cwd": str(PIPELINE_CODE_DIR), "env": env}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        
         proc = subprocess.Popen([sys.executable, "-u", "dashboard_enhanced.py"], **kwargs)
         processes.append(("dashboard", proc))
         logger.info("dashboard started (PID %s)", proc.pid)
