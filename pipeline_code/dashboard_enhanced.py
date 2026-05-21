@@ -1042,11 +1042,17 @@ def api_thumbnail():
     except Exception as exc:
         logger.debug("thumbnail fail: %s", exc)
         abort(404)
+    # max_age=0 forces a conditional revalidation on every request: the disk
+    # cache file is content-hashed (path + mtime + size — see thumb_cache.py),
+    # but the URL the browser sees is keyed only on the source image path, so a
+    # long max_age would serve stale thumbnails when an image at the same path
+    # gets replaced. With conditional=True, send_file emits Last-Modified +
+    # ETag and a matching client gets a small 304 instead of a fresh JPEG.
     return send_file(
         cache_file,
         mimetype="image/jpeg",
-        max_age=86400,           # 1 day; the file path is content-hashed so it never goes stale.
-        conditional=True,        # respect If-Modified-Since / If-None-Match for 304s.
+        max_age=0,
+        conditional=True,
     )
 
 

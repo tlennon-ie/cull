@@ -62,12 +62,17 @@ tmp/
 Thumbs.db
 
 # ─── Credentials safety net ────────────────────────────────────────────────
+# Catch-all to keep ad-hoc secret dumps out of the repo. The pipeline_code/
+# credentials.py module is the only committed file matching *credentials*; it
+# contains no secrets (reads os.environ at call time) and is explicitly
+# whitelisted below.
 *credentials*
 *secret*
 *token*
 *password*
 !credentials.template
 !*credentials*.example
+!pipeline_code/credentials.py
 
 # ─── Exception: allow template and example files ──────────────────────────
 !.env.template
