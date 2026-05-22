@@ -623,13 +623,17 @@ ALLOWED_VISION_WORKERS = [
     "balanced-lm",            # targets LMSTUDIO_PRIMARY_*
     "balanced-lm-secondary",  # same worker script, forced to LMSTUDIO_SECONDARY_* via env override
     "lm-autodetect",
+    "balanced-openai-compat", # llama.cpp / vLLM / koboldcpp / LocalAI / text-generation-webui
+    "balanced-ollama",        # Ollama native /api/chat
 ]
 
 _VISION_WORKER_DESCRIPTIONS = {
-    "balanced-groq":          "Groq cloud, llama-4-scout - fast",
-    "balanced-lm":            "LMStudio PRIMARY endpoint",
-    "balanced-lm-secondary":  "LMStudio SECONDARY endpoint (runs in parallel)",
-    "lm-autodetect":          "LMStudio, auto-picks vision-capable model",
+    "balanced-groq":           "Groq cloud, llama-4-scout - fast, paid",
+    "balanced-lm":             "LM Studio PRIMARY endpoint",
+    "balanced-lm-secondary":   "LM Studio SECONDARY endpoint (runs in parallel to primary)",
+    "lm-autodetect":           "LM Studio, auto-picks vision-capable model",
+    "balanced-openai-compat":  "Local OpenAI-compatible server (llama.cpp, vLLM, koboldcpp, LocalAI, text-gen-webui)",
+    "balanced-ollama":         "Ollama via native /api/chat (best structured-output path for Ollama)",
 }
 
 
@@ -706,6 +710,15 @@ SETTINGS_KEYS: list[str] = [
     "LMSTUDIO_SECONDARY_TIMEOUT",
     "LMSTUDIO_UNLOAD_ON_STOP",
     "LMSTUDIO_IDLE_UNLOAD_MINUTES",
+    # Generic OpenAI-compatible local server (llama.cpp / vLLM / koboldcpp / LocalAI / text-gen-webui)
+    "OPENAI_COMPAT_URL",
+    "OPENAI_COMPAT_MODEL",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_TIMEOUT",
+    # Ollama (native /api/chat)
+    "OLLAMA_URL",
+    "OLLAMA_MODEL",
+    "OLLAMA_TIMEOUT",
     # Scraper credentials
     "CIVITAI_API_KEY",
     "CIVITAI_API_RED_KEY",
@@ -732,6 +745,7 @@ SECRET_KEYS: set[str] = {
     "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY",
     "TWITTER_COOKIES", "DISCORD_BOT_TOKEN", "DISCORD_CHANNELS_JSON",
     "REDDIT_CLIENT_SECRET",
+    "OPENAI_COMPAT_API_KEY",
 }
 PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
                        "LOG_DIR", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"}
@@ -2249,9 +2263,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="card rounded-xl p-5">
           <h3 class="font-semibold mb-3">Vision workers</h3>
           <p class="text-xs text-slate-400 mb-3">
-            Toggle multiple providers on to run them in parallel. Each enabled worker runs as its own subprocess and
-            pulls from the shared queue via round-robin. Writes <code>PIPELINE_VISION_WORKERS</code>. Restart pipeline
-            to apply changes.
+            <strong class="text-slate-200">Enable just one provider unless you genuinely have parallel hardware.</strong>
+            Each enabled worker runs as its own subprocess against the shared queue, so toggling two local LLMs on the same
+            GPU will thrash VRAM and slow everything down. The intended multi-worker case is a second LM Studio host on a
+            different machine (<code>balanced-lm-secondary</code>), or cloud + local in parallel (e.g. Groq + LM Studio).
+            Writes <code>PIPELINE_VISION_WORKERS</code>. Restart pipeline to apply changes.
           </p>
           <div class="grid gap-2">
             <template x-for="w in visionWorkers" :key="w.name">

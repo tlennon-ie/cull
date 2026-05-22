@@ -68,6 +68,23 @@ WORKERS: dict[str, WorkerSpec] = {
         script="vision_worker_lm_autodetect.py",
         description="LM Studio - auto-picks whichever VL model is loaded",
     ),
+    "balanced-openai-compat": WorkerSpec(
+        name="balanced-openai-compat",
+        script="vision_worker_balanced_openai.py",
+        description=(
+            "Generic OpenAI-compatible local server (llama.cpp / vLLM / "
+            "koboldcpp / LocalAI / text-generation-webui). Reads "
+            "OPENAI_COMPAT_URL + OPENAI_COMPAT_MODEL."
+        ),
+    ),
+    "balanced-ollama": WorkerSpec(
+        name="balanced-ollama",
+        script="vision_worker_balanced_ollama.py",
+        description=(
+            "Ollama via native /api/chat (more reliable JSON-schema output "
+            "than its OpenAI compat layer). Reads OLLAMA_URL + OLLAMA_MODEL."
+        ),
+    ),
     "local": WorkerSpec(
         name="local",
         script="vision_worker.py",

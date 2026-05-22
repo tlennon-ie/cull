@@ -43,7 +43,7 @@ These are load-bearing — breaking them will silently misroute images.
 | You want to… | Look at |
 |---|---|
 | Add a new scraper source | [`scraper_civitai.py`](pipeline_code/scraper_civitai.py) as a template, register in [`run_pipeline.py`](pipeline_code/run_pipeline.py) `compute_desired_agents` |
-| Add a new vision provider | Subclass [`BaseVisionWorker`](pipeline_code/vision_worker_base.py), register in [`vision_workers.py`](pipeline_code/vision_workers.py), update `ALLOWED_VISION_WORKERS` in [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) |
+| Add a new vision provider | Subclass [`BaseVisionWorker`](pipeline_code/vision_worker_base.py), register in [`vision_workers.py`](pipeline_code/vision_workers.py), update `ALLOWED_VISION_WORKERS` in [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py). For *any* OpenAI-compatible local server (llama.cpp, vLLM, koboldcpp, LocalAI, text-gen-webui) no new worker is needed — point the `balanced-openai-compat` worker at it via `OPENAI_COMPAT_URL` + `OPENAI_COMPAT_MODEL`. Ollama has its own worker (`balanced-ollama`) because its OpenAI compat layer's JSON-schema support is weaker than its native `/api/chat`. |
 | Change classification taxonomy | [`categories.py`](pipeline_code/categories.py) — affects JSON schema + worker mkdir + dashboard automatically |
 | Tune classification quality | [`vision_prompt.py`](pipeline_code/vision_prompt.py) — `build_classification_prompt` for the model-side instruction, `apply_scores` for post-hoc validation gates |
 | Add a dashboard endpoint | [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) — single-file Flask + giant `HTML_TEMPLATE` Alpine.js string |
