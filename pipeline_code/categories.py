@@ -115,10 +115,14 @@ def set_active(payload: dict[str, Any]) -> None:
     """
     global _cache, _cache_mtime
     ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ACTIVE_PATH.write_text(
+    # atomic write — the supervisor watches this file's mtime and loads it, so a
+    # torn write must never be observable.
+    _tmp = ACTIVE_PATH.with_name(ACTIVE_PATH.name + ".tmp")
+    _tmp.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(_tmp, ACTIVE_PATH)
     with _lock:
         _cache = json.loads(json.dumps(payload))
         try:
