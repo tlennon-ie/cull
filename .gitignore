@@ -77,3 +77,6 @@ Thumbs.db
 # ─── Exception: allow template and example files ──────────────────────────
 !.env.template
 !.env.example
+
+# Internal design docs — working contracts, not shipped
+docs/*-design.md
