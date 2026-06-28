@@ -721,5 +721,27 @@ def test_single_job_import_brings_its_preset(client):
     assert "customp" in jc.list_presets()["presets"]
 
 
+def test_config_import_validates_job_overrides(client):
+    c, jc, _tmp = client
+    bundle = {"kind": "cull.job", "version": 1,
+              "job": {"slug": "badov", "name": "BadOv", "subject": "x",
+                      "preset": "default",
+                      "overrides": {"scoring": {"ovr_min": "not-an-int"}}}}
+    r = c.post("/api/config/import", json=bundle)
+    assert r.status_code == 200
+    assert jc.get_job("badov") is None                       # rejected, not saved
+    assert any("badov" in s for s in r.get_json()["skipped"])
+
+
+def test_imported_job_status_reset_to_idle(client):
+    c, jc, _tmp = client
+    bundle = {"kind": "cull.job", "version": 1,
+              "job": {"slug": "wasrunning", "name": "Run", "subject": "x",
+                      "preset": "default", "overrides": {}, "status": "running"}}
+    r = c.post("/api/config/import", json=bundle)
+    assert r.status_code == 200
+    assert jc.get_job("wasrunning").status == "idle"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

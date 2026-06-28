@@ -1143,15 +1143,15 @@ def api_vision_test():
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
             return _done(True, "Groq key accepted")
         if provider == "ollama":
-            url = (data.get("url") or os.environ.get("OLLAMA_URL", "")
-                   or "http://127.0.0.1:11434").rstrip("/")
+            # URL from env only (never the request body) — avoids an SSRF probe.
+            url = (os.environ.get("OLLAMA_URL", "") or "http://127.0.0.1:11434").rstrip("/")
             r = requests.get(f"{url}/api/tags", timeout=5)
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
             n = len(r.json().get("models") or [])
             return _done(True, f"connected, {n} model(s) available")
         if provider in ("openai-compat", "openai_compat"):
-            url = (data.get("url") or os.environ.get("OPENAI_COMPAT_URL", "")).rstrip("/")
+            url = os.environ.get("OPENAI_COMPAT_URL", "").rstrip("/")  # env only (no SSRF)
             if not url:
                 return _done(False, "no OPENAI_COMPAT_URL configured", 400)
             key = os.environ.get("OPENAI_COMPAT_API_KEY", "")
@@ -1164,7 +1164,8 @@ def api_vision_test():
             n = len(r.json().get("data") or [])
             return _done(True, f"connected, {n} model(s)")
         return _done(False, f"unknown provider: {provider!r}", 400)
-    except requests.RequestException as exc:
+    except (requests.RequestException, ValueError) as exc:
+        # ValueError covers JSONDecodeError on a 200-but-non-JSON response.
         return _done(False, f"connection error: {exc}")
 
 
@@ -1863,8 +1864,8 @@ def api_presets_export(name: str):
     payload = {"kind": "cull.preset", "version": EXPORT_VERSION,
                "name": name, "cfg": job_config.get_preset(name)}
     resp = jsonify(payload)
-    resp.headers["Content-Disposition"] = \
-        f'attachment; filename="{name.replace(" ", "_")}.preset.json"'
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name)  # header-injection defence
+    resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name}.preset.json"'
     return resp
 
 
@@ -1947,7 +1948,13 @@ def api_config_import():
         if job_config.get_job(job.slug) is not None and not overwrite:
             summary["skipped"].append(f"job {job.slug!r} (exists)")
             return
-        job_config.save_job(job)
+        # Validate overrides like the PUT path does, and reset runtime state.
+        if job.overrides:
+            _, ov_err = _validate_inheritable_cfg(job.overrides, partial=True)
+            if ov_err:
+                summary["skipped"].append(f"job {job.slug!r} (bad overrides: {ov_err})")
+                return
+        job_config.save_job(job.with_updates(status="idle"))
         summary["jobs_added"] += 1
 
     if kind == "cull.job":
