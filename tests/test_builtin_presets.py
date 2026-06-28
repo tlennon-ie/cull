@@ -10,6 +10,7 @@ Runnable:
 """
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import sys
@@ -216,6 +217,106 @@ def test_resolve_env_projects_seeded_scraper_targets(isolated):
     assert "drones" in env["REDDIT_SUBREDDITS"]
     assert "DroneDJ" in env["X_ACCOUNTS"]
     assert int(env["VISION_OVR_MIN_SCORE"]) == 50
+
+
+# ── managed-defaults refresh: stale builtins pick up new seed data ────────────
+# (the reported bug: builtin_presets.py has seeded keywords/subreddits but an
+# install whose _presets.json predates the seeding kept showing empty fields)
+
+def _write_legacy_presets(tmp_path, presets: dict) -> Path:
+    """Write a pre-baseline _presets.json (no _builtin_baselines key)."""
+    p = tmp_path / "jobs" / "_presets.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"default": "default", "presets": presets}),
+                 encoding="utf-8")
+    return p
+
+
+def test_list_presets_fills_stale_builtin_seed_fields(isolated):
+    jc, tmp_path = isolated
+    # An older install: aerial_drone exists but its seed fields predate the
+    # seeding (empty keywords / subreddits / accounts, zero scoring floors).
+    stale = jc.get_preset("aerial_drone")
+    stale["topic_filters"]["keywords_extra"] = []
+    stale["scrapers"]["reddit_subreddits"] = []
+    stale["scrapers"]["x_accounts"] = []
+    stale["scoring"]["ovr_min"] = 0
+    stale["scoring"]["rel_min"] = 0
+    user_made = jc.get_preset("default")
+    user_made["scoring"]["notes"] = "hand tuned"
+    _write_legacy_presets(tmp_path, {"aerial_drone": stale, "my_custom": user_made})
+
+    lib = jc.list_presets()
+    aerial = lib["presets"]["aerial_drone"]
+    assert aerial["topic_filters"]["keywords_extra"], "keywords not refreshed"
+    assert aerial["scrapers"]["reddit_subreddits"], "subreddits not refreshed"
+    assert aerial["scrapers"]["x_accounts"], "x_accounts not refreshed"
+    assert aerial["scoring"]["ovr_min"] > 0, "ovr floor not seeded"
+    assert aerial["scoring"]["rel_min"] > 0, "rel floor not seeded"
+    # a user-CREATED preset is never touched
+    assert lib["presets"]["my_custom"]["scoring"]["notes"] == "hand tuned"
+
+
+def test_list_presets_preserves_explicit_user_customisation_on_legacy_builtin(isolated):
+    jc, tmp_path = isolated
+    # On a legacy file we only fill EMPTY seed fields — a non-empty customisation
+    # the user typed into a builtin must survive (no clobber).
+    edited = jc.get_preset("aerial_drone")
+    edited["scoring"]["notes"] = "do not clobber me"
+    edited["category_rules"] = "MY CUSTOM RULES"
+    _write_legacy_presets(tmp_path, {"aerial_drone": edited})
+
+    aerial = jc.list_presets()["presets"]["aerial_drone"]
+    assert aerial["scoring"]["notes"] == "do not clobber me"
+    assert aerial["category_rules"] == "MY CUSTOM RULES"
+
+
+def test_list_presets_preserves_user_edited_builtin_after_baseline(isolated):
+    jc, _ = isolated
+    jc.list_presets()                          # seed library + record baselines
+    edited = jc.get_preset("aerial_drone")
+    edited["scoring"]["notes"] = "my notes"
+    jc.save_preset("aerial_drone", edited)     # user edits a builtin in the UI
+    lib = jc.list_presets()                    # must NOT auto-refresh over it
+    assert lib["presets"]["aerial_drone"]["scoring"]["notes"] == "my notes"
+
+
+def test_list_presets_refreshes_unmodified_builtin_on_upgrade(isolated, monkeypatch):
+    jc, _ = isolated
+    jc.list_presets()                          # baselines recorded at current ship
+    import builtin_presets as bp
+    base = bp.builtin_library()
+
+    def newer_ship():
+        lib = copy.deepcopy(base)
+        lib["presets"]["aerial_drone"]["scoring"]["notes"] = "ship v2 notes"
+        return lib
+
+    monkeypatch.setattr(bp, "builtin_library", newer_ship)
+    lib = jc.list_presets()
+    # unmodified builtin tracks the newer ship
+    assert lib["presets"]["aerial_drone"]["scoring"]["notes"] == "ship v2 notes"
+
+
+def test_reset_preset_to_builtin_restores_shipped(isolated):
+    jc, _ = isolated
+    jc.list_presets()
+    edited = jc.get_preset("aerial_drone")
+    edited["scoring"]["notes"] = "changed"
+    edited["topic_filters"]["keywords_extra"] = []
+    jc.save_preset("aerial_drone", edited)
+    restored = jc.reset_preset_to_builtin("aerial_drone")
+    assert restored["scoring"]["notes"] != "changed"
+    assert restored["topic_filters"]["keywords_extra"]          # back from ship
+    # re-baselined: a subsequent reconcile keeps the restored content
+    assert jc.list_presets()["presets"]["aerial_drone"]["scoring"]["notes"] != "changed"
+
+
+def test_reset_preset_rejects_non_builtin(isolated):
+    jc, _ = isolated
+    jc.list_presets()
+    with pytest.raises(ValueError):
+        jc.reset_preset_to_builtin("not_a_builtin_name")
 
 
 if __name__ == "__main__":

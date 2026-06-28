@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -188,13 +189,84 @@ def _default_preset_cfg() -> dict:
 
 # ── Preset library ───────────────────────────────────────────────────────────
 
+# Records, per builtin preset, the signature of the shipped content we last
+# reconciled against. A builtin still matching its baseline is "unmodified" and
+# safe to refresh to a newer ship; a diverged one is a user edit we keep.
+_BASELINE_KEY = "_builtin_baselines"
+
+# Taste-bearing leaves a *legacy* (pre-baseline) builtin gets filled from the
+# ship when blank — exactly the keyword / scraper-target / scoring-floor fields
+# that shipped empty before seeding. Categories, rules and captioning are left
+# to the user (only replaced wholesale for a brand-new or provably-unmodified
+# builtin), so a customised legacy preset is never clobbered.
+_SEED_FILL_PATHS: tuple[tuple[str, str], ...] = (
+    ("topic_filters", "keywords_extra"),
+    ("topic_filters", "banned_keywords"),
+    ("topic_filters", "generation_hints"),
+    ("topic_filters", "min_prompt_length"),
+    ("scrapers", "x_accounts"),
+    ("scrapers", "reddit_subreddits"),
+    ("scrapers", "civitai_domains"),
+    ("scoring", "ovr_min"),
+    ("scoring", "rel_min"),
+)
+
+
+def _preset_signature(cfg: dict) -> str:
+    """Stable content hash of a preset (or library), for change detection."""
+    blob = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _is_blank(v: Any) -> bool:
+    """A seed field counts as needing a fill when empty or a zero scoring floor."""
+    return v is None or v == "" or v == [] or v == {} or v == 0
+
+
+def _scoped_seed_fill(on_disk: dict, shipped: dict) -> dict:
+    """Copy of ``on_disk`` with only its BLANK seed leaves filled from ``shipped``.
+    Non-empty user content (categories, rules, custom keywords) is preserved."""
+    merged = copy.deepcopy(on_disk)
+    for sect, key in _SEED_FILL_PATHS:
+        section = merged.get(sect)
+        cur = section.get(key, _MISSING) if isinstance(section, dict) else _MISSING
+        if cur is _MISSING or _is_blank(cur):
+            ship_val = (shipped.get(sect) or {}).get(key, _MISSING)
+            if ship_val is not _MISSING and not _is_blank(ship_val):
+                merged.setdefault(sect, {})[key] = copy.deepcopy(ship_val)
+    return merged
+
+
 def _merge_builtin_presets(lib: dict) -> dict:
-    """Additively ensure every shipped builtin preset exists in ``lib`` so an
-    older install picks up newly-added themed presets on upgrade — WITHOUT
-    clobbering any preset the user created or edited (``setdefault`` only)."""
+    """Ensure every shipped builtin preset is present and reconciled with the
+    library — a managed-defaults merge that never touches a user-CREATED preset.
+
+    Per builtin:
+      * absent            -> insert the ship, record its baseline.
+      * baseline == on-disk (unmodified) -> refresh wholesale to the latest ship.
+      * baseline != on-disk (user edited) -> keep the user's version.
+      * no baseline (legacy file) -> fill only BLANK seed leaves from the ship
+        (new keywords / subreddits / scoring floors appear without clobbering a
+        customisation), then record the ship baseline so later edits are detected.
+    """
     presets = lib.setdefault("presets", {})
+    baselines = lib.setdefault(_BASELINE_KEY, {})
     for name, cfg in builtin_presets.builtin_library()["presets"].items():
-        presets.setdefault(name, copy.deepcopy(cfg))
+        shipped = copy.deepcopy(cfg)
+        shipped_sig = _preset_signature(shipped)
+        existing = presets.get(name)
+        if existing is None:
+            presets[name] = shipped
+            baselines[name] = shipped_sig
+            continue
+        recorded = baselines.get(name)
+        if recorded is None:
+            presets[name] = _scoped_seed_fill(existing, shipped)
+            baselines[name] = shipped_sig
+        elif _preset_signature(existing) == recorded:
+            presets[name] = shipped
+            baselines[name] = shipped_sig
+        # else: user-edited builtin -> keep as-is (baseline unchanged)
     lib.setdefault("default", builtin_presets.DEFAULT_PRESET)
     return lib
 
@@ -218,7 +290,7 @@ def _read_presets_raw(path: Path) -> dict | None:
 def _read_presets() -> dict:
     data = _read_presets_raw(_presets_path())
     if data is None:
-        return builtin_presets.builtin_library()
+        return _merge_builtin_presets(builtin_presets.builtin_library())
     data.setdefault("default", next(iter(data["presets"])))
     return _merge_builtin_presets(data)
 
@@ -233,14 +305,14 @@ def list_presets() -> dict:
     path = _presets_path()
     raw = _read_presets_raw(path)
     if raw is None:
-        lib = builtin_presets.builtin_library()
-        _write_presets(lib)                    # seed on first access
+        lib = _merge_builtin_presets(builtin_presets.builtin_library())
+        _write_presets(lib)                    # seed + record baselines on first access
         return lib
-    before = set(raw.get("presets", {}))
     raw.setdefault("default", next(iter(raw["presets"])))
+    before = _preset_signature(raw)            # snapshot pre-merge (content, not just names)
     lib = _merge_builtin_presets(raw)
-    if set(lib.get("presets", {})) != before:
-        _write_presets(lib)                    # persist newly-merged builtins
+    if _preset_signature(lib) != before:
+        _write_presets(lib)                    # persist refreshed/seeded builtins + baselines
     return lib
 
 
@@ -283,6 +355,25 @@ def set_default_preset(name: str) -> None:
         raise ValueError(f"unknown preset: {name}")
     lib["default"] = name
     _write_presets(lib)
+
+
+def builtin_preset_names() -> tuple[str, ...]:
+    """Names of the presets cull ships (the ones a Reset-to-defaults applies to)."""
+    return builtin_presets.PRESET_NAMES
+
+
+def reset_preset_to_builtin(name: str) -> dict:
+    """Restore a builtin preset to its shipped definition and re-baseline it, so
+    a user can force a stale/edited builtin back to the library. Raises
+    ValueError for a name that isn't a shipped builtin."""
+    shipped = builtin_presets.builtin_library()["presets"].get(name)
+    if shipped is None:
+        raise ValueError(f"{name!r} is not a builtin preset")
+    lib = list_presets()
+    lib["presets"][name] = copy.deepcopy(shipped)
+    lib.setdefault(_BASELINE_KEY, {})[name] = _preset_signature(shipped)
+    _write_presets(lib)
+    return get_preset(name)
 
 
 # ── v1 → v2 conversion ───────────────────────────────────────────────────────

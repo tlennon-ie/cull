@@ -22,6 +22,10 @@ Design notes:
   per-theme `style` is just the sensible choice for when a user turns it on.
 - This module imports nothing from `job_config` (it is imported BY it), so it
   stays free of the SCRAPER_NAMES dependency by omitting the scrapers block.
+- Scraper targets seeded here are PUBLIC, verifiable handles (subreddits, X
+  accounts) and both Civitai hosts. Discord is intentionally NOT pre-seeded:
+  the Discord scraper needs numeric server+channel IDs reachable by *your* bot
+  token, so a shipped guess would be wrong for everyone — leave it per-job.
 """
 from __future__ import annotations
 
@@ -171,7 +175,7 @@ def _build_presets() -> dict[str, dict]:
             keywords_extra=("aerial", "drone", "overhead", "birds eye", "top-down",
                             "satellite", "from above", "altitude"),
             reddit_subreddits=("drones", "aerialphotography", "dronephotography",
-                               "Multicopter", "SatelliteImages"),
+                               "Multicopter", "SatelliteImages", "fpv", "AerialPorn"),
             x_accounts=("DroneDJ",),
             ovr_min=50, rel_min=25,
             categories=[
@@ -204,8 +208,8 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("underwater", "scuba", "diving", "reef", "ocean",
                             "marine", "coral", "sea"),
-            reddit_subreddits=("underwaterphotography", "scuba", "reef",
-                               "WaterPorn", "Ocean"),
+            reddit_subreddits=("underwaterphotography", "scuba", "ScubaDiving",
+                               "reef", "WaterPorn", "Ocean", "marinebiology"),
             ovr_min=50, rel_min=25,
             categories=[
                 ("Keep", "Clearly underwater/marine subject, good visibility, "
@@ -308,7 +312,8 @@ def _build_presets() -> dict[str, dict]:
             generation_hints=("anime", "illustration", "masterpiece",
                               "best quality", "detailed"),
             reddit_subreddits=("anime", "awwnime", "Animewallpaper",
-                               "ImaginaryCharacters", "DigitalArt"),
+                               "ImaginaryCharacters", "DigitalArt", "Illustration",
+                               "characterdrawing"),
             ovr_min=45, rel_min=25,
             categories=[
                 ("Keep", "Clean anime/illustration artwork, on-topic, no severe AI "
@@ -343,8 +348,11 @@ def _build_presets() -> dict[str, dict]:
             theme_rules="",
             keywords_extra=("woman", "model", "portrait", "fashion", "editorial",
                             "photoshoot"),
+            banned_keywords=("onlyfans", "linktr.ee", "telegram", "snapchat",
+                             "cashapp", "promo code"),
             generation_hints=("photorealistic", "skin texture", "portrait",
                               "natural light", "studio light", "bokeh", "85mm"),
+            reddit_subreddits=("portraits",),
             ovr_min=55, rel_min=0,
             categories=[
                 ("InstagramInfluencer", "photorealistic person, social-media "

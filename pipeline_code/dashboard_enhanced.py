@@ -1742,6 +1742,7 @@ def api_presets_list():
     return jsonify({
         "default": lib.get("default", "default"),
         "presets": sorted(lib.get("presets", {}).keys()),
+        "builtins": sorted(job_config.builtin_preset_names()),
     })
 
 
@@ -1847,6 +1848,18 @@ def api_presets_set_default():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"success": True, "default": name})
+
+
+@app.route("/api/presets/<name>/reset", methods=["POST"])
+def api_presets_reset(name: str):
+    """Restore a shipped (builtin) preset to its library definition."""
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    try:
+        cfg = job_config.reset_preset_to_builtin(name)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "name": name, "cfg": cfg})
 
 
 # ── API: export / import (presets + full config backup) ──────────────────────
@@ -3989,10 +4002,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Preset (inherited defaults)</span>
-            <select :value="je.preset" @change="setPreset($event.target.value)"
+            <!-- Bind :selected on each option (not :value on the select): with
+                 x-for-rendered options, :value applies before the options exist
+                 and never re-applies, so the select would wrongly show the first
+                 entry instead of je.preset. -->
+            <select @change="setPreset($event.target.value)"
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
               <template x-for="p in je.presets" :key="p">
-                <option :value="p" x-text="p + (p === je.default_preset ? ' (default)' : '')"></option>
+                <option :value="p" :selected="p === je.preset"
+                        x-text="p + (p === je.default_preset ? ' (default)' : '')"></option>
               </template>
             </select>
           </label>
@@ -4246,6 +4264,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
                 <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
+                <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
+                        title="Restore this shipped preset to its built-in defaults"
+                        class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
                 <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
                 <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
               </div>
@@ -4859,7 +4880,7 @@ function dashboard() {
     // Jobs landing state.
     jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
     newJob: { name: '', base_on: '', preset: '' },
-    presetsList: [], presetsDefault: '',
+    presetsList: [], presetsDefault: '', presetsBuiltins: [],
     // Per-job config editor (Job Settings tab) — v2 inherit/override model.
     // eff = effective (resolved) cfg; overrides = the sparse override map.
     je: {
@@ -5377,6 +5398,7 @@ function dashboard() {
         const p = await fetch('/api/presets').then(r => r.json());
         this.presetsList = p.presets || [];
         this.presetsDefault = p.default || '';
+        this.presetsBuiltins = p.builtins || [];
         // Default the "Start from" picker to the library default (no more
         // redundant empty "Clone the default" option). Keep a valid selection.
         if (!this.presetsList.includes(this.newPreset.base_on)) {
@@ -5422,6 +5444,16 @@ function dashboard() {
       if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadPresets();
       this.notify('"' + name + '" is now the default preset.', 'success');
+    },
+    async resetPreset(name) {
+      if (!(await this.askConfirm('Reset "' + name + '" to its shipped defaults? Your edits to this preset will be discarded.',
+                                  { title: 'Reset preset', confirmLabel: 'Reset', danger: true }))) return;
+      const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/reset', {method:'POST'});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) { this.notify('Reset failed: ' + (j.error || r.status), 'error'); return; }
+      await this.loadPresets();
+      if (this.presetEditor.open && this.presetEditor.name === name) await this.openPreset(name);
+      this.notify('Preset "' + name + '" reset to defaults.', 'success');
     },
     async openPreset(name) {
       try {
