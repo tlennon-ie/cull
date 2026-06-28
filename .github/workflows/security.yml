@@ -1,0 +1,102 @@
+# Security — dependency CVE audit, CodeQL static analysis, and secret scanning.
+#
+# Three independent jobs so one failing gate does not mask the others:
+#   * pip-audit  — fails the build on any known CVE in the pinned requirements.
+#   * codeql     — GitHub's semantic code-scanning for Python (init + analyze).
+#   * secrets    — trufflehog scan of the PR diff for committed credentials.
+#
+# Runs on every PR into the protected branches and on a weekly cron so freshly
+# disclosed CVEs / advisories are caught even when the tree is quiet.
+name: Security
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+  schedule:
+    # Mondays at 06:17 UTC — odd minute to dodge the top-of-hour runner rush.
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Dependency CVE audit — hard-fails on a known-vulnerable pinned dependency.
+  # ---------------------------------------------------------------------------
+  pip-audit:
+    name: pip-audit (dependency CVEs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Run pip-audit against requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+          # Audits the pinned dependency set directly (no full install needed).
+          # Non-zero exit on any matched advisory fails the job.
+          pip-audit -r requirements.txt
+
+  # ---------------------------------------------------------------------------
+  # CodeQL static analysis for Python.
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: CodeQL (python)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required so the analysis can upload its SARIF results to code scanning.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["python"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning — trufflehog over the PR diff (and full tree on schedule).
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secret scan (trufflehog)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so trufflehog can diff base..head on pull_request.
+          fetch-depth: 0
+
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@v3.90.5
+        with:
+          extra_args: --results=verified,unknown
