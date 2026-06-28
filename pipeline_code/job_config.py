@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import builtin_presets
 import categories
 import paths
 from pipeline_logging import get_logger
@@ -187,6 +188,17 @@ def _default_preset_cfg() -> dict:
 
 # ── Preset library ───────────────────────────────────────────────────────────
 
+def _merge_builtin_presets(lib: dict) -> dict:
+    """Additively ensure every shipped builtin preset exists in ``lib`` so an
+    older install picks up newly-added themed presets on upgrade — WITHOUT
+    clobbering any preset the user created or edited (``setdefault`` only)."""
+    presets = lib.setdefault("presets", {})
+    for name, cfg in builtin_presets.builtin_library()["presets"].items():
+        presets.setdefault(name, copy.deepcopy(cfg))
+    lib.setdefault("default", builtin_presets.DEFAULT_PRESET)
+    return lib
+
+
 def _read_presets() -> dict:
     p = _presets_path()
     if p.is_file():
@@ -194,10 +206,10 @@ def _read_presets() -> dict:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("presets"), dict) and data["presets"]:
                 data.setdefault("default", next(iter(data["presets"])))
-                return data
+                return _merge_builtin_presets(data)
         except (OSError, json.JSONDecodeError):
             logger.warning("presets file %s is unreadable; using built-in defaults", p)
-    return {"default": "default", "presets": {"default": _default_preset_cfg()}}
+    return builtin_presets.builtin_library()
 
 
 def _write_presets(lib: dict) -> None:
@@ -206,8 +218,18 @@ def _write_presets(lib: dict) -> None:
 
 def list_presets() -> dict:
     lib = _read_presets()
-    if not _presets_path().is_file():
+    path = _presets_path()
+    if not path.is_file():
         _write_presets(lib)                    # seed on first access
+    else:
+        # Durably persist builtin presets merged into an older library so the
+        # on-disk file matches what callers see (only when the set changed).
+        try:
+            on_disk = json.loads(path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError):
+            on_disk = {}
+        if set(on_disk.get("presets", {})) != set(lib.get("presets", {})):
+            _write_presets(lib)
     return lib
 
 
