@@ -989,13 +989,23 @@ SECRET_KEYS: set[str] = {
     "REDDIT_CLIENT_SECRET",
     "OPENAI_COMPAT_API_KEY",
 }
+# Placeholder shown in the UI for a credential that IS set. The real value never
+# leaves the server: GET returns this for any non-empty secret, and POST treats
+# an incoming mask as "unchanged" so saving the form can't wipe a stored secret.
+SECRET_MASK = "********"
 PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
                        "LOG_DIR"}
 
 
 @app.route("/api/settings")
 def api_settings_get():
-    return jsonify({key: os.environ.get(key, "") for key in SETTINGS_KEYS})
+    # Never ship credentials to the browser in plaintext: a set secret returns
+    # the mask; an unset secret returns "" (so the UI shows an empty field).
+    out: dict[str, str] = {}
+    for key in SETTINGS_KEYS:
+        val = os.environ.get(key, "")
+        out[key] = SECRET_MASK if (key in SECRET_KEYS and val) else val
+    return jsonify(out)
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -1009,6 +1019,11 @@ def api_settings_post():
             errors[key] = "unknown setting"
             continue
         value = ("" if value is None else str(value)).strip()
+        # A secret echoed back as the mask means "unchanged" — skip it so the
+        # stored credential is preserved (a real typed value still updates it,
+        # and an explicit empty string still clears it).
+        if key in SECRET_KEYS and value == SECRET_MASK:
+            continue
         if key == "PIPELINE_RECONCILE_SECONDS" and value:
             try:
                 parsed = int(value)

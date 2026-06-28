@@ -15,6 +15,7 @@ storage modules and the dashboard so everything lands under a temp dir.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -445,6 +446,56 @@ def test_settings_post_rejects_per_job_key(client):
     r = c.post("/api/settings", json={"PIPELINE_TOPIC": "nope"})
     assert r.status_code == 400
     assert "PIPELINE_TOPIC" in r.get_json()["errors"]
+
+
+# ── secret masking (never ship credentials to the browser in plaintext) ──────
+
+def test_settings_get_masks_secret_values(client, monkeypatch):
+    c, _jc, _tmp = client
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_realsecret")
+    monkeypatch.setenv("TWITTER_COOKIES", "auth_token=supersecret")
+    data = c.get("/api/settings").get_json()
+    assert data["GROQ_API_KEY"] == "********"
+    assert data["TWITTER_COOKIES"] == "********"
+    blob = json.dumps(data)
+    assert "gsk_realsecret" not in blob
+    assert "supersecret" not in blob
+
+
+def test_settings_get_leaves_nonsecret_visible_and_empty_secret_empty(client, monkeypatch):
+    c, _jc, _tmp = client
+    monkeypatch.setenv("GROQ_MODEL", "llama-4-scout")        # not a secret → visible
+    monkeypatch.delenv("CIVITAI_API_KEY", raising=False)     # unset secret → "" not mask
+    data = c.get("/api/settings").get_json()
+    assert data["GROQ_MODEL"] == "llama-4-scout"
+    assert data["CIVITAI_API_KEY"] == ""
+
+
+def test_settings_post_preserves_masked_secret(client, monkeypatch):
+    c, _jc, _tmp = client
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_realsecret")
+    # user saves the form without touching the secret → posts the mask back
+    r = c.post("/api/settings", json={"GROQ_API_KEY": "********", "GROQ_MODEL": "m2"})
+    assert r.status_code == 200
+    assert os.environ["GROQ_API_KEY"] == "gsk_realsecret"    # NOT overwritten with stars
+    assert os.environ["GROQ_MODEL"] == "m2"
+    assert "GROQ_API_KEY" not in r.get_json()["applied"]     # untouched
+
+
+def test_settings_post_updates_typed_secret(client, monkeypatch):
+    c, _jc, _tmp = client
+    monkeypatch.setenv("GROQ_API_KEY", "old")
+    r = c.post("/api/settings", json={"GROQ_API_KEY": "gsk_brand_new"})
+    assert r.status_code == 200
+    assert os.environ["GROQ_API_KEY"] == "gsk_brand_new"
+
+
+def test_settings_post_can_clear_secret_with_empty(client, monkeypatch):
+    c, _jc, _tmp = client
+    monkeypatch.setenv("GROQ_API_KEY", "old")
+    r = c.post("/api/settings", json={"GROQ_API_KEY": ""})
+    assert r.status_code == 200
+    assert os.environ.get("GROQ_API_KEY", "") == ""          # explicit empty clears
 
 
 # ── pipeline start gate ──────────────────────────────────────────────────────
