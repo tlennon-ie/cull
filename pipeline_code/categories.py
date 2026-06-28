@@ -1,11 +1,17 @@
-"""User-configurable classification taxonomy.
+"""Active classification taxonomy (the buckets the vision worker can pick).
 
-Source of truth for which buckets the vision worker can classify into. Edit
-via the dashboard's Settings -> Categories panel, or write JSON directly to
-``data/cull_categories.json``. The shipped fallback (loaded automatically
-when no user file exists) is the ``portrait_curation`` preset in
-``cull_categories_default.json`` — six buckets tuned for influencer / model
-photography, identical to cull's pre-customisation defaults.
+The ACTIVE taxonomy lives at ``data/cull_categories.json``. In the v2 jobs model
+it is *projected* there by ``job_config.project_categories`` whenever a job is
+activated — categories are configured per-job/preset (authored in
+``builtin_presets.py``, edited in the dashboard's job/preset editor), NOT in a
+global Categories panel. This module just reads whatever is currently active.
+
+``cull_categories_default.json`` is the shipped FALLBACK: it supplies the
+default taxonomy (the ``general_dataset`` preset — a topic-agnostic
+Keep/Borderline/OffTopic triage with no person gates) used when no job is active
+and as ``job_config``'s merge-base default. It also carries a few legacy
+category-only presets; the per-theme taxonomies are owned by
+``builtin_presets.py`` (the single source of truth) and are not duplicated here.
 
 Two distinctions:
   CATEGORIES        - keep-bucket folders that vision workers create on-write.
