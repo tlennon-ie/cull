@@ -24,8 +24,13 @@ Schema (single table):
         quality INTEGER,                -- vision quality_score (1-10)
         nsfw INTEGER,                   -- 0 / 1
         prompt TEXT,                    -- contents of <stem>.txt
-        vision_json TEXT                -- raw JSON of <stem>.vision.json
+        vision_json TEXT,               -- raw JSON of <stem>.vision.json
+        phash TEXT                      -- 16-char hex dHash (nullable; see phash_dedup)
     )
+
+The ``phash`` column is added by a backward-safe migration (``ALTER TABLE ADD
+COLUMN`` guarded by ``PRAGMA table_info``) so databases created before this
+column shipped keep working — existing rows simply get ``NULL``.
 
 Connection model: one connection per thread (sqlite3 connections are
 not safe to share across threads without serialising). The module
@@ -105,7 +110,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 quality     INTEGER,
                 nsfw        INTEGER,
                 prompt      TEXT,
-                vision_json TEXT
+                vision_json TEXT,
+                phash       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_status            ON images(status);
             CREATE INDEX IF NOT EXISTS idx_status_category   ON images(status, category);
@@ -119,6 +125,29 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             );
             """
         )
+        _migrate_add_columns(conn)
+
+
+# Backward-safe migrations. Each entry is (column_name, column_def). Adding a
+# nullable column via ``ALTER TABLE ADD COLUMN`` is the one schema change SQLite
+# applies in-place without a table rewrite, so old databases upgrade cheaply and
+# pre-existing rows get NULL for the new column.
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("phash", "TEXT"),
+)
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing columns from ``_ADDED_COLUMNS`` to the images table.
+
+    Idempotent: inspects ``PRAGMA table_info`` and only issues ``ALTER TABLE``
+    for columns that don't already exist, so running it on every connection /
+    process start is harmless.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(images)")}
+    for column, definition in _ADDED_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE images ADD COLUMN {column} {definition}")
 
 
 # ── Public DTO ──────────────────────────────────────────────────────────────
@@ -396,6 +425,46 @@ def existing_paths(status: str | None = None) -> dict[str, float]:
         else:
             cur = conn.execute("SELECT path, mtime FROM images WHERE status = ?", (status,))
         return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def set_phash(key: str, phash: str | None) -> None:
+    """Store the perceptual hash for an already-indexed image row.
+
+    No-op if the row doesn't exist (the indexer upserts rows; this only
+    annotates them). Pass ``None`` to clear a previously-stored hash.
+    """
+    with with_conn() as conn:
+        conn.execute(
+            "UPDATE images SET phash = ? WHERE path = ?",
+            (phash, key),
+        )
+
+
+def iter_phashes(
+    slug: str | None = None, *, status: str | None = None,
+) -> Iterator[tuple[str, str | None]]:
+    """Yield ``(path, phash)`` for indexed images, optionally filtered.
+
+    Used by the near-duplicate scan (``phash_dedup.find_near_duplicates``).
+    Filter by ``slug`` (``topic_slug``) and/or ``status`` (``queue`` / ``sorted``).
+    Rows whose ``phash`` was never computed yield ``None`` so callers can decide
+    whether to skip or backfill them.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if slug is not None:
+        where.append("topic_slug = ?")
+        params.append(slug)
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with with_conn() as conn:
+        cur = conn.execute(
+            f"SELECT path, phash FROM images{where_sql}", params,
+        )
+        for row in cur.fetchall():
+            yield row[0], row[1]
 
 
 def set_meta(key: str, value: str) -> None:
@@ -767,6 +836,8 @@ __all__ = [
     "upsert_many",
     "delete_paths",
     "existing_paths",
+    "set_phash",
+    "iter_phashes",
     "scan",
     "start_background_indexer",
     "stop_background_indexer",
