@@ -1147,7 +1147,10 @@ def api_vision_test():
             if not _http(url):
                 return _done(False, "url must be an http(s) address", 400)
             headers = {"Authorization": f"Bearer {body_key}"} if body_key else {}
-            r = requests.get(f"{url}/api/tags", headers=headers, timeout=6)
+            # allow_redirects=False so a hostile endpoint can't 302-bounce the
+            # probe to a metadata URL (169.254.169.254) the user didn't type.
+            r = requests.get(f"{url}/api/tags", headers=headers, timeout=6,
+                             allow_redirects=False)
             if r.status_code in (401, 403):
                 return _done(False, f"auth rejected (HTTP {r.status_code}) - check the API key")
             if r.status_code != 200:
@@ -1165,7 +1168,8 @@ def api_vision_test():
                 return _done(False, "url must be an http(s) address", 400)
             key = body_key or os.environ.get("OPENAI_COMPAT_API_KEY", "")
             headers = {"Authorization": f"Bearer {key}"} if key else {}
-            r = requests.get(f"{url}/v1/models", headers=headers, timeout=6)
+            r = requests.get(f"{url}/v1/models", headers=headers, timeout=6,
+                             allow_redirects=False)   # no 302-bounce to metadata
             if r.status_code in (401, 403):
                 return _done(False, f"auth rejected (HTTP {r.status_code}) - check the API key")
             if r.status_code != 200:
