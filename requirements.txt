@@ -18,6 +18,9 @@ requests>=2.31
 
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
 groq>=0.11                        # Groq cloud worker
+openai>=1.0                       # OpenAI + OpenRouter cloud vision workers
+anthropic>=0.39                   # Anthropic Claude cloud vision worker
+google-genai>=1.0                 # Gemini cloud vision worker (NEW SDK, not google-generativeai)
 
 # ── Scrapers ─────────────────────────────────────────────────────────────
 playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install
@@ -27,6 +30,10 @@ schedule>=1.2                     # vision_worker_lm_keepalive.py
 # breaks an extractor. Bump deliberately after smoke-testing the relevant
 # scrapers.
 gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.1
+yt-dlp>=2024.8                    # video scraping lane (scraper_yt_dlp.py)
+
+# ── Dataset export ───────────────────────────────────────────────────────
+huggingface_hub>=0.24             # push curated sets to a private HF dataset repo (hf_export.py)
 
 # ── Optional dev tools (uncomment for development) ───────────────────────
 # pytest>=8.0

@@ -924,6 +924,10 @@ def api_update_run():
 
 ALLOWED_VISION_WORKERS = [
     "balanced-groq",
+    "openai",                 # OpenAI cloud (GPT vision)
+    "anthropic",              # Anthropic Claude vision
+    "gemini",                 # Google Gemini vision (google-genai SDK)
+    "openrouter",             # OpenRouter OpenAI-compatible gateway
     "balanced-lm",            # targets LMSTUDIO_PRIMARY_*
     "balanced-lm-secondary",  # same worker script, forced to LMSTUDIO_SECONDARY_* via env override
     "lm-autodetect",
@@ -933,6 +937,10 @@ ALLOWED_VISION_WORKERS = [
 
 _VISION_WORKER_DESCRIPTIONS = {
     "balanced-groq":           "Groq cloud, llama-4-scout - fast, paid",
+    "openai":                  "OpenAI cloud (GPT vision) - structured JSON schema. Reads OPENAI_API_KEY + OPENAI_VISION_MODEL",
+    "anthropic":               "Anthropic Claude vision - structured output via forced tool-use. Reads ANTHROPIC_API_KEY + ANTHROPIC_VISION_MODEL",
+    "gemini":                  "Google Gemini vision (new google-genai SDK) - response_schema output. Reads GEMINI_API_KEY/GOOGLE_API_KEY + GEMINI_VISION_MODEL",
+    "openrouter":              "OpenRouter - OpenAI-compatible gateway to many vision models. Reads OPENROUTER_API_KEY + OPENROUTER_VISION_MODEL",
     "balanced-lm":             "LM Studio PRIMARY endpoint",
     "balanced-lm-secondary":   "LM Studio SECONDARY endpoint (runs in parallel to primary)",
     "lm-autodetect":           "LM Studio, auto-picks vision-capable model",
