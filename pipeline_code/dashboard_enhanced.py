@@ -3955,12 +3955,18 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
+              <span class="text-xs text-slate-400">Civitai domains{{ tip('Tick which Civitai hosts to scrape (civitai.com and/or the civitai.red mirror).') }}</span>
               <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('scrapers.civitai_domains')" @input="setOverrideList('scrapers.civitai_domains', $event.target.value)"
-                   placeholder="civitai.com,civitai.red" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.civitai_domains') ? 'text-slate-400' : ''"/>
+            <div class="flex items-center gap-5 py-1.5" :class="!isOver('scrapers.civitai_domains') ? 'opacity-70' : ''">
+              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" :checked="civOn('civitai.com')" @change="civToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> civitai.com
+              </label>
+              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" :checked="civOn('civitai.red')" @change="civToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> civitai.red
+              </label>
+            </div>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
@@ -4162,8 +4168,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <input :value="peList('scrapers.x_accounts')" @input="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
               <input :value="peList('scrapers.reddit_subreddits')" @input="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
-              <input :value="peList('scrapers.civitai_domains')" @input="peSetList('scrapers.civitai_domains', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <div class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains{{ tip('Tick which Civitai hosts to scrape (civitai.com and/or the civitai.red mirror).') }}</span>
+              <div class="flex items-center gap-5 py-1.5 mt-1">
+                <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
+                  <input type="checkbox" :checked="peCivOn('civitai.com')" @change="peCivToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> civitai.com
+                </label>
+                <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
+                  <input type="checkbox" :checked="peCivOn('civitai.red')" @change="peCivToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> civitai.red
+                </label>
+              </div></div>
           </div>
           <div class="grid md:grid-cols-2 gap-3">
             <label class="block"><span class="text-xs text-slate-400">Scrapers enabled (toggles)</span>
@@ -4773,6 +4786,20 @@ function dashboard() {
       } catch (e) {
         this.scraperTest = { ...this.scraperTest, [name]: { pending: false, ok: false, message: 'request failed' } };
       }
+    },
+    // Civitai domains as a fixed two-option multiselect (com / red), not free text.
+    _domainsList(str) { return (str || '').split(',').map(s => s.trim()).filter(Boolean); },
+    civOn(d) { return this._domainsList(this.effList('scrapers.civitai_domains')).includes(d); },
+    civToggle(d, on) {
+      let cur = this._domainsList(this.effList('scrapers.civitai_domains')).filter(x => x !== d);
+      if (on) cur.push(d);
+      this.setOverrideList('scrapers.civitai_domains', cur.join(','));
+    },
+    peCivOn(d) { return this._domainsList(this.peList('scrapers.civitai_domains')).includes(d); },
+    peCivToggle(d, on) {
+      let cur = this._domainsList(this.peList('scrapers.civitai_domains')).filter(x => x !== d);
+      if (on) cur.push(d);
+      this.peSetList('scrapers.civitai_domains', cur.join(','));
     },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
