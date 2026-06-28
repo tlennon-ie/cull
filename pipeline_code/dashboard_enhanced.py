@@ -2604,7 +2604,10 @@ def api_gallery_download():
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
-HTML_TEMPLATE = r"""<!doctype html>
+HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
+<span class="tip" tabindex="0" aria-label="Help"><span class="tip-i" aria-hidden="true">i</span><span class="tip-pop" role="tooltip">{{ body|safe }}{% if example %}<span class="ex">{{ example|safe }}</span>{% endif %}</span></span>
+{%- endmacro -%}
+<!doctype html>
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8"/>
@@ -2655,6 +2658,23 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   .nsfw-eye:hover { background: rgba(15,23,42,0.65); color:#fde68a; }
   .nsfw-eye svg { width:60%; height:60%; max-width:34px; max-height:34px; opacity:.95; }
+  /* Field help tooltips — an "i" trigger; hover/focus reveals a positioned
+     popover. CSS-only so it needs no per-instance Alpine state. See tip() macro. */
+  .tip { position:relative; display:inline-flex; align-items:center; vertical-align:middle; margin-left:.3rem; }
+  .tip-i { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+           border-radius:9999px; border:1px solid #64748b; color:#94a3b8; font-size:10px; line-height:1;
+           font-style:normal; font-weight:700; cursor:help; user-select:none; }
+  .tip:hover .tip-i, .tip:focus-within .tip-i { border-color:#38bdf8; color:#7dd3fc; }
+  .tip-pop { visibility:hidden; opacity:0; transition:opacity .12s ease; position:absolute; z-index:80;
+             left:0; top:1.5em; width:18rem; max-width:min(18rem,70vw); padding:.55rem .65rem;
+             border-radius:.4rem; background:#1e293b; border:1px solid #475569; color:#e2e8f0;
+             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.45);
+             text-transform:none; letter-spacing:normal; font-weight:400; white-space:normal; }
+  .tip:hover .tip-pop, .tip:focus-within .tip-pop { visibility:visible; opacity:1; }
+  .tip.tip-r .tip-pop { left:auto; right:0; }
+  .tip-pop b { color:#f1f5f9; font-weight:600; }
+  .tip-pop code { background:#0f172a; border:1px solid #334155; border-radius:3px; padding:0 .25rem; color:#fcd34d; }
+  .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -3481,7 +3501,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('captioning.enabled')"
                        @change="setOverride('captioning.enabled', $event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Enable auto-captioning</span>
+                <span class="text-sm">Enable auto-captioning{{ tip('Writes a training caption <code>.txt</code> next to each kept image, produced by the same vision call in the chosen style. Off by default — it adds output tokens per image.') }}</span>
               </label>
               <span x-show="!isOver('captioning.enabled')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400" title="inherited from preset">global</span>
               <button x-show="isOver('captioning.enabled')" @click="resetOverride('captioning.enabled')" class="text-xs link-btn" title="reset to preset">reset ↺</button>
@@ -3491,7 +3511,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('captioning.overwrite')" :disabled="!effVal('captioning.enabled')"
                        @change="setOverride('captioning.overwrite', $event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Overwrite existing captions</span>
+                <span class="text-sm">Overwrite existing captions{{ tip('When on, replaces any caption a scraper already saved. Off keeps the source-side prompt and only fills in gaps.') }}</span>
               </label>
               <span x-show="!isOver('captioning.overwrite')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('captioning.overwrite')" @click="resetOverride('captioning.overwrite')" class="text-xs link-btn">reset ↺</button>
@@ -3501,7 +3521,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('topic_filters.require_prompt') === false"
                        @change="setOverride('topic_filters.require_prompt', !$event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Ingest images without a prompt</span>
+                <span class="text-sm">Ingest images without a prompt{{ tip('Accept images that have no generation prompt/caption (e.g. plain photos). Off = require a prompt — right for AI-art, wrong for real-photo datasets.') }}</span>
               </label>
               <span x-show="!isOver('topic_filters.require_prompt')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.require_prompt')" @click="resetOverride('topic_filters.require_prompt')" class="text-xs link-btn">reset ↺</button>
@@ -3509,7 +3529,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <label class="text-xs text-slate-400">Caption style</label>
+              <label class="text-xs text-slate-400">Caption style{{ tip('Format of the generated caption. <b>SD/Flux</b>: comma-separated tag phrases. <b>Booru tags</b>: underscored tags. <b>Natural language</b>: a descriptive sentence.', 'booru tags suit anime; natural language suits photos') }}</label>
               <span x-show="!isOver('captioning.style')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('captioning.style')" @click="resetOverride('captioning.style')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3533,7 +3553,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-2 gap-4">
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
+              <span class="text-xs text-slate-400">Minimum OVR score{{ tip('Hard floor on the model&#39;s <b>overall</b> quality score (0-100). Images below this go straight to DISCARD before category routing.', 'e.g. 0 disables the gate; 60 drops weak shots') }}</span>
               <span x-show="!isOver('scoring.ovr_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.ovr_min')" @click="resetOverride('scoring.ovr_min')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3542,7 +3562,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
+              <span class="text-xs text-slate-400">Minimum REL score{{ tip('Hard floor on the <b>relevance</b> score — how well the image matches this job&#39;s subject (0-100).', 'e.g. 0 disables; 50-60 trims off-topic scrapes') }}</span>
               <span x-show="!isOver('scoring.rel_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.rel_min')" @click="resetOverride('scoring.rel_min')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3551,7 +3571,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Scoring notes (appended to the rubric)</span>
+              <span class="text-xs text-slate-400">Scoring notes{{ tip('Free text appended to the vision model&#39;s scoring rubric for this job — steer what &quot;quality&quot; means here.', 'e.g. Reward golden-hour light; penalise harsh on-camera flash') }}</span>
               <span x-show="!isOver('scoring.notes')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.notes')" @click="resetOverride('scoring.notes')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3784,7 +3804,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-2 gap-4">
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
+              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. When a source has a prompt/caption it must contain at least one of these, or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
               <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3793,7 +3813,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
+              <span class="text-xs text-slate-400">Banned keywords{{ tip('Comma-separated. Any match in the prompt/caption rejects the image.', 'e.g. nsfw, watermark, meme') }}</span>
               <span x-show="!isOver('topic_filters.banned_keywords')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.banned_keywords')" @click="resetOverride('topic_filters.banned_keywords')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3803,7 +3823,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
+              <span class="text-xs text-slate-400">Generation hints{{ tip('Comma-separated. Like required keywords, but matched against the generation prompt specifically.', 'e.g. 35mm, f/1.8, golden hour') }}</span>
               <span x-show="!isOver('topic_filters.generation_hints')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.generation_hints')" @click="resetOverride('topic_filters.generation_hints')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3813,7 +3833,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
+              <span class="text-xs text-slate-400">Minimum prompt length{{ tip('Reject images whose prompt/caption is shorter than this many characters — filters out junk one-word captions.', 'e.g. 0 = no minimum; 40 is a sane floor') }}</span>
               <span x-show="!isOver('topic_filters.min_prompt_length')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.min_prompt_length')" @click="resetOverride('topic_filters.min_prompt_length')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3840,7 +3860,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-1 gap-4">
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
+              <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
               <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3849,7 +3869,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
+              <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
               <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3858,7 +3878,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+              <span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
               <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3867,7 +3887,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Discord channels JSON</span>
+              <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
               <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3896,23 +3916,23 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span class="text-sm">Enable gallery-dl for this job</span>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Images per URL (limit)</span>
+            <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
             <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
+            <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="effUrls()" @input="setOverrideUrls($event.target.value)" rows="4"
                       placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
+            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
             <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Custom config path (advanced)</span>
+            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
             <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
@@ -4051,21 +4071,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         <template x-if="presetEditor.cfg">
         <div class="space-y-4">
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">Required keywords (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. A source prompt/caption must contain at least one of these or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
               <input :value="peList('topic_filters.keywords_extra')" @input="peSetList('topic_filters.keywords_extra', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Banned keywords (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Banned keywords{{ tip('Comma-separated. Any match in the prompt/caption rejects the image.', 'e.g. nsfw, watermark, meme') }}</span>
               <input :value="peList('topic_filters.banned_keywords')" @input="peSetList('topic_filters.banned_keywords', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Generation hints (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Generation hints{{ tip('Comma-separated. Like required keywords, but matched against the generation prompt specifically.', 'e.g. 35mm, f/1.8, golden hour') }}</span>
               <input :value="peList('topic_filters.generation_hints')" @input="peSetList('topic_filters.generation_hints', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block"><span class="text-xs text-slate-400">Minimum prompt length</span>
               <input type="number" min="0" :value="presetEditor.cfg.topic_filters.min_prompt_length" @input="peSet('topic_filters.min_prompt_length', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
           </div>
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles, <b>without</b> the @. Empty scrapes search results only.', 'e.g. dronefeed, natureshots') }}</span>
               <input :value="peList('scrapers.x_accounts')" @input="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
               <input :value="peList('scrapers.reddit_subreddits')" @input="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
               <input :value="peList('scrapers.civitai_domains')" @input="peSetList('scrapers.civitai_domains', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
           </div>
           <div class="grid md:grid-cols-2 gap-3">
@@ -4082,7 +4102,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             </label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
           </div>
-          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs (one per line)</span>
+          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
 
           <div>
@@ -4117,9 +4137,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
 
           <div class="grid md:grid-cols-3 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">Min OVR (0-100)</span>
+            <label class="block"><span class="text-xs text-slate-400">Min OVR{{ tip('Hard floor on the <b>overall</b> quality score (0-100); below this goes to DISCARD. 0 disables.', 'e.g. 60') }}</span>
               <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.ovr_min" @input="peSet('scoring.ovr_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Min REL (0-100)</span>
+            <label class="block"><span class="text-xs text-slate-400">Min REL{{ tip('Hard floor on the <b>relevance</b> score to the subject (0-100). 0 disables.', 'e.g. 50') }}</span>
               <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
           </div>
@@ -4184,13 +4204,13 @@ HTML_TEMPLATE = r"""<!doctype html>
         </p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Discord token (bot or user account)</span>
+            <span class="text-xs text-slate-400">Discord token{{ tip('A bot token (from a Discord application) or a user account token. Bot tokens are safer and more rate-limit friendly; user tokens see exactly what that account sees.') }}</span>
             <input x-model="settings.DISCORD_BOT_TOKEN" type="password"
                    placeholder="paste token, no quotes"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Auth mode</span>
+            <span class="text-xs text-slate-400">Auth mode{{ tip('How the token is sent: <b>auto</b> tries a Bot prefix then falls back, <b>bot</b> forces <code>Bot &lt;token&gt;</code>, <b>user</b> sends a raw user token.') }}</span>
             <select x-model="settings.DISCORD_AUTH_MODE"
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
               <option value="auto">auto (try bot → fall back to user on 401)</option>
@@ -4216,7 +4236,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span x-show="settingsErrors.GROQ_API_KEY" class="text-xs text-rose-300 mt-1 block" x-text="settingsErrors.GROQ_API_KEY"></span>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">GROQ_API_KEYS (comma-sep, rotated round-robin)</span>
+            <span class="text-xs text-slate-400">GROQ_API_KEYS{{ tip('One or more Groq API keys, comma-separated. cull rotates them round-robin to spread rate limits across keys.', 'gsk_one, gsk_two, gsk_three') }}</span>
             <input x-model="settings.GROQ_API_KEYS" type="password" placeholder="gsk_one,gsk_two,gsk_three"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
@@ -4271,33 +4291,33 @@ HTML_TEMPLATE = r"""<!doctype html>
         <p class="text-xs text-slate-400 mb-3">Required only for the scrapers you've enabled on the <strong>Scrapers</strong> tab.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
-            <span class="text-xs text-slate-400">CIVITAI_API_KEY (civitai.com)</span>
+            <span class="text-xs text-slate-400">CIVITAI_API_KEY{{ tip('API key for civitai.com — get one at civitai.com under Account settings &rarr; API Keys. Needed for the Civitai-Com scraper.') }}</span>
             <input x-model="settings.CIVITAI_API_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY (civitai.red)</span>
+            <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY{{ tip('API key for the civitai.red mirror. Falls back to CIVITAI_API_KEY when left blank.') }}</span>
             <input x-model="settings.CIVITAI_API_RED_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">TWITTER_COOKIES (full cookie string from a logged-in browser)</span>
+            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}</span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">REDDIT_CLIENT_ID (optional)</span>
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_ID{{ tip('Optional. Create a &quot;script&quot; app at reddit.com/prefs/apps for higher rate limits; the scraper still works unauthenticated without it.') }}</span>
             <input x-model="settings.REDDIT_CLIENT_ID"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">REDDIT_CLIENT_SECRET (optional)</span>
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_SECRET{{ tip('Optional. The secret paired with REDDIT_CLIENT_ID from reddit.com/prefs/apps.') }}</span>
             <input x-model="settings.REDDIT_CLIENT_SECRET" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">REDDIT_USER_AGENT</span>
+            <span class="text-xs text-slate-400">REDDIT_USER_AGENT{{ tip('Identifies your client to Reddit — use a unique, descriptive string.', 'e.g. cull/0.1 by your_username') }}</span>
             <input x-model="settings.REDDIT_USER_AGENT" placeholder="cull/0.1"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
