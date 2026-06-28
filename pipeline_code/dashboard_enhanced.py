@@ -75,15 +75,24 @@ PIPELINE_SORTED: Path = Path(os.environ.get("PIPELINE_SORTED", "sorted"))
 LOG_DIR: Path = Path(os.environ.get("LOG_DIR", "logs_test"))
 FLASK_PORT: int = int(os.environ.get("FLASK_PORT", 5000))
 
-_STATIC_SCRAPERS: list[dict[str, str]] = [
-    {"name": "X.com",       "description": "X.com (Playwright + cookies, no API)"},
-    {"name": "Discord-1",   "description": "Discord UD channels"},
-    {"name": "Civitai-Com", "description": "Civitai (civitai.com)"},
-    {"name": "Civitai-Red", "description": "Civitai (civitai.red)"},
-    {"name": "Web",         "description": "Reddit / ZforFree.com / promptsref"},
-    {"name": "ZFF-Local",   "description": "ZforFree local folder (legacy)"},
-    {"name": "Gallery-DL",  "description": "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in Settings."},
-]
+# Scraper display descriptions, keyed by the canonical name. The NAME list
+# itself is owned by job_config.SCRAPER_NAMES (single source of truth shared
+# with the jobs model); we only annotate them here for the UI. A name without
+# an entry here falls back to an empty description.
+_SCRAPER_DESCRIPTIONS: dict[str, str] = {
+    "X.com":       "X.com (Playwright + cookies, no API)",
+    "Discord-1":   "Discord UD channels",
+    "Civitai-Com": "Civitai (civitai.com)",
+    "Civitai-Red": "Civitai (civitai.red)",
+    "Web":         "Reddit / ZforFree.com / promptsref",
+    "ZFF-Local":   "ZforFree local folder (legacy)",
+    "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
+}
+
+# _STATIC_SCRAPERS is derived from job_config.SCRAPER_NAMES (built just below,
+# once job_config is importable) so the dashboard toggle list and the job
+# config's scrapers.enabled map can never drift apart.
+_STATIC_SCRAPERS: list[dict[str, str]] = []
 
 
 def _scraper_definitions() -> list[dict[str, str]]:
@@ -102,8 +111,6 @@ def _scraper_definitions() -> list[dict[str, str]]:
     return [*_STATIC_SCRAPERS, local_entry]
 
 
-SCRAPERS = _STATIC_SCRAPERS  # kept for anything still importing this module-level constant
-
 sys.path.insert(0, str(PIPELINE_CODE_DIR))
 try:
     from lmstudio_models import get_all_models, get_recommended_models
@@ -118,6 +125,16 @@ except ImportError:
 from lmstudio_admin import unload_all as _lmstudio_unload_all
 import index_store
 import thumb_cache
+import job_config
+import paths as _paths
+
+# Now that job_config is importable, derive the canonical scraper toggle list
+# from its SCRAPER_NAMES (single source of truth) annotated with UI descriptions.
+_STATIC_SCRAPERS[:] = [
+    {"name": name, "description": _SCRAPER_DESCRIPTIONS.get(name, "")}
+    for name in job_config.SCRAPER_NAMES
+]
+SCRAPERS = _STATIC_SCRAPERS  # kept for anything still importing this module-level constant
 
 # Configure the SQLite index + thumbnail cache against PIPELINE_BASE_DIR
 # (resolved from PIPELINE_QUEUE/PIPELINE_SORTED's parent if not set explicitly).
@@ -132,6 +149,15 @@ try:
     _INDEXER_INTERVAL = max(5.0, float(os.environ.get("INDEX_REFRESH_SECONDS", "30")))
 except ValueError:
     _INDEXER_INTERVAL = 30.0
+
+# Jobs model: ensure existing installs get a `default` job built from the
+# current .env so the pipeline has something to activate. Idempotent — a no-op
+# once any job file exists. Done at import so both `python dashboard_enhanced.py`
+# and an embedding test client see a migrated store.
+try:
+    job_config.migrate_env_to_default_job()
+except Exception as _exc:  # pragma: no cover - never block dashboard boot
+    logger.warning("job migration skipped: %s", _exc)
 
 
 app = Flask(__name__)
@@ -170,13 +196,9 @@ def get_env(key: str, default: str = "") -> str:
 # ── stats helpers ──────────────────────────────────────────────────────────────
 
 def get_queue_stats() -> dict[str, int]:
-    """{<topic>/<source>: count} — served from the SQLite index."""
+    """{<topic>/<source>: count} — served from the SQLite index. Still used by
+    the idle-unload watcher to detect an empty queue."""
     return index_store.count_queue_by_topic_source()
-
-
-def get_sorted_stats() -> dict[str, dict[str, int]]:
-    """{topic: {category: count}} — served from the SQLite index."""
-    return index_store.count_sorted_by_topic_category()
 
 
 # Error logs are re-read incrementally: track each log file's last (size, mtime)
@@ -260,15 +282,147 @@ def safe_inside(raw: str, roots: list[Path]) -> Path | None:
     return None
 
 
+# ── Jobs: slug resolution + per-slug index scoping ────────────────────────────
+#
+# Every job-aware endpoint resolves an effective slug from an optional
+# ``?job=<slug>`` query param, defaulting to the active job. The index_store
+# layer keys every row by ``topic_slug`` already, so scoping is just adding a
+# ``topic_slug = ?`` predicate. We query the shared connection directly because
+# index_store's public listing helpers don't take a slug filter.
+
+# Slugs that would collide with literal route segments under /api/jobs/. A job
+# with one of these slugs would shadow (or be shadowed by) the static-path
+# handlers below, so we forbid creating them. Defence in depth — job_config
+# could add the same guard, but the dashboard owns these route names.
+RESERVED_JOB_SLUGS: frozenset[str] = frozenset({"queue", "advance"})
+
+
+def _resolve_job_slug(default: str | None = "__active__") -> str | None:
+    """Effective slug for a request.
+
+    ``?job=<slug>`` wins when present and well-formed; otherwise fall back to
+    ``default`` (sentinel ``"__active__"`` means "use the active job"). A
+    malformed ``?job=`` falls back too (never silently widens scope to *all*
+    jobs). Returns None only when there is no active job and none was supplied —
+    callers treat that as "unscoped / behave as today" for pre-jobs installs.
+    """
+    raw = (request.args.get("job") or "").strip()
+    if raw and job_config.JOB_SLUG_RE.match(raw):
+        return raw
+    if default == "__active__":
+        return job_config.get_active_slug()
+    return default
+
+
+def _scoped_queue_by_source(slug: str | None) -> dict[str, int]:
+    """{'<slug>/<source>': count} for one slug (or all when slug is None)."""
+    with index_store.with_conn() as conn:
+        if slug is None:
+            cur = conn.execute(
+                "SELECT topic_slug, source, COUNT(*) FROM images "
+                "WHERE status = 'queue' GROUP BY topic_slug, source"
+            )
+        else:
+            cur = conn.execute(
+                "SELECT topic_slug, source, COUNT(*) FROM images "
+                "WHERE status = 'queue' AND topic_slug = ? GROUP BY topic_slug, source",
+                (slug,),
+            )
+        return {f"{row[0] or 'default'}/{row[1]}": int(row[2]) for row in cur.fetchall()}
+
+
+def _scoped_sorted_by_category(slug: str | None) -> dict[str, dict[str, int]]:
+    """{topic: {category: count}} for one slug (or all when slug is None)."""
+    with index_store.with_conn() as conn:
+        if slug is None:
+            cur = conn.execute(
+                "SELECT topic_slug, category, COUNT(*) FROM images "
+                "WHERE status = 'sorted' AND category IS NOT NULL "
+                "GROUP BY topic_slug, category"
+            )
+        else:
+            cur = conn.execute(
+                "SELECT topic_slug, category, COUNT(*) FROM images "
+                "WHERE status = 'sorted' AND category IS NOT NULL AND topic_slug = ? "
+                "GROUP BY topic_slug, category",
+                (slug,),
+            )
+        out: dict[str, dict[str, int]] = {}
+        for topic, cat, count in cur.fetchall():
+            out.setdefault(topic or "default", {})[cat] = int(count)
+        return out
+
+
+def _scoped_counts(slug: str | None) -> dict[str, int]:
+    """{'queued': n, 'sorted': n} for a single slug. Used by the jobs grid."""
+    with index_store.with_conn() as conn:
+        if slug is None:
+            q = conn.execute("SELECT COUNT(*) FROM images WHERE status = 'queue'").fetchone()[0]
+            s = conn.execute("SELECT COUNT(*) FROM images WHERE status = 'sorted'").fetchone()[0]
+        else:
+            q = conn.execute(
+                "SELECT COUNT(*) FROM images WHERE status = 'queue' AND topic_slug = ?",
+                (slug,),
+            ).fetchone()[0]
+            s = conn.execute(
+                "SELECT COUNT(*) FROM images WHERE status = 'sorted' AND topic_slug = ?",
+                (slug,),
+            ).fetchone()[0]
+        return {"queued": int(q), "sorted": int(s)}
+
+
+def _job_status_label(slug: str, job: job_config.Job, *, active: str | None,
+                      queue: list[str]) -> str:
+    """Derive a display status for a job from the index + runtime state.
+
+    The job file carries a ``status`` field but the live truth is: the active
+    job is 'running' iff the supervisor process is up, else 'active'; queued
+    jobs are 'queued'; everything else is 'idle'. We don't mutate the job file
+    here — this is a read-only projection for the UI.
+    """
+    if slug == active:
+        return "running" if pipeline_running() else "active"
+    if slug in queue:
+        return "queued"
+    return job.status or "idle"
+
+
+def _job_card(job: job_config.Job, *, active: str | None, queue: list[str]) -> dict[str, Any]:
+    """Compact per-job payload for the jobs grid (list view)."""
+    counts = _scoped_counts(job.slug)
+    if job.slug == active:
+        position = 0
+    elif job.slug in queue:
+        position = 1 + queue.index(job.slug)
+    else:
+        position = None
+    return {
+        "slug": job.slug,
+        "name": job.name,
+        "status": _job_status_label(job.slug, job, active=active, queue=queue),
+        "is_active": job.slug == active,
+        "queue_position": position,
+        "queued": counts["queued"],
+        "sorted": counts["sorted"],
+        "updated_at": job.updated_at,
+    }
+
+
 # ── API: status / controls ────────────────────────────────────────────────────
 
 @app.route("/api/status")
 def api_status():
-    queue = get_queue_stats()
-    sorted_stats = get_sorted_stats()
+    # Scope queue/sorted counts to ?job=<slug> (default active). When no jobs
+    # exist yet (pre-migration installs) the slug resolves to None and we show
+    # the global totals exactly as before.
+    slug = _resolve_job_slug()
+    queue = _scoped_queue_by_source(slug)
+    sorted_stats = _scoped_sorted_by_category(slug)
     errors = get_error_logs()
     return jsonify({
         "timestamp": datetime.now().isoformat(),
+        "job": slug,
+        "active_job": job_config.get_active_slug(),
         "pipeline": {
             "running": pipeline_running(),
             "pid": _pipeline_proc.pid if pipeline_running() else None,
@@ -287,26 +441,67 @@ def api_status():
     })
 
 
+def _job_for_scope(slug: str | None) -> job_config.Job | None:
+    """Load the job a scrapers/categories request targets, or None when no jobs
+    exist yet (pre-migration). Raises nothing — callers decide on None."""
+    if slug is None:
+        return None
+    return job_config.get_job(slug)
+
+
+def _save_scraper_enabled(job: job_config.Job, enabled_map: dict[str, bool]) -> None:
+    """Persist a job's scrapers.enabled map immutably, then re-project if it is
+    the active job so the running supervisor re-resolves SCRAPER_DISABLED."""
+    merged = job.to_dict()
+    merged["scrapers"] = {**job.scrapers, "enabled": enabled_map}
+    saved = job_config.save_job(job_config.Job.from_dict(merged))
+    if saved.slug == job_config.get_active_slug():
+        job_config.activate(saved.slug)
+
+
+def _scraper_enabled_response(job: job_config.Job | None) -> list[dict[str, Any]]:
+    """[{name, description, enabled}] for the Scrapers tab, sourced from the
+    job's enabled map (falling back to the legacy env when no job is in scope)."""
+    if job is not None:
+        enabled = job.scrapers.get("enabled", {})
+        return [
+            {**s, "enabled": bool(enabled.get(s["name"], True))}
+            for s in _scraper_definitions()
+        ]
+    disabled = disabled_set()
+    return [{**s, "enabled": s["name"] not in disabled} for s in _scraper_definitions()]
+
+
 @app.route("/api/scrapers")
 def api_scrapers():
-    disabled = disabled_set()
-    return jsonify([{**s, "enabled": s["name"] not in disabled} for s in _scraper_definitions()])
+    job = _job_for_scope(_resolve_job_slug())
+    return jsonify(_scraper_enabled_response(job))
 
 
 @app.route("/api/scrapers/bulk", methods=["POST"])
 def api_scrapers_bulk():
     data = request.get_json() or {}
     action = data.get("action")
-    defs = _scraper_definitions()
-    names = [s["name"] for s in defs]
+    if action not in {"disable_all", "enable_all"}:
+        return jsonify({"error": "action must be disable_all|enable_all"}), 400
+    want_enabled = action == "enable_all"
 
-    if action == "disable_all":
-        update_env("SCRAPER_DISABLED", ",".join(sorted(names)))
-        return jsonify({"success": True, "disabled": names})
-    if action == "enable_all":
+    job = _job_for_scope(_resolve_job_slug())
+    if job is not None:
+        # Only flip the canonical scraper names the job tracks; the dynamic
+        # Local-<name> toggle isn't part of the job's enabled map.
+        enabled_map = {n: want_enabled for n in job_config.SCRAPER_NAMES}
+        _save_scraper_enabled(job, enabled_map)
+        disabled = sorted(n for n, on in enabled_map.items() if not on)
+        return jsonify({"success": True, "job": job.slug, "disabled": disabled})
+
+    # No job in scope (pre-migration): fall back to the legacy global env.
+    names = [s["name"] for s in _scraper_definitions()]
+    if want_enabled:
         update_env("SCRAPER_DISABLED", "")
         return jsonify({"success": True, "disabled": []})
-    return jsonify({"error": "action must be disable_all|enable_all"}), 400
+    update_env("SCRAPER_DISABLED", ",".join(sorted(names)))
+    return jsonify({"success": True, "disabled": names})
 
 
 @app.route("/api/scrapers/toggle", methods=["POST"])
@@ -316,6 +511,25 @@ def api_scraper_toggle():
     enabled = bool(data.get("enabled"))
     if name not in {s["name"] for s in _scraper_definitions()}:
         return jsonify({"error": "Unknown scraper"}), 400
+
+    job = _job_for_scope(_resolve_job_slug())
+    if job is not None:
+        if name in job_config.SCRAPER_NAMES:
+            enabled_map = {**{n: True for n in job_config.SCRAPER_NAMES},
+                           **job.scrapers.get("enabled", {})}
+            enabled_map[name] = enabled
+            _save_scraper_enabled(job, enabled_map)
+            return jsonify({"success": True, "name": name, "enabled": enabled, "job": job.slug})
+        # The dynamic Local-<name> entry is not part of the job's enabled map;
+        # the local feeder is gated by the job's scrapers.local_import.enabled.
+        # Writing SCRAPER_DISABLED here would be clobbered by the active job's
+        # projection, so we refuse rather than silently lose the toggle.
+        return jsonify({
+            "error": "local import is controlled per-job via Job Settings → Local import",
+            "name": name,
+        }), 400
+
+    # Pre-migration (no jobs yet): fall back to the legacy global env.
     current = disabled_set()
     (current.discard if enabled else current.add)(name)
     update_env("SCRAPER_DISABLED", ",".join(sorted(current)))
@@ -325,6 +539,11 @@ def api_scraper_toggle():
 @app.route("/api/pipeline/start", methods=["POST"])
 def api_pipeline_start():
     global _pipeline_proc
+    # The jobs model requires an active job: the supervisor projects the active
+    # job's config (env + categories) into the spawn environment. Without one
+    # there is nothing to run.
+    if job_config.get_active_slug() is None:
+        return jsonify({"error": "Activate a job before starting the pipeline"}), 409
     with _pipeline_lock:
         if pipeline_running():
             return jsonify({"success": True, "already_running": True, "pid": _pipeline_proc.pid})
@@ -425,14 +644,49 @@ def _validate_categories_payload(payload: Any) -> tuple[dict[str, Any] | None, s
     return {"preset": preset, "categories": cleaned, "global_rules": rules}, ""
 
 
+def _job_active_taxonomy(job: job_config.Job | None) -> dict[str, Any]:
+    """Shape the ``active`` taxonomy block for the categories editor.
+
+    Per-job: read the job's own categories + rules. Pre-migration (no job in
+    scope): fall back to the global active taxonomy file as before."""
+    if job is not None:
+        return {
+            "preset": "custom",
+            "categories": [dict(c) for c in (job.categories or [])],
+            "global_rules": job.category_rules or "",
+        }
+    return _categories_mod.get_active()
+
+
 @app.route("/api/categories")
 def api_categories_get():
+    job = _job_for_scope(_resolve_job_slug())
     return jsonify({
-        "active": _categories_mod.get_active(),
+        "active": _job_active_taxonomy(job),
         "presets": _categories_mod.get_presets()["presets"],
         "default_preset": _categories_mod.get_presets().get("default"),
         "system_terminal": list(_categories_mod.SYSTEM_TERMINAL),
+        "job": job.slug if job is not None else None,
     })
+
+
+def _count_sorted_in_categories(slug: str | None, cats: set[str]) -> dict[str, int]:
+    """{category: count} of sorted rows in the given categories, scoped to slug.
+    Index-backed so we don't walk the filesystem."""
+    if not cats:
+        return {}
+    placeholders = ",".join("?" * len(cats))
+    params: list[Any] = list(cats)
+    where = f"status = 'sorted' AND category IN ({placeholders})"
+    if slug is not None:
+        where += " AND topic_slug = ?"
+        params.append(slug)
+    with index_store.with_conn() as conn:
+        cur = conn.execute(
+            f"SELECT category, COUNT(*) FROM images WHERE {where} GROUP BY category",
+            params,
+        )
+        return {row[0]: int(row[1]) for row in cur.fetchall() if row[1]}
 
 
 @app.route("/api/categories", methods=["POST"])
@@ -442,22 +696,23 @@ def api_categories_set():
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
-    # If user is removing a category that already has sorted images, warn
-    # unless they sent ?force=1.
+    job = _job_for_scope(_resolve_job_slug())
     force = request.args.get("force") == "1"
     new_names = {c["name"] for c in cleaned["categories"]}
-    current_names = set(_categories_mod.get_categories())
-    removed = current_names - new_names
-    if removed and not force and PIPELINE_SORTED.exists():
-        legacy: dict[str, int] = {}
-        for cat in removed:
-            count = 0
-            for topic_dir in PIPELINE_SORTED.iterdir():
-                cat_dir = topic_dir / cat
-                if cat_dir.is_dir():
-                    count += sum(1 for _ in cat_dir.rglob("*.jpg")) + sum(1 for _ in cat_dir.rglob("*.png"))
-            if count:
-                legacy[cat] = count
+
+    # Warn before dropping a category that still has sorted images. Scope the
+    # count + current-name comparison to the slug of the job we actually loaded
+    # for this request (NOT the active-default), so editing an INACTIVE job
+    # reflects that job's data, never the active job's. Index-backed; honours
+    # ?force=1 to proceed anyway.
+    count_slug = job.slug if job is not None else None
+    if job is not None:
+        current_names = {c.get("name") for c in (job.categories or [])}
+    else:
+        current_names = set(_categories_mod.get_categories())
+    removed = {n for n in (current_names - new_names) if n}
+    if removed and not force:
+        legacy = _count_sorted_in_categories(count_slug, removed)
         if legacy:
             return jsonify({
                 "ok": False,
@@ -466,6 +721,21 @@ def api_categories_set():
                 "hint": "These categories still have sorted images. Requeue them first via tools/requeue_sorted.py, or POST again with ?force=1 to remove anyway (folders stay on disk).",
             }), 409
 
+    if job is not None:
+        merged = job.to_dict()
+        merged["categories"] = cleaned["categories"]
+        merged["category_rules"] = cleaned["global_rules"]
+        saved = job_config.save_job(job_config.Job.from_dict(merged))
+        # POST to the active job must re-project AND bump _index.json so the
+        # supervisor's mtime watch (env-reload + struct-snapshot) fires.
+        # activate() does both (set_active + project_categories); a bare
+        # project_categories writes cull_categories.json but never touches
+        # _index.json, so the supervisor wouldn't re-resolve.
+        if saved.slug == job_config.get_active_slug():
+            job_config.activate(saved.slug)
+        return jsonify({"ok": True, "active": _job_active_taxonomy(saved), "job": saved.slug})
+
+    # Pre-migration fallback: write the global active taxonomy file directly.
     _categories_mod.set_active(cleaned)
     return jsonify({"ok": True, "active": cleaned})
 
@@ -671,38 +941,21 @@ def api_vision_workers_toggle():
     return jsonify({"success": True, "active": current})
 
 
+# GLOBAL settings only. Under the jobs model, everything that defines *what to
+# scrape and how to judge it* (topic, keywords, scraper targets, scoring,
+# captioning, gallery-dl URLs, local-import) lives in the per-job config and is
+# edited via the Job Settings tab — NOT here. This list is credentials, model
+# endpoints, vision-worker selection, throttle, storage roots, and global UX.
 SETTINGS_KEYS: list[str] = [
-    # Topic + categorisation
-    "PIPELINE_TOPIC",
-    "PIPELINE_SLUG",
-    "TOPIC_KEYWORDS_EXTRA",
-    "TOPIC_BANNED_KEYWORDS",
-    "TOPIC_GENERATION_HINTS",
-    "REDDIT_SUBREDDITS",
-    "MIN_PROMPT_LENGTH",
-    "REQUIRE_PROMPT",
-    "X_ACCOUNTS",
-    # Vision quality + UX
-    "VISION_OVR_MIN_SCORE",
-    "VISION_REL_MIN_SCORE",
+    # Global UX / runtime
     "BLUR_NSFW_THUMBS",
-    "VISION_SCORE_NOTES",
     "PIPELINE_RECONCILE_SECONDS",
-    # Auto-captioning
-    "AUTO_CAPTION_ENABLED",
-    "AUTO_CAPTION_STYLE",
-    "AUTO_CAPTION_OVERWRITE",
-    # Storage paths
+    # Storage paths (global roots; per-slug subdirs derive from the job slug)
     "PIPELINE_BASE_DIR",
     "PIPELINE_QUEUE",
     "PIPELINE_SORTED",
     "LOG_DIR",
-    "ZFORFREE_LOCAL_SRC",
-    "LOCAL_IMPORT_DIR",
-    "LOCAL_IMPORT_NAME",
-    "LOCAL_IMPORT_ENABLED",
-    "LOCAL_IMPORT_MIGRATE_FROM",
-    # Vision provider credentials
+    # Vision provider credentials + endpoints
     "GROQ_API_KEY",
     "GROQ_API_KEYS",
     "GROQ_MODEL",
@@ -719,41 +972,25 @@ SETTINGS_KEYS: list[str] = [
     "OLLAMA_URL",
     "OLLAMA_MODEL",
     "OLLAMA_TIMEOUT",
-    # Scraper credentials
+    # Scraper credentials (the keys are global; per-job targets live in the job)
     "CIVITAI_API_KEY",
     "CIVITAI_API_RED_KEY",
-    "CIVITAI_DOMAINS",
     "TWITTER_COOKIES",
     "DISCORD_BOT_TOKEN",
     "DISCORD_AUTH_MODE",
-    "DISCORD_CHANNELS_JSON",
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
     "REDDIT_USER_AGENT",
-    # ZForFree feeders
-    "ZFORFREE_LOCAL_ENABLED",
-    "ZFORFREE_WEB_ENABLED",
-    # gallery-dl scraper
-    "GALLERY_DL_ENABLED",
-    "GALLERY_DL_URLS",
-    "GALLERY_DL_LIMIT_PER_URL",
-    "GALLERY_DL_COOKIES_FILE",
-    "GALLERY_DL_CONFIG_PATH",
 ]
 SECRET_KEYS: set[str] = {
     "GROQ_API_KEY", "GROQ_API_KEYS",
     "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY",
-    "TWITTER_COOKIES", "DISCORD_BOT_TOKEN", "DISCORD_CHANNELS_JSON",
+    "TWITTER_COOKIES", "DISCORD_BOT_TOKEN",
     "REDDIT_CLIENT_SECRET",
     "OPENAI_COMPAT_API_KEY",
 }
 PATH_KEYS: set[str] = {"PIPELINE_BASE_DIR", "PIPELINE_QUEUE", "PIPELINE_SORTED",
-                       "LOG_DIR", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"}
-
-
-def _slugify(topic: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_")
-    return slug or "default"
+                       "LOG_DIR"}
 
 
 @app.route("/api/settings")
@@ -772,24 +1009,6 @@ def api_settings_post():
             errors[key] = "unknown setting"
             continue
         value = ("" if value is None else str(value)).strip()
-        if key == "MIN_PROMPT_LENGTH" and value:
-            try:
-                parsed = int(value)
-                if parsed < 0 or parsed > 10000:
-                    raise ValueError
-                value = str(parsed)
-            except ValueError:
-                errors[key] = "must be a non-negative integer"
-                continue
-        if key in {"VISION_OVR_MIN_SCORE", "VISION_REL_MIN_SCORE"} and value:
-            try:
-                parsed = int(value)
-                if parsed < 0 or parsed > 100:
-                    raise ValueError
-                value = str(parsed)
-            except ValueError:
-                errors[key] = "must be an integer 0-100"
-                continue
         if key == "PIPELINE_RECONCILE_SECONDS" and value:
             try:
                 parsed = int(value)
@@ -821,10 +1040,6 @@ def api_settings_post():
 
     if errors:
         return jsonify({"success": False, "errors": errors, "applied": {}}), 400
-
-    # Auto-derive slug if topic changed and slug not explicitly provided.
-    if "PIPELINE_TOPIC" in changes and "PIPELINE_SLUG" not in changes:
-        changes["PIPELINE_SLUG"] = _slugify(changes["PIPELINE_TOPIC"])
 
     for key, value in changes.items():
         update_env(key, value)
@@ -951,7 +1166,316 @@ def api_set_model():
     return jsonify({"success": True, "instance": instance, "model_id": model_id})
 
 
+# ── API: jobs (the jobs model) ────────────────────────────────────────────────
+#
+# job_config.py is the single source of truth for job state. These routes are a
+# thin HTTP surface over it; they never write job JSON directly. Every <slug>
+# path param is validated against JOB_SLUG_RE as defence in depth (job_config
+# also guards on its own).
+
+def _valid_slug_or_400(slug: str) -> bool:
+    return bool(job_config.JOB_SLUG_RE.match(slug or ""))
+
+
+@app.route("/api/jobs")
+def api_jobs_list():
+    """List jobs with status, queue position, and queued/sorted counts, plus the
+    active slug and queue order from the index."""
+    idx = job_config.get_index()
+    active = idx.get("active")
+    queue = list(idx.get("queue") or [])
+    jobs = job_config.list_jobs()
+    return jsonify({
+        "active": active,
+        "queue": queue,
+        "pipeline_running": pipeline_running(),
+        "jobs": [_job_card(j, active=active, queue=queue) for j in jobs],
+    })
+
+
+@app.route("/api/jobs", methods=["POST"])
+def api_jobs_create():
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    base_on = (data.get("base_on") or "").strip() or None
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if base_on and not _valid_slug_or_400(base_on):
+        return jsonify({"error": "invalid base_on slug"}), 400
+    if job_config.slugify(name) in RESERVED_JOB_SLUGS:
+        return jsonify({"error": f"'{job_config.slugify(name)}' is a reserved slug"}), 400
+    try:
+        job = job_config.create_job(name, base_on=base_on)
+    except ValueError as exc:
+        # Duplicate slug / empty slug / unknown base_on all surface here.
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "job": job.to_dict()}), 201
+
+
+@app.route("/api/jobs/<slug>")
+def api_jobs_get(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    job = job_config.get_job(slug)
+    if job is None:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job.to_dict())
+
+
+# Fields a PUT may patch. Identity (slug) + timestamps are owned by job_config;
+# ``status`` is a runtime projection (derived by _job_status_label from the
+# index + active/queue state), so it is intentionally NOT user-editable here.
+_JOB_EDITABLE_FIELDS = (
+    "name", "topic", "scrapers",
+    "categories", "category_rules", "scoring", "captioning",
+)
+
+
+def _validate_job_scoring(raw: Any) -> tuple[dict | None, str]:
+    """Validate a job's scoring block. ``ovr_min`` / ``rel_min`` must be integers
+    in [0, 100] (same gate the old /api/settings applied to VISION_*_MIN_SCORE);
+    ``notes`` is free text. Returns (clean_scoring, error)."""
+    if not isinstance(raw, dict):
+        return None, "scoring must be an object"
+    out: dict[str, Any] = {}
+    for key in ("ovr_min", "rel_min"):
+        if key not in raw:
+            continue
+        try:
+            val = int(raw[key])
+        except (TypeError, ValueError):
+            return None, f"scoring.{key} must be an integer 0-100"
+        if val < 0 or val > 100:
+            return None, f"scoring.{key} must be an integer 0-100"
+        out[key] = val
+    if "notes" in raw:
+        if not isinstance(raw["notes"], str):
+            return None, "scoring.notes must be a string"
+        out["notes"] = raw["notes"]
+    return out, ""
+
+
+@app.route("/api/jobs/<slug>", methods=["PUT"])
+def api_jobs_update(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    existing = job_config.get_job(slug)
+    if existing is None:
+        return jsonify({"error": "job not found"}), 404
+    data = request.get_json() or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be an object"}), 400
+
+    # Merge the submitted fields over the existing job; slug is immutable.
+    merged = existing.to_dict()
+    for key in _JOB_EDITABLE_FIELDS:
+        if key in data:
+            merged[key] = data[key]
+    merged["slug"] = slug
+
+    # Validate category names at the write boundary — they become folder paths
+    # (sorted_dir/<cat>), so a name like "../../x" must be rejected. Reuse the
+    # same validator the /api/categories POST uses. Only runs when the PUT
+    # actually touches categories/rules.
+    if "categories" in data or "category_rules" in data:
+        cat_payload = {
+            "categories": merged.get("categories", []),
+            "global_rules": merged.get("category_rules", ""),
+        }
+        cleaned, cat_err = _validate_categories_payload(cat_payload)
+        if cat_err:
+            return jsonify({"error": f"invalid categories: {cat_err}"}), 400
+        merged["categories"] = cleaned["categories"]
+        merged["category_rules"] = cleaned["global_rules"]
+
+    # Validate / clamp scoring thresholds when present.
+    if "scoring" in data:
+        clean_scoring, score_err = _validate_job_scoring(data["scoring"])
+        if score_err:
+            return jsonify({"error": score_err}), 400
+        merged["scoring"] = {**(existing.scoring or {}), **clean_scoring}
+
+    try:
+        saved = job_config.save_job(job_config.Job.from_dict(merged))
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": f"invalid job config: {exc}"}), 400
+
+    # If this is the active job, re-project so the running supervisor re-resolves
+    # env + taxonomy (categories projection + _index.json mtime bump).
+    if saved.slug == job_config.get_active_slug():
+        job_config.activate(saved.slug)
+    return jsonify({"success": True, "job": saved.to_dict()})
+
+
+@app.route("/api/jobs/<slug>", methods=["DELETE"])
+def api_jobs_delete(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    if slug == job_config.get_active_slug():
+        return jsonify({"error": "cannot delete the active job"}), 409
+
+    force = request.args.get("force") == "1"
+    removed_dirs: list[str] = []
+    if force:
+        # Optionally drop the job's on-disk data — but ONLY paths that pass the
+        # safe_inside() guard against the queue/sorted roots. A path that didn't
+        # come back from the guard is never unlinked.
+        for candidate in (_paths.queue_dir(slug), _paths.sorted_dir(slug)):
+            roots = [_paths.queue_root(), _paths.sorted_root()]
+            safe = safe_inside(str(candidate), roots)
+            if safe is not None and safe.exists() and safe.is_dir():
+                shutil.rmtree(safe, ignore_errors=True)
+                removed_dirs.append(str(safe))
+
+    job_config.delete_job(slug)
+    return jsonify({"success": True, "slug": slug, "removed_dirs": removed_dirs})
+
+
+@app.route("/api/jobs/<slug>/clone", methods=["POST"])
+def api_jobs_clone(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if job_config.slugify(name) in RESERVED_JOB_SLUGS:
+        return jsonify({"error": f"'{job_config.slugify(name)}' is a reserved slug"}), 400
+    try:
+        job = job_config.create_job(name, base_on=slug)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "job": job.to_dict()}), 201
+
+
+@app.route("/api/jobs/<slug>/activate", methods=["POST"])
+def api_jobs_activate(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    job_config.activate(slug)
+    return jsonify({"success": True, "active": slug})
+
+
+@app.route("/api/jobs/queue", methods=["POST"])
+def api_jobs_set_queue():
+    data = request.get_json() or {}
+    order = data.get("order")
+    if not isinstance(order, list) or any(not isinstance(s, str) for s in order):
+        return jsonify({"error": "order must be a list of slugs"}), 400
+    if any(not _valid_slug_or_400(s) for s in order):
+        return jsonify({"error": "order contains an invalid slug"}), 400
+    try:
+        job_config.set_queue(order)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "queue": job_config.get_index().get("queue", [])})
+
+
+@app.route("/api/jobs/<slug>/enqueue", methods=["POST"])
+def api_jobs_enqueue(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    try:
+        job_config.enqueue(slug)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "queue": job_config.get_index().get("queue", [])})
+
+
+@app.route("/api/jobs/<slug>/dequeue", methods=["POST"])
+def api_jobs_dequeue(slug: str):
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    job_config.dequeue(slug)
+    return jsonify({"success": True, "queue": job_config.get_index().get("queue", [])})
+
+
+@app.route("/api/jobs/advance", methods=["POST"])
+@app.route("/api/jobs/<slug>/advance", methods=["POST"])
+def api_jobs_advance(slug: str | None = None):
+    """Promote the next queued job to active. The optional <slug> is accepted
+    for symmetry but advance() always pops the queue head (sequential model)."""
+    if slug is not None and not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    new_active = job_config.advance()
+    return jsonify({"success": True, "active": new_active})
+
+
 # ── API: queue / thumbnails / prompts ─────────────────────────────────────────
+
+
+def _list_recent_queue_scoped(slug: str | None, limit: int) -> list[index_store.IndexedImage]:
+    """Newest queued images, optionally scoped to one slug. When slug is None
+    (pre-migration), behaves like index_store.list_recent_queue."""
+    if slug is None:
+        return index_store.list_recent_queue(limit=limit)
+    with index_store.with_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM images WHERE status = 'queue' AND topic_slug = ? "
+            "ORDER BY mtime DESC LIMIT ?",
+            (slug, int(limit)),
+        )
+        return [index_store.IndexedImage.from_row(row) for row in cur.fetchall()]
+
+
+def _list_recent_sorted_scoped(slug: str | None, limit: int) -> list[index_store.IndexedImage]:
+    """Newest classified images, optionally scoped to one slug."""
+    if slug is None:
+        return index_store.list_recent_sorted(limit=limit)
+    with index_store.with_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM images WHERE status = 'sorted' AND topic_slug = ? "
+            "ORDER BY mtime DESC LIMIT ?",
+            (slug, int(limit)),
+        )
+        return [index_store.IndexedImage.from_row(row) for row in cur.fetchall()]
+
+
+def _list_sorted_scoped(
+    slug: str | None,
+    *,
+    sources: list[str] | None = None,
+    categories: list[str] | None = None,
+    sort: str = "newest",
+    limit: int = 200,
+) -> list[index_store.IndexedImage]:
+    """Sorted listing with the same filters as index_store.list_sorted but with
+    an optional topic_slug scope. Falls back to the library helper when slug is
+    None so pre-migration installs behave exactly as before."""
+    if slug is None:
+        items, _total = index_store.list_sorted(
+            sources=sources, categories=categories, sort=sort, limit=limit, offset=0,
+        )
+        return items
+    sort_clause = {
+        "newest": "mtime DESC", "oldest": "mtime ASC",
+        "ovr": "ovr DESC NULLS LAST, mtime DESC",
+        "rel": "rel DESC NULLS LAST, mtime DESC",
+        "quality": "quality DESC NULLS LAST, mtime DESC",
+    }.get(sort, "mtime DESC")
+    where = ["status = 'sorted'", "topic_slug = ?"]
+    params: list[Any] = [slug]
+    if sources:
+        where.append("source IN (" + ",".join("?" * len(sources)) + ")")
+        params.extend(sources)
+    if categories:
+        where.append("category IN (" + ",".join("?" * len(categories)) + ")")
+        params.extend(categories)
+    with index_store.with_conn() as conn:
+        cur = conn.execute(
+            f"SELECT * FROM images WHERE {' AND '.join(where)} "
+            f"ORDER BY {sort_clause} LIMIT ?",
+            [*params, int(limit)],
+        )
+        return [index_store.IndexedImage.from_row(row) for row in cur.fetchall()]
 
 
 @app.route("/api/queue/files")
@@ -959,11 +1483,13 @@ def api_queue_files():
     """Newest queued images, served from the SQLite index.
 
     The old version globbed the entire queue tree on every request. Index-
-    backed listing is sub-millisecond regardless of queue depth.
+    backed listing is sub-millisecond regardless of queue depth. Scoped to
+    ?job=<slug> (default active).
     """
     limit = int(request.args.get("limit", 60))
+    slug = _resolve_job_slug()
     results: list[dict[str, Any]] = []
-    for item in index_store.list_recent_queue(limit=limit):
+    for item in _list_recent_queue_scoped(slug, limit):
         path = Path(item.path)
         if not path.exists():
             continue  # indexer hasn't caught up to a worker that just moved it
@@ -1095,13 +1621,14 @@ def api_logs_history():
     source = request.args.get("source")
     category = request.args.get("category")
     limit = int(request.args.get("limit", 200))
+    slug = _resolve_job_slug()
 
-    items, _total = index_store.list_sorted(
+    items = _list_sorted_scoped(
+        slug,
         sources=[source] if source else None,
         categories=[category] if category else None,
         sort="newest",
         limit=limit,
-        offset=0,
     )
 
     out: list[dict[str, Any]] = []
@@ -1137,10 +1664,12 @@ def _is_in_archive(path: Path) -> bool:
 
 @app.route("/api/activity")
 def api_activity():
-    """Newest classified items, served from the SQLite index."""
+    """Newest classified items, served from the SQLite index. Scoped to
+    ?job=<slug> (default active)."""
     limit = int(request.args.get("limit", 12))
+    slug = _resolve_job_slug()
     results: list[dict[str, Any]] = []
-    for item in index_store.list_recent_sorted(limit=limit):
+    for item in _list_recent_sorted_scoped(slug, limit):
         if not Path(item.path).exists():
             continue  # indexer hasn't caught up to a deletion / move
         results.append({
@@ -1201,6 +1730,7 @@ class _SortedItem:
     prompt_text: str
     width: int = 0
     height: int = 0
+    topic_slug: str | None = None
 
 
 _sorted_cache: dict[str, Any] = {"items": [], "ts": 0.0, "signature": None}
@@ -1240,6 +1770,7 @@ def _index_row_to_item(row: index_store.IndexedImage) -> _SortedItem:
         prompt_text=row.prompt or "",
         width=row.width or 0,
         height=row.height or 0,
+        topic_slug=row.topic_slug,
     )
 
 
@@ -1266,6 +1797,16 @@ def _get_sorted_items(force: bool = False) -> list[_SortedItem]:
         _sorted_cache["ts"] = now
         _sorted_cache["signature"] = (len(items), now)
         return items
+
+
+def _get_sorted_items_scoped(slug: str | None, force: bool = False) -> list[_SortedItem]:
+    """Sorted items filtered to one job slug. When slug is None (pre-migration)
+    returns the full set so behaviour is unchanged. Reuses the materialised
+    cache from _get_sorted_items so stats/gallery stay fast."""
+    items = _get_sorted_items(force=force)
+    if slug is None:
+        return items
+    return [it for it in items if (it.topic_slug or "default") == slug]
 
 
 _TOKEN_RX = re.compile(r"[A-Za-z][A-Za-z'\-]{2,}")
@@ -1323,8 +1864,9 @@ def _item_to_card(item: _SortedItem) -> dict[str, Any]:
 def api_stats():
     """Aggregates over every sorted image: keyword frequency, top thumbnails,
     per-source platform analytics. Cached for 60s via _get_sorted_items.
+    Scoped to ?job=<slug> (default active).
     """
-    items = _get_sorted_items()
+    items = _get_sorted_items_scoped(_resolve_job_slug())
     non_discard = [it for it in items if it.category.upper() != "DISCARD"]
 
     # Keyword frequency over non-DISCARD prompts.
@@ -1506,7 +2048,7 @@ def _filter_items(items: list[_SortedItem], args: Any) -> list[_SortedItem]:
 
 @app.route("/api/gallery")
 def api_gallery():
-    items = _get_sorted_items()
+    items = _get_sorted_items_scoped(_resolve_job_slug())
     filtered = _filter_items(items, request.args)
     sort_key = (request.args.get("sort") or "newest").lower()
     if sort_key == "ovr":
@@ -1538,8 +2080,8 @@ def api_gallery():
 @app.route("/api/gallery/insights")
 def api_gallery_insights():
     """N-gram insights computed only over the FILTERED set so they reflect
-    whatever the user is actively browsing."""
-    items = _get_sorted_items()
+    whatever the user is actively browsing. Scoped to ?job=<slug>."""
+    items = _get_sorted_items_scoped(_resolve_job_slug())
     filtered = _filter_items(items, request.args)
     non_discard = [it for it in filtered if it.category.upper() != "DISCARD"]
 
@@ -1618,7 +2160,7 @@ def api_prompt_save():
 
 @app.route("/api/gallery/download.zip")
 def api_gallery_download():
-    items = _get_sorted_items()
+    items = _get_sorted_items_scoped(_resolve_job_slug())
     filtered = _filter_items(items, request.args)
     if not filtered:
         return Response("no items match the current filters", status=404, mimetype="text/plain")
@@ -1675,7 +2217,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title x-text="'cull · ' + (tabs.find(t => t.id === active)?.label || 'overview')">cull</title>
+<title x-text="'cull · ' + (currentTabLabel() || 'jobs')">cull</title>
 <link rel="icon" type="image/png" href="/brand/logo-transparent-dark.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1795,8 +2337,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       <!-- Brand lockup: inline SVG funnel mark + JetBrains Mono lowercase wordmark.
            One bead falling through, rendered in brand mustard. Keeps the dashboard
            branded before the user has dropped real logo SVGs into docs/brand/. -->
-      <a href="#" @click.prevent="active = 'about'"
-         class="flex items-center gap-2 hover:opacity-80 transition" aria-label="About cull">
+      <a href="#" @click.prevent="backToJobs()"
+         class="flex items-center gap-2 hover:opacity-80 transition" aria-label="cull — back to Jobs">
         <img src="/brand/logo-transparent-dark.png" alt="" width="32" height="32"
              class="shrink-0"/>
         <span class="font-brand text-2xl font-medium tracking-tight">cull</span>
@@ -1806,14 +2348,40 @@ HTML_TEMPLATE = r"""<!doctype html>
         <span class="pill px-2 py-0.5 rounded"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
           x-text="status.pipeline?.running ? 'running' : 'stopped'"></span>
+        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 ml-1"
+          x-show="jobsActive" x-text="'active: ' + (jobsActive || '')"></span>
       </div>
     </div>
-    <template x-for="tab in tabs" :key="tab.id">
-      <button @click="active = tab.id; sidebarOpen = false"
-        class="w-full text-left px-3 py-2 rounded text-sm transition"
-        :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-        x-text="tab.label"></button>
+
+    <!-- GLOBAL nav (Jobs landing view) -->
+    <template x-if="view === 'jobs'">
+      <div class="space-y-1">
+        <template x-for="tab in globalTabs" :key="tab.id">
+          <button @click="active = tab.id; sidebarOpen = false"
+            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
+            x-text="tab.label"></button>
+        </template>
+      </div>
     </template>
+
+    <!-- JOB-SCOPED nav (single job view) -->
+    <template x-if="view === 'job'">
+      <div class="space-y-1">
+        <button @click="backToJobs()"
+          class="w-full text-left px-3 py-2 rounded text-sm text-slate-300 hover:bg-slate-800 transition flex items-center gap-2">
+          <span aria-hidden="true">←</span> Jobs
+        </button>
+        <div class="px-3 py-1 text-xs text-slate-500 truncate" x-text="currentJob"></div>
+        <template x-for="tab in jobTabs" :key="tab.id">
+          <button @click="active = tab.id; sidebarOpen = false"
+            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
+            x-text="tab.label"></button>
+        </template>
+      </div>
+    </template>
+
     <div class="pt-6 text-xs text-slate-500" x-text="'Refreshed: ' + lastRefresh"></div>
     <!-- Indexer status: shown only while a scan is running OR while there are
          indexed rows but no successful scan timestamp yet (initial bootstrap).
@@ -1839,13 +2407,16 @@ HTML_TEMPLATE = r"""<!doctype html>
   <main class="flex-1 p-6 space-y-6 overflow-y-auto">
     <header class="flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-bold" x-text="tabs.find(t => t.id === active)?.label"></h2>
+        <h2 class="text-2xl font-bold" x-text="currentTabLabel()"></h2>
         <p class="text-sm text-slate-400">
-          <span x-show="active !== 'gallery'">Realtime operations console - auto-refresh every 5 s</span>
-          <span x-show="active === 'gallery'">Filter, browse, edit, and export the sorted library</span>
+          <span x-show="view === 'jobs' && active === 'jobs'">Each job is a curation target with its own scrapers, taxonomy, and scoring. Activate one to run it.</span>
+          <span x-show="view === 'jobs' && active === 'settings'">Global credentials, model endpoints, and storage roots. Per-job settings live inside each job.</span>
+          <span x-show="view === 'jobs' && active === 'gstats'">Aggregate analytics across every job — filter to one job to drill in.</span>
+          <span x-show="view === 'job' && active !== 'gallery'" x-text="'Job: ' + currentJob + ' — auto-refresh every 5 s'"></span>
+          <span x-show="view === 'job' && active === 'gallery'" x-text="'Filter, browse, edit, and export ' + currentJob + '\'s sorted library'"></span>
         </p>
       </div>
-      <div class="flex gap-2">
+      <div class="flex gap-2" x-show="view === 'job'">
         <template x-if="!status.pipeline?.running">
           <button @click="startPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-emerald-600 hover:bg-emerald-500">Start pipeline</button>
         </template>
@@ -1856,8 +2427,156 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </header>
 
+    <!-- JOBS LANDING ──────────────────────────────────────────────────────
+         The first thing the user sees: a grid of job cards + a New Job card.
+         Each job is its own curation target; activating one makes the
+         supervisor run it. -->
+    <section x-show="view === 'jobs' && active === 'jobs'" class="space-y-4">
+      <!-- Job queue strip: active job + next queued, with advance control. -->
+      <div class="card rounded-xl p-5" x-show="jobsActive || jobsQueue.length">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Run queue</h3>
+          <button @click="advanceQueue()" :disabled="!jobsQueue.length"
+            class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"
+            title="Promote the next queued job to active">Advance →</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-sm">
+          <span class="text-xs text-slate-400">Active:</span>
+          <span class="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 font-mono text-xs"
+                x-text="jobsActive || '(none — activate a job)'"></span>
+          <template x-if="jobsQueue.length">
+            <span class="text-xs text-slate-400 ml-2">then:</span>
+          </template>
+          <template x-for="(slug, i) in jobsQueue" :key="slug">
+            <span class="px-2 py-1 rounded bg-amber-900/40 text-amber-200 font-mono text-xs"
+                  x-text="(i+1) + '. ' + slug"></span>
+          </template>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <!-- Existing jobs -->
+        <template x-for="jb in jobsList" :key="jb.slug">
+          <div class="card rounded-xl p-5 flex flex-col">
+            <div class="flex items-start justify-between gap-2 mb-2">
+              <div class="min-w-0">
+                <div class="font-semibold truncate" x-text="jb.name"></div>
+                <div class="text-xs text-slate-500 font-mono truncate" x-text="jb.slug"></div>
+              </div>
+              <span class="pill px-2 py-0.5 rounded shrink-0" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-center my-2">
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2">
+                <div class="pill text-indigo-300">Queued</div>
+                <div class="text-xl font-mono mt-0.5" x-text="jb.queued"></div>
+              </div>
+              <div class="bg-slate-900/60 border border-slate-800 rounded p-2">
+                <div class="pill text-emerald-300">Sorted</div>
+                <div class="text-xl font-mono mt-0.5" x-text="jb.sorted"></div>
+              </div>
+            </div>
+            <div class="text-[11px] text-slate-500 mb-3" x-show="jb.queue_position !== null"
+                 x-text="jb.queue_position === 0 ? 'Active' : ('Queue position #' + jb.queue_position)"></div>
+            <div class="mt-auto flex flex-wrap gap-1.5">
+              <button @click="openJob(jb.slug)" class="px-2.5 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Open</button>
+              <button @click="activateJob(jb.slug)" :disabled="jb.is_active"
+                class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40"
+                x-text="jb.is_active ? 'Active' : 'Activate'"></button>
+              <button @click="openJob(jb.slug); active='jobSettings'" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+              <button @click="cloneJob(jb.slug)" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+              <template x-if="!jb.is_active && jb.queue_position === null">
+                <button @click="enqueueJob(jb.slug)" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Enqueue</button>
+              </template>
+              <template x-if="jb.queue_position !== null && jb.queue_position > 0">
+                <button @click="dequeueJob(jb.slug)" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Dequeue</button>
+              </template>
+              <button @click="deleteJob(jb.slug)" :disabled="jb.is_active"
+                class="px-2.5 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- New Job card -->
+        <div class="card rounded-xl p-5 border-dashed border-2 border-slate-700 flex flex-col justify-center">
+          <h3 class="font-semibold mb-2">New job</h3>
+          <input x-model="newJob.name" @keydown.enter="createJob()"
+            placeholder="Job name (e.g. Car Ads)"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2"/>
+          <select x-model="newJob.base_on"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-3">
+            <option value="">Start from defaults</option>
+            <template x-for="jb in jobsList" :key="'base_'+jb.slug">
+              <option :value="jb.slug" x-text="'Clone: ' + jb.name"></option>
+            </template>
+          </select>
+          <button @click="createJob()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Create job</button>
+        </div>
+      </div>
+
+      <template x-if="!jobsLoading && jobsList.length === 0">
+        <div class="text-xs text-slate-500">No jobs yet — create one above to begin curating.</div>
+      </template>
+    </section>
+
+    <!-- GLOBAL STATS ──────────────────────────────────────────────────────
+         Aggregate analytics with a per-job filter. Reuses the Stats payload
+         shape; just driven by an explicit ?job= rather than the active job. -->
+    <section x-show="view === 'jobs' && active === 'gstats'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <h3 class="font-semibold">Global analytics</h3>
+            <p class="text-xs text-slate-400">Aggregate across all jobs, or filter to one.</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-slate-400">Job filter</label>
+            <select x-model="globalStatsJob" @change="loadGlobalStats()"
+              class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm">
+              <option value="">All jobs</option>
+              <template x-for="jb in jobsList" :key="'gs_'+jb.slug">
+                <option :value="jb.slug" x-text="jb.name"></option>
+              </template>
+            </select>
+            <button @click="loadGlobalStats()" :disabled="statsLoading"
+              class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-60">Refresh</button>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Total classified</div><div class="text-2xl font-mono mt-1" x-text="stats.totals?.all ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-emerald-300">Kept</div><div class="text-2xl font-mono mt-1 text-emerald-200" x-text="stats.totals?.non_discard ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-rose-300">Discarded</div><div class="text-2xl font-mono mt-1 text-rose-200" x-text="stats.totals?.discard ?? 0"></div></div>
+          <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Sources</div><div class="text-2xl font-mono mt-1" x-text="(stats.sources?.length ?? 0)"></div></div>
+        </div>
+      </div>
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Per-source platform analytics</h3>
+        <div class="scroll-box"><table>
+          <thead><tr>
+            <th>Source</th><th class="text-right">Total</th>
+            <th class="text-right">DISCARD %</th><th class="text-right">NSFW %</th>
+            <th class="text-right">Avg OVR</th><th class="text-right">Avg REL</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="s in stats.sources" :key="'gs_src_'+s.source">
+              <tr>
+                <td class="font-mono text-xs" x-text="s.source"></td>
+                <td class="text-right font-mono" x-text="s.total"></td>
+                <td class="text-right font-mono" x-text="s.discard_pct + '%'"></td>
+                <td class="text-right font-mono" x-text="s.nsfw_pct + '%'"></td>
+                <td class="text-right font-mono" x-text="s.avg_ovr ?? '-'"></td>
+                <td class="text-right font-mono" x-text="s.avg_rel ?? '-'"></td>
+              </tr>
+            </template>
+            <template x-if="(stats.sources?.length ?? 0) === 0">
+              <tr><td colspan="6" class="text-xs text-slate-500">No data yet.</td></tr>
+            </template>
+          </tbody>
+        </table></div>
+      </div>
+    </section>
+
     <!-- OVERVIEW -->
-    <section x-show="active === 'overview'" class="space-y-4">
+    <section x-show="view === 'job' && active === 'overview'" class="space-y-4">
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div class="card rounded-xl p-5">
           <div class="pill text-indigo-300">Queue</div>
@@ -1935,8 +2654,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- STATS -->
-    <section x-show="active === 'stats'" class="space-y-4">
+    <!-- STATS (job-scoped) -->
+    <section x-show="view === 'job' && active === 'stats'" class="space-y-4">
       <div class="card rounded-xl p-5">
         <div class="flex items-center justify-between mb-2">
           <div>
@@ -2035,8 +2754,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- GALLERY -->
-    <section x-show="active === 'gallery'" class="space-y-4">
+    <!-- GALLERY (job-scoped) -->
+    <section x-show="view === 'job' && active === 'gallery'" class="space-y-4">
       <div class="card rounded-xl p-4">
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
           <div class="lg:col-span-4">
@@ -2225,12 +2944,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- SCRAPERS -->
-    <section x-show="active === 'scrapers'" class="card rounded-xl p-5">
+    <!-- SCRAPERS (per-job toggles) -->
+    <section x-show="view === 'job' && active === 'scrapers'" class="card rounded-xl p-5">
       <div class="flex items-start justify-between gap-4 mb-3">
         <div>
           <h3 class="font-semibold">Scraper controls</h3>
-          <p class="text-xs text-slate-400 mt-1">Toggles persist to <code>.env</code> (SCRAPER_DISABLED). Restart the pipeline to pick up changes.</p>
+          <p class="text-xs text-slate-400 mt-1">Per-job toggles, saved into this job's config. The active job re-projects on save so a running supervisor re-resolves which scrapers to spawn.</p>
         </div>
         <div class="flex gap-2">
           <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off (vision only)</button>
@@ -2257,8 +2976,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- VISION -->
-    <section x-show="active === 'vision'" class="space-y-4">
+    <!-- VISION (global endpoints readout + this job's captioning/scoring) -->
+    <section x-show="view === 'job' && active === 'vision'" class="space-y-4">
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="card rounded-xl p-5">
           <h3 class="font-semibold mb-3">Vision workers</h3>
@@ -2295,11 +3014,20 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- Auto-captioning + prompt-required toggles. Writes AUTO_CAPTION_*
-           and REQUIRE_PROMPT to .env via /api/settings; the supervisor
-           soft-restarts the vision worker pool the next reconcile tick. -->
-      <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">Auto-captioning</h3>
+      <!-- Auto-captioning + prompt-required toggles — PER JOB. These live in
+           this job's config (captioning + topic.require_prompt); saving the
+           active job re-projects so the worker pool picks them up. -->
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Auto-captioning <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
+          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
+            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
+            <span x-text="jobEditor.saving ? 'Saving…' : 'Save'"></span>
+          </button>
+        </div>
+        <div x-show="jobEditor.banner" x-cloak class="border text-xs px-3 py-2 rounded mb-3"
+             :class="jobEditor.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200' : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+             x-text="jobEditor.banner"></div>
         <p class="text-xs text-slate-400 mb-3">
           When enabled, the vision worker writes a training-ready caption to
           <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">&lt;image&gt;.txt</code>
@@ -2308,11 +3036,11 @@ HTML_TEMPLATE = r"""<!doctype html>
           so there's no extra request. Captions never overwrite an existing
           source-side prompt unless the overwrite toggle is also on.
         </p>
+        <template x-if="jobEditor.cfg">
         <div class="grid md:grid-cols-2 gap-4">
           <div>
             <label class="flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" :checked="settings.AUTO_CAPTION_ENABLED === 'true'"
-                     @change="settings.AUTO_CAPTION_ENABLED = $event.target.checked ? 'true' : 'false'; saveSettings()"
+              <input type="checkbox" x-model="jobEditor.cfg.captioning.enabled"
                      class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
                        checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
                        before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
@@ -2320,9 +3048,8 @@ HTML_TEMPLATE = r"""<!doctype html>
               <span class="text-sm">Enable auto-captioning</span>
             </label>
             <label class="flex items-center gap-3 cursor-pointer mt-3">
-              <input type="checkbox" :checked="settings.AUTO_CAPTION_OVERWRITE === 'true'"
-                     :disabled="settings.AUTO_CAPTION_ENABLED !== 'true'"
-                     @change="settings.AUTO_CAPTION_OVERWRITE = $event.target.checked ? 'true' : 'false'; saveSettings()"
+              <input type="checkbox" x-model="jobEditor.cfg.captioning.overwrite"
+                     :disabled="!jobEditor.cfg.captioning.enabled"
                      class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
                        checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5
                        before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
@@ -2330,21 +3057,21 @@ HTML_TEMPLATE = r"""<!doctype html>
               <span class="text-sm">Overwrite any existing captions found</span>
             </label>
             <label class="flex items-center gap-3 cursor-pointer mt-3">
-              <input type="checkbox" :checked="settings.REQUIRE_PROMPT === 'false'"
-                     @change="settings.REQUIRE_PROMPT = $event.target.checked ? 'false' : 'true'; saveSettings()"
+              <input type="checkbox" :checked="jobEditor.cfg.topic.require_prompt === false"
+                     @change="jobEditor.cfg.topic.require_prompt = !$event.target.checked"
                      class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
                        checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
                        before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
                        checked:before:translate-x-5"/>
               <span class="text-sm">Allow scrapers to ingest images without a prompt
-                <span class="block text-xs text-slate-500">(off = current behaviour: require MIN_PROMPT_LENGTH chars)</span>
+                <span class="block text-xs text-slate-500">(off = require min prompt length chars)</span>
               </span>
             </label>
           </div>
           <div>
             <label class="text-xs text-slate-400 block mb-1">Caption style</label>
-            <select x-model="settings.AUTO_CAPTION_STYLE" @change="saveSettings()"
-                    :disabled="settings.AUTO_CAPTION_ENABLED !== 'true'"
+            <select x-model="jobEditor.cfg.captioning.style"
+                    :disabled="!jobEditor.cfg.captioning.enabled"
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 disabled:opacity-50">
               <option value="sd_prompt">SD / Flux prompt (comma-separated descriptive phrases)</option>
               <option value="booru_tags">Booru tags (lowercase_underscored, comma-separated)</option>
@@ -2357,10 +3084,47 @@ HTML_TEMPLATE = r"""<!doctype html>
             </p>
           </div>
         </div>
+        </template>
+      </div>
+
+      <!-- Per-job quality scoring. OVR/REL gates + scoring notes live in this
+           job's config; saving the active job re-projects them. -->
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Quality scoring <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
+          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
+            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
+            <span x-text="jobEditor.saving ? 'Saving…' : 'Save'"></span>
+          </button>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">
+          Every classification emits two 0-100 scores. <code>OVR</code> judges absolute craft;
+          <code>REL</code> judges topic relevance. Either threshold forces a DISCARD when not met; set 0 to disable.
+        </p>
+        <template x-if="jobEditor.cfg">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
+            <input type="number" min="0" max="100" x-model.number="jobEditor.cfg.scoring.ovr_min"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
+            <input type="number" min="0" max="100" x-model.number="jobEditor.cfg.scoring.rel_min"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Scoring notes (appended to the rubric)</span>
+            <textarea x-model="jobEditor.cfg.scoring.notes" rows="3"
+                      placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+        </div>
+        </template>
       </div>
 
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">LMStudio endpoints</h3>
+        <h3 class="font-semibold mb-3">LMStudio endpoints <span class="text-xs font-normal text-slate-500">(global)</span></h3>
         <div class="grid md:grid-cols-2 gap-6">
           <template x-for="inst in ['primary', 'secondary']" :key="inst">
             <div>
@@ -2406,26 +3170,50 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- QUEUE -->
-    <section x-show="active === 'queue'" class="space-y-4">
+    <!-- QUEUE (job queue strip + this job's image queue) -->
+    <section x-show="view === 'job' && active === 'queue'" class="space-y-4">
+      <!-- Job-queue strip: the run order across jobs, as cards. The card for
+           the job you're viewing is highlighted; clicking another drills into
+           that job's image queue. -->
+      <div class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Job queue</h3>
+          <button @click="backToJobs()" class="text-xs link-btn">Manage run queue →</button>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <template x-for="jb in jobsList.filter(j => j.is_active || j.queue_position !== null)" :key="'jq_'+jb.slug">
+            <button @click="openJob(jb.slug)"
+              class="text-left px-3 py-2 rounded border transition"
+              :class="jb.slug === currentJob ? 'bg-indigo-600/30 border-indigo-400' : 'bg-slate-900/60 border-slate-800 hover:border-slate-600'">
+              <div class="flex items-center gap-2">
+                <span class="pill px-1.5 py-0.5 rounded" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
+                <span class="font-mono text-xs" x-text="jb.slug"></span>
+              </div>
+              <div class="text-[11px] text-slate-400 mt-1" x-text="'queued ' + jb.queued + ' · sorted ' + jb.sorted"></div>
+            </button>
+          </template>
+          <template x-if="jobsList.filter(j => j.is_active || j.queue_position !== null).length === 0">
+            <span class="text-xs text-slate-500">No active or queued jobs.</span>
+          </template>
+        </div>
+      </div>
+
       <!-- First-run welcome card: shown only when nothing has been queued OR
-           classified yet. Keeps the empty state from looking like a bug. -->
+           classified yet for THIS job. Keeps the empty state from looking like a bug. -->
       <template x-if="(status.queue?.total ?? 0) === 0 && (status.sorted?.total ?? 0) === 0">
         <div class="card rounded-xl p-6">
           <div class="flex items-start gap-4">
             <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64"
                  class="shrink-0"/>
             <div class="flex-1">
-              <h3 class="font-brand text-2xl font-medium tracking-tight">Welcome to cull</h3>
+              <h3 class="font-brand text-2xl font-medium tracking-tight">Nothing here yet</h3>
               <p class="text-sm text-slate-300 mt-1 mb-4">
-                cull is a curation engine for AI image datasets. Configure a scraper and a vision worker to begin,
-                or seed a synthetic dataset to see what the dashboard looks like with data in it.
+                This job has no queued or sorted images. Configure its scrapers and target, activate it, then start the pipeline.
               </p>
               <div class="flex flex-wrap gap-2">
                 <button @click="active = 'scrapers'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure scrapers</button>
-                <button @click="active = 'vision'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure vision worker</button>
-                <button @click="active = 'settings'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Open settings</button>
-                <button @click="active = 'about'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">About cull</button>
+                <button @click="active = 'jobSettings'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Job settings</button>
+                <button @click="active = 'vision'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Vision worker</button>
               </div>
               <p class="text-xs text-slate-500 mt-4">
                 Want a demo first? Run <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code> from the repo root.
@@ -2436,7 +3224,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       </template>
 
       <div class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Queue (newest 60)</h3>
+      <h3 class="font-semibold mb-3">Queue (newest 60) <span class="text-xs font-normal text-slate-500" x-text="'· ' + currentJob"></span></h3>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Name</th><th>Source</th><th>Size</th><th>Prompt</th><th></th></tr></thead>
         <tbody>
@@ -2465,8 +3253,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- LOGS -->
-    <section x-show="active === 'logs'" class="card rounded-xl p-5">
+    <!-- LOGS (job-scoped Historical) -->
+    <section x-show="view === 'job' && active === 'logs'" class="card rounded-xl p-5">
       <h3 class="font-semibold mb-3">Historical sorter log</h3>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Time</th><th>Image</th><th>Source</th><th>Classification</th></tr></thead>
@@ -2504,71 +3292,210 @@ HTML_TEMPLATE = r"""<!doctype html>
       </table></div>
     </section>
 
-    <!-- SETTINGS -->
-    <section x-show="active === 'settings'" class="space-y-4"
-      @input="markSettingsDirty()" @change="markSettingsDirty()">
-      <div class="card rounded-xl p-5">
+    <!-- JOB SETTINGS (per-job config editor) ──────────────────────────────
+         Everything that defines what THIS job scrapes and how it's judged.
+         Bound to jobEditor.cfg; PUT /api/jobs/<slug> persists it and (if active)
+         re-projects so the supervisor re-resolves env + taxonomy. -->
+    <section x-show="view === 'job' && active === 'jobSettings'" class="space-y-4">
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
-            <h3 class="font-semibold">Topic &amp; scraper filters</h3>
-            <p class="text-xs text-slate-400">Changes write to <code>.env</code>. Stop + Start the pipeline to apply.</p>
+            <h3 class="font-semibold">Topic &amp; targets <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
+            <p class="text-xs text-slate-400">Saved into this job's config. The active job re-projects on save.</p>
           </div>
           <div class="flex gap-2">
-            <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-            <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+            <button @click="loadJobEditor()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
+            <button @click="saveJobEditor()" :disabled="jobEditor.saving"
+              class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
+              <span x-text="jobEditor.saving ? 'Saving…' : 'Save job'"></span>
+            </button>
           </div>
         </div>
-        <template x-if="settingsBanner">
-          <div class="border text-xs px-3 py-2 rounded mb-3"
-            :class="settingsBannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
-                                     : 'bg-rose-950/60 border-rose-700 text-rose-200'"
-            x-text="settingsBanner"></div>
-        </template>
+        <div x-show="jobEditor.banner" x-cloak class="border text-xs px-3 py-2 rounded mb-3"
+             :class="jobEditor.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200' : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+             x-text="jobEditor.banner"></div>
+        <template x-if="jobEditor.cfg">
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
-            <span class="text-xs text-slate-400">Topic</span>
-            <input x-model="settings.PIPELINE_TOPIC" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-            <span class="text-[10px] text-slate-500">Slug auto-derives from topic unless you override below.</span>
+            <span class="text-xs text-slate-400">Display name</span>
+            <input x-model="jobEditor.cfg.name" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Slug (folder name)</span>
-            <input x-model="settings.PIPELINE_SLUG" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+            <span class="text-xs text-slate-400">Slug (immutable)</span>
+            <input :value="jobEditor.cfg.slug" disabled
+                   class="w-full bg-slate-900 border border-slate-800 rounded px-3 py-2 mt-1 font-mono text-xs text-slate-500"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Topic</span>
+            <input x-model="jobEditor.cfg.topic.topic" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
-            <input x-model="settings.TOPIC_KEYWORDS_EXTRA" placeholder="leave empty = auto-derive from topic"
+            <input :value="jobList('topic.keywords_extra')" @input="setJobList('topic.keywords_extra', $event.target.value)"
+                   placeholder="leave empty = auto-derive from topic"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
-            <input x-model="settings.TOPIC_BANNED_KEYWORDS" placeholder="link in bio, dm me, patreon, onlyfans..."
+            <input :value="jobList('topic.banned_keywords')" @input="setJobList('topic.banned_keywords', $event.target.value)"
+                   placeholder="link in bio, dm me, patreon, onlyfans..."
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
-            <input x-model="settings.TOPIC_GENERATION_HINTS" placeholder="photorealistic, cinematic, cfg, lora..."
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
-            <input x-model="settings.REDDIT_SUBREDDITS"
+            <input :value="jobList('topic.generation_hints')" @input="setJobList('topic.generation_hints', $event.target.value)"
+                   placeholder="photorealistic, cinematic, cfg, lora..."
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
-            <input x-model="settings.MIN_PROMPT_LENGTH" type="number" min="0"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.MIN_PROMPT_LENGTH ? 'border-rose-600' : ''"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
-            <input x-model="settings.X_ACCOUNTS" placeholder="account1,account2,account3"
+            <input type="number" min="0" x-model.number="jobEditor.cfg.topic.min_prompt_length"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
+          <label class="flex items-center gap-3 cursor-pointer mt-6">
+            <input type="checkbox" x-model="jobEditor.cfg.topic.require_prompt"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                     checked:before:translate-x-5"/>
+            <span class="text-sm">Require a prompt (reject promptless images)</span>
+          </label>
         </div>
+        </template>
       </div>
 
-      <!-- Categories: user-editable taxonomy. Lives in data/cull_categories.json,
-           not .env, so the supervisor watches its mtime separately. -->
+      <!-- Scraper targets (per job): accounts, subreddits, channels, domains,
+           gallery-dl, local import, zforfree. -->
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Scraper targets</h3>
+          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
+            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
+            <span x-text="jobEditor.saving ? 'Saving…' : 'Save job'"></span>
+          </button>
+        </div>
+        <template x-if="jobEditor.cfg">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
+            <input :value="jobList('scrapers.x_accounts')" @input="setJobList('scrapers.x_accounts', $event.target.value)"
+                   placeholder="account1,account2,account3"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
+            <input :value="jobList('scrapers.reddit_subreddits')" @input="setJobList('scrapers.reddit_subreddits', $event.target.value)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+            <input :value="jobList('scrapers.civitai_domains')" @input="setJobList('scrapers.civitai_domains', $event.target.value)"
+                   placeholder="civitai.com,civitai.red"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Discord channels JSON</span>
+            <textarea x-model="jobEditor.cfg.scrapers.discord_channels_json" rows="3"
+              placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+        </div>
+        </template>
+      </div>
+
+      <!-- gallery-dl (per job) -->
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+        <h3 class="font-semibold mb-3">gallery-dl</h3>
+        <template x-if="jobEditor.cfg">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" x-model="jobEditor.cfg.scrapers.gallery_dl.enabled"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                     checked:before:translate-x-5"/>
+            <span class="text-sm">Enable gallery-dl for this job</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Images per URL (limit)</span>
+            <input type="number" min="1" max="5000" x-model.number="jobEditor.cfg.scrapers.gallery_dl.limit_per_url"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
+            <textarea :value="jobUrls()" @input="setJobUrls($event.target.value)" rows="4"
+                      placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
+            <input x-model="jobEditor.cfg.scrapers.gallery_dl.cookies_file" placeholder="C:\\Users\\you\\cookies.txt"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Custom config path (advanced)</span>
+            <input x-model="jobEditor.cfg.scrapers.gallery_dl.config_path"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+        </template>
+      </div>
+
+      <!-- Local import + ZForFree (per job) -->
+      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+        <h3 class="font-semibold mb-3">Local import &amp; ZForFree</h3>
+        <template x-if="jobEditor.cfg">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" x-model="jobEditor.cfg.scrapers.local_import.enabled"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                     checked:before:translate-x-5"/>
+            <span class="text-sm">Enable local folder import</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Source label (queue subfolder)</span>
+            <input x-model="jobEditor.cfg.scrapers.local_import.name" placeholder="local"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Local import folder (absolute path)</span>
+            <input x-model="jobEditor.cfg.scrapers.local_import.dir" placeholder="D:\\my-dataset"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Migrate dedup from (optional, comma-sep)</span>
+            <input x-model="jobEditor.cfg.scrapers.local_import.migrate_from" placeholder="zff_local:zff:zforfree"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" x-model="jobEditor.cfg.scrapers.zforfree.local_enabled"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                     checked:before:translate-x-5"/>
+            <span class="text-sm">ZForFree local feeder</span>
+          </label>
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" x-model="jobEditor.cfg.scrapers.zforfree.web_enabled"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                     checked:before:translate-x-5"/>
+            <span class="text-sm">ZForFree web feeder</span>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">ZForFree local source folder</span>
+            <input x-model="jobEditor.cfg.scrapers.zforfree.local_src"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+        </template>
+      </div>
+
+      <!-- Categories: per-job taxonomy. Projected into data/cull_categories.json
+           when this is the active job; the supervisor watches that file. -->
       <div class="card rounded-xl p-5">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
@@ -2650,6 +3577,49 @@ HTML_TEMPLATE = r"""<!doctype html>
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-[11px] leading-snug"></textarea>
           <span class="text-[10px] text-slate-500">Free-text. Used verbatim by every vision worker. Keep portrait-specific gates here when using the default taxonomy; relax them when sorting by art-style or quality only.</span>
         </label>
+      </div>
+    </section>
+
+    <!-- GLOBAL SETTINGS ────────────────────────────────────────────────────
+         Credentials, model endpoints, storage roots, and global UX. Per-job
+         settings (topic / targets / scoring / captioning) live in Job Settings.
+         Writes to .env via /api/settings. -->
+    <section x-show="view === 'jobs' && active === 'settings'" class="space-y-4"
+      @input="markSettingsDirty()" @change="markSettingsDirty()">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <h3 class="font-semibold">Global settings</h3>
+            <p class="text-xs text-slate-400">Credentials, endpoints, paths, and global UX. Changes write to <code>.env</code>. Stop + Start the pipeline to apply.</p>
+          </div>
+          <div class="flex gap-2">
+            <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
+            <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+          </div>
+        </div>
+        <template x-if="settingsBanner">
+          <div class="border text-xs px-3 py-2 rounded mb-3"
+            :class="settingsBannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
+                                     : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+            x-text="settingsBanner"></div>
+        </template>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Supervisor reconcile interval (seconds)</span>
+            <input x-model="settings.PIPELINE_RECONCILE_SECONDS" type="number" min="1" max="3600"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.PIPELINE_RECONCILE_SECONDS ? 'border-rose-600' : ''"/>
+            <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
+          </label>
+          <label class="flex items-start gap-2 mt-5">
+            <input type="checkbox" :checked="settings.BLUR_NSFW_THUMBS === 'true'"
+                   @change="settings.BLUR_NSFW_THUMBS = $event.target.checked ? 'true' : 'false'"
+                   class="mt-1"/>
+            <div>
+              <div class="text-xs text-slate-300">Blur NSFW thumbnails by default</div>
+              <div class="text-[10px] text-slate-500">A small eye icon reveals a single image temporarily.</div>
+            </div>
+          </label>
+        </div>
       </div>
 
       <div class="card rounded-xl p-5">
@@ -2763,20 +3733,9 @@ HTML_TEMPLATE = r"""<!doctype html>
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">CIVITAI_DOMAINS (comma-sep)</span>
-            <input x-model="settings.CIVITAI_DOMAINS" placeholder="civitai.com,civitai.red"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">TWITTER_COOKIES (full cookie string from a logged-in browser)</span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">DISCORD_CHANNELS_JSON</span>
-            <textarea x-model="settings.DISCORD_CHANNELS_JSON" rows="3"
-              placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
           <label class="block">
@@ -2798,51 +3757,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
 
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">Vision quality scoring</h3>
-        <p class="text-xs text-slate-400 mb-3">
-          Every classification now emits two 0-100 scores. <code>OVR_Quality_Score</code> judges absolute
-          craft (composition, lighting, colour, emotion, …). <code>REL_Quality_Score</code> judges how
-          closely the image matches the configured topic at its platonic best. Reserve 90+ for the rarest
-          images. Either threshold forces a DISCARD when not met; set 0 to disable.
-        </p>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
-            <input x-model="settings.VISION_OVR_MIN_SCORE" type="number" min="0" max="100"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.VISION_OVR_MIN_SCORE ? 'border-rose-600' : ''"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
-            <input x-model="settings.VISION_REL_MIN_SCORE" type="number" min="0" max="100"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.VISION_REL_MIN_SCORE ? 'border-rose-600' : ''"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Scoring notes (appended to rubric - nudge the model toward your taste)</span>
-            <textarea x-model="settings.VISION_SCORE_NOTES" rows="3"
-                      placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Supervisor reconcile interval (seconds)</span>
-            <input x-model="settings.PIPELINE_RECONCILE_SECONDS" type="number" min="1" max="3600"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.PIPELINE_RECONCILE_SECONDS ? 'border-rose-600' : ''"/>
-            <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
-          </label>
-          <label class="flex items-start gap-2 md:col-span-2">
-            <input type="checkbox" :checked="settings.BLUR_NSFW_THUMBS === 'true'"
-                   @change="settings.BLUR_NSFW_THUMBS = $event.target.checked ? 'true' : 'false'"
-                   class="mt-1"/>
-            <div>
-              <div class="text-xs text-slate-300">Blur NSFW thumbnails by default</div>
-              <div class="text-[10px] text-slate-500">A small eye icon on each NSFW image lets you reveal it temporarily; the setting persists per browser session for revealed items only.</div>
-            </div>
-          </label>
-        </div>
-      </div>
-
-      <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Paths</h3>
-        <p class="text-xs text-slate-400 mb-3">Absolute paths only. Pipeline must be stopped before changing these.</p>
+        <p class="text-xs text-slate-400 mb-3">Absolute paths only (global storage roots). Pipeline must be stopped before changing these. Per-slug subfolders derive from each job's slug.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Pipeline base dir (parent of queue/, sorted/)</span>
@@ -2864,96 +3780,12 @@ HTML_TEMPLATE = r"""<!doctype html>
             <input x-model="settings.LOG_DIR"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">ZforFree local source</span>
-            <input x-model="settings.ZFORFREE_LOCAL_SRC"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-        </div>
-      </div>
-
-      <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">Local folder import</h3>
-        <p class="text-xs text-slate-400 mb-3">
-          Mirror any folder on disk into the queue. Expected layout: <code>&lt;n&gt;.jpg|png|webp</code>
-          paired with <code>&lt;n&gt;.txt</code> (prompt). Items already under
-          <code>&lt;sorted&gt;/&lt;slug&gt;/*/&lt;label&gt;/</code> are skipped automatically.
-        </p>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Local import folder (absolute path)</span>
-            <input x-model="settings.LOCAL_IMPORT_DIR" placeholder="e.g. D:\\my-dataset"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Source label (queue subfolder)</span>
-            <input x-model="settings.LOCAL_IMPORT_NAME" placeholder="local"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-            <span class="text-[10px] text-slate-500">Lowercase, letters/digits/underscore. Used as the queue + sorted subfolder name.</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Enabled</span>
-            <select x-model="settings.LOCAL_IMPORT_ENABLED"
-                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
-              <option value="true">true</option>
-              <option value="false">false</option>
-            </select>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Migrate dedup from (optional, comma-sep)</span>
-            <input x-model="settings.LOCAL_IMPORT_MIGRATE_FROM" placeholder="zff_local:zff:zforfree"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-            <span class="text-[10px] text-slate-500">Each spec <code>&lt;seen_prefix&gt;:&lt;stem_prefix&gt;:&lt;sorted_src&gt;</code> re-uses a legacy feeder's dedup history.</span>
-          </label>
-        </div>
-      </div>
-
-      <!-- gallery-dl scraper config. URLs is a textarea; everything else is
-           an env var the supervisor picks up live. -->
-      <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">gallery-dl scraper</h3>
-        <p class="text-xs text-slate-400 mb-3">
-          gallery-dl handles 340+ sites - <strong>Pixiv, DeviantArt, Danbooru/Gelbooru/e621, ArtStation, Tumblr, Newgrounds, FurAffinity, X, Reddit, Imgur, Flickr</strong>, and many more. Paste one or more URLs (newline or comma separated), enable the toggle, and the supervisor spawns a Gallery-DL agent that downloads, dedupes, and routes each image through the same vision pipeline as the rest. Cookies file is required for Pixiv / X / login-walled sites - export <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">cookies.txt</code> from your browser. Captions are mined from each site's metadata (description / caption / selftext / tags) and written as the image's <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">.txt</code> automatically.
-        </p>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">Enabled</span>
-            <select x-model="settings.GALLERY_DL_ENABLED"
-                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
-              <option value="true">true</option>
-              <option value="false">false</option>
-            </select>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Images per URL (limit)</span>
-            <input x-model="settings.GALLERY_DL_LIMIT_PER_URL" type="number" min="1" max="5000" placeholder="50"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-            <span class="text-[10px] text-slate-500">Capped via gallery-dl <code>image-range</code>; default 50.</span>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
-            <textarea x-model="settings.GALLERY_DL_URLS" rows="5"
-                      placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait&#10;https://www.deviantart.com/SOMEONE/gallery"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
-            <input x-model="settings.GALLERY_DL_COOKIES_FILE" placeholder="e.g. C:\\Users\\you\\cookies.txt"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-            <span class="text-[10px] text-slate-500">Optional. Required for Pixiv, X, and any private gallery. Use the &quot;Get cookies.txt LOCALLY&quot; browser extension.</span>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Custom gallery-dl config path (advanced)</span>
-            <input x-model="settings.GALLERY_DL_CONFIG_PATH" placeholder="e.g. C:\\Users\\you\\gallery-dl\\config.json"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-            <span class="text-[10px] text-slate-500">Optional. Loaded on top of cull's defaults so power users can tune per-extractor settings.</span>
-          </label>
         </div>
       </div>
     </section>
 
-    <!-- ERRORS -->
-    <section x-show="active === 'errors'" class="card rounded-xl p-5">
+    <!-- ERRORS (job-scoped) -->
+    <section x-show="view === 'job' && active === 'errors'" class="card rounded-xl p-5">
       <h3 class="font-semibold mb-3 text-rose-300">Recent errors</h3>
       <div class="space-y-2">
         <template x-for="e in status.errors ?? []" :key="e.timestamp + e.message">
@@ -3154,21 +3986,41 @@ HTML_TEMPLATE = r"""<!doctype html>
 <script>
 function dashboard() {
   return {
-    active: 'overview',
+    // ── Top-level navigation (jobs model) ────────────────────────────────
+    // view 'jobs'  → landing: grid of job cards + global settings/stats.
+    // view 'job'   → a single job's scoped workspace (tabs below).
+    view: 'jobs',
+    currentJob: null,         // slug of the job being viewed, when view==='job'
+    active: 'jobs',           // active section id within the current view
     sidebarOpen: false,
-    tabs: [
-      {id:'overview', label:'Overview'},
-      {id:'stats',    label:'Stats'},
-      {id:'gallery',  label:'Gallery'},
-      {id:'scrapers', label:'Scrapers'},
-      {id:'vision',   label:'Vision'},
-      {id:'queue',    label:'Queue'},
-      {id:'logs',     label:'Historical'},
-      {id:'errors',   label:'Errors'},
-      {id:'settings', label:'Settings'},
+    // Job-scoped tabs (shown when view==='job'). Job Settings is the per-job
+    // config editor; the rest reuse today's sections filtered by currentJob.
+    jobTabs: [
+      {id:'logs',         label:'Historical'},
+      {id:'queue',        label:'Queue'},
+      {id:'gallery',      label:'Gallery'},
+      {id:'stats',        label:'Stats'},
+      {id:'overview',     label:'Overview'},
+      {id:'scrapers',     label:'Scrapers'},
+      {id:'vision',       label:'Vision'},
+      {id:'jobSettings',  label:'Job Settings'},
+      {id:'errors',       label:'Errors'},
+    ],
+    // Global sections (shown when view==='jobs').
+    globalTabs: [
+      {id:'jobs',     label:'Jobs'},
+      {id:'gstats',   label:'Global Stats'},
+      {id:'settings', label:'Global Settings'},
       {id:'faq',      label:'FAQ'},
       {id:'about',    label:'About'},
     ],
+    // Jobs landing state.
+    jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
+    newJob: { name: '', base_on: '' },
+    // Per-job config editor (Job Settings tab).
+    jobEditor: { loaded: false, saving: false, banner: '', bannerOk: true, cfg: null, slug: null },
+    // Global Stats per-job filter (null = all jobs aggregate).
+    globalStatsJob: '',
     providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',
     throttle: 100,
@@ -3215,55 +4067,274 @@ function dashboard() {
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
     modalReturnFocus: null,
 
+    // Label for the active section, resolved across whichever tab set is live.
+    currentTabLabel() {
+      const set = this.view === 'job' ? this.jobTabs : this.globalTabs;
+      const found = set.find(t => t.id === this.active);
+      return found ? found.label : '';
+    },
+
+    // Query-string fragment that scopes a request to the job currently being
+    // viewed. Empty when on the global (jobs) view so global endpoints aren't
+    // accidentally pinned to a stale slug.
+    jobParam(prefix) {
+      if (this.view !== 'job' || !this.currentJob) return '';
+      return (prefix || '?') + 'job=' + encodeURIComponent(this.currentJob);
+    },
+
     async refresh() {
-      // Per-tab gating: only fetch what the active tab needs. Always pull
-      // /api/status (it powers the sidebar pill) and /api/scrapers + workers
-      // (cheap, used in multiple tabs). Skip the heavy 200-row history poll
-      // unless the user is on the Historical or Overview tab.
+      // On the jobs landing view, refresh the jobs grid + the (cheap) global
+      // status pill, and skip the job-scoped polls entirely.
+      const j = (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status));
+      if (this.view === 'jobs') {
+        const [status, jobs] = await Promise.allSettled([j('/api/status'), j('/api/jobs')]);
+        if (status.status === 'fulfilled') this.applyStatus(status.value);
+        if (jobs.status === 'fulfilled') this.applyJobs(jobs.value);
+        if (this.active === 'settings' || this.active === 'gstats') {
+          const s = await j('/api/settings').catch(() => null);
+          if (s && !this.settingsDirty && Object.keys(this.settings).length === 0) this.settings = s;
+        }
+        this.lastRefresh = new Date().toLocaleTimeString();
+        return;
+      }
+      // Job view: scope every job-aware poll to the current job slug.
+      const q = this.jobParam('?');
+      const sep = q ? '&' : '?';
       const tab = this.active;
       const need = (id) => tab === id || tab === 'overview';
-      const j = (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status));
       const tasks = {
-        status:    j('/api/status'),
-        scrapers:  j('/api/scrapers'),
+        status:    j('/api/status' + q),
+        scrapers:  j('/api/scrapers' + q),
         workers:   j('/api/vision/workers'),
         models:    (need('vision') ? j('/api/lmstudio/models') : null),
-        queue:     (need('queue')  ? j('/api/queue/files?limit=60') : null),
-        history:   (need('logs')   ? j('/api/logs/history?limit=200') : null),
-        activity:  (need('overview') || tab === 'vision' ? j('/api/activity?limit=12') : null),
-        // Vision tab also needs settings for the auto-caption toggles.
-        settings:  (need('settings') || tab === 'vision' ? j('/api/settings') : null),
+        queue:     (need('queue')  ? j('/api/queue/files' + q + sep + 'limit=60') : null),
+        history:   (need('logs')   ? j('/api/logs/history' + q + sep + 'limit=200') : null),
+        activity:  (need('overview') || tab === 'vision' ? j('/api/activity' + q + sep + 'limit=12') : null),
+        // Vision tab also needs GLOBAL settings for the LMStudio knobs.
+        settings:  (tab === 'vision' ? j('/api/settings') : null),
       };
       const keys = Object.keys(tasks);
       const results = await Promise.allSettled(Object.values(tasks).map(p => p ?? Promise.resolve(null)));
       const out = {};
       results.forEach((r, i) => { out[keys[i]] = r.status === 'fulfilled' ? r.value : null; });
-      if (out.status)    this.status = out.status;
+      if (out.status)    this.applyStatus(out.status);
       if (out.scrapers)  this.scrapers = out.scrapers;
       if (out.workers)   this.visionWorkers = out.workers;
       if (out.models)    this.models = out.models;
       if (out.queue)     this.queueFiles = out.queue;
       if (out.history)   this.history = out.history;
       if (out.activity)  this.activity = out.activity;
-      // Indexer state rides on /api/status so we don't add a third poll.
-      if (out.status && out.status.indexer) {
-        this.indexer = out.status.indexer;
-        // Show the cold-scan toast once: when in_progress flips on AND no
-        // prior successful scan timestamp exists. Stays dismissed for the
-        // session so it doesn't pop again on refresh.
+      // Only seed settings on first load OR when the user explicitly hits Reload.
+      if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
+        this.settings = out.settings;
+      }
+      this.lastRefresh = new Date().toLocaleTimeString();
+    },
+
+    // Apply a /api/status payload: pipeline pill, throttle, and the indexer
+    // toast logic that rides on the same poll.
+    applyStatus(status) {
+      if (!status) return;
+      this.status = status;
+      if (status.indexer) {
+        this.indexer = status.indexer;
         if (this.indexer.in_progress && !this.indexer.last_scan_at && !this.indexerToast.dismissed) {
           this.indexerToast.show = true;
         } else if (!this.indexer.in_progress) {
           this.indexerToast.show = false;
         }
       }
-      // Only seed settings on first load OR when the user explicitly hits Reload.
-      if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
-        this.settings = out.settings;
+      this.provider = status.pipeline?.vision_worker || this.provider;
+      this.throttle = status.pipeline?.throttle ?? this.throttle;
+    },
+
+    // ── Jobs landing ─────────────────────────────────────────────────────
+    applyJobs(payload) {
+      if (!payload) return;
+      this.jobsList = payload.jobs || [];
+      this.jobsQueue = payload.queue || [];
+      this.jobsActive = payload.active || null;
+    },
+    async loadJobs() {
+      this.jobsLoading = true;
+      try {
+        const j = await fetch('/api/jobs').then(r => r.json());
+        this.applyJobs(j);
+      } catch (e) { /* swallow — grid stays as-is */ }
+      this.jobsLoading = false;
+    },
+    async createJob() {
+      const name = (this.newJob.name || '').trim();
+      if (!name) { alert('Give the job a name.'); return; }
+      const body = { name };
+      if (this.newJob.base_on) body.base_on = this.newJob.base_on;
+      const r = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)});
+      const j = await r.json();
+      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      this.newJob = { name: '', base_on: '' };
+      await this.loadJobs();
+      // Drop straight into the new job's workspace.
+      this.openJob(j.job.slug);
+    },
+    async activateJob(slug) {
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
+      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Activate failed: ' + (j.error || r.status)); return; }
+      await this.loadJobs();
+      await this.refresh();
+    },
+    async cloneJob(slug) {
+      const name = prompt('Name for the clone of "' + slug + '":', slug + ' copy');
+      if (!name) return;
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/clone', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+      const j = await r.json();
+      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      await this.loadJobs();
+    },
+    async deleteJob(slug) {
+      if (!confirm('Delete job "' + slug + '"? Its config is removed. (Data folders are kept unless you confirm again.)')) return;
+      let url = '/api/jobs/' + encodeURIComponent(slug);
+      if (confirm('Also delete this job\'s queue + sorted data folders on disk? This cannot be undone.\n\nOK = delete data too · Cancel = keep data.')) {
+        url += '?force=1';
       }
-      this.provider = this.status.pipeline?.vision_worker || this.provider;
-      this.throttle = this.status.pipeline?.throttle ?? this.throttle;
-      this.lastRefresh = new Date().toLocaleTimeString();
+      const r = await fetch(url, {method:'DELETE'});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      await this.loadJobs();
+    },
+    async enqueueJob(slug) {
+      await fetch('/api/jobs/' + encodeURIComponent(slug) + '/enqueue', {method:'POST'});
+      await this.loadJobs();
+    },
+    async dequeueJob(slug) {
+      await fetch('/api/jobs/' + encodeURIComponent(slug) + '/dequeue', {method:'POST'});
+      await this.loadJobs();
+    },
+    async advanceQueue() {
+      await fetch('/api/jobs/advance', {method:'POST'});
+      await this.loadJobs();
+      await this.refresh();
+    },
+    jobStatusClass(s) {
+      if (s === 'running') return 'bg-emerald-900/60 text-emerald-300';
+      if (s === 'active')  return 'bg-indigo-900/60 text-indigo-300';
+      if (s === 'queued')  return 'bg-amber-900/60 text-amber-300';
+      return 'bg-slate-800 text-slate-400';
+    },
+
+    // ── Job view navigation ──────────────────────────────────────────────
+    openJob(slug) {
+      this.view = 'job';
+      this.currentJob = slug;
+      this.active = 'logs';            // default tab: Historical
+      this.sidebarOpen = false;
+      // Reset per-job tab data so we don't show the previous job's rows.
+      this.history = []; this.queueFiles = []; this.activity = [];
+      this.gallery = { ...this.gallery, page: 1, items: [] };
+      this.stats = { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] };
+      this.jobEditor = { loaded: false, saving: false, banner: '', bannerOk: true, cfg: null, slug: null };
+      this.cats.loaded = false;
+      this.refresh();
+      this.loadJobEditor();
+    },
+    backToJobs() {
+      this.view = 'jobs';
+      this.currentJob = null;
+      this.active = 'jobs';
+      this.sidebarOpen = false;
+      this.loadJobs();
+      this.refresh();
+    },
+
+    // ── Job Settings (per-job config editor) ─────────────────────────────
+    async loadJobEditor() {
+      if (!this.currentJob) return;
+      this.jobEditor.banner = '';
+      try {
+        const cfg = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob)).then(r => r.json());
+        // Defensive defaults so v-models never bind to undefined.
+        cfg.topic = cfg.topic || {};
+        cfg.scrapers = cfg.scrapers || {};
+        cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
+        cfg.scrapers.local_import = cfg.scrapers.local_import || {};
+        cfg.scrapers.zforfree = cfg.scrapers.zforfree || {};
+        cfg.scoring = cfg.scoring || {};
+        cfg.captioning = cfg.captioning || {};
+        this.jobEditor.cfg = cfg;
+        this.jobEditor.slug = this.currentJob;
+        this.jobEditor.loaded = true;
+      } catch (e) {
+        this.jobEditor.banner = 'Failed to load job config: ' + e.message;
+        this.jobEditor.bannerOk = false;
+      }
+    },
+    // Helpers to edit list fields as comma-separated text without losing the
+    // array shape the API expects.
+    jobList(path) {
+      const v = this._jobGet(path);
+      return Array.isArray(v) ? v.join(', ') : (v || '');
+    },
+    setJobList(path, text) {
+      const arr = (text || '').split(',').map(s => s.trim()).filter(Boolean);
+      this._jobSet(path, arr);
+    },
+    jobUrls() {
+      const v = this._jobGet('scrapers.gallery_dl.urls');
+      return Array.isArray(v) ? v.join('\n') : (v || '');
+    },
+    setJobUrls(text) {
+      const arr = (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+      this._jobSet('scrapers.gallery_dl.urls', arr);
+    },
+    _jobGet(path) {
+      return path.split('.').reduce((o, k) => (o == null ? o : o[k]), this.jobEditor.cfg);
+    },
+    _jobSet(path, value) {
+      const keys = path.split('.');
+      let o = this.jobEditor.cfg;
+      for (let i = 0; i < keys.length - 1; i++) {
+        if (o[keys[i]] == null) o[keys[i]] = {};
+        o = o[keys[i]];
+      }
+      o[keys[keys.length - 1]] = value;
+    },
+    async saveJobEditor() {
+      if (!this.jobEditor.cfg || !this.currentJob) return;
+      this.jobEditor.saving = true;
+      this.jobEditor.banner = '';
+      try {
+        const r = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob), {
+          method: 'PUT', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(this.jobEditor.cfg)});
+        const j = await r.json();
+        if (r.ok && j.success) {
+          // Re-apply the same defensive nested defaults loadJobEditor uses, so
+          // the editor's deep v-model binds never hit an undefined branch.
+          const cfg = j.job;
+          cfg.topic = cfg.topic || {};
+          cfg.scrapers = cfg.scrapers || {};
+          cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
+          cfg.scrapers.local_import = cfg.scrapers.local_import || {};
+          cfg.scrapers.zforfree = cfg.scrapers.zforfree || {};
+          cfg.scoring = cfg.scoring || {};
+          cfg.captioning = cfg.captioning || {};
+          this.jobEditor.cfg = cfg;
+          this.jobEditor.banner = (this.currentJob === this.jobsActive)
+            ? 'Saved. Active job re-projected — workers pick it up on the next reconcile tick.'
+            : 'Saved.';
+          this.jobEditor.bannerOk = true;
+          this.loadJobs();
+          setTimeout(() => this.jobEditor.banner = '', 6000);
+        } else {
+          this.jobEditor.banner = 'Save failed: ' + (j.error || r.status);
+          this.jobEditor.bannerOk = false;
+        }
+      } catch (e) {
+        this.jobEditor.banner = 'Network error: ' + e.message;
+        this.jobEditor.bannerOk = false;
+      }
+      this.jobEditor.saving = false;
     },
     async saveSettings() {
       this.settingsBanner = 'Saving...';
@@ -3314,7 +4385,7 @@ function dashboard() {
     },
     async loadCategories() {
       try {
-        const r = await fetch('/api/categories');
+        const r = await fetch('/api/categories' + this.jobParam('?'));
         const j = await r.json();
         this.cats.presets = j.presets || {};
         this.cats.draft = JSON.parse(JSON.stringify(j.active || { preset: 'custom', categories: [], global_rules: '' }));
@@ -3352,7 +4423,9 @@ function dashboard() {
     async saveCategories(force) {
       this.cats.saving = true;
       this.cats.banner = '';
-      const url = '/api/categories' + (force ? '?force=1' : '');
+      // Scope to the current job; append force as a second param when present.
+      let url = '/api/categories' + this.jobParam('?');
+      if (force) url += (url.includes('?') ? '&' : '?') + 'force=1';
       try {
         const r = await fetch(url, {
           method: 'POST',
@@ -3482,11 +4555,11 @@ function dashboard() {
     },
 
     async toggleScraper(name, enabled) {
-      await fetch('/api/scrapers/toggle', {method:'POST', headers:{'Content-Type':'application/json'},
+      await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})}); this.refresh();
     },
     async scrapersBulk(action) {
-      await fetch('/api/scrapers/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+      await fetch('/api/scrapers/bulk' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({action})}); this.refresh();
     },
     async setProvider() {
@@ -3621,9 +4694,19 @@ function dashboard() {
     async loadStats() {
       this.statsLoading = true;
       try {
-        const r = await fetch('/api/stats').then(r=>r.json());
+        const r = await fetch('/api/stats' + this.jobParam('?')).then(r=>r.json());
         this.stats = r;
       } catch (e) { /* fall through silently */ }
+      this.statsLoading = false;
+    },
+    // Global Stats (jobs view): aggregate across all jobs, or one job when the
+    // per-job filter is set. Uses an explicit ?job= rather than currentJob.
+    async loadGlobalStats() {
+      this.statsLoading = true;
+      try {
+        const q = this.globalStatsJob ? ('?job=' + encodeURIComponent(this.globalStatsJob)) : '';
+        this.stats = await fetch('/api/stats' + q).then(r=>r.json());
+      } catch (e) { /* swallow */ }
       this.statsLoading = false;
     },
 
@@ -3645,6 +4728,8 @@ function dashboard() {
       Object.entries(extra || {}).forEach(([k, v]) => {
         if (v !== null && v !== undefined && v !== '') params.set(k, v);
       });
+      // Scope the gallery to the job being viewed.
+      if (this.view === 'job' && this.currentJob) params.set('job', this.currentJob);
       return params.toString();
     },
     async loadGallery(page) {
@@ -3715,6 +4800,7 @@ function dashboard() {
     },
 
     start() {
+      this.loadJobs();
       this.refresh();
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
@@ -3722,11 +4808,19 @@ function dashboard() {
       // user-driven because filter state shouldn't be clobbered on poll.
       this.$watch('active', (tab) => {
         if (tab === 'stats') this.loadStats();
+        if (tab === 'gstats') this.loadGlobalStats();
         if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
           this.loadGallery();
           this.loadGalleryInsights();
         }
-        if (tab === 'settings' && !this.cats.loaded) this.loadCategories();
+        // Job-scoped categories editor now lives under Job Settings.
+        if (tab === 'jobSettings') {
+          if (!this.jobEditor.loaded) this.loadJobEditor();
+          if (!this.cats.loaded) this.loadCategories();
+        }
+        // Vision tab edits this job's captioning + scoring, so it needs the
+        // job config too (alongside the global endpoint readout).
+        if (tab === 'vision' && !this.jobEditor.loaded) this.loadJobEditor();
       });
       setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
       // Self-update: check on load, then every 30 minutes. The endpoint is

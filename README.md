@@ -106,16 +106,36 @@ Adding a new scraper source is similar — `SeenStore("name", slug=SLUG)` for de
 
 For URL-based sources, you don't need to write a scraper at all — paste the URL into the **gallery-dl** scraper card in Settings (Pixiv, DeviantArt, Danbooru, e621, ArtStation, Tumblr, Newgrounds, FurAffinity, X, Reddit, Imgur, Flickr — [340+ sites supported](https://codeberg.org/mikf/gallery-dl#supported-sites)). gallery-dl's metadata postprocessor extracts `description` / `caption` / `selftext` / `tags` and cull writes that as the image's `.txt` automatically. Cookies file required for sites gated behind login (Pixiv, X, Patreon).
 
+## Jobs
+
+cull is **job-centric**. A *job* is a named curation target — one topic, its scraper targets, its categories and judgement rules, its scoring and captioning. You can keep several around (a LoRA dataset, a personal archive, an ad-image pull) and run them one at a time.
+
+The dashboard opens on a grid of **job cards** (name, status, queue position, queued/sorted counts). Open a job to get its own workspace — **Historical**, **Queue**, **Scrapers** (per-job on/off + targets), **Vision** (this job's captioning + score gates), **Stats**, and **Settings** (the job editor: topic, keywords, subreddits, X accounts, Discord channels, gallery-dl URLs, local folders, categories, scoring, captioning). Jobs run sequentially: activate one, queue the rest, and cull advances down the queue.
+
+Each job's config is a plain JSON file at `data/jobs/<slug>.json` (queue order + the active pointer in `data/jobs/_index.json`) — diff-able, version-able, nothing in a database you don't own.
+
+**Global Settings** (reached from the jobs grid) holds the things shared across every job: credentials (Groq / Civitai / Twitter cookies / Discord token / Reddit), model endpoints (LM Studio / OpenAI-compatible / Ollama / Groq), which vision worker runs, throttle, and storage paths.
+
+### Upgrading from a pre-jobs version
+
+If you're coming from an older cull where everything lived in a flat `.env`, run the one-shot migration from the repo root (inside the venv):
+
+```bash
+python tools/migrate_to_jobs.py
+```
+
+It captures your current `.env` as a `default` job and adopts any other slug already on disk as its own job. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
+
 ## The dashboard
 
-Eleven tabs, single-file Flask + Alpine.js, zero build step. Auto-refreshes every 5 seconds.
+Single-file Flask + Alpine.js, zero build step. The jobs grid is the landing surface; open a job for its scoped tabs. Auto-refreshes every 5 seconds.
 
 | | |
 |---|---|
 | ![Overview](docs/screenshots/overview.png) | ![Stats](docs/screenshots/stats.png) |
 | **Overview** — queue and sorted totals, recent classifications, queue-by-source | **Stats** — top keywords, three top-10 leaderboards, per-source DISCARD / NSFW / quality |
 | ![Gallery](docs/screenshots/gallery.png) | ![Scrapers](docs/screenshots/scrapers.png) |
-| **Gallery** — filterable grid, score / date / source / resolution / NSFW filters, ZIP export of the current view, n-gram insights, click-to-edit prompts | **Scrapers** — per-source on/off toggles, persists to `.env` |
+| **Gallery** — filterable grid, score / date / source / resolution / NSFW filters, ZIP export of the current view, n-gram insights, click-to-edit prompts | **Scrapers** — per-source on/off toggles, scoped to the open job |
 | ![About](docs/screenshots/about.png) | ![FAQ](docs/screenshots/faq.png) |
 | **About** — what cull is, repo + license, live counters, brand palette swatches | **FAQ** — pre-empts the GitHub issues (Why no Redis · Why force a JSON schema · What is "Watermarked" · How to add a scraper · How to switch LM Studio · Where data lives · Why "cull") |
 
@@ -139,7 +159,9 @@ Every concern has exactly one canonical module. Adding categories, vision provid
 
 ## Configuration
 
-Settings live in `.env`. The dashboard's Settings tab edits the same file from the browser, so you don't need to leave the UI to add a key. Required only for the providers you'll use:
+Global settings (credentials, model endpoints, vision worker selection, throttle, storage paths) live in `.env` — the dashboard's **Global Settings** edits the same file from the browser. Everything else is **per-job** and lives in each job's config (`data/jobs/<slug>.json`), edited in the job's own Settings/Vision tabs; the keys below are the env names those per-job fields project to (and the legacy `.env` seeds the `default` job adopts on first upgrade).
+
+Global credentials — required only for the providers you'll use:
 
 - `GROQ_API_KEY` — for the `balanced-groq` worker (cloud, fast, handles NSFW)
 - `LMSTUDIO_PRIMARY_URL` — for `balanced-lm` / `lm-autodetect` (defaults to `http://127.0.0.1:1234`)
