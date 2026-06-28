@@ -351,6 +351,17 @@ class TestXCom:
         assert result["ok"] is False
         assert "auth rejected" in result["message"]
 
+    def test_deprecated_endpoint_404_degrades_to_structural_ok(self, st, monkeypatch):
+        """X has deprecated these v1.1 endpoints (they 404). Structurally-valid
+        cookies must still pass with a 'could not verify live' note rather than a
+        hard 404 failure — the scraper authenticates via a real browser."""
+        calls = _patch_http(monkeypatch, st, 404)
+        result = st.test_scraper("X.com",
+                                 env={"TWITTER_COOKIES": "auth_token=abc; ct0=def"})
+        assert result["ok"] is True
+        assert "could NOT verify live" in result["message"]
+        assert len(calls) == 3            # tried every candidate before degrading
+
 
 # ===========================================================================
 # 7. Discord — bot vs user mode Authorization header

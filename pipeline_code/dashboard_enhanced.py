@@ -5672,7 +5672,7 @@ function dashboard() {
       const head = (w.model && !fetched.includes(w.model)) ? [w.model] : [];
       return head.concat(fetched);
     },
-    peSetFleet(idx, field, val) { const l = this.peFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; this.peSet('vision.workers', l); },
+    peSetFleet(idx, field, val) { const l = this.peFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; if (field === 'provider' || field === 'base_url' || field === 'api_key') delete this.peFleetTest[idx]; this.peSet('vision.workers', l); },
     peAddFleet() { const l = this.peFleet().map(w => ({ ...w })); l.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio', base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true }); this.peSet('vision.workers', l); },
     peRemoveFleet(idx) { const l = this.peFleet().map(w => ({ ...w })); l.splice(idx, 1); this.peFleetTest = {}; this.peSet('vision.workers', l); },
     async peTestFleet(idx) {
@@ -5711,7 +5711,7 @@ function dashboard() {
       this.globalVision.cfg.vision.workers = list;
       this._scheduleGlobalVisionSave();
     },
-    gSetFleet(idx, field, val) { const l = this.gFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; this._gWrite(l); },
+    gSetFleet(idx, field, val) { const l = this.gFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; if (field === 'provider' || field === 'base_url' || field === 'api_key') delete this.globalFleetTest[idx]; this._gWrite(l); },
     gAddFleet() { const l = this.gFleet().map(w => ({ ...w })); l.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio', base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true }); this._gWrite(l); },
     gRemoveFleet(idx) { const l = this.gFleet().map(w => ({ ...w })); l.splice(idx, 1); this.globalFleetTest = {}; this._gWrite(l); },
     async gTestFleet(idx) {
@@ -5825,6 +5825,10 @@ function dashboard() {
       const list = this.visionFleet().map(w => ({ ...w }));
       if (!list[idx]) return;
       list[idx][field] = val;
+      // A changed endpoint/provider/key invalidates the last Test — drop the
+      // stale "connected + models" so it can't carry over (e.g. LM Studio models
+      // lingering after you switch the row to Ollama).
+      if (field === 'provider' || field === 'base_url' || field === 'api_key') delete this.fleetTest[idx];
       this._writeFleet(list);
     },
     addFleetWorker() {

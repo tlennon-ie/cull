@@ -300,12 +300,42 @@ def _check_x_com(config: dict, env: dict | None) -> dict:
             "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
         ),
     }
-    return _live_call(
-        "GET",
+    # Best-effort LIVE verification. X has deprecated most v1.1 endpoints (they now
+    # 404), so we try the surviving web-app paths and DEGRADE GRACEFULLY:
+    #   * 2xx          -> session is live (cookies valid).
+    #   * 401/403      -> cookies rejected (invalid/expired) — a real failure.
+    #   * 404/5xx/err  -> the endpoint moved or blocks plain HTTP; do NOT condemn
+    #                     structurally-valid cookies — the scraper signs in with a
+    #                     real browser (Playwright), not this probe.
+    t0 = time.monotonic()
+    last_status: int | None = None
+    for url in (
+        "https://api.x.com/1.1/account/settings.json",
+        "https://x.com/i/api/1.1/account/settings.json",
         "https://api.twitter.com/1.1/account/verify_credentials.json",
-        headers=headers,
-        detail="twitter verify_credentials",
-    )
+    ):
+        try:
+            status, _body = _http_request("GET", url, headers=headers, timeout=_TIMEOUT)
+        except Exception:  # noqa: BLE001 - try the next endpoint
+            continue
+        last_status = status
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if 200 <= status < 300:
+            return _ok("authenticated — session is live", latency_ms=latency_ms,
+                       detail="x.com account settings")
+        if status in (401, 403):
+            return _fail(
+                f"auth rejected (HTTP {status}) — cookies are invalid or expired; "
+                "re-copy the full Cookie header from a logged-in x.com tab",
+                latency_ms=latency_ms, detail="x.com account settings")
+        # 404 / other -> endpoint moved; fall through to the next candidate.
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    note = f"x.com API returned HTTP {last_status}" if last_status else "x.com API unreachable"
+    return _ok(
+        "cookies look valid (auth_token + ct0 present) — could NOT verify live "
+        f"({note}); the scraper signs in with a real browser, so valid cookies "
+        "should still work",
+        latency_ms=latency_ms, detail="structural check only")
 
 
 def _check_discord(config: dict, env: dict | None) -> dict:
