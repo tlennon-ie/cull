@@ -1848,6 +1848,125 @@ def api_presets_set_default():
     return jsonify({"success": True, "default": name})
 
 
+# ── API: export / import (presets + full config backup) ──────────────────────
+
+EXPORT_VERSION = 1
+
+
+@app.route("/api/presets/<name>/export")
+def api_presets_export(name: str):
+    """Download one preset as a portable, versioned JSON envelope."""
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    if not _preset_exists(name):
+        return jsonify({"error": "preset not found"}), 404
+    payload = {"kind": "cull.preset", "version": EXPORT_VERSION,
+               "name": name, "cfg": job_config.get_preset(name)}
+    resp = jsonify(payload)
+    resp.headers["Content-Disposition"] = \
+        f'attachment; filename="{name.replace(" ", "_")}.preset.json"'
+    return resp
+
+
+def _import_one_preset(name: str, cfg: Any, *, overwrite: bool) -> tuple[bool, str]:
+    """Validate + save a single imported preset. Returns (ok, reason)."""
+    if not _valid_preset_name(name):
+        return False, "bad name"
+    clean, err = _validate_inheritable_cfg(cfg, partial=False)
+    if err:
+        return False, err
+    if _preset_exists(name) and not overwrite:
+        return False, "exists"
+    merged = job_config._deep_merge(job_config._default_preset_cfg(), clean)
+    job_config.save_preset(name, merged)
+    return True, "ok"
+
+
+@app.route("/api/presets/import", methods=["POST"])
+def api_presets_import():
+    """Import one preset from {name, cfg} (or a cull.preset envelope)."""
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    overwrite = bool(data.get("overwrite"))
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name (letters/digits/space/_/- , max 40)"}), 400
+    if _preset_exists(name) and not overwrite:
+        return jsonify({"error": f"preset already exists: {name}", "exists": True}), 409
+    ok, reason = _import_one_preset(name, data.get("cfg"), overwrite=overwrite)
+    if not ok:
+        return jsonify({"error": f"invalid preset: {reason}"}), 400
+    return jsonify({"success": True, "name": name})
+
+
+@app.route("/api/config/export")
+def api_config_export():
+    """Download a full backup: every job, the preset library, and the queue index."""
+    payload = {
+        "kind": "cull.config", "version": EXPORT_VERSION,
+        "jobs": [j.to_dict() for j in job_config.list_jobs()],
+        "presets": job_config.list_presets(),
+        "index": job_config.get_index(),
+    }
+    resp = jsonify(payload)
+    resp.headers["Content-Disposition"] = 'attachment; filename="cull-config.json"'
+    return resp
+
+
+@app.route("/api/config/import", methods=["POST"])
+def api_config_import():
+    """Restore a cull.config bundle or a single cull.job export.
+
+    Additive by default (existing presets/jobs are skipped); pass overwrite=true
+    to replace. Everything is validated; nothing can escape the jobs dir."""
+    data = request.get_json() or {}
+    kind = data.get("kind")
+    if kind not in ("cull.config", "cull.job"):
+        return jsonify({"error": "not a cull config/job export (bad 'kind')"}), 400
+    overwrite = bool(data.get("overwrite"))
+    summary: dict[str, Any] = {"presets_added": 0, "jobs_added": 0, "skipped": []}
+
+    def _do_preset(pname: Any, pcfg: Any) -> None:
+        ok, reason = _import_one_preset(str(pname or ""), pcfg, overwrite=overwrite)
+        if ok:
+            summary["presets_added"] += 1
+        else:
+            summary["skipped"].append(f"preset {pname!r} ({reason})")
+
+    def _do_job(jd: Any) -> None:
+        if not isinstance(jd, dict):
+            summary["skipped"].append("job (not an object)")
+            return
+        try:
+            job = job_config.Job.from_dict(jd)
+        except Exception:
+            summary["skipped"].append("job (unreadable)")
+            return
+        if not job_config.JOB_SLUG_RE.match(job.slug or ""):
+            summary["skipped"].append(f"job {job.slug!r} (bad slug)")
+            return
+        if job_config.get_job(job.slug) is not None and not overwrite:
+            summary["skipped"].append(f"job {job.slug!r} (exists)")
+            return
+        job_config.save_job(job)
+        summary["jobs_added"] += 1
+
+    if kind == "cull.job":
+        pre = data.get("preset")
+        if isinstance(pre, dict) and pre.get("name"):
+            _do_preset(pre.get("name"), pre.get("cfg"))
+        if isinstance(data.get("job"), dict):
+            _do_job(data.get("job"))
+    else:  # cull.config
+        presets = ((data.get("presets") or {}).get("presets")) or {}
+        if isinstance(presets, dict):
+            for pname, pcfg in presets.items():
+                _do_preset(pname, pcfg)
+        for jd in (data.get("jobs") or []):
+            _do_job(jd)
+
+    return jsonify({"success": True, **summary})
+
+
 # ── API: queue / thumbnails / prompts ─────────────────────────────────────────
 
 
@@ -4119,13 +4238,18 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="flex flex-wrap gap-1 shrink-0">
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+                <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
                 <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
                 <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
               </div>
             </div>
           </template>
           <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
-            <div class="text-sm font-semibold mb-2">New preset</div>
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-sm font-semibold">New preset</div>
+              <button @click="$refs.presetImport.click()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Import…</button>
+              <input x-ref="presetImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
+            </div>
             <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
             <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
@@ -4277,6 +4401,17 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div x-show="update.dirty" class="text-rose-300">Working tree has uncommitted changes — commit or stash before updating.</div>
           <div x-show="update.error" class="text-rose-300" x-text="'⚠ ' + update.error"></div>
           <div x-show="update.running" class="text-slate-400">Pulling, reinstalling deps if needed, and relaunching. The dashboard will restart — refresh in a moment.</div>
+        </div>
+      </div>
+
+      <!-- Backup & restore — export/import all jobs + presets, or a single preset/job. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-2">Backup &amp; restore</h3>
+        <p class="text-xs text-slate-400 mb-3">Export every job + preset to one JSON file, or import a config / preset / job export. Import is additive — existing names are skipped unless you confirm an overwrite.</p>
+        <div class="flex flex-wrap gap-2">
+          <a href="/api/config/export" download class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Export all config</a>
+          <button @click="$refs.configImport.click()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Import config / preset / job…</button>
+          <input x-ref="configImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
         </div>
       </div>
 
@@ -4836,6 +4971,35 @@ function dashboard() {
       let cur = this._domainsList(this.peList('scrapers.civitai_domains')).filter(x => x !== d);
       if (on) cur.push(d);
       this.peSetList('scrapers.civitai_domains', cur.join(','));
+    },
+    // ── Export / import. One importer dispatches by the file's "kind". ──────
+    async importConfigFile(ev) {
+      const file = ev.target.files && ev.target.files[0];
+      ev.target.value = '';
+      if (!file) return;
+      let env;
+      try { env = JSON.parse(await file.text()); } catch (e) { this.notify('Not valid JSON', 'error'); return; }
+      if (env.kind === 'cull.preset' || (env.name && env.cfg && !env.kind)) { return this._importPreset(env.name, env.cfg); }
+      if (env.kind !== 'cull.config' && env.kind !== 'cull.job') { this.notify('Unrecognised export file (no "kind")', 'error'); return; }
+      const r = await fetch('/api/config/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(env) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { this.notify('Import failed: ' + (j.error || r.status), 'error'); return; }
+      await this.loadPresets(); await this.loadJobs();
+      this.notify('Imported ' + (j.presets_added || 0) + ' preset(s), ' + (j.jobs_added || 0) + ' job(s)'
+        + (j.skipped && j.skipped.length ? ' · ' + j.skipped.length + ' skipped' : ''), 'success');
+    },
+    async _importPreset(name, cfg) {
+      name = (name || '').trim();
+      if (!name || !cfg) { this.notify('File is missing a preset name or cfg', 'error'); return; }
+      let r = await fetch('/api/presets/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, cfg }) });
+      if (r.status === 409) {
+        if (!(await this.askConfirm('Preset "' + name + '" already exists. Overwrite it?', { title: 'Overwrite preset', confirmLabel: 'Overwrite', danger: true }))) return;
+        r = await fetch('/api/presets/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, cfg, overwrite: true }) });
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { this.notify('Import failed: ' + (j.error || r.status), 'error'); return; }
+      await this.loadPresets();
+      this.notify('Imported preset "' + name + '".', 'success');
     },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',

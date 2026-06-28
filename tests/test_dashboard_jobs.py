@@ -652,5 +652,74 @@ def test_scrapers_test_never_500s_on_bad_body(client):
     assert r.status_code == 400
 
 
+# ── export / import (presets + full config) ──────────────────────────────────
+
+def test_preset_export_returns_envelope(client):
+    c, _jc, _tmp = client
+    r = c.get("/api/presets/default/export")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["kind"] == "cull.preset" and j["name"] == "default"
+    assert "categories" in j["cfg"] and "scoring" in j["cfg"]
+    assert "attachment" in r.headers.get("Content-Disposition", "")
+
+
+def test_preset_import_creates_and_conflicts(client):
+    c, jc, _tmp = client
+    cfg = jc.get_preset("default")
+    cfg["scoring"]["ovr_min"] = 71
+    r = c.post("/api/presets/import", json={"name": "imported", "cfg": cfg})
+    assert r.status_code == 200
+    assert jc.get_preset("imported")["scoring"]["ovr_min"] == 71
+    r2 = c.post("/api/presets/import", json={"name": "imported", "cfg": cfg})
+    assert r2.status_code == 409 and r2.get_json().get("exists") is True
+    cfg["scoring"]["ovr_min"] = 42
+    r3 = c.post("/api/presets/import", json={"name": "imported", "cfg": cfg, "overwrite": True})
+    assert r3.status_code == 200
+    assert jc.get_preset("imported")["scoring"]["ovr_min"] == 42
+
+
+def test_preset_import_rejects_bad_cfg(client):
+    c, _jc, _tmp = client
+    r = c.post("/api/presets/import", json={"name": "bad", "cfg": {"scoring": {"ovr_min": "nope"}}})
+    assert r.status_code == 400
+
+
+def test_config_export_then_import_roundtrip(client):
+    c, jc, _tmp = client
+    jc.create_job("Alpha", subject="Aerial things", preset="aerial_drone")
+    exported = c.get("/api/config/export").get_json()
+    assert exported["kind"] == "cull.config"
+    assert any(j["slug"] == "alpha" for j in exported["jobs"])
+    assert "aerial_drone" in exported["presets"]["presets"]
+    jc.delete_job("alpha")
+    assert jc.get_job("alpha") is None
+    r = c.post("/api/config/import", json=exported)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["success"] is True and body["jobs_added"] >= 1
+    assert jc.get_job("alpha") is not None
+
+
+def test_config_import_rejects_unknown_kind(client):
+    c, _jc, _tmp = client
+    r = c.post("/api/config/import", json={"kind": "something.else"})
+    assert r.status_code == 400
+
+
+def test_single_job_import_brings_its_preset(client):
+    c, jc, _tmp = client
+    bundle = {
+        "kind": "cull.job", "version": 1,
+        "job": {"slug": "ported", "name": "Ported", "subject": "Ported subject",
+                "preset": "customp", "overrides": {}},
+        "preset": {"name": "customp", "cfg": jc.get_preset("default")},
+    }
+    r = c.post("/api/config/import", json=bundle)
+    assert r.status_code == 200
+    assert jc.get_job("ported") is not None
+    assert "customp" in jc.list_presets()["presets"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
