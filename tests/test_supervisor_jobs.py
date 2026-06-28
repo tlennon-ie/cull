@@ -366,25 +366,21 @@ def test_compute_desired_skips_malformed_folder_entries(isolated, monkeypatch):
     assert _local_labels(agents) == {"Local-good", "Local-alsogood"}
 
 
-# ── ZFF-Local source is fully removed ─────────────────────────────────────────
+# ── Local-folder sources only spawn via LOCAL_IMPORTS_JSON ────────────────────
 
-def test_no_zff_local_agent_even_when_legacy_env_set(isolated, monkeypatch):
-    """The ZFF-Local source is gone: feed_zforfree_local.py must never be spawned,
-    even if the legacy ZFORFREE_* env vars are present and the topic matches the
-    old human-keyword gate."""
+def test_no_local_agent_when_no_local_imports(isolated, monkeypatch):
+    """With an empty LOCAL_IMPORTS_JSON, no local-folder feeder agent is spawned,
+    even when the topic matches the old human-keyword gate."""
     run_pipeline, _job_config, _ = isolated
-    monkeypatch.setenv("ZFORFREE_LOCAL_ENABLED", "true")
-    monkeypatch.setenv("ZFORFREE_LOCAL_SRC", "/zff")
     monkeypatch.setenv("LOCAL_IMPORTS_JSON", "[]")
     agents = run_pipeline.compute_desired_agents("realistic female influencer")
-    assert "ZFF-Local" not in agents
-    assert all(spec.script != "feed_zforfree_local.py" for spec in agents.values())
+    assert not any(spec.script == "feed_local_folder.py" for spec in agents.values())
 
 
-def test_scraper_names_dropped_zff_local(isolated):
-    """The shared scraper-name source of truth no longer lists ZFF-Local."""
+def test_scraper_names_has_no_local_folder_entry(isolated):
+    """The shared scraper-name source of truth has no local-folder entry."""
     _run_pipeline, job_config, _ = isolated
-    assert "ZFF-Local" not in job_config.SCRAPER_NAMES
+    assert all("local" not in n.lower() for n in job_config.SCRAPER_NAMES)
 
 
 # ── end-to-end: job projection → desired Local agents ─────────────────────────

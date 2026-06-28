@@ -121,7 +121,7 @@ cull ships a **starter preset library** so a new job lands on sensible defaults:
 
 The dashboard opens on a grid of **job cards** (name, status, queue position, queued/sorted counts). Open a job to get its own workspace — **Historical**, **Queue**, **Scrapers** (per-job on/off + targets), **Vision** (this job's captioning + score gates), **Stats**, and **Settings** (the job editor: subject, keywords, subreddits, X accounts, Discord channels, gallery-dl URLs, local folders, categories, scoring, captioning). Jobs run sequentially: activate one, queue the rest, and cull advances down the queue.
 
-**Multiple local folders.** A job can pull from any number of local folders at once — add them as a list in the job's Scrapers/Settings (each with its own name and optional dedup-migration). The old single-folder importer and the separate ZForFree-local source are folded into this one list.
+**Multiple local folders.** A job can pull from any number of local folders at once — add them as a list in the job's Scrapers/Settings (each with its own name and optional dedup-migration). The old single-folder importer is folded into this one list.
 
 Each job is a plain JSON file at `data/jobs/<slug>.json` — just `subject`, the chosen `preset`, and a sparse `overrides` map (queue order + active pointer in `data/jobs/_index.json`, the preset library in `data/jobs/_presets.json`). Diff-able, version-able, nothing in a database you don't own.
 
@@ -135,7 +135,7 @@ If you're coming from an older cull where everything lived in a flat `.env`, run
 python tools/migrate_to_jobs.py
 ```
 
-It seeds a `default` preset, captures your current `.env` as a `default` job (its settings stored as that job's overrides), and adopts any other slug already on disk as its own job — folding any legacy local-folder / ZForFree-local settings into the new local-folders list. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job/preset JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script, and old v1 job files auto-upgrade when read. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
+It seeds a `default` preset, captures your current `.env` as a `default` job (its settings stored as that job's overrides), and adopts any other slug already on disk as its own job — folding any legacy local-folder settings into the new local-folders list. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job/preset JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script, and old v1 job files auto-upgrade when read. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
 
 ## The dashboard
 

@@ -72,7 +72,7 @@ def local_import_dir() -> Path | None:
     """Optional admin-configured folder to mirror into the queue.
 
     Returns None if `LOCAL_IMPORT_DIR` isn't set. Enables generic local-folder
-    ingestion (ZFF was the only example previously).
+    ingestion.
     """
     raw = os.environ.get("LOCAL_IMPORT_DIR", "").strip()
     return Path(raw) if raw else None

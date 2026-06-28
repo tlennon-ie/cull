@@ -46,7 +46,7 @@ PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}$")
 JOB_STATUSES: tuple[str, ...] = ("idle", "queued", "running", "paused", "done")
 
 # Canonical scraper names (single source of truth shared with the dashboard).
-# ZFF-Local is gone — local folders are managed via scrapers.local_imports.
+# Local folders are managed via scrapers.local_imports, not as a scraper name.
 SCRAPER_NAMES: tuple[str, ...] = (
     "X.com", "Discord-1", "Civitai-Com", "Civitai-Red", "Web", "Gallery-DL",
 )
@@ -296,12 +296,6 @@ def _v1_scrapers_to_cfg(v1: dict) -> dict:
         local_imports.append({
             "name": li.get("name", "local") or "local", "dir": li.get("dir", "") or "",
             "enabled": bool(li.get("enabled", False)), "migrate_from": li.get("migrate_from", "") or "",
-        })
-    zf = v1.get("zforfree")
-    if isinstance(zf, dict) and zf.get("local_src"):
-        local_imports.append({
-            "name": "zforfree", "dir": zf.get("local_src", "") or "",
-            "enabled": bool(zf.get("local_enabled", False)), "migrate_from": "",
         })
     gd = v1.get("gallery_dl", {}) or {}
     return {
@@ -700,11 +694,6 @@ def _env_to_cfg() -> dict:
             "dir": os.environ.get("LOCAL_IMPORT_DIR", "") or "",
             "enabled": _bool_env("LOCAL_IMPORT_ENABLED", False),
             "migrate_from": os.environ.get("LOCAL_IMPORT_MIGRATE_FROM", "") or "",
-        })
-    if os.environ.get("ZFORFREE_LOCAL_SRC"):
-        local_imports.append({
-            "name": "zforfree", "dir": os.environ.get("ZFORFREE_LOCAL_SRC", "") or "",
-            "enabled": _bool_env("ZFORFREE_LOCAL_ENABLED", False), "migrate_from": "",
         })
     cfg["topic_filters"] = {
         "keywords_extra": _csv_to_list(os.environ.get("TOPIC_KEYWORDS_EXTRA")),

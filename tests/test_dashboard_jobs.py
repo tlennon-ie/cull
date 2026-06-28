@@ -8,8 +8,8 @@ v2 model: a Job is {slug, name, status, subject, preset, overrides}; the
 effective config is preset ⊕ overrides with subject as topic.topic. These
 tests cover: jobs CRUD with the v2 GET shape, PUT overrides round-trip,
 preset CRUD/clone/default, scraper toggles via override, the multi-folder
-local_imports list, ZForFree removal, the shrunk global settings, the
-pipeline-start gate, and ?job= scoping.
+local_imports list, the shrunk global settings, the pipeline-start gate, and
+?job= scoping.
 
 The dashboard resolves PIPELINE_QUEUE / PIPELINE_SORTED / the SQLite index path
 at IMPORT time, so the fixture sets PIPELINE_BASE_DIR first, then reloads the
@@ -45,7 +45,7 @@ _DOTENV_SOURCED_KEYS = (
     "TOPIC_BANNED_KEYWORDS", "TOPIC_GENERATION_HINTS", "SCRAPER_DISABLED",
     "X_ACCOUNTS", "REDDIT_SUBREDDITS", "GALLERY_DL_URLS", "GALLERY_DL_ENABLED",
     "VISION_OVR_MIN_SCORE", "VISION_REL_MIN_SCORE", "AUTO_CAPTION_ENABLED",
-    "MIN_PROMPT_LENGTH", "REQUIRE_PROMPT", "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR",
+    "MIN_PROMPT_LENGTH", "REQUIRE_PROMPT", "LOCAL_IMPORT_DIR",
 )
 for _k in _DOTENV_SOURCED_KEYS:
     os.environ.pop(_k, None)
@@ -358,12 +358,12 @@ def test_scraper_toggle_rejects_local_row(client):
     assert r.status_code == 400
 
 
-def test_scrapers_list_has_no_zforfree(client):
+def test_scrapers_list_has_no_local_folder_entry(client):
     c, _jc, _tmp = client
-    c.post("/api/jobs", json={"name": "NoZff"})
-    c.post("/api/jobs/nozff/activate")
-    names = [s["name"] for s in c.get("/api/scrapers?job=nozff").get_json()]
-    assert "ZFF-Local" not in names
+    c.post("/api/jobs", json={"name": "NoLocal"})
+    c.post("/api/jobs/nolocal/activate")
+    names = [s["name"] for s in c.get("/api/scrapers?job=nolocal").get_json()]
+    assert all("local" not in n.lower() for n in names)
     assert len([n for n in names if n in ("X.com", "Discord-1", "Civitai-Com",
                                           "Civitai-Red", "Web", "Gallery-DL")]) == 6
 
@@ -385,9 +385,9 @@ def test_local_imports_list_via_put(client):
     assert "Local-ds1" in names and "Local-ds2" in names
     ds1 = next(s for s in rows if s["name"] == "Local-ds1")
     assert ds1["kind"] == "local" and ds1["enabled"] is True
-    # resolve_env emits LOCAL_IMPORTS_JSON (enabled only), no ZFORFREE keys.
+    # resolve_env emits LOCAL_IMPORTS_JSON (enabled only).
     env = jc.resolve_env(jc.get_job("multi"))
-    assert "LOCAL_IMPORTS_JSON" in env and "ZFORFREE_LOCAL_SRC" not in env
+    assert "LOCAL_IMPORTS_JSON" in env
     assert [f["name"] for f in json.loads(env["LOCAL_IMPORTS_JSON"])] == ["ds1"]
 
 
@@ -493,7 +493,7 @@ def test_settings_get_excludes_per_job_keys(client):
     for moved in ("PIPELINE_TOPIC", "TOPIC_KEYWORDS_EXTRA", "X_ACCOUNTS",
                   "REDDIT_SUBREDDITS", "GALLERY_DL_URLS", "AUTO_CAPTION_ENABLED",
                   "VISION_OVR_MIN_SCORE", "DISCORD_CHANNELS_JSON",
-                  "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR"):
+                  "LOCAL_IMPORT_DIR"):
         assert moved not in body
 
 

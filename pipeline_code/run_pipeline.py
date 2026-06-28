@@ -271,8 +271,8 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
     # {name, dir, migrate_from}. We fan that out into one Local-<name> agent per
     # folder, each carrying its own LOCAL_IMPORT_* env so the (unchanged)
     # feed_local_folder.py reads its folder from its own process env. (The legacy
-    # single-folder LOCAL_IMPORT_* branch and the ZFF-Local / feed_zforfree_local
-    # source are gone — local folders are the one mechanism now.)
+    # single-folder LOCAL_IMPORT_* branch is gone — local folders are the one
+    # mechanism now.)
     for folder in _local_import_folders():
         name = (folder.get("name") or "local").strip() or "local"
         add(AgentSpec(

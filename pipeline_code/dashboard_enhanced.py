@@ -84,7 +84,7 @@ _SCRAPER_DESCRIPTIONS: dict[str, str] = {
     "Discord-1":   "Discord UD channels",
     "Civitai-Com": "Civitai (civitai.com)",
     "Civitai-Red": "Civitai (civitai.red)",
-    "Web":         "Reddit / ZforFree.com / promptsref",
+    "Web":         "Reddit / promptsref",
     "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
 }
 
@@ -4018,7 +4018,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <!-- Local folders (multi): scrapers.local_imports list. Each row is its
-           own concurrent source. ZForFree-local is gone — migrate it here. -->
+           own concurrent source. -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-center justify-between mb-3">
           <div>

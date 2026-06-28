@@ -50,8 +50,6 @@ BASE_QUEUE_DIR = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
 SOURCES: dict[str, str] = {
     "civitai": "civitai",
     "civitai_red": "civitai_red",
-    "zforfree": "zforfree",
-    "zforfree_web": "zforfree_web",
     "discord_ud": "discord_ud",
     "discord_mj": "discord_mj",
     "reddit": "reddit",

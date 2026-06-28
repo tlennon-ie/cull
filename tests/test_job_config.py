@@ -53,7 +53,6 @@ def test_default_preset_seeded(isolated):
     cfg = jc.get_preset("default")
     assert "topic_filters" in cfg and "scrapers" in cfg and "categories" in cfg
     assert "local_imports" in cfg["scrapers"]
-    assert "ZForFree" not in json.dumps(cfg)        # ZForFree is gone from the schema
 
 
 def test_save_and_get_preset(isolated):
@@ -189,8 +188,7 @@ def test_from_dict_upgrades_v1_job_file(isolated, tmp_path):
                      "discord_channels_json": "", "civitai_domains": [],
                      "gallery_dl": {"enabled": False, "urls": [], "limit_per_url": 200,
                                      "cookies_file": "", "config_path": ""},
-                     "local_import": {"enabled": True, "dir": "/d", "name": "loc", "migrate_from": ""},
-                     "zforfree": {"local_enabled": True, "web_enabled": False, "local_src": "/z"}},
+                     "local_import": {"enabled": True, "dir": "/d", "name": "loc", "migrate_from": ""}},
         "categories": [{"name": "Keepers", "hint": "k"}],
         "category_rules": "rules", "scoring": {"ovr_min": 42, "rel_min": 0, "notes": ""},
         "captioning": {"enabled": True, "style": "booru_tags", "overwrite": False},
@@ -202,10 +200,10 @@ def test_from_dict_upgrades_v1_job_file(isolated, tmp_path):
     assert eff["topic"]["keywords_extra"] == ["k1"]
     assert eff["scrapers"]["enabled"]["X.com"] is False
     assert eff["scoring"]["ovr_min"] == 42
-    # the two legacy local sources fold into the local_imports list
+    # the legacy single-folder local source folds into the local_imports list
     li = eff["scrapers"]["local_imports"]
     names = {f["name"] for f in li}
-    assert "loc" in names and any(f["dir"] == "/z" for f in li)
+    assert "loc" in names and any(f["dir"] == "/d" for f in li)
 
 
 # ── resolve_env via effective config ─────────────────────────────────────────
@@ -246,20 +244,18 @@ def test_resolve_env_local_imports_json_only_enabled(isolated):
     assert folders[0]["dir"] == "/a"
 
 
-def test_resolve_env_drops_zforfree_keys(isolated):
+def test_resolve_env_values_are_all_strings(isolated):
     jc, _ = isolated
     job = jc.create_job("Z", subject="S")
     env = jc.resolve_env(job)
-    assert "ZFORFREE_LOCAL_ENABLED" not in env
-    assert "ZFORFREE_WEB_ENABLED" not in env
-    assert "ZFORFREE_LOCAL_SRC" not in env
     assert all(isinstance(v, str) for v in env.values())
 
 
-def test_scraper_names_excludes_zff_local(isolated):
+def test_scraper_names_has_no_local_folder_entry(isolated):
     jc, _ = isolated
-    assert "ZFF-Local" not in jc.SCRAPER_NAMES
+    # Local folders are projected via LOCAL_IMPORTS_JSON, never as a scraper name.
     assert "Web" in jc.SCRAPER_NAMES
+    assert all("local" not in n.lower() for n in jc.SCRAPER_NAMES)
 
 
 # ── projection ───────────────────────────────────────────────────────────────
@@ -387,19 +383,17 @@ def test_migrate_env_creates_default_preset_and_job(isolated, monkeypatch):
     assert jc.get_active_slug() == "myslug"
 
 
-def test_migrate_env_folds_legacy_local_sources(isolated, monkeypatch):
+def test_migrate_env_folds_legacy_local_source(isolated, monkeypatch):
     jc, _ = isolated
     monkeypatch.setenv("PIPELINE_SLUG", "s")
     monkeypatch.setenv("LOCAL_IMPORT_ENABLED", "true")
     monkeypatch.setenv("LOCAL_IMPORT_DIR", "/data/local")
     monkeypatch.setenv("LOCAL_IMPORT_NAME", "mylocal")
-    monkeypatch.setenv("ZFORFREE_LOCAL_ENABLED", "true")
-    monkeypatch.setenv("ZFORFREE_LOCAL_SRC", "/data/zff")
     job = jc.migrate_env_to_default_job()
     li = jc.effective_config(job)["scrapers"]["local_imports"]
     names = {f["name"] for f in li}
     assert "mylocal" in names
-    assert any(f["dir"] == "/data/zff" for f in li)
+    assert any(f["dir"] == "/data/local" for f in li)
 
 
 def test_migrate_idempotent(isolated):
@@ -425,14 +419,14 @@ def test_effective_config_does_not_mutate_preset(isolated):
     eff1["scoring"]["ovr_min"] = 999
     eff2 = jc.effective_config(job)
     assert eff2["scrapers"]["x_accounts"] == []          # preset untouched
-    assert eff2["scoring"]["ovr_min"] == 0
+    assert eff2["scoring"]["ovr_min"] == 40              # default preset value, not the mutated 999
 
 
 def test_job_with_unknown_preset_falls_back_to_default(isolated):
     jc, _ = isolated
     job = jc.create_job("J", subject="S").with_updates(preset="ghost")
     eff = jc.effective_config(job)                        # must not raise
-    assert eff["scoring"]["ovr_min"] == 0
+    assert eff["scoring"]["ovr_min"] == 40               # falls back to the default preset
 
 
 def test_resolve_env_tolerates_malformed_override(isolated):

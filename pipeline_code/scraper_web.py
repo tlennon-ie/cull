@@ -1,12 +1,11 @@
 """
-scraper_web.py - Reddit + ZforFree + promptsref.com scraper
+scraper_web.py - Reddit + promptsref.com scraper
 ALL sources download both image AND prompt to queue/, never just text.
 Saves to source-based queue using queue_manager for balanced processing.
 
 Sources:
   1. Reddit search (topic-aware queries, downloads linked images)
-  2. ZforFree API (paginated, downloads image + prompt pairs)
-  3. promptsref.com/library/nano-banana-pro + /library/grok (structured JSON prompts)
+  2. promptsref.com/library/nano-banana-pro + /library/grok (structured JSON prompts)
 """
 import re, json, os, html, time, hashlib, requests, tempfile
 from pathlib import Path
@@ -15,7 +14,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from topic_filter import load_config as _load_topic_config, passes as _topic_passes, prompt_optional
+from topic_filter import load_config as _load_topic_config, passes as _topic_passes
 from paths import base_dir
 
 BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
@@ -23,7 +22,6 @@ TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
 SLUG      = os.environ.get("PIPELINE_SLUG",  "realistic_female_influencer")
 _RAW_QUEUE = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
 QUEUE_DIR = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
-ZFORFREE_WEB_ENABLED = os.environ.get("ZFORFREE_WEB_ENABLED", "false").lower() == "true"
 
 # Import queue manager
 from queue_manager import save_to_queue as queue_save
@@ -327,134 +325,7 @@ def scrape_reddit(seen: "SeenStore") -> int:
     return saved
 
 
-# ── 2. ZforFree API ───────────────────────────────────────────────────────────
-
-def build_zff_queries(topic: str) -> list:
-    t = topic.lower()
-    skip = {"realistic","real","ultra","ai","generated","a","an","the"}
-    words = [w for w in t.split() if w not in skip]
-
-    queries = list(dict.fromkeys([
-        " ".join(words[:2]) if len(words) >= 2 else words[0] if words else topic,
-        topic,
-        "selfie", "portrait", "influencer", "instagram",
-        "mirror selfie", "candid", "lifestyle", "beach",
-    ]))
-    if "influencer" in t or "instagram" in t:
-        queries += ["realistic woman", "girl influencer", "social media"]
-    if "male" in t or "man" in t:
-        queries += ["realistic man", "guy influencer", "male portrait"]
-    return queries
-
-def scrape_zforfree(seen: "SeenStore") -> int:
-    """ZFF.com web API branch. ``seen`` is a SeenStore created in main()."""
-    queries = build_zff_queries(TOPIC)
-    saved   = 0
-
-    # Possible ZFF API patterns - we'll try each
-    API_BASES = [
-        "https://zforfree.com/api/feed",
-        "https://zforfree.com/api/images",
-        "https://zforfree.com/api/v1/images",
-    ]
-
-    def try_zff_api(base: str, params: dict) -> list:
-        try:
-            r = requests.get(base, params=params, headers=HEADERS, timeout=15)
-            if not r.ok:
-                return None  # None = this base doesn't work
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                return data.get("items") or data.get("data") or data.get("results") or []
-        except:
-            return None
-        return []
-
-    # Discover which API base works
-    working_base = None
-    for base in API_BASES:
-        result = try_zff_api(base, {"limit": 5, "skip": 0})
-        if result is not None:
-            working_base = base
-            print(f"  ZFF API working at: {base}", flush=True)
-            break
-
-    if not working_base:
-        print("  ZFF API not reachable - trying browser-style fetch...", flush=True)
-        # Try without search param - just paginate top
-        for base in API_BASES:
-            result = try_zff_api(base, {"limit": 5})
-            if result is not None:
-                working_base = base
-                break
-
-    if not working_base:
-        print("  ZFF API unavailable - skipping", flush=True)
-        return 0
-
-    for query in queries:
-        print(f"  ZFF query: {query}", flush=True)
-        skip  = 0
-        query_saved = 0
-
-        while query_saved < 300:  # max 300 per query term
-            params = {"skip": skip, "limit": 50, "sort": "top", "search": query}
-            items  = try_zff_api(working_base, params)
-            if items is None or len(items) == 0:
-                break
-
-            for item in items:
-                # Handle various field name conventions
-                iid     = str(item.get("id") or item.get("_id") or "")
-                prompt  = (item.get("prompt") or item.get("text") or item.get("description") or "").strip()
-                img_url = (item.get("image_url") or item.get("imageUrl") or
-                           item.get("image") or item.get("url") or "")
-
-                # Try to construct image URL if missing
-                if not img_url and iid:
-                    img_url = f"https://zforfree.com/images/{iid}.jpg"
-
-                dedup_key = f"zff_{iid}" if iid else f"zff_{url_hash(img_url)}"
-                if dedup_key in seen or not img_url:
-                    continue
-                if len(prompt) < 30 and not prompt_optional():
-                    continue
-
-                seen.add(dedup_key)
-
-                try:
-                    resp = requests.get(img_url, headers=IMG_HEADERS, timeout=20)
-                    if resp.ok:
-                        stem = f"zff_api_{iid or url_hash(img_url)}"
-                        ok = save_to_queue(stem, img_url, resp.content, prompt, {
-                            "source_channel": f"zforfree_api",
-                            "source_guild":   "zforfree.com",
-                            "author":         str(item.get("author") or item.get("username") or ""),
-                            "timestamp":      str(item.get("created_at") or item.get("createdAt") or ""),
-                            "zff_id":         iid,
-                            "query":          query,
-                        }, source="zforfree")
-                        if ok:
-                            saved += 1
-                            query_saved += 1
-                except Exception as e:
-                    pass
-
-                time.sleep(0.05)
-
-            seen.flush()
-            skip += 50
-            if len(items) < 50:
-                break
-            time.sleep(0.5)
-
-    print(f"  ZFF done: {saved} saved", flush=True)
-    return saved
-
-
-# ── 3. promptsref.com ─────────────────────────────────────────────────────────
+# ── 2. promptsref.com ─────────────────────────────────────────────────────────
 
 PROMPTSREF_PAGES = [
     ("https://promptsref.com/library/nano-banana-pro", "promptsref_nano_banana"),
@@ -545,12 +416,11 @@ def scrape_promptsref(seen: set) -> int:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== Web Scraper (Reddit + ZFF + promptsref) ===", flush=True)
+    print("=== Web Scraper (Reddit + promptsref) ===", flush=True)
     print(f"Topic: {TOPIC}", flush=True)
     print(f"Queue: {QUEUE_DIR}", flush=True)
 
     seen_reddit      = SeenStore("reddit", slug=SLUG, autoflush_every=10)
-    seen_zff         = SeenStore("zff", slug=SLUG, autoflush_every=25)
     seen_promptsref  = SeenStore("promptsref", slug=SLUG, autoflush_every=10)
 
     total = 0
@@ -558,17 +428,10 @@ if __name__ == "__main__":
     print("\n[Reddit]", flush=True)
     total += scrape_reddit(seen_reddit)
 
-    print("\n[ZforFree API]", flush=True)
-    if ZFORFREE_WEB_ENABLED:
-        total += scrape_zforfree(seen_zff)
-    else:
-        print("  Skipping ZforFree API (ZFORFREE_WEB_ENABLED=false)", flush=True)
-
     print("\n[promptsref.com]", flush=True)
     total += scrape_promptsref(seen_promptsref)
 
     seen_reddit.flush()
-    seen_zff.flush()
     seen_promptsref.flush()
 
     print(f"\n=== Web scraper done. Total saved: {total} ===", flush=True)
