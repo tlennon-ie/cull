@@ -4025,9 +4025,11 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div class="text-sm font-semibold mb-2">New preset</div>
             <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
+            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
             <select x-model="newPreset.base_on" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
-              <option value="">Clone the default</option>
-              <template x-for="p in presetsList" :key="'b_'+p"><option :value="p" x-text="'Clone: ' + p"></option></template>
+              <template x-for="p in presetsList" :key="'b_'+p">
+                <option :value="p" x-text="p === presetsDefault ? (p + '  (default)') : p"></option>
+              </template>
             </select>
             <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
           </div>
@@ -5014,6 +5016,11 @@ function dashboard() {
         const p = await fetch('/api/presets').then(r => r.json());
         this.presetsList = p.presets || [];
         this.presetsDefault = p.default || '';
+        // Default the "Start from" picker to the library default (no more
+        // redundant empty "Clone the default" option). Keep a valid selection.
+        if (!this.presetsList.includes(this.newPreset.base_on)) {
+          this.newPreset.base_on = this.presetsDefault || (this.presetsList[0] || '');
+        }
       } catch (e) { /* swallow */ }
     },
     async createPreset() {
