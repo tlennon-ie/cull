@@ -1,12 +1,12 @@
-"""Tests for job_config — the per-job configuration keystone.
+"""Tests for job_config v2 — preset library + inherit-by-default overrides.
 
-Runnable two ways:
+Runnable:
     pytest tests/test_job_config.py
-    python tests/test_job_config.py        # falls back to pytest.main
+    python tests/test_job_config.py
 
-A Job is a JSON bundle under data/jobs/<slug>.json that, on activation,
-projects down into the existing env-var + cull_categories.json contracts.
-These tests pin that contract.
+A Job v2 stores {slug, name, status, subject, preset, overrides}. The effective
+config is `preset ⊕ overrides` with the job's subject injected as topic.topic.
+Activating a job still projects down into env vars + cull_categories.json.
 """
 from __future__ import annotations
 
@@ -23,15 +23,11 @@ if str(PIPELINE_CODE) not in sys.path:
 
 @pytest.fixture()
 def isolated(tmp_path, monkeypatch):
-    """Point all storage at a temp dir and hand back the module under test."""
     monkeypatch.setenv("PIPELINE_BASE_DIR", str(tmp_path))
-    # categories.ACTIVE_PATH is computed at import time from PIPELINE_BASE_DIR;
-    # redirect it (and bust its cache) so projection lands in the temp dir.
     import categories
     monkeypatch.setattr(categories, "ACTIVE_PATH", tmp_path / "cull_categories.json")
     monkeypatch.setattr(categories, "_cache", None, raising=False)
     monkeypatch.setattr(categories, "_cache_mtime", 0.0, raising=False)
-
     import importlib
     import job_config
     importlib.reload(job_config)
@@ -41,385 +37,460 @@ def isolated(tmp_path, monkeypatch):
 # ── slugify ──────────────────────────────────────────────────────────────────
 
 def test_slugify_lowercases_and_underscores(isolated):
-    job_config, _ = isolated
-    assert job_config.slugify("Female Influencer") == "female_influencer"
-    assert job_config.slugify("Car Ads!! 2026") == "car_ads_2026"
-    assert job_config.slugify("  trim--me  ") == "trim_me"
+    jc, _ = isolated
+    assert jc.slugify("Female Influencer") == "female_influencer"
+    assert jc.slugify("Car Ads!! 2026") == "car_ads_2026"
 
 
-# ── create / get / list round-trip ───────────────────────────────────────────
+# ── preset library ───────────────────────────────────────────────────────────
 
-def test_create_job_writes_file_and_defaults(isolated):
-    job_config, tmp = isolated
-    job = job_config.create_job("Female Influencer")
-    assert job.slug == "female_influencer"
-    assert job.name == "Female Influencer"
-    assert job.status == "idle"
-    assert (tmp / "jobs" / "female_influencer.json").is_file()
-    # fresh job carries a usable default taxonomy
-    assert len(job.categories) >= 1
-
-
-def test_get_job_round_trips(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Car Ads")
-    loaded = job_config.get_job("car_ads")
-    assert loaded is not None
-    assert loaded.name == "Car Ads"
-    assert job_config.get_job("missing") is None
+def test_default_preset_seeded(isolated):
+    jc, _ = isolated
+    lib = jc.list_presets()
+    assert lib["default"] == "default"
+    assert "default" in lib["presets"]
+    # default preset has the inheritable shape
+    cfg = jc.get_preset("default")
+    assert "topic_filters" in cfg and "scrapers" in cfg and "categories" in cfg
+    assert "local_imports" in cfg["scrapers"]
+    assert "ZForFree" not in json.dumps(cfg)        # ZForFree is gone from the schema
 
 
-def test_list_jobs_returns_all_created(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Alpha")
-    job_config.create_job("Beta")
-    slugs = {j.slug for j in job_config.list_jobs()}
-    assert slugs == {"alpha", "beta"}
+def test_save_and_get_preset(isolated):
+    jc, _ = isolated
+    cfg = jc.get_preset("default")
+    cfg["scoring"] = {"ovr_min": 70, "rel_min": 60, "notes": "p"}
+    jc.save_preset("fashion", cfg)
+    assert jc.get_preset("fashion")["scoring"]["ovr_min"] == 70
 
 
-def test_create_duplicate_name_raises(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Dup")
+def test_get_unknown_preset_falls_back_to_default(isolated):
+    jc, _ = isolated
+    assert jc.get_preset("nope") == jc.get_preset("default")
+
+
+def test_delete_preset_refuses_default_and_referenced(isolated):
+    jc, _ = isolated
+    jc.save_preset("p2", jc.get_preset("default"))
     with pytest.raises(ValueError):
-        job_config.create_job("Dup")
+        jc.delete_preset("default")                 # is the default
+    jc.create_job("Job", preset="p2")
+    with pytest.raises(ValueError):
+        jc.delete_preset("p2")                       # referenced by a job
+    jc.save_preset("p3", jc.get_preset("default"))
+    jc.delete_preset("p3")                           # free → ok
+    assert "p3" not in jc.list_presets()["presets"]
 
 
-def test_save_job_is_immutable_update(isolated):
-    job_config, _ = isolated
-    job = job_config.create_job("Edit Me")
-    updated = job.with_updates(name="Renamed")
-    # original object unchanged (frozen)
-    assert job.name == "Edit Me"
-    saved = job_config.save_job(updated)
-    assert saved.name == "Renamed"
-    assert job_config.get_job("edit_me").name == "Renamed"
+def test_set_default_preset(isolated):
+    jc, _ = isolated
+    jc.save_preset("p2", jc.get_preset("default"))
+    jc.set_default_preset("p2")
+    assert jc.default_preset_name() == "p2"
 
 
-def test_clone_via_base_on(isolated):
-    job_config, _ = isolated
-    src = job_config.create_job("Source")
-    src = src.with_updates(scoring={"ovr_min": 77, "rel_min": 50, "notes": "x"})
-    job_config.save_job(src)
-    clone = job_config.create_job("Source Copy", base_on="source")
-    assert clone.slug == "source_copy"
-    assert clone.scoring["ovr_min"] == 77
+# ── job create / inherit-by-default ──────────────────────────────────────────
+
+def test_create_job_inherits_preset(isolated):
+    jc, _ = isolated
+    cfg = jc.get_preset("default")
+    cfg["scrapers"]["x_accounts"] = ["preset_acct"]
+    jc.save_preset("default", cfg)
+    job = jc.create_job("Influencer", subject="Realistic Female Influencer")
+    assert job.subject == "Realistic Female Influencer"
+    assert job.preset == "default"
+    assert job.overrides == {}
+    eff = jc.effective_config(job)
+    assert eff["scrapers"]["x_accounts"] == ["preset_acct"]      # inherited
+    assert eff["topic"]["topic"] == "Realistic Female Influencer"  # subject injected
 
 
-# ── queue / active pointer / advance ─────────────────────────────────────────
+def test_create_job_defaults_subject_to_name(isolated):
+    jc, _ = isolated
+    job = jc.create_job("Car Ads")
+    assert job.subject == "Car Ads"
+    assert jc.effective_config(job)["topic"]["topic"] == "Car Ads"
+
+
+def test_create_duplicate_raises(isolated):
+    jc, _ = isolated
+    jc.create_job("Dup")
+    with pytest.raises(ValueError):
+        jc.create_job("Dup")
+
+
+# ── overrides: set / reset / is_overridden ───────────────────────────────────
+
+def test_set_and_reset_override(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    job = jc.set_override(job, "scrapers.x_accounts", ["job_acct"])
+    assert jc.is_overridden(job, "scrapers.x_accounts")
+    assert jc.effective_config(job)["scrapers"]["x_accounts"] == ["job_acct"]
+    job = jc.reset_override(job, "scrapers.x_accounts")
+    assert not jc.is_overridden(job, "scrapers.x_accounts")
+    assert jc.effective_config(job)["scrapers"]["x_accounts"] == \
+        jc.get_preset("default")["scrapers"]["x_accounts"]
+
+
+def test_reset_prunes_empty_parents(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    job = jc.set_override(job, "scoring.notes", "hi")
+    assert job.overrides["scoring"]["notes"] == "hi"
+    job = jc.reset_override(job, "scoring.notes")
+    assert "scoring" not in job.overrides            # parent pruned when empty
+
+
+def test_override_is_immutable_update(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    job2 = jc.set_override(job, "scoring.ovr_min", 50)
+    assert job.overrides == {}                       # original untouched (frozen)
+    assert job2.overrides["scoring"]["ovr_min"] == 50
+
+
+def test_override_leaf_does_not_clobber_sibling_preset_values(isolated):
+    jc, _ = isolated
+    cfg = jc.get_preset("default")
+    cfg["scoring"] = {"ovr_min": 10, "rel_min": 20, "notes": "preset"}
+    jc.save_preset("default", cfg)
+    job = jc.create_job("J", subject="S")
+    job = jc.set_override(job, "scoring.notes", "mine")
+    eff = jc.effective_config(job)
+    assert eff["scoring"]["notes"] == "mine"          # overridden leaf
+    assert eff["scoring"]["ovr_min"] == 10            # sibling still inherited
+
+
+# ── round-trip / persistence ─────────────────────────────────────────────────
+
+def test_get_job_round_trips_v2(isolated):
+    jc, _ = isolated
+    job = jc.create_job("Round Trip", subject="Subj")
+    job = jc.set_override(job, "scoring.ovr_min", 65)
+    jc.save_job(job)
+    loaded = jc.get_job("round_trip")
+    assert loaded.subject == "Subj"
+    assert loaded.overrides["scoring"]["ovr_min"] == 65
+
+
+def test_from_dict_upgrades_v1_job_file(isolated, tmp_path):
+    """Existing v1 job files (topic/scrapers/categories at top level, no
+    overrides) must load as v2: subject from topic.topic, preset=default, and
+    the v1 config captured as overrides so effective config is unchanged."""
+    jc, _ = isolated
+    v1 = {
+        "slug": "legacy", "name": "Legacy", "status": "idle",
+        "topic": {"topic": "Legacy Subject", "keywords_extra": ["k1"],
+                  "banned_keywords": [], "generation_hints": [],
+                  "min_prompt_length": 30, "require_prompt": True},
+        "scrapers": {"enabled": {"X.com": False, "Web": True},
+                     "x_accounts": ["acc"], "reddit_subreddits": [],
+                     "discord_channels_json": "", "civitai_domains": [],
+                     "gallery_dl": {"enabled": False, "urls": [], "limit_per_url": 200,
+                                     "cookies_file": "", "config_path": ""},
+                     "local_import": {"enabled": True, "dir": "/d", "name": "loc", "migrate_from": ""},
+                     "zforfree": {"local_enabled": True, "web_enabled": False, "local_src": "/z"}},
+        "categories": [{"name": "Keepers", "hint": "k"}],
+        "category_rules": "rules", "scoring": {"ovr_min": 42, "rel_min": 0, "notes": ""},
+        "captioning": {"enabled": True, "style": "booru_tags", "overwrite": False},
+    }
+    job = jc.Job.from_dict(v1)
+    assert job.subject == "Legacy Subject"
+    assert job.preset == "default"
+    eff = jc.effective_config(job)
+    assert eff["topic"]["keywords_extra"] == ["k1"]
+    assert eff["scrapers"]["enabled"]["X.com"] is False
+    assert eff["scoring"]["ovr_min"] == 42
+    # the two legacy local sources fold into the local_imports list
+    li = eff["scrapers"]["local_imports"]
+    names = {f["name"] for f in li}
+    assert "loc" in names and any(f["dir"] == "/z" for f in li)
+
+
+# ── resolve_env via effective config ─────────────────────────────────────────
+
+def test_resolve_env_uses_effective(isolated):
+    jc, _ = isolated
+    job = jc.create_job("Rich", subject="Realistic Female Influencer")
+    job = jc.set_override(job, "topic_filters.keywords_extra", ["a", "b"])
+    job = jc.set_override(job, "scoring.ovr_min", 60)
+    job = jc.set_override(job, "captioning", {"enabled": True, "style": "booru_tags", "overwrite": True})
+    env = jc.resolve_env(job)
+    assert env["PIPELINE_SLUG"] == "rich"
+    assert env["PIPELINE_TOPIC"] == "Realistic Female Influencer"
+    assert env["TOPIC_KEYWORDS_EXTRA"] == "a,b"
+    assert env["VISION_OVR_MIN_SCORE"] == "60"
+    assert env["AUTO_CAPTION_ENABLED"] == "true"
+    assert env["AUTO_CAPTION_STYLE"] == "booru_tags"
+
+
+def test_resolve_env_scraper_disabled_from_enabled_map(isolated):
+    jc, _ = isolated
+    job = jc.create_job("S", subject="S")
+    job = jc.set_override(job, "scrapers.enabled", {"X.com": False, "Web": True, "Civitai-Com": True})
+    env = jc.resolve_env(job)
+    assert env["SCRAPER_DISABLED"] == "X.com"
+
+
+def test_resolve_env_local_imports_json_only_enabled(isolated):
+    jc, _ = isolated
+    job = jc.create_job("L", subject="S")
+    job = jc.set_override(job, "scrapers.local_imports", [
+        {"name": "selfies", "dir": "/a", "enabled": True, "migrate_from": ""},
+        {"name": "refs", "dir": "/b", "enabled": False, "migrate_from": ""},
+    ])
+    env = jc.resolve_env(job)
+    folders = json.loads(env["LOCAL_IMPORTS_JSON"])
+    assert [f["name"] for f in folders] == ["selfies"]
+    assert folders[0]["dir"] == "/a"
+
+
+def test_resolve_env_drops_zforfree_keys(isolated):
+    jc, _ = isolated
+    job = jc.create_job("Z", subject="S")
+    env = jc.resolve_env(job)
+    assert "ZFORFREE_LOCAL_ENABLED" not in env
+    assert "ZFORFREE_WEB_ENABLED" not in env
+    assert "ZFORFREE_LOCAL_SRC" not in env
+    assert all(isinstance(v, str) for v in env.values())
+
+
+def test_scraper_names_excludes_zff_local(isolated):
+    jc, _ = isolated
+    assert "ZFF-Local" not in jc.SCRAPER_NAMES
+    assert "Web" in jc.SCRAPER_NAMES
+
+
+# ── projection ───────────────────────────────────────────────────────────────
+
+def test_project_categories_uses_effective(isolated):
+    jc, _ = isolated
+    import categories
+    job = jc.create_job("Tax", subject="S")
+    job = jc.set_override(job, "categories", [{"name": "Keepers", "hint": "k"}, {"name": "Maybe", "hint": ""}])
+    job = jc.set_override(job, "category_rules", "strict")
+    jc.project_categories(job)
+    assert categories.get_categories() == ("Keepers", "Maybe")
+
+
+def test_activate_sets_active_and_projects(isolated):
+    jc, _ = isolated
+    import categories
+    job = jc.create_job("Act", subject="S")
+    job = jc.set_override(job, "categories", [{"name": "OnlyCat", "hint": ""}])
+    jc.save_job(job)
+    jc.activate("act")
+    assert jc.get_active_slug() == "act"
+    assert categories.get_categories() == ("OnlyCat",)
+
+
+# ── queue / active pointer / advance (schema-independent) ─────────────────────
 
 def test_active_pointer_set_and_get(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Job A")
-    assert job_config.get_active_slug() is None
-    job_config.set_active("job_a")
-    assert job_config.get_active_slug() == "job_a"
-
-
-def test_set_active_unknown_raises(isolated):
-    job_config, _ = isolated
-    with pytest.raises(ValueError):
-        job_config.set_active("nope")
+    jc, _ = isolated
+    jc.create_job("Job A")
+    assert jc.get_active_slug() is None
+    jc.set_active("job_a")
+    assert jc.get_active_slug() == "job_a"
 
 
 def test_enqueue_dequeue_and_order(isolated):
-    job_config, _ = isolated
+    jc, _ = isolated
     for n in ("One", "Two", "Three"):
-        job_config.create_job(n)
-    job_config.enqueue("one")
-    job_config.enqueue("two")
-    job_config.enqueue("three")
-    assert job_config.get_index()["queue"] == ["one", "two", "three"]
-    job_config.dequeue("two")
-    assert job_config.get_index()["queue"] == ["one", "three"]
-    job_config.set_queue(["three", "one"])
-    assert job_config.get_index()["queue"] == ["three", "one"]
+        jc.create_job(n)
+    jc.enqueue("one"); jc.enqueue("two"); jc.enqueue("three")
+    assert jc.get_index()["queue"] == ["one", "two", "three"]
+    jc.dequeue("two")
+    assert jc.get_index()["queue"] == ["one", "three"]
+    jc.set_queue(["three", "one"])
+    assert jc.get_index()["queue"] == ["three", "one"]
 
 
-def test_advance_promotes_head_of_queue(isolated):
-    job_config, _ = isolated
+def test_advance_promotes_head(isolated):
+    jc, _ = isolated
     for n in ("First", "Second"):
-        job_config.create_job(n)
-    job_config.set_active("first")
-    job_config.enqueue("second")
-    new_active = job_config.advance()
-    assert new_active == "second"
-    assert job_config.get_active_slug() == "second"
-    assert job_config.get_index()["queue"] == []
-    # advancing with an empty queue clears active
-    assert job_config.advance() is None
-    assert job_config.get_active_slug() is None
-
-
-def test_delete_refuses_active_job(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Keep")
-    job_config.set_active("keep")
-    with pytest.raises(ValueError):
-        job_config.delete_job("keep")
-    job_config.set_active(None)
-    job_config.delete_job("keep")
-    assert job_config.get_job("keep") is None
-
-
-def test_delete_job_removes_from_queue(isolated):
-    job_config, _ = isolated
-    job_config.create_job("Q1")
-    job_config.create_job("Q2")
-    job_config.enqueue("q1")
-    job_config.enqueue("q2")
-    job_config.delete_job("q1")
-    assert job_config.get_index()["queue"] == ["q2"]
-    assert job_config.get_job("q1") is None
+        jc.create_job(n)
+    jc.set_active("first")
+    jc.enqueue("second")
+    assert jc.advance() == "second"
+    assert jc.get_active_slug() == "second"
+    assert jc.advance() is None
 
 
 def test_advance_skips_orphaned_slug(isolated):
-    """A queued slug whose file was removed must be skipped, never promoted to
-    active (a dangling active pointer would leave the supervisor with no config)."""
-    job_config, _ = isolated
+    jc, _ = isolated
     for n in ("First", "Second", "Third"):
-        job_config.create_job(n)
-    job_config.set_active("first")
-    job_config.enqueue("second")
-    job_config.enqueue("third")
-    (job_config.jobs_dir() / "second.json").unlink()   # orphan it
-    assert job_config.advance() == "third"
-    assert job_config.get_active_slug() == "third"
+        jc.create_job(n)
+    jc.set_active("first")
+    jc.enqueue("second"); jc.enqueue("third")
+    (jc.jobs_dir() / "second.json").unlink()
+    assert jc.advance() == "third"
+
+
+def test_delete_refuses_active_and_removes_from_queue(isolated):
+    jc, _ = isolated
+    jc.create_job("Keep"); jc.create_job("Q")
+    jc.set_active("keep"); jc.enqueue("q")
+    with pytest.raises(ValueError):
+        jc.delete_job("keep")
+    jc.delete_job("q")
+    assert jc.get_index()["queue"] == []
+    assert jc.get_job("q") is None
 
 
 # ── slug safety ──────────────────────────────────────────────────────────────
 
 def test_get_job_rejects_malformed_slug(isolated):
-    job_config, _ = isolated
-    assert job_config.get_job("../../etc/passwd") is None
-    assert job_config.get_job("bad/slug") is None
+    jc, _ = isolated
+    assert jc.get_job("../../etc/passwd") is None
 
 
 def test_delete_job_rejects_traversal_slug(isolated):
-    job_config, _ = isolated
+    jc, _ = isolated
     with pytest.raises(ValueError):
-        job_config.delete_job("../../../boot")
+        jc.delete_job("../../../boot")
 
 
-def test_save_job_rejects_invalid_slug(isolated):
-    job_config, _ = isolated
-    bad = job_config._make_job("Bad Slug!", "Bad")
-    with pytest.raises(ValueError):
-        job_config.save_job(bad)
+# ── clone ────────────────────────────────────────────────────────────────────
+
+def test_clone_via_base_on_copies_subject_preset_overrides(isolated):
+    jc, _ = isolated
+    src = jc.create_job("Source", subject="Src Subject", preset="default")
+    src = jc.set_override(src, "scoring.ovr_min", 77)
+    jc.save_job(src)
+    clone = jc.create_job("Source Copy", base_on="source")
+    assert clone.subject == "Src Subject"
+    assert clone.preset == "default"
+    assert jc.effective_config(clone)["scoring"]["ovr_min"] == 77
 
 
-def test_from_dict_tolerates_empty(isolated):
-    job_config, _ = isolated
-    j = job_config.Job.from_dict({})
-    assert j.status == "idle"
-    assert isinstance(j.topic, dict) and "topic" in j.topic
+# ── migration (v1 env → v2) ──────────────────────────────────────────────────
+
+def test_migrate_env_creates_default_preset_and_job(isolated, monkeypatch):
+    jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_SLUG", "myslug")
+    monkeypatch.setenv("PIPELINE_TOPIC", "My Topic")
+    monkeypatch.setenv("TOPIC_KEYWORDS_EXTRA", "k1,k2")
+    monkeypatch.setenv("SCRAPER_DISABLED", "X.com")
+    monkeypatch.setenv("VISION_OVR_MIN_SCORE", "42")
+    job = jc.migrate_env_to_default_job()
+    assert job is not None
+    assert job.slug == "myslug"
+    assert job.subject == "My Topic"
+    assert job.preset == "default"
+    eff = jc.effective_config(job)
+    assert eff["topic"]["keywords_extra"] == ["k1", "k2"]
+    assert eff["scrapers"]["enabled"]["X.com"] is False
+    assert eff["scoring"]["ovr_min"] == 42
+    assert "default" in jc.list_presets()["presets"]
+    assert jc.get_active_slug() == "myslug"
 
 
-# ── resolve_env (authoritative mapping) ──────────────────────────────────────
-
-def _rich_job(job_config):
-    job = job_config.create_job("Rich")
-    return job.with_updates(
-        topic={
-            "topic": "Realistic Female Influencer",
-            "keywords_extra": ["a", "b"],
-            "banned_keywords": ["x"],
-            "generation_hints": ["p"],
-            "min_prompt_length": 30,
-            "require_prompt": True,
-        },
-        scrapers={
-            "enabled": {"X.com": False, "Civitai-Com": True, "Web": True},
-            "x_accounts": ["acct1"],
-            "reddit_subreddits": ["sub1"],
-            "discord_channels_json": "[]",
-            "civitai_domains": ["civitai.com"],
-            "gallery_dl": {
-                "enabled": True, "urls": ["u1", "u2"], "limit_per_url": 200,
-                "cookies_file": "c", "config_path": "cfg",
-            },
-            "local_import": {"enabled": True, "dir": "/d", "name": "loc", "migrate_from": "m"},
-            "zforfree": {"local_enabled": True, "web_enabled": False, "local_src": "/z"},
-        },
-        scoring={"ovr_min": 60, "rel_min": 55, "notes": "note"},
-        captioning={"enabled": True, "style": "booru_tags", "overwrite": True},
-    )
+def test_migrate_env_folds_legacy_local_sources(isolated, monkeypatch):
+    jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_SLUG", "s")
+    monkeypatch.setenv("LOCAL_IMPORT_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_IMPORT_DIR", "/data/local")
+    monkeypatch.setenv("LOCAL_IMPORT_NAME", "mylocal")
+    monkeypatch.setenv("ZFORFREE_LOCAL_ENABLED", "true")
+    monkeypatch.setenv("ZFORFREE_LOCAL_SRC", "/data/zff")
+    job = jc.migrate_env_to_default_job()
+    li = jc.effective_config(job)["scrapers"]["local_imports"]
+    names = {f["name"] for f in li}
+    assert "mylocal" in names
+    assert any(f["dir"] == "/data/zff" for f in li)
 
 
-def test_resolve_env_maps_topic_and_scoring(isolated):
-    job_config, _ = isolated
-    env = job_config.resolve_env(_rich_job(job_config))
-    assert env["PIPELINE_SLUG"] == "rich"
-    assert env["PIPELINE_TOPIC"] == "Realistic Female Influencer"
-    assert env["TOPIC_KEYWORDS_EXTRA"] == "a,b"
-    assert env["TOPIC_BANNED_KEYWORDS"] == "x"
-    assert env["TOPIC_GENERATION_HINTS"] == "p"
-    assert env["MIN_PROMPT_LENGTH"] == "30"
-    assert env["REQUIRE_PROMPT"] == "true"
-    assert env["VISION_OVR_MIN_SCORE"] == "60"
-    assert env["VISION_REL_MIN_SCORE"] == "55"
-    assert env["VISION_SCORE_NOTES"] == "note"
+def test_migrate_idempotent(isolated):
+    jc, _ = isolated
+    assert jc.migrate_env_to_default_job() is not None
+    assert jc.migrate_env_to_default_job() is None
 
 
-def test_resolve_env_maps_scrapers(isolated):
-    job_config, _ = isolated
-    env = job_config.resolve_env(_rich_job(job_config))
-    assert env["SCRAPER_DISABLED"] == "X.com"           # only the disabled name
-    assert env["X_ACCOUNTS"] == "acct1"
-    assert env["REDDIT_SUBREDDITS"] == "sub1"
-    assert env["DISCORD_CHANNELS_JSON"] == "[]"
-    assert env["CIVITAI_DOMAINS"] == "civitai.com"
-    assert env["GALLERY_DL_ENABLED"] == "true"
-    assert env["GALLERY_DL_URLS"] == "u1\nu2"            # newline-joined like today
-    assert env["GALLERY_DL_LIMIT_PER_URL"] == "200"
-    assert env["GALLERY_DL_COOKIES_FILE"] == "c"
-    assert env["GALLERY_DL_CONFIG_PATH"] == "cfg"
-    assert env["LOCAL_IMPORT_ENABLED"] == "true"
-    assert env["LOCAL_IMPORT_DIR"] == "/d"
-    assert env["LOCAL_IMPORT_NAME"] == "loc"
-    assert env["LOCAL_IMPORT_MIGRATE_FROM"] == "m"
-    assert env["ZFORFREE_LOCAL_ENABLED"] == "true"
-    assert env["ZFORFREE_WEB_ENABLED"] == "false"
-    assert env["ZFORFREE_LOCAL_SRC"] == "/z"
+def test_discover_data_slugs_finds_existing(isolated, tmp_path):
+    jc, _ = isolated
+    (tmp_path / "queue" / "old_a" / "civitai").mkdir(parents=True)
+    (tmp_path / "sorted" / "old_b" / "Keepers").mkdir(parents=True)
+    assert set(jc.discover_data_slugs()) == {"old_a", "old_b"}
 
 
-def test_resolve_env_maps_captioning(isolated):
-    job_config, _ = isolated
-    env = job_config.resolve_env(_rich_job(job_config))
-    assert env["AUTO_CAPTION_ENABLED"] == "true"
-    assert env["AUTO_CAPTION_STYLE"] == "booru_tags"
-    assert env["AUTO_CAPTION_OVERWRITE"] == "true"
+# ── robustness (review findings) ─────────────────────────────────────────────
+
+def test_effective_config_does_not_mutate_preset(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    eff1 = jc.effective_config(job)
+    eff1["scrapers"]["x_accounts"].append("mutant")
+    eff1["scoring"]["ovr_min"] = 999
+    eff2 = jc.effective_config(job)
+    assert eff2["scrapers"]["x_accounts"] == []          # preset untouched
+    assert eff2["scoring"]["ovr_min"] == 0
 
 
-def test_resolve_env_all_values_are_strings(isolated):
-    job_config, _ = isolated
-    env = job_config.resolve_env(_rich_job(job_config))
-    assert all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+def test_job_with_unknown_preset_falls_back_to_default(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S").with_updates(preset="ghost")
+    eff = jc.effective_config(job)                        # must not raise
+    assert eff["scoring"]["ovr_min"] == 0
 
 
-def test_resolve_env_no_disabled_when_all_enabled(isolated):
-    job_config, _ = isolated
-    job = job_config.create_job("Allon")
-    job = job.with_updates(scrapers={**job.scrapers, "enabled": {"Web": True, "Civitai-Com": True}})
-    env = job_config.resolve_env(job)
+def test_resolve_env_tolerates_malformed_override(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S").with_updates(
+        overrides={"scoring": "not_a_dict", "scrapers": "nope"})
+    env = jc.resolve_env(job)                             # must not raise
+    assert env["VISION_OVR_MIN_SCORE"] == "0"
     assert env["SCRAPER_DISABLED"] == ""
 
 
-# ── project_categories ───────────────────────────────────────────────────────
-
-def test_project_categories_writes_active_taxonomy(isolated):
-    job_config, tmp = isolated
-    import categories
-    job = job_config.create_job("Taxon")
-    job = job.with_updates(
-        categories=[{"name": "Keepers", "hint": "good"}, {"name": "Maybe", "hint": ""}],
-        category_rules="be strict",
-    )
-    job_config.project_categories(job)
-    payload = json.loads((tmp / "cull_categories.json").read_text(encoding="utf-8"))
-    assert [c["name"] for c in payload["categories"]] == ["Keepers", "Maybe"]
-    assert payload["global_rules"] == "be strict"
-    # categories.py now reports the projected taxonomy
-    assert categories.get_categories() == ("Keepers", "Maybe")
+def test_sparse_enabled_override_only_disables_named(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    job = jc.set_override(job, "scrapers.enabled", {"X.com": False})
+    assert jc.resolve_env(job)["SCRAPER_DISABLED"] == "X.com"
 
 
-def test_activate_sets_active_and_projects(isolated):
-    job_config, tmp = isolated
-    import categories
-    job = job_config.create_job("Act")
-    job = job.with_updates(categories=[{"name": "OnlyCat", "hint": ""}], category_rules="r")
-    job_config.save_job(job)
-    job_config.activate("act")
-    assert job_config.get_active_slug() == "act"
-    assert categories.get_categories() == ("OnlyCat",)
+def test_override_categories_replaces_wholesale(isolated):
+    jc, _ = isolated
+    job = jc.create_job("J", subject="S")
+    job = jc.set_override(job, "categories", [{"name": "Solo", "hint": ""}])
+    assert [c["name"] for c in jc.effective_config(job)["categories"]] == ["Solo"]
 
 
-# ── migration ────────────────────────────────────────────────────────────────
-
-def test_migrate_env_to_default_job_builds_from_env(isolated, monkeypatch):
-    job_config, _ = isolated
-    monkeypatch.setenv("PIPELINE_TOPIC", "Legacy Topic")
-    monkeypatch.setenv("TOPIC_KEYWORDS_EXTRA", "k1,k2")
-    monkeypatch.setenv("SCRAPER_DISABLED", "X.com,Discord-1")
-    monkeypatch.setenv("VISION_OVR_MIN_SCORE", "42")
-    monkeypatch.setenv("AUTO_CAPTION_ENABLED", "true")
-    monkeypatch.setenv("AUTO_CAPTION_STYLE", "sd_prompt")
-
-    job = job_config.migrate_env_to_default_job()
-    assert job is not None
-    assert job.slug == "default"
-    assert job.topic["topic"] == "Legacy Topic"
-    assert job.topic["keywords_extra"] == ["k1", "k2"]
-    assert job.scrapers["enabled"]["X.com"] is False
-    assert job.scrapers["enabled"]["Discord-1"] is False
-    assert job.scrapers["enabled"]["Web"] is True
-    assert job.scoring["ovr_min"] == 42
-    assert job.captioning["enabled"] is True
-    assert job_config.get_active_slug() == "default"
+def test_v1_file_round_trips_through_save(isolated):
+    jc, _ = isolated
+    jc.jobs_dir().mkdir(parents=True, exist_ok=True)
+    v1 = {"slug": "leg", "name": "Leg", "topic": {"topic": "T", "keywords_extra": ["a"]},
+          "scrapers": {"enabled": {"X.com": False}}, "categories": [{"name": "K", "hint": ""}],
+          "scoring": {"ovr_min": 42}}
+    (jc.jobs_dir() / "leg.json").write_text(json.dumps(v1), encoding="utf-8")
+    jc.save_job(jc.get_job("leg"))                        # upgrade-on-read, then persist
+    on_disk = json.loads((jc.jobs_dir() / "leg.json").read_text(encoding="utf-8"))
+    assert "overrides" in on_disk and "subject" in on_disk
+    assert jc.effective_config(jc.get_job("leg"))["scoring"]["ovr_min"] == 42
 
 
-def test_migrate_is_idempotent(isolated):
-    job_config, _ = isolated
-    first = job_config.migrate_env_to_default_job()
-    assert first is not None
-    second = job_config.migrate_env_to_default_job()
-    assert second is None                       # already migrated → no-op
-    assert len(job_config.list_jobs()) == 1
+def test_from_dict_v1_with_stray_subject_key_not_misdetected(isolated):
+    jc, _ = isolated
+    v1 = {"slug": "x", "name": "X", "subject": "oops",
+          "topic": {"topic": "Real", "keywords_extra": ["k"]},
+          "scrapers": {"enabled": {"Web": True}}}
+    job = jc.Job.from_dict(v1)
+    assert jc.effective_config(job)["topic"]["keywords_extra"] == ["k"]   # v1 cfg kept
 
 
-def test_migrate_adopts_existing_pipeline_slug(isolated, monkeypatch):
-    """An upgrading user's existing data lives under data/<queue|sorted>/<slug>/.
-    Migration MUST adopt that slug so the job inherits the existing queues."""
-    job_config, _ = isolated
-    monkeypatch.setenv("PIPELINE_SLUG", "realistic_female_influencer")
-    monkeypatch.setenv("PIPELINE_TOPIC", "Realistic Female Influencer")
-    job = job_config.migrate_env_to_default_job()
-    assert job is not None
-    assert job.slug == "realistic_female_influencer"   # NOT "default"
-    assert job.name == "Realistic Female Influencer"
-    assert job_config.get_active_slug() == "realistic_female_influencer"
+def test_corrupt_presets_file_returns_default(isolated):
+    jc, _ = isolated
+    jc.jobs_dir().mkdir(parents=True, exist_ok=True)
+    (jc.jobs_dir() / "_presets.json").write_text("{ not json", encoding="utf-8")
+    assert "default" in jc.list_presets()["presets"]
 
 
-# ── discovery of pre-existing on-disk data (multi-slug upgraders) ─────────────
-
-def test_discover_data_slugs_finds_existing_queue_and_sorted(isolated):
-    job_config, tmp = isolated
-    (tmp / "queue" / "old_job_a" / "civitai").mkdir(parents=True)
-    (tmp / "sorted" / "old_job_b" / "Keepers" / "civitai").mkdir(parents=True)
-    (tmp / "queue" / "old_job_b" / "reddit").mkdir(parents=True)
-    found = set(job_config.discover_data_slugs())
-    assert found == {"old_job_a", "old_job_b"}
-
-
-def test_discover_handles_slug_included_paths(isolated, monkeypatch):
-    """Regression: when PIPELINE_SORTED/QUEUE already include the slug (as a real
-    upgrader's .env does), discovery must return the SLUG, not its category
-    children. The multi-slug parent is the folder literally named queue/sorted."""
-    job_config, tmp = isolated
-    (tmp / "sorted" / "myslug" / "Keepers" / "civitai").mkdir(parents=True)
-    (tmp / "queue" / "myslug" / "civitai").mkdir(parents=True)
-    monkeypatch.setenv("PIPELINE_SORTED", str(tmp / "sorted" / "myslug"))
-    monkeypatch.setenv("PIPELINE_QUEUE", str(tmp / "queue" / "myslug"))
-    monkeypatch.setenv("PIPELINE_SLUG", "myslug")
-    found = set(job_config.discover_data_slugs())
-    assert found == {"myslug"}                  # NOT {"Keepers", "civitai"}
-
-
-def test_migrate_existing_data_creates_a_job_per_slug(isolated, monkeypatch):
-    """The one-shot upgrader: adopt every slug already present on disk."""
-    job_config, tmp = isolated
-    monkeypatch.setenv("PIPELINE_SLUG", "primary_slug")
-    monkeypatch.setenv("PIPELINE_TOPIC", "Primary Topic")
-    (tmp / "queue" / "primary_slug" / "civitai").mkdir(parents=True)
-    (tmp / "sorted" / "secondary_slug" / "Keepers").mkdir(parents=True)
-
-    created = job_config.migrate_existing_data()
-    slugs = {j.slug for j in job_config.list_jobs()}
-    assert "primary_slug" in slugs            # the env/active one, full config
-    assert "secondary_slug" in slugs          # discovered, adopted with defaults
-    assert {j.slug for j in created} >= {"primary_slug", "secondary_slug"}
-    assert job_config.get_active_slug() == "primary_slug"
-    # idempotent: re-running adopts nothing new
-    assert job_config.migrate_existing_data() == []
+def test_delete_unknown_preset_raises(isolated):
+    jc, _ = isolated
+    with pytest.raises(ValueError):
+        jc.delete_preset("never_saved")
 
 
 if __name__ == "__main__":

@@ -84,8 +84,12 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "VISION_OVR_MIN_SCORE", "VISION_REL_MIN_SCORE", "VISION_SCORE_NOTES",
     "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY", "CIVITAI_DOMAINS",
     "CIVITAI_SEARCH_URL", "CIVITAI_SEARCH_HOST", "CIVITAI_TRPC_BASE",
-    "ZFORFREE_LOCAL_SRC", "LOCAL_IMPORT_DIR", "LOCAL_IMPORT_NAME",
-    "LOCAL_IMPORT_MIGRATE_FROM", "TWITTER_COOKIES",
+    # Local folders are projected as a single JSON blob; changing the set of
+    # folders (add/remove/retarget) must restart the feeders. The per-folder
+    # LOCAL_IMPORT_* vars are no longer job-global — the supervisor sets them
+    # per-feeder-agent from LOCAL_IMPORTS_JSON, so they're not tracked here.
+    "LOCAL_IMPORTS_JSON",
+    "TWITTER_COOKIES",
     "DISCORD_BOT_TOKEN", "DISCORD_AUTH_MODE",
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
@@ -113,11 +117,17 @@ CHANNEL_GROUPS: list[list[dict]] = [
 
 @dataclass
 class AgentSpec:
-    """Blueprint for one long-running child process."""
+    """Blueprint for one long-running child process.
+
+    ``env`` is merged OVER the supervisor's base spawn env when this agent is
+    launched, so each agent can carry per-agent overrides (e.g. a civitai
+    domain, a vision-worker's keepalive flag, or a local folder's
+    LOCAL_IMPORT_DIR/NAME fanned out from LOCAL_IMPORTS_JSON).
+    """
     label: str
     script: str
     args: list[str] = field(default_factory=list)
-    env_override: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
     loop_sleep: int = 300  # seconds between respawns if the child exits on its own
 
 
@@ -144,6 +154,34 @@ def vision_worker_list() -> list[str]:
         return [w.strip() for w in raw.split(",") if w.strip()]
     single = os.environ.get("PIPELINE_VISION_WORKER", "").strip()
     return [single] if single else []
+
+
+def _local_import_folders() -> list[dict]:
+    """Parse LOCAL_IMPORTS_JSON into the list of enabled local-folder dicts.
+
+    job_config.resolve_env emits LOCAL_IMPORTS_JSON as a JSON array of
+    ``{name, dir, migrate_from}`` (already filtered to ENABLED folders). We parse
+    it defensively: empty / missing / malformed JSON → ``[]``, non-list payload →
+    ``[]``, and any non-dict element or an entry with no ``dir`` is skipped so a
+    garbled value can never spawn a broken feeder.
+    """
+    raw = (os.environ.get("LOCAL_IMPORTS_JSON", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    folders: list[dict] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if not str(entry.get("dir", "") or "").strip():
+            continue  # a folder with no path can't be imported
+        folders.append(entry)
+    return folders
 
 
 # ── Jobs model: active-job resolution (pure helpers, unit-tested) ──────────────
@@ -194,13 +232,19 @@ def _vision_spec(worker: str) -> AgentSpec | None:
     return AgentSpec(
         label=f"Vision-{worker}",
         script=spec.script,
-        env_override=spec.env_override(),
+        env=spec.env_override(),  # WorkerSpec.env_override() -> per-agent env dict
         loop_sleep=10,
     )
 
 
 def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
-    """Build {label: AgentSpec} for everything that *should* be running right now."""
+    """Build {label: AgentSpec} for everything that *should* be running right now.
+
+    ``topic`` is retained for signature stability (the supervisor passes
+    ``self.topic``); it is no longer consulted directly now that local folders
+    are driven by LOCAL_IMPORTS_JSON rather than topic-keyword gating.
+    """
+    _ = topic  # reserved; see docstring
     disabled = disabled_scrapers()
     agents: dict[str, AgentSpec] = {}
 
@@ -219,20 +263,29 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
     for domain in (d.strip() for d in os.environ.get("CIVITAI_DOMAINS", "civitai.com,civitai.red").split(",") if d.strip()):
         domain_label = "Civitai-Red" if domain == "civitai.red" else "Civitai-Com"
         add(AgentSpec(label=domain_label, script="scraper_civitai_search.py",
-                      env_override={"CIVITAI_DOMAIN": domain}, loop_sleep=600))
+                      env={"CIVITAI_DOMAIN": domain}, loop_sleep=600))
     add(AgentSpec(label="Web", script="scraper_web.py", loop_sleep=1800))
 
-    # ZFF-Local honours its own flag AND topic gating
-    if os.environ.get("ZFORFREE_LOCAL_ENABLED", "false").lower() == "true":
-        human_keywords = ("influencer", "instagram", "woman", "girl", "female", "male", "man",
-                          "person", "portrait", "model", "instagrammer")
-        if any(kw in topic.lower() for kw in human_keywords):
-            add(AgentSpec(label="ZFF-Local", script="feed_zforfree_local.py", loop_sleep=3600))
-
-    # Generic local importer - label follows LOCAL_IMPORT_NAME so toggles match
-    if os.environ.get("LOCAL_IMPORT_ENABLED", "false").lower() == "true":
-        local_name = (os.environ.get("LOCAL_IMPORT_NAME", "local") or "local").strip() or "local"
-        add(AgentSpec(label=f"Local-{local_name}", script="feed_local_folder.py", loop_sleep=3600))
+    # Local-folder importers. The job (via job_config.resolve_env) projects every
+    # ENABLED folder into LOCAL_IMPORTS_JSON as a JSON array of
+    # {name, dir, migrate_from}. We fan that out into one Local-<name> agent per
+    # folder, each carrying its own LOCAL_IMPORT_* env so the (unchanged)
+    # feed_local_folder.py reads its folder from its own process env. (The legacy
+    # single-folder LOCAL_IMPORT_* branch and the ZFF-Local / feed_zforfree_local
+    # source are gone — local folders are the one mechanism now.)
+    for folder in _local_import_folders():
+        name = (folder.get("name") or "local").strip() or "local"
+        add(AgentSpec(
+            label=f"Local-{name}",
+            script="feed_local_folder.py",
+            loop_sleep=3600,
+            env={
+                "LOCAL_IMPORT_DIR": str(folder.get("dir", "") or ""),
+                "LOCAL_IMPORT_NAME": name,
+                "LOCAL_IMPORT_ENABLED": "true",
+                "LOCAL_IMPORT_MIGRATE_FROM": str(folder.get("migrate_from", "") or ""),
+            },
+        ))
 
     # gallery-dl URL-based scraper (Pixiv, DeviantArt, booru sites, ArtStation,
     # Tumblr, Newgrounds, X, Reddit, Imgur, Flickr — anything gallery-dl knows).
@@ -355,7 +408,9 @@ class Supervisor:
 
     def _spawn(self, spec: AgentSpec) -> None:
         script_path = PIPELINE_CODE_DIR / spec.script
-        run_env = {**self.base_env, **spec.env_override}
+        # spec.env is merged OVER the base spawn env so per-agent overrides win
+        # (civitai domain, vision keepalive flag, a local folder's LOCAL_IMPORT_*).
+        run_env = {**self.base_env, **spec.env}
         args = [PY, "-u", str(script_path)] + spec.args
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=run_env)
         self._active[spec.label] = proc
