@@ -165,6 +165,20 @@ def _default_categories() -> tuple[list[dict], str]:
         return [], ""
 
 
+# Local vision-worker providers a fleet instance may use. lmstudio + llamacpp
+# both speak the OpenAI /v1 API (one worker script); ollama uses its native API.
+VISION_PROVIDERS: tuple[str, ...] = ("lmstudio", "llamacpp", "ollama")
+
+# Shipped default fleet — "one local LLM initially" (LM Studio on localhost,
+# model auto-detected on connect). Inherited by every preset/job until overridden.
+def _default_vision_workers() -> list[dict]:
+    return [{
+        "id": "local-lm", "name": "LM Studio", "provider": "lmstudio",
+        "base_url": "http://127.0.0.1:1234", "model": "", "api_key": "",
+        "enabled": True,
+    }]
+
+
 def _default_preset_cfg() -> dict:
     cats, rules = _default_categories()
     return {
@@ -184,6 +198,7 @@ def _default_preset_cfg() -> dict:
         "category_rules": rules,
         "scoring": {"ovr_min": 0, "rel_min": 0, "notes": ""},
         "captioning": {"enabled": False, "style": "sd_prompt", "overwrite": False},
+        "vision": {"workers": _default_vision_workers()},
     }
 
 
@@ -504,6 +519,7 @@ def effective_config(job: Job) -> dict:
         "category_rules": cfg.get("category_rules", ""),
         "scoring": cfg.get("scoring", {}),
         "captioning": cfg.get("captioning", {}),
+        "vision": cfg.get("vision", {}),
     }
 
 
@@ -685,6 +701,32 @@ def _csv(xs: Any) -> str:
     return ",".join(str(x) for x in xs)
 
 
+def clean_vision_fleet(workers: Any) -> list[dict]:
+    """Normalise an effective ``vision.workers`` list into the JSON the supervisor
+    fans out: only ENABLED instances with a real base_url and a known provider,
+    each a flat ``{id, name, provider, base_url, model, api_key}`` dict."""
+    out: list[dict] = []
+    if not isinstance(workers, list):
+        return out
+    for i, w in enumerate(workers):
+        if not isinstance(w, dict) or not w.get("enabled", True):
+            continue
+        provider = str(w.get("provider", "") or "").strip().lower()
+        base_url = str(w.get("base_url", "") or "").strip()
+        if provider not in VISION_PROVIDERS or not base_url:
+            continue
+        wid = str(w.get("id", "") or f"w{i}").strip() or f"w{i}"
+        out.append({
+            "id": wid,
+            "name": str(w.get("name", "") or wid).strip() or wid,
+            "provider": provider,
+            "base_url": base_url,
+            "model": str(w.get("model", "") or "").strip(),
+            "api_key": str(w.get("api_key", "") or "").strip(),
+        })
+    return out
+
+
 def resolve_env(job: Job) -> dict[str, str]:
     """Flatten the EFFECTIVE config into the existing env-var names. Every key is
     always emitted so a job fully overrides any stale value in the global .env."""
@@ -699,6 +741,8 @@ def resolve_env(job: Job) -> dict[str, str]:
     sc = _d(eff.get("scoring"))
     cap = _d(eff.get("captioning"))
     enabled = _d(s.get("enabled"))
+    vision = _d(eff.get("vision"))
+    fleet = clean_vision_fleet(vision.get("workers"))
     # Only known scrapers contribute to SCRAPER_DISABLED (ignore stale/unknown names).
     disabled = sorted(n for n in SCRAPER_NAMES if not enabled.get(n, True))
     local_list = s.get("local_imports") if isinstance(s.get("local_imports"), list) else []
@@ -729,6 +773,7 @@ def resolve_env(job: Job) -> dict[str, str]:
         "VISION_OVR_MIN_SCORE": str(int(sc.get("ovr_min", 0) or 0)),
         "VISION_REL_MIN_SCORE": str(int(sc.get("rel_min", 0) or 0)),
         "VISION_SCORE_NOTES": str(sc.get("notes", "") or ""),
+        "VISION_WORKERS_JSON": json.dumps(fleet),
         "AUTO_CAPTION_ENABLED": _b(cap.get("enabled", False)),
         "AUTO_CAPTION_STYLE": str(cap.get("style", "sd_prompt") or "sd_prompt"),
         "AUTO_CAPTION_OVERWRITE": _b(cap.get("overwrite", False)),
@@ -896,6 +941,52 @@ def migrate_existing_data() -> list[Job]:
     return created
 
 
+def _legacy_vision_workers_from_env() -> list[dict]:
+    """Build fleet instances from the legacy single-endpoint vision env vars."""
+    out: list[dict] = []
+
+    def add(provider: str, name: str, url_key: str, model_key: str,
+            key_key: str | None = None) -> None:
+        url = (os.environ.get(url_key, "") or "").strip()
+        if not url:
+            return
+        out.append({
+            "id": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or provider,
+            "name": name, "provider": provider, "base_url": url,
+            "model": (os.environ.get(model_key, "") or "").strip(),
+            "api_key": (os.environ.get(key_key, "") or "").strip() if key_key else "",
+            "enabled": True,
+        })
+
+    add("lmstudio", "LM Studio Primary", "LMSTUDIO_PRIMARY_URL", "LMSTUDIO_PRIMARY_MODEL")
+    add("lmstudio", "LM Studio Secondary", "LMSTUDIO_SECONDARY_URL", "LMSTUDIO_SECONDARY_MODEL")
+    add("ollama", "Ollama", "OLLAMA_URL", "OLLAMA_MODEL")
+    add("llamacpp", "OpenAI-compatible", "OPENAI_COMPAT_URL", "OPENAI_COMPAT_MODEL",
+        "OPENAI_COMPAT_API_KEY")
+    return out
+
+
+def migrate_legacy_vision_to_fleet() -> bool:
+    """One-shot: fold legacy single-endpoint vision env (LMSTUDIO_*/OLLAMA_*/
+    OPENAI_COMPAT_*) into the default preset's ``vision.workers`` fleet so an
+    upgrade keeps the user's working endpoints. Idempotent — only acts while the
+    default preset still carries the shipped localhost default. Returns True when
+    it changed the fleet."""
+    legacy = _legacy_vision_workers_from_env()
+    if not legacy:
+        return False
+    default_name = default_preset_name()
+    cfg = get_preset(default_name)
+    current = (cfg.get("vision") or {}).get("workers")
+    if clean_vision_fleet(current) != clean_vision_fleet(_default_vision_workers()):
+        return False                       # user already configured a fleet
+    cfg.setdefault("vision", {})["workers"] = legacy
+    save_preset(default_name, cfg)
+    logger.info("migrated %d legacy vision endpoint(s) into the %r preset fleet",
+                len(legacy), default_name)
+    return True
+
+
 __all__ = [
     "Job", "JOB_SLUG_RE", "PRESET_NAME_RE", "JOB_STATUSES", "SCRAPER_NAMES",
     "slugify", "jobs_dir",
@@ -906,4 +997,6 @@ __all__ = [
     "get_index", "get_active_slug", "set_active", "set_queue", "enqueue", "dequeue", "advance",
     "resolve_env", "project_categories", "activate",
     "migrate_env_to_default_job", "discover_data_slugs", "migrate_existing_data",
+    "migrate_legacy_vision_to_fleet", "clean_vision_fleet", "VISION_PROVIDERS",
+    "reset_preset_to_builtin", "builtin_preset_names",
 ]

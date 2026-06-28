@@ -50,6 +50,11 @@ load_dotenv()
 
 logger = get_logger(__name__)
 
+# Substrings that hint a listed model is vision-capable — used to pick sensibly
+# when the user leaves the model blank (auto-detect on connect).
+_VISION_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "pixtral",
+                 "gemma-3", "qwen-vl", "internvl", "smolvlm", "phi-3.5-vision")
+
 
 class BalancedOpenAICompatWorker(BaseVisionWorker):
     name = "balanced-openai-compat"
@@ -72,10 +77,30 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
 
     def setup(self) -> None:
         if not self.model:
+            self.model = self._autodetect_model()
+        if not self.model:
             raise SystemExit(
-                "OPENAI_COMPAT_MODEL is unset. Set it to the model identifier your "
+                "OPENAI_COMPAT_MODEL is unset and no model could be auto-detected "
+                f"from {self.base_url}/v1/models. Set the model identifier your "
                 "local server expects (run e.g. `curl <url>/v1/models` to list)."
             )
+
+    def _autodetect_model(self) -> str:
+        """Pick a model when none is configured: prefer a vision-capable id, else
+        the first one the server lists. Empty string if the endpoint is down."""
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            r = requests.get(f"{self.base_url}/v1/models", headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json().get("data") or []
+        except (requests.RequestException, ValueError, KeyError):
+            return ""
+        ids = [m.get("id", "") for m in data if isinstance(m, dict) and m.get("id")]
+        if not ids:
+            return ""
+        chosen = next((i for i in ids if any(h in i.lower() for h in _VISION_HINTS)), ids[0])
+        logger.info("auto-detected model %r from %s/v1/models", chosen, self.base_url)
+        return chosen
 
     def banner(self) -> None:
         logger.info("=== Vision Worker (OpenAI-compatible %s) ===", self.name)

@@ -383,6 +383,62 @@ def test_scraper_names_has_no_local_folder_entry(isolated):
     assert all("local" not in n.lower() for n in job_config.SCRAPER_NAMES)
 
 
+# ── compute_desired_agents: vision fleet fan-out from VISION_WORKERS_JSON ──────
+
+def _vision_labels(agents: dict) -> set[str]:
+    return {label for label in agents if label.startswith("Vision-")}
+
+
+def test_compute_desired_fans_out_one_vision_worker_per_instance(isolated, monkeypatch):
+    """Each enabled instance in VISION_WORKERS_JSON → one Vision-<name> agent with
+    its own per-agent endpoint env (provider-correct script + URL/model/key)."""
+    run_pipeline, _jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")   # keep registry noise out
+    monkeypatch.setenv("VISION_WORKERS_JSON", json.dumps([
+        {"id": "a", "name": "LM A", "provider": "lmstudio",
+         "base_url": "http://h:1234", "model": "m1", "api_key": ""},
+        {"id": "b", "name": "Olla", "provider": "ollama",
+         "base_url": "http://h:11434", "model": "", "api_key": "k"},
+    ]))
+    agents = run_pipeline.compute_desired_agents("anything")
+    assert _vision_labels(agents) == {"Vision-LM A", "Vision-Olla"}
+
+    a = agents["Vision-LM A"]
+    assert a.script == "vision_worker_balanced_openai.py"
+    assert a.env["OPENAI_COMPAT_URL"] == "http://h:1234"
+    assert a.env["OPENAI_COMPAT_MODEL"] == "m1"
+    assert a.env["VISION_INSTANCE_NAME"] == "LM A"
+
+    b = agents["Vision-Olla"]
+    assert b.script == "vision_worker_balanced_ollama.py"
+    assert b.env["OLLAMA_URL"] == "http://h:11434"
+    assert b.env["OLLAMA_API_KEY"] == "k"
+
+
+def test_compute_desired_llamacpp_uses_openai_script(isolated, monkeypatch):
+    """llama.cpp is OpenAI-compatible → routed to the openai-compat worker."""
+    run_pipeline, _jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")
+    monkeypatch.setenv("VISION_WORKERS_JSON", json.dumps([
+        {"id": "c", "name": "vLLM", "provider": "llamacpp",
+         "base_url": "http://h:8000", "api_key": "sk"}]))
+    spec = run_pipeline.compute_desired_agents("x")["Vision-vLLM"]
+    assert spec.script == "vision_worker_balanced_openai.py"
+    assert spec.env["OPENAI_COMPAT_API_KEY"] == "sk"
+
+
+def test_compute_desired_no_vision_fleet_when_blob_bad(isolated, monkeypatch):
+    """Empty / malformed / url-less / bad-provider blobs spawn no fleet agents."""
+    run_pipeline, _jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")
+    for blob in ("", "[]", "not json", '{"x": 1}',
+                 json.dumps([{"provider": "lmstudio", "base_url": ""}]),
+                 json.dumps([{"provider": "bogus", "base_url": "http://h:1"}])):
+        monkeypatch.setenv("VISION_WORKERS_JSON", blob)
+        agents = run_pipeline.compute_desired_agents("t")
+        assert _vision_labels(agents) == set(), f"blob={blob!r}"
+
+
 # ── end-to-end: job projection → desired Local agents ─────────────────────────
 
 def test_job_local_imports_project_into_desired_agents(isolated, monkeypatch):

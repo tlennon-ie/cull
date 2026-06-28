@@ -15,7 +15,8 @@ Env vars:
 
     OLLAMA_URL       Base URL, default ``http://127.0.0.1:11434``.
     OLLAMA_MODEL     Vision-capable model tag, e.g. ``llama3.2-vision`` or
-                     ``minicpm-v``.
+                     ``minicpm-v``. Blank → auto-detected from ``/api/tags``.
+    OLLAMA_API_KEY   Optional bearer token (for an auth-fronted / hosted Ollama).
     OLLAMA_TIMEOUT   Per-request timeout in seconds. Default 600.
 """
 from __future__ import annotations
@@ -67,6 +68,7 @@ class BalancedOllamaWorker(BaseVisionWorker):
             "OLLAMA_URL", "http://127.0.0.1:11434"
         ).rstrip("/")
         self.model: str = os.environ.get("OLLAMA_MODEL", "").strip()
+        self.api_key: str = os.environ.get("OLLAMA_API_KEY", "").strip()
         try:
             self.request_timeout = int(
                 os.environ.get("OLLAMA_TIMEOUT", str(self.request_timeout))
@@ -74,18 +76,40 @@ class BalancedOllamaWorker(BaseVisionWorker):
         except ValueError:
             pass
 
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
     def setup(self) -> None:
         if not self.model:
+            self.model = self._autodetect_model()
+        if not self.model:
             raise SystemExit(
-                "OLLAMA_MODEL is unset. Pull a vision-capable model (e.g. "
+                "OLLAMA_MODEL is unset and no model could be auto-detected from "
+                f"{self.base_url}/api/tags. Pull a vision-capable model (e.g. "
                 "`ollama pull llama3.2-vision`) and set OLLAMA_MODEL to its tag."
             )
+
+    def _autodetect_model(self) -> str:
+        """Use the first model the server lists when none is configured."""
+        try:
+            r = requests.get(f"{self.base_url}/api/tags",
+                             headers=self._headers(), timeout=10)
+            r.raise_for_status()
+            models = r.json().get("models") or []
+        except (requests.RequestException, ValueError, KeyError):
+            return ""
+        names = [m.get("name", "") for m in models if isinstance(m, dict) and m.get("name")]
+        if not names:
+            return ""
+        logger.info("auto-detected model %r from %s/api/tags", names[0], self.base_url)
+        return names[0]
 
     def banner(self) -> None:
         logger.info("=== Vision Worker (Ollama %s) ===", self.name)
         logger.info("  URL:     %s", self.base_url)
         logger.info("  Model:   %s", self.model)
         logger.info("  Workers: %d", self.parallel_workers)
+        logger.info("  Auth:    %s", "bearer token set" if self.api_key else "(none)")
 
     def classify_image_bytes(
         self,
@@ -98,6 +122,7 @@ class BalancedOllamaWorker(BaseVisionWorker):
         try:
             response = requests.post(
                 f"{self.base_url}/api/chat",
+                headers=self._headers(),
                 json={
                     "model": self.model,
                     "messages": [

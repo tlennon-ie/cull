@@ -144,6 +144,9 @@ except ValueError:
 # and an embedding test client see a migrated store.
 try:
     job_config.migrate_env_to_default_job()
+    # Fold legacy single-endpoint vision env (LMSTUDIO_*/OLLAMA_*/OPENAI_COMPAT_*)
+    # into the default preset's worker fleet so an upgrade keeps working endpoints.
+    job_config.migrate_legacy_vision_to_fleet()
 except Exception as _exc:  # pragma: no cover - never block dashboard boot
     logger.warning("job migration skipped: %s", _exc)
 
@@ -1306,9 +1309,12 @@ def _validate_job_scoring(raw: Any) -> tuple[dict | None, str]:
 # overrides). Both job overrides and preset bodies flow through the same
 # validators so a bad value can't reach the projection layer from either path.
 _INHERITABLE_KEYS = frozenset({
-    "topic_filters", "scrapers", "categories", "category_rules", "scoring", "captioning",
+    "topic_filters", "scrapers", "categories", "category_rules", "scoring",
+    "captioning", "vision",
 })
 _CAPTION_STYLES = frozenset({"sd_prompt", "booru_tags", "natural_language"})
+_VISION_PROVIDERS = frozenset(job_config.VISION_PROVIDERS)
+_MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
 # A local-import folder's ``name`` is used downstream as the ``Local-<name>``
 # queue subfolder + SeenStore name, i.e. a filesystem path component. Restrict
@@ -1459,6 +1465,49 @@ def _validate_captioning(cap: Any) -> tuple[dict | None, str]:
     return out, ""
 
 
+def _validate_vision(v: Any) -> tuple[dict | None, str]:
+    """Validate the ``vision`` block — a list of local worker instances. base_url
+    may be blank (a half-filled new row); it's dropped at projection by
+    clean_vision_fleet. Private/LAN/Tailscale URLs are allowed on purpose: a
+    user's GPU mesh lives on those, and this is a localhost admin tool."""
+    if not isinstance(v, dict):
+        return None, "vision must be an object"
+    out: dict[str, Any] = {}
+    for k, val in v.items():
+        if k != "workers":
+            return None, f"unknown vision key: {k!r}"
+        if not isinstance(val, list):
+            return None, "vision.workers must be a list"
+        if len(val) > _MAX_VISION_WORKERS:
+            return None, f"too many vision workers (max {_MAX_VISION_WORKERS})"
+        workers: list[dict] = []
+        seen: set[str] = set()
+        for i, w in enumerate(val):
+            if not isinstance(w, dict):
+                return None, "each vision worker must be an object"
+            provider = str(w.get("provider", "") or "").strip().lower()
+            if provider not in _VISION_PROVIDERS:
+                return None, f"vision worker provider must be one of {sorted(_VISION_PROVIDERS)}"
+            base_url = str(w.get("base_url", "") or "").strip()
+            if base_url and not re.match(r"^https?://", base_url, re.I):
+                return None, "vision worker base_url must be an http(s) URL"
+            wid = (str(w.get("id", "") or "").strip() or f"w{i}")[:64]
+            if wid in seen:
+                return None, f"duplicate vision worker id: {wid!r}"
+            seen.add(wid)
+            workers.append({
+                "id": wid,
+                "name": str(w.get("name", "") or "").strip()[:80],
+                "provider": provider,
+                "base_url": base_url,
+                "model": str(w.get("model", "") or "").strip()[:200],
+                "api_key": str(w.get("api_key", "") or "").strip()[:400],
+                "enabled": bool(w.get("enabled", True)),
+            })
+        out["workers"] = workers
+    return out, ""
+
+
 def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, str]:
     """Validate a preset cfg (``partial=False``) or a job override map
     (``partial=True``). Returns (clean_cfg, error).
@@ -1500,11 +1549,16 @@ def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, 
             if err:
                 return None, err
             out["scrapers"] = clean_s
-        else:  # captioning
+        elif key == "captioning":
             clean_cap, err = _validate_captioning(value)
             if err:
                 return None, err
             out["captioning"] = clean_cap
+        else:  # vision
+            clean_vis, err = _validate_vision(value)
+            if err:
+                return None, err
+            out["vision"] = clean_vis
     if not partial:
         # A full preset must carry valid categories (they drive the schema enum).
         if "categories" not in out:

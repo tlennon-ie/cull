@@ -89,6 +89,11 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     # LOCAL_IMPORT_* vars are no longer job-global — the supervisor sets them
     # per-feeder-agent from LOCAL_IMPORTS_JSON, so they're not tracked here.
     "LOCAL_IMPORTS_JSON",
+    # The local vision fleet is projected as a single JSON blob; changing the set
+    # of workers (add/remove/retarget/rekey) must restart the vision workers. The
+    # per-instance OPENAI_COMPAT_*/OLLAMA_* vars are set per-agent from this blob,
+    # so they aren't tracked individually.
+    "VISION_WORKERS_JSON",
     "TWITTER_COOKIES",
     "DISCORD_BOT_TOKEN", "DISCORD_AUTH_MODE",
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
@@ -237,6 +242,73 @@ def _vision_spec(worker: str) -> AgentSpec | None:
     )
 
 
+# Local-LLM provider -> worker script. lmstudio + llama.cpp speak the OpenAI
+# /v1 API (one script); ollama uses its native API.
+_VISION_PROVIDER_SCRIPTS: dict[str, str] = {
+    "lmstudio": "vision_worker_balanced_openai.py",
+    "llamacpp": "vision_worker_balanced_openai.py",
+    "ollama": "vision_worker_balanced_ollama.py",
+}
+
+
+def _vision_fleet() -> list[dict]:
+    """Parse VISION_WORKERS_JSON (projected by job_config.resolve_env) into the
+    list of usable local worker instances. Defensive: empty / missing / malformed
+    JSON, non-list payloads, non-dict entries, blank base_url, and unknown
+    providers are all dropped so a garbled value can never spawn a broken worker.
+    """
+    raw = (os.environ.get("VISION_WORKERS_JSON", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    fleet: list[dict] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if not str(entry.get("base_url", "") or "").strip():
+            continue
+        if entry.get("provider") not in _VISION_PROVIDER_SCRIPTS:
+            continue
+        fleet.append(entry)
+    return fleet
+
+
+def _vision_fleet_specs() -> list[AgentSpec]:
+    """Fan VISION_WORKERS_JSON out into one Vision-<name> AgentSpec per instance,
+    each carrying its own endpoint env so the (unchanged) worker script reads its
+    URL/model/key from its own process env — mirrors the LOCAL_IMPORTS_JSON
+    fan-out for local folders."""
+    specs: list[AgentSpec] = []
+    seen: set[str] = set()
+    for i, w in enumerate(_vision_fleet()):
+        provider = w["provider"]
+        name = (str(w.get("name", "") or w.get("id", "") or f"w{i}")).strip() or f"w{i}"
+        label = base = f"Vision-{name}"
+        n = 2
+        while label in seen:                     # keep labels unique on name clash
+            label, n = f"{base}-{n}", n + 1
+        seen.add(label)
+        env = {"VISION_INSTANCE_ID": str(w.get("id", "") or name),
+               "VISION_INSTANCE_NAME": name}
+        base_url = str(w.get("base_url", "") or "").strip()
+        model = str(w.get("model", "") or "")
+        api_key = str(w.get("api_key", "") or "")
+        if provider in ("lmstudio", "llamacpp"):
+            env.update({"OPENAI_COMPAT_URL": base_url, "OPENAI_COMPAT_MODEL": model,
+                        "OPENAI_COMPAT_API_KEY": api_key})
+        else:  # ollama
+            env.update({"OLLAMA_URL": base_url, "OLLAMA_MODEL": model,
+                        "OLLAMA_API_KEY": api_key})
+        specs.append(AgentSpec(label=label, script=_VISION_PROVIDER_SCRIPTS[provider],
+                               env=env, loop_sleep=10))
+    return specs
+
+
 def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
     """Build {label: AgentSpec} for everything that *should* be running right now.
 
@@ -297,8 +369,14 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
     ):
         add(AgentSpec(label="Gallery-DL", script="scraper_gallery_dl.py", loop_sleep=1800))
 
-    # Vision workers (the Vision-* labels are also filterable via SCRAPER_DISABLED
-    # so admins can force everything off with one bulk call.)
+    # Local vision-worker fleet (LM Studio / llama.cpp / Ollama) — one worker per
+    # enabled instance in VISION_WORKERS_JSON, fanned out like local folders above.
+    for spec in _vision_fleet_specs():
+        add(spec)
+
+    # Registry vision workers (cloud Groq + any legacy names still in
+    # PIPELINE_VISION_WORKERS). The Vision-* labels are also filterable via
+    # SCRAPER_DISABLED so admins can force everything off with one bulk call.
     for worker in vision_worker_list():
         spec = _vision_spec(worker)
         if spec is not None:
@@ -798,6 +876,7 @@ def main() -> None:
     # Idempotent — safe even though the dashboard may also call it on startup.
     try:
         job_config.migrate_env_to_default_job()
+        job_config.migrate_legacy_vision_to_fleet()
     except Exception as exc:  # never let migration block the supervisor booting
         logger.warning("migrate_env_to_default_job failed: %s", exc)
 
