@@ -199,17 +199,28 @@ def _merge_builtin_presets(lib: dict) -> dict:
     return lib
 
 
+def _read_presets_raw(path: Path) -> dict | None:
+    """Parse the on-disk presets file ONCE. Returns the raw dict, or None when
+    the file is absent/unreadable/structurally invalid (caller falls back to the
+    builtin library). Read exactly once per call to avoid a TOCTOU re-read."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("presets file %s is unreadable; using built-in defaults", path)
+        return None
+    if isinstance(data, dict) and isinstance(data.get("presets"), dict) and data["presets"]:
+        return data
+    return None
+
+
 def _read_presets() -> dict:
-    p = _presets_path()
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("presets"), dict) and data["presets"]:
-                data.setdefault("default", next(iter(data["presets"])))
-                return _merge_builtin_presets(data)
-        except (OSError, json.JSONDecodeError):
-            logger.warning("presets file %s is unreadable; using built-in defaults", p)
-    return builtin_presets.builtin_library()
+    data = _read_presets_raw(_presets_path())
+    if data is None:
+        return builtin_presets.builtin_library()
+    data.setdefault("default", next(iter(data["presets"])))
+    return _merge_builtin_presets(data)
 
 
 def _write_presets(lib: dict) -> None:
@@ -217,19 +228,19 @@ def _write_presets(lib: dict) -> None:
 
 
 def list_presets() -> dict:
-    lib = _read_presets()
+    # Single read of the file (no TOCTOU re-read): seed on first access, else
+    # durably persist any builtin presets merged into an older library.
     path = _presets_path()
-    if not path.is_file():
+    raw = _read_presets_raw(path)
+    if raw is None:
+        lib = builtin_presets.builtin_library()
         _write_presets(lib)                    # seed on first access
-    else:
-        # Durably persist builtin presets merged into an older library so the
-        # on-disk file matches what callers see (only when the set changed).
-        try:
-            on_disk = json.loads(path.read_text(encoding="utf-8")) or {}
-        except (OSError, json.JSONDecodeError):
-            on_disk = {}
-        if set(on_disk.get("presets", {})) != set(lib.get("presets", {})):
-            _write_presets(lib)
+        return lib
+    before = set(raw.get("presets", {}))
+    raw.setdefault("default", next(iter(raw["presets"])))
+    lib = _merge_builtin_presets(raw)
+    if set(lib.get("presets", {})) != before:
+        _write_presets(lib)                    # persist newly-merged builtins
     return lib
 
 

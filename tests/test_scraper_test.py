@@ -509,6 +509,37 @@ class TestWeb:
         assert result["ok"] is False
 
 
+class TestWebSsrfGuard:
+    """The Web test must refuse to probe non-public / non-HTTP URLs so it can't
+    be used as an SSRF primitive against localhost or cloud metadata."""
+
+    BLOCKED = [
+        "file:///etc/passwd",
+        "http://localhost:6379/",
+        "http://127.0.0.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/admin",
+        "http://[::1]:8080/",
+        "ftp://example.com/x",
+        "gopher://127.0.0.1:11211/",
+    ]
+
+    def test_blocked_urls_never_hit_the_network(self, st, monkeypatch):
+        for url in self.BLOCKED:
+            calls = _patch_http(monkeypatch, st, 200)
+            result = st.test_scraper("Web", config={"target_url": url}, env={})
+            assert result["ok"] is False, f"{url} should be refused"
+            assert calls == [], f"{url} must not be fetched"
+
+    def test_public_https_url_is_allowed(self, st, monkeypatch):
+        calls = _patch_http(monkeypatch, st, 200)
+        result = st.test_scraper(
+            "Web", config={"target_url": "https://example.com/feed"}, env={})
+        assert result["ok"] is True
+        assert len(calls) == 1
+
+
 # ===========================================================================
 # 10. Gallery-DL
 # ===========================================================================

@@ -24,10 +24,13 @@ Timeout is 8 seconds; responses are mapped to clear user-facing messages.
 """
 from __future__ import annotations
 
+import base64
+import ipaddress
 import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -105,6 +108,38 @@ def _get(key: str, env: dict[str, Any] | None) -> str | None:
     return val or None
 
 
+def _is_safe_public_url(url: str) -> bool:
+    """True only for an http(s) URL aimed at a public host.
+
+    Blocks ``file://`` and other schemes, ``localhost``, and literal
+    loopback / private / link-local / reserved IPs so the per-scraper Test
+    button can't be turned into an SSRF primitive against the host's own
+    services or a cloud metadata endpoint. We deliberately do NOT resolve DNS
+    (keeps the check hermetic and fast); a hostname that *resolves* to a private
+    IP is out of scope for a single-machine localhost tool.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001 - never raise from a validator
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return False
+    low = host.lower()
+    if low == "localhost" or low.endswith(".localhost"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local
+                           or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # HTTP outcome mapper (status -> (ok, message))
 # ---------------------------------------------------------------------------
@@ -149,7 +184,9 @@ def _live_call(
     try:
         status, body = _http_request(method, url, headers=headers, timeout=_TIMEOUT)
         latency_ms = int((time.monotonic() - t0) * 1000)
-        return _status_to_result(status, latency_ms, detail=detail or body[:200])
+        # Never forward the raw response body to the client by default — it could
+        # echo token hints or internal error text. Callers pass an explicit detail.
+        return _status_to_result(status, latency_ms, detail=detail or "")
     except requests.exceptions.Timeout:
         return _fail(
             "could not connect (timed out)",
@@ -314,7 +351,7 @@ def _check_reddit(config: dict, env: dict | None) -> dict:
                     # Basic auth encoded into the Authorization header so the
                     # monkeypatched _http_request receives it without needing
                     # requests.post(auth=...) which can't be intercepted.
-                    "Authorization": "Basic " + __import__("base64").b64encode(
+                    "Authorization": "Basic " + base64.b64encode(
                         f"{client_id}:{client_secret}".encode()
                     ).decode(),
                 },
@@ -358,6 +395,11 @@ def _check_web(config: dict, env: dict | None) -> dict:
             detail="no target_url configured",
         )
 
+    if not _is_safe_public_url(str(target)):
+        return _fail(
+            "refusing to probe a non-public or non-HTTP URL",
+            detail="Web test only allows http(s) URLs to public hosts",
+        )
     return _live_call("GET", str(target), detail=f"web target: {target}")
 
 
@@ -372,8 +414,11 @@ def _check_gallery_dl(config: dict, env: dict | None) -> dict:
     """
     try:
         import gallery_dl  # noqa: F401
-    except ImportError:
-        return _fail("gallery-dl not installed — run: pip install gallery-dl")
+    except Exception:  # noqa: BLE001 - corrupt install / missing transitive dep
+        return _fail(
+            "gallery-dl not importable — ensure it is in requirements.txt and "
+            "your virtualenv is active"
+        )
 
     if isinstance(config, dict):
         cookies_file = config.get("cookies_file")
@@ -467,9 +512,11 @@ def test_scraper(
     try:
         return checker(safe_config, env)
     except Exception as exc:  # noqa: BLE001
+        # Log the full exception server-side; never leak str(exc) (may carry a
+        # credential value or path) into the user-facing message.
         logger.exception("unexpected error in test_scraper(%r): %s", name, exc)
         return _fail(
-            f"internal error: {type(exc).__name__}: {exc}",
+            f"internal error: {type(exc).__name__}",
             detail="unexpected exception — check logs",
         )
 

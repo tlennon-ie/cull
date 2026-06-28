@@ -332,9 +332,12 @@ def _build_presets() -> dict[str, dict]:
     }
 
 
-PRESET_NAMES: tuple[str, ...] = tuple(_build_presets().keys())
+# Build the library ONCE at import; every public accessor deep-copies from this
+# single source so PRESET_NAMES and builtin_library() can never diverge.
+_PRESETS: dict[str, dict] = _build_presets()
+PRESET_NAMES: tuple[str, ...] = tuple(_PRESETS.keys())
 
 
 def builtin_library() -> dict:
     """Return a fresh {default, presets} library (safe for the caller to mutate)."""
-    return {"default": DEFAULT_PRESET, "presets": copy.deepcopy(_build_presets())}
+    return {"default": DEFAULT_PRESET, "presets": copy.deepcopy(_PRESETS)}
