@@ -113,7 +113,9 @@ For URL-based sources, you don't need to write a scraper at all — paste the UR
 
 cull is **job-centric**. A *job* is a named curation target — one subject, its scraper targets, its categories and judgement rules, its scoring and captioning. Keep several around (a LoRA dataset, a personal archive, an ad-image pull) and run them one at a time.
 
-**Presets + inherit-by-default.** Shared config lives in a **preset library** (`data/jobs/_presets.json`). A job picks a preset and **inherits everything**; you only override the fields you want to change for that job. Every field in the editor shows its effective value with a "global" chip when it's inherited and a "reset to global" affordance once you override it — so a job file stays tiny (just its `subject` + the handful of overridden leaves). Edit the preset to change the default for every job that inherits it.
+**Presets + inherit-by-default.** Shared config lives in a **preset library** (`data/jobs/_presets.json`). A job picks a preset and **inherits everything**; you only override the fields you want to change for that job. Every field in the editor shows its effective value with a "global" chip when it's inherited and a "reset to global" affordance once you override it — so a job file stays tiny (just its `subject` + the handful of overridden leaves). Edit the preset to change the default for every job that inherits it. Hover the ⓘ next to any field for guidance and example values.
+
+cull ships a **starter preset library** so a new job lands on sensible defaults: a general `default` (a topic-agnostic Keep / Borderline / OffTopic triage with **no** person/subject gates) plus themed starters for **aerial/drone**, **underwater**, **wildlife & macro**, **product**, and **anime/illustration** — with a **photoreal-portrait** and a **quality-only** preset retained. Clone any of them and tweak its categories, judgement rules, scoring and topic filters.
 
 **Auto-saving.** Job and preset settings save themselves as you type — there are no Save buttons. For the job that's currently running, your edits are held and **applied when you leave the editor** (or hit Apply), so the pipeline re-projects and restarts once instead of on every keystroke.
 
@@ -206,7 +208,11 @@ gallery-dl scraper:
 
 **Why force a JSON schema on every backend?** Because vision models love to reply with `<think>...</think>` blocks, markdown fences, or "I'd be happy to help!" prefixes that break regex parsers. The schema constraint moves the problem one layer down — the model literally cannot emit invalid output. Adding a new backend is reduced to the API call shape.
 
-**What is the "Watermarked" category?** A photo that passes every other gate (photoreal, real human, scores above threshold, not NSFW) but the model flagged a watermark. The shot is salvageable if you remove the overlay; the bucket exists so you don't lose those to DISCARD.
+**What is the "Watermarked" category?** A photo that passes every other gate (photoreal, real human, scores above threshold, not NSFW) but the model flagged a watermark. The shot is salvageable if you remove the overlay; the bucket exists so you don't lose those to DISCARD. (It belongs to the retained `photoreal_portrait` preset — the general `default` and themed presets use their own buckets.)
+
+**What presets ship with cull, and how do I start a job?** A new job inherits the general `default` preset — a topic-agnostic Keep / Borderline / OffTopic triage with no person or subject gates. The Presets tab also ships themed starters (aerial/drone, underwater, wildlife & macro, product, anime/illustration) plus a photoreal-portrait and a quality-only preset. Pick one when you create the job, or clone any preset and tweak its categories, judgement rules, scoring and topic filters. Hover the ⓘ next to a field for guidance and example values.
+
+**How do I check a scraper's credentials actually work?** Every scraper with auth has a **Test connection** button — next to its credential in Global Settings (Civitai, X/Twitter, Reddit, Discord) and on each row of a job's Scrapers tab. It makes a real, cheap authenticated call and reports ✓/✗ with latency, so you can confirm a key, cookie, or token before kicking off a run — you can even test a freshly typed credential before saving it.
 
 **How do I add a new scraper?** Copy `pipeline_code/scraper_civitai.py`, swap the API specifics, register in `run_pipeline.compute_desired_agents`, add a row in `_STATIC_SCRAPERS` so it shows up as a toggle. The `SeenStore` and `credentials` helpers handle dedup and key resolution.
 

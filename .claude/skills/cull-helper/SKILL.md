@@ -16,6 +16,7 @@ cull is a single-machine curation engine for AI-generated images. Pulls from man
    | Concern | Module |
    |---|---|
    | Job state (config / queue / active) | `pipeline_code/job_config.py` |
+   | Shipped starter preset library | `pipeline_code/builtin_presets.py` |
    | Categories | `pipeline_code/categories.py` |
    | Vision worker registration | `pipeline_code/vision_workers.py` |
    | Vision worker scaffolding | `pipeline_code/vision_worker_base.py` |
@@ -23,6 +24,7 @@ cull is a single-machine curation engine for AI-generated images. Pulls from man
    | Queue (FS by default) | `pipeline_code/queue_manager.py` |
    | Per-source dedup | `pipeline_code/seen_store.py` |
    | API credentials | `pipeline_code/credentials.py` |
+   | Scraper connectivity / auth test | `pipeline_code/scraper_test.py` |
    | Logging | `pipeline_code/pipeline_logging.py` |
    | Classification prompt + schema | `pipeline_code/vision_prompt.py` |
 
@@ -40,7 +42,7 @@ cull is a single-machine curation engine for AI-generated images. Pulls from man
 
 cull runs one **active job** at a time. Config is split: a global **preset library** (`data/jobs/_presets.json`) holds the inheritable config; a **Job** (`data/jobs/<slug>.json` = `{slug, name, status, created_at, updated_at, subject, preset, overrides}`) references a preset and stores only sparse overrides (queue order + active pointer in `data/jobs/_index.json`). `pipeline_code/job_config.py` is the single source of truth for jobs AND presets — never scatter job state elsewhere. Read it directly; the design docs are gitignored and may drift.
 
-1. **Effective config = preset ⊕ overrides.** `job_config.effective_config(job)` deep-merges the job's `overrides` over `get_preset(job.preset)` and injects `subject` as `topic.topic`, returning the v1-shaped dict (`topic`/`scrapers`/`categories`/`category_rules`/`scoring`/`captioning`) the runtime mappers consume. Edit a field with `set_override(job, "dotted.path", value)`; revert with `reset_override(job, path)` (prunes emptied parents); test with `is_overridden(job, path)`. Lists override wholesale. Preset CRUD: `list_presets`/`get_preset`/`save_preset`/`delete_preset`/`set_default_preset`/`default_preset_name` (`PRESET_NAME_RE` guards names; `delete_preset` refuses the default or a referenced preset).
+1. **Effective config = preset ⊕ overrides.** `job_config.effective_config(job)` deep-merges the job's `overrides` over `get_preset(job.preset)` and injects `subject` as `topic.topic`, returning the v1-shaped dict (`topic`/`scrapers`/`categories`/`category_rules`/`scoring`/`captioning`) the runtime mappers consume. Edit a field with `set_override(job, "dotted.path", value)`; revert with `reset_override(job, path)` (prunes emptied parents); test with `is_overridden(job, path)`. Lists override wholesale. Preset CRUD: `list_presets`/`get_preset`/`save_preset`/`delete_preset`/`set_default_preset`/`default_preset_name` (`PRESET_NAME_RE` guards names; `delete_preset` refuses the default or a referenced preset). The shipped starter library lives in `pipeline_code/builtin_presets.py` — the `default` general dataset-prep preset (Keep/Borderline/OffTopic, **no** influencer/person gates) plus themed `aerial_drone`/`underwater_marine`/`wildlife_macro`/`product_ecommerce`/`anime_illustration` and the retained `photoreal_portrait`/`quality_only`. `_read_presets` seeds it on a fresh install and **additively** merges any new builtin presets into an existing library without clobbering user edits. To add/rename a shipped preset, edit `builtin_presets.py` (sparse bundles merged over `_default_preset_cfg`); don't hand-write `_presets.json`.
 2. **Projection, not rewiring.** *Activating* a job projects its EFFECTIVE config down. `job_config.resolve_env(job)` flattens it into the existing env-var names (`PIPELINE_TOPIC`, `X_ACCOUNTS`, `SCRAPER_DISABLED`, `VISION_OVR_MIN_SCORE`, `AUTO_CAPTION_*`, `LOCAL_IMPORTS_JSON`, …) merged over the global `.env` at spawn; `job_config.project_categories(job)` writes the taxonomy into `data/cull_categories.json`. `job_config.activate(slug)` does both. **Scrapers and vision workers stay env-driven and unchanged — they still read `os.environ`.**
 3. **Multi-folder local imports / no ZForFree.** `scrapers.local_imports` is a **list** of `{name, dir, enabled, migrate_from}`; `resolve_env` emits enabled ones as `LOCAL_IMPORTS_JSON` and the supervisor fans them into per-agent `LOCAL_IMPORT_*` envs. ZForFree-local is gone — `SCRAPER_NAMES` has no `ZFF-Local`; don't reintroduce it.
 4. **Add/rename an inheritable field:** add it to `_default_preset_cfg` in `job_config.py`, map it in `resolve_env` (or `effective_config`), and wire the override dotted-path into the dashboard editor. Keep the three in lockstep — a field with no `resolve_env` mapping never reaches the workers.
@@ -58,6 +60,7 @@ cull runs one **active job** at a time. Config is split: a global **preset libra
 6. Register in `run_pipeline.py` `compute_desired_agents` (search for `add(AgentSpec(label="...", script="scraper_..."`).
 7. Add a row to `_STATIC_SCRAPERS` in `dashboard_enhanced.py` so it shows up in the Scrapers tab toggle list.
 8. Add the credential key to `SETTINGS_KEYS` in `dashboard_enhanced.py` so admins can enter it via UI.
+9. If it authenticates (key / token / cookies), add a `_check_<name>` to `scraper_test.py` and register it in `SUPPORTED` + `_CHECKERS`. The per-scraper **Test connection** button (Global Settings + the per-job Scrapers tab) then surfaces it automatically via `POST /api/scrapers/test` — keep all HTTP behind `_http_request` (so tests can monkeypatch it) and guard any user-supplied URL with `_is_safe_public_url`.
 
 ### Add a new vision provider
 
@@ -90,17 +93,17 @@ cull runs one **active job** at a time. Config is split: a global **preset libra
 ### Smoke-test before committing
 
 ```bash
-python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; [importlib.import_module(m) for m in (
-  'paths','pipeline_logging','categories','vision_workers','vision_prompt',
-  'queue_manager','topic_filter','seen_store','credentials',
+python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; mods=(
+  'paths','pipeline_logging','categories','job_config','builtin_presets','vision_workers','vision_prompt',
+  'queue_manager','topic_filter','seen_store','credentials','scraper_test',
   'feed_local_folder','feed_zforfree_local',
-  'scraper_civitai','scraper_civitai_search','scraper_x','scraper_discord','scraper_web',
+  'scraper_civitai','scraper_civitai_search','scraper_x','scraper_discord','scraper_web','scraper_gallery_dl',
   'vision_worker_base','vision_worker_balanced_lm','vision_worker_balanced_groq',
   'vision_worker_lm_autodetect','vision_worker_lm_keepalive','vision_worker',
-  'run_pipeline','integrated_launcher','dashboard_enhanced')]; print('all 25 modules import')"
+  'run_pipeline','integrated_launcher','dashboard_enhanced'); [importlib.import_module(m) for m in mods]; print(f'all {len(mods)} modules import')"
 ```
 
-If that prints `all 25 modules import`, your changes haven't broken any import-time invariants.
+If that prints the module count (`all N modules import`), your changes haven't broken any import-time invariants.
 
 ## Anti-patterns to call out in code review
 
