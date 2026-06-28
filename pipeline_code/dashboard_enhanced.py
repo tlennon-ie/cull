@@ -113,6 +113,7 @@ from lmstudio_admin import unload_all as _lmstudio_unload_all
 import index_store
 import thumb_cache
 import job_config
+import scraper_test
 import paths as _paths
 
 # Now that job_config is importable, derive the canonical scraper toggle list
@@ -1144,6 +1145,31 @@ def api_vision_test():
         return _done(False, f"unknown provider: {provider!r}", 400)
     except requests.RequestException as exc:
         return _done(False, f"connection error: {exc}")
+
+
+@app.route("/api/scrapers/test", methods=["POST"])
+def api_scrapers_test():
+    """Live connectivity + auth probe for one scraper.
+
+    Body: ``{"scraper": "<name>", "settings": {<cred form values>}?, "config": {<targets>}?}``
+    Credentials resolve from the live process env, overlaid with any NON-MASKED
+    values the user has typed in the Settings form — so an unsaved key can be
+    tested immediately, while a masked secret falls back to the stored value.
+    Returns scraper_test.test_scraper's ``{ok, message, latency_ms, detail}``.
+    """
+    data = request.get_json() or {}
+    name = (data.get("scraper") or "").strip()
+    if name not in scraper_test.SUPPORTED:
+        return jsonify({"ok": False, "message": f"unsupported scraper: {name}",
+                        "latency_ms": None, "detail": ""}), 400
+    env = dict(os.environ)
+    form = data.get("settings")
+    if isinstance(form, dict):
+        for key, val in form.items():
+            if key in SETTINGS_KEYS and isinstance(val, str) and val != SECRET_MASK:
+                env[key] = val
+    config = data.get("config") if isinstance(data.get("config"), dict) else None
+    return jsonify(scraper_test.test_scraper(name, config=config, env=env))
 
 
 @app.route("/api/vision/provider", methods=["POST"])
@@ -2607,6 +2633,17 @@ def api_gallery_download():
 HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 <span class="tip" tabindex="0" aria-label="Help"><span class="tip-i" aria-hidden="true">i</span><span class="tip-pop" role="tooltip">{{ body|safe }}{% if example %}<span class="ex">{{ example|safe }}</span>{% endif %}</span></span>
 {%- endmacro -%}
+{% macro testbtn(scraper, label='Test connection') -%}
+<div class="mt-1.5 flex items-center gap-2 flex-wrap">
+  <button type="button" @click="testScraper('{{ scraper }}')" :disabled="scraperTest['{{ scraper }}']?.pending"
+    class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+    <span x-text="scraperTest['{{ scraper }}']?.pending ? 'Testing…' : '{{ label }}'"></span>
+  </button>
+  <span x-show="scraperTest['{{ scraper }}'] && !scraperTest['{{ scraper }}'].pending" class="text-xs"
+    :class="scraperTest['{{ scraper }}']?.ok ? 'text-emerald-400' : 'text-rose-400'"
+    x-text="(scraperTest['{{ scraper }}']?.ok ? '✓ ' : '✕ ') + (scraperTest['{{ scraper }}']?.message || '') + (scraperTest['{{ scraper }}']?.latency_ms != null ? ' (' + scraperTest['{{ scraper }}'].latency_ms + 'ms)' : '')"></span>
+</div>
+{%- endmacro -%}
 <!doctype html>
 <html lang="en" class="dark">
 <head>
@@ -3425,17 +3462,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <div>
               <div class="font-medium" x-text="s.name"></div>
               <div class="text-xs text-slate-400" x-text="s.description"></div>
+              <div x-show="scraperTest[s.name] && !scraperTest[s.name].pending" class="text-xs mt-0.5"
+                :class="scraperTest[s.name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                x-text="(scraperTest[s.name]?.ok ? '✓ ' : '✕ ') + (scraperTest[s.name]?.message || '') + (scraperTest[s.name]?.latency_ms != null ? ' (' + scraperTest[s.name].latency_ms + 'ms)' : '')"></div>
             </div>
             <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
             <template x-if="s.kind !== 'local'">
-              <label class="inline-flex items-center cursor-pointer gap-2">
-                <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-                <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
-                  class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                    checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                    before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                    checked:before:translate-x-5"/>
-              </label>
+              <div class="flex items-center gap-3 shrink-0">
+                <button type="button" @click="testScraper(s.name)" :disabled="scraperTest[s.name]?.pending"
+                  class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="scraperTest[s.name]?.pending ? 'Testing…' : 'Test'"></span>
+                </button>
+                <label class="inline-flex items-center cursor-pointer gap-2">
+                  <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
+                  <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
+                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                      checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                      before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                      checked:before:translate-x-5"/>
+                </label>
+              </div>
             </template>
             <template x-if="s.kind === 'local'">
               <span class="pill px-2 py-0.5 rounded" :class="s.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'" x-text="s.enabled ? 'enabled' : 'disabled'"></span>
@@ -4208,6 +4254,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <input x-model="settings.DISCORD_BOT_TOKEN" type="password"
                    placeholder="paste token, no quotes"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Discord-1') }}
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Auth mode{{ tip('How the token is sent: <b>auto</b> tries a Bot prefix then falls back, <b>bot</b> forces <code>Bot &lt;token&gt;</code>, <b>user</b> sends a raw user token.') }}</span>
@@ -4294,17 +4341,20 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <span class="text-xs text-slate-400">CIVITAI_API_KEY{{ tip('API key for civitai.com — get one at civitai.com under Account settings &rarr; API Keys. Needed for the Civitai-Com scraper.') }}</span>
             <input x-model="settings.CIVITAI_API_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Civitai-Com') }}
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY{{ tip('API key for the civitai.red mirror. Falls back to CIVITAI_API_KEY when left blank.') }}</span>
             <input x-model="settings.CIVITAI_API_RED_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Civitai-Red') }}
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}</span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            {{ testbtn('X.com') }}
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">REDDIT_CLIENT_ID{{ tip('Optional. Create a &quot;script&quot; app at reddit.com/prefs/apps for higher rate limits; the scraper still works unauthenticated without it.') }}</span>
@@ -4320,6 +4370,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <span class="text-xs text-slate-400">REDDIT_USER_AGENT{{ tip('Identifies your client to Reddit — use a unique, descriptive string.', 'e.g. cull/0.1 by your_username') }}</span>
             <input x-model="settings.REDDIT_USER_AGENT" placeholder="cull/0.1"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Reddit') }}
           </label>
         </div>
       </div>
@@ -4666,6 +4717,22 @@ function dashboard() {
       const value = d.input ? (result ? d.inputValue : null) : result;
       this.confirmDialog = { ...d, open: false, _resolve: null };
       if (resolve) resolve(value);
+    },
+    // Live connectivity/auth test for one scraper. Sends the current Settings
+    // form values (server skips masked secrets, falling back to the stored env).
+    async testScraper(name, config = null) {
+      this.scraperTest = { ...this.scraperTest, [name]: { pending: true } };
+      try {
+        const r = await fetch('/api/scrapers/test', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scraper: name, settings: this.settings, config }),
+        });
+        const j = await r.json();
+        this.scraperTest = { ...this.scraperTest, [name]: {
+          pending: false, ok: !!j.ok, message: j.message || '', latency_ms: j.latency_ms } };
+      } catch (e) {
+        this.scraperTest = { ...this.scraperTest, [name]: { pending: false, ok: false, message: 'request failed' } };
+      }
     },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',

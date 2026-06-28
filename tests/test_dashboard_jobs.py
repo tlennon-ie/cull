@@ -601,5 +601,56 @@ def test_force_delete_removes_data_dirs(client):
     assert jc.get_job("trash") is None
 
 
+# ── scraper connectivity / auth test endpoint ────────────────────────────────
+
+def test_scrapers_test_rejects_unsupported(client):
+    c, _jc, _tmp = client
+    r = c.post("/api/scrapers/test", json={"scraper": "Nope"})
+    assert r.status_code == 400
+    assert r.get_json()["ok"] is False
+
+
+def test_scrapers_test_returns_module_result(client, monkeypatch):
+    c, _jc, _tmp = client
+    import scraper_test
+    monkeypatch.setattr(scraper_test, "test_scraper",
+                        lambda name, config=None, env=None: {
+                            "ok": True, "message": "authenticated OK",
+                            "latency_ms": 12, "detail": name})
+    r = c.post("/api/scrapers/test", json={"scraper": "Civitai-Com"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["detail"] == "Civitai-Com"
+
+
+def test_scrapers_test_typed_value_used_mask_falls_back(client, monkeypatch):
+    """A freshly typed cred is tested as-is; a masked secret falls back to the
+    stored env value so an untouched field still tests the real credential."""
+    c, _jc, _tmp = client
+    import scraper_test
+    seen = {}
+
+    def _capture(name, config=None, env=None):
+        seen["env"] = env
+        return {"ok": True, "message": "ok", "latency_ms": 1, "detail": ""}
+
+    monkeypatch.setattr(scraper_test, "test_scraper", _capture)
+    monkeypatch.setenv("CIVITAI_API_KEY", "REAL_STORED_KEY")
+    r = c.post("/api/scrapers/test", json={
+        "scraper": "Civitai-Com",
+        "settings": {"CIVITAI_API_RED_KEY": "TYPED_NEW", "CIVITAI_API_KEY": "********"},
+    })
+    assert r.status_code == 200
+    env = seen["env"]
+    assert env["CIVITAI_API_RED_KEY"] == "TYPED_NEW"       # typed value passed through
+    assert env["CIVITAI_API_KEY"] == "REAL_STORED_KEY"     # mask fell back to stored
+
+
+def test_scrapers_test_never_500s_on_bad_body(client):
+    c, _jc, _tmp = client
+    r = c.post("/api/scrapers/test", json={})
+    assert r.status_code == 400
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
