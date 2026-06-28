@@ -98,6 +98,7 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "DISCORD_BOT_TOKEN", "DISCORD_AUTH_MODE",
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
+    "YT_DLP_URLS", "YT_DLP_COOKIES", "YT_DLP_LIMIT",
     "REQUIRE_PROMPT",
     "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
@@ -368,6 +369,16 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
         and (os.environ.get("GALLERY_DL_URLS", "") or "").strip()
     ):
         add(AgentSpec(label="Gallery-DL", script="scraper_gallery_dl.py", loop_sleep=1800))
+
+    # yt-dlp video scraper (YouTube, TikTok, X, Reddit, Vimeo, Twitch clips —
+    # anything yt-dlp knows). Gated identically to gallery-dl: desired only when
+    # the toggle is on AND at least one URL is configured, otherwise the
+    # supervisor would respawn an empty agent every loop_sleep.
+    if (
+        os.environ.get("YT_DLP_ENABLED", "false").lower() == "true"
+        and (os.environ.get("YT_DLP_URLS", "") or "").strip()
+    ):
+        add(AgentSpec(label="YT-DLP", script="scraper_yt_dlp.py", loop_sleep=1800))
 
     # Local vision-worker fleet (LM Studio / llama.cpp / Ollama) — one worker per
     # enabled instance in VISION_WORKERS_JSON, fanned out like local folders above.

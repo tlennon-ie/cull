@@ -25,7 +25,8 @@ if str(PIPELINE_CODE) not in sys.path:
 import builtin_presets as bp  # noqa: E402
 
 
-# Themed presets the user signed off on (general "default" + 7 themes).
+# Themed presets the user signed off on (general "default" + 7 image themes +
+# the video-dataset family added in the roadmap wave-1 push).
 EXPECTED_PRESETS = {
     "default",            # general dataset-prep triage — the new shipped default
     "aerial_drone",
@@ -35,6 +36,12 @@ EXPECTED_PRESETS = {
     "anime_illustration",
     "photoreal_portrait",  # retained influencer/portrait taxonomy (NOT default)
     "quality_only",        # retained quality-only triage
+    # video-dataset presets (LTX-Video / Wan / Hunyuan / CogVideoX audiences)
+    "video_default",
+    "video_cinematic",
+    "video_anime",
+    "video_product",
+    "video_nature",
 }
 
 # Real photo themes curate image-first (often no generation prompt); AI-gen
