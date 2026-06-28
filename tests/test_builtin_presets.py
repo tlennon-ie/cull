@@ -209,6 +209,26 @@ def test_all_presets_have_a_nonzero_ovr_floor():
         assert cfg["scoring"]["ovr_min"] > 0, name
 
 
+def test_every_preset_seeds_banned_keywords():
+    # No preset relies on the invisible runtime spam-list fallback — each carries
+    # its own banned list (spam terms + theme exclusions), so the field is visible.
+    for name, cfg in bp.builtin_library()["presets"].items():
+        banned = cfg["topic_filters"]["banned_keywords"]
+        assert banned, name
+        assert "onlyfans" in banned, name          # spam baseline carried forward
+
+
+def test_generation_hints_seeded_except_lenient_presets():
+    presets = bp.builtin_library()["presets"]
+    for name in ("aerial_drone", "underwater_marine", "wildlife_macro",
+                 "product_ecommerce", "anime_illustration", "photoreal_portrait"):
+        assert presets[name]["topic_filters"]["generation_hints"], name
+    # default + quality_only stay lenient: a generation-hint gate there would
+    # silently reject any prompt missing those markers.
+    assert presets["default"]["topic_filters"]["generation_hints"] == []
+    assert presets["quality_only"]["topic_filters"]["generation_hints"] == []
+
+
 def test_resolve_env_projects_seeded_scraper_targets(isolated):
     jc, _ = isolated
     job = jc.create_job("Aerial Set", preset="aerial_drone")

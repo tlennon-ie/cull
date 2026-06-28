@@ -3745,12 +3745,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 </select>
                 <input :value="w.base_url" @change="setFleetField(idx,'base_url',$event.target.value)" placeholder="http://host:port"
                        class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"/>
-                <input :value="w.model" @change="setFleetField(idx,'model',$event.target.value)" placeholder="Model (blank = auto)"
-                       :list="'fleet-models-'+idx"
-                       class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <datalist :id="'fleet-models-'+idx">
-                  <template x-for="m in (fleetTest[idx]?.models || [])" :key="m"><option :value="m"></option></template>
-                </datalist>
+                <select @change="setFleetField(idx,'model',$event.target.value)" title="Run Test to load the model list"
+                        class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+                  <option value="" :selected="!w.model">(auto-detect on connect)</option>
+                  <template x-for="m in fleetModelOptions(idx)" :key="m">
+                    <option :value="m" :selected="m === w.model" x-text="m"></option>
+                  </template>
+                </select>
               </div>
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="setFleetField(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
@@ -4478,8 +4479,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       <template x-for="p in visionProviders" :key="'pep_'+p"><option :value="p" :selected="p === w.provider" x-text="visionProviderLabels[p]"></option></template>
                     </select>
                     <input :value="w.base_url" @change="peSetFleet(idx,'base_url',$event.target.value)" placeholder="http://host:port" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono"/>
-                    <input :value="w.model" @change="peSetFleet(idx,'model',$event.target.value)" placeholder="Model (blank = auto)" :list="'pe-fleet-models-'+idx" class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-                    <datalist :id="'pe-fleet-models-'+idx"><template x-for="m in (peFleetTest[idx]?.models || [])" :key="'pem_'+m"><option :value="m"></option></template></datalist>
+                    <select @change="peSetFleet(idx,'model',$event.target.value)" title="Run Test to load the model list" class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                      <option value="" :selected="!w.model">(auto-detect)</option>
+                      <template x-for="m in peFleetModelOptions(idx)" :key="'pem_'+m"><option :value="m" :selected="m === w.model" x-text="m"></option></template>
+                    </select>
                   </div>
                   <div class="grid md:grid-cols-12 gap-2 mt-1 items-center">
                     <input type="password" :value="w.api_key" @change="peSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)" autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
@@ -4552,6 +4555,64 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="$refs.configImport.click()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Import config / preset / job…</button>
           <input x-ref="configImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
         </div>
+      </div>
+
+      <!-- Vision workers (global default fleet) — edits the default preset every
+           job inherits. A job can override it in its own Vision tab. Saves via the
+           preset PUT (NOT .env), so .stop keeps it from marking the .env form dirty. -->
+      <div class="card rounded-xl p-5" @change.stop @input.stop>
+        <div class="flex items-start justify-between gap-4 mb-1">
+          <div>
+            <h3 class="font-semibold">Vision workers <span class="text-xs font-normal text-slate-500">(global default)</span></h3>
+            <p class="text-xs text-slate-400">The local LLM fleet every job inherits (the <span class="font-mono" x-text="globalVision.preset || 'default'"></span> preset) — a job can override it in its own Vision tab. Pick LM Studio / llama.cpp / Ollama, set the URL, <b>Test</b> to load models (leave Model blank to auto-detect). Private / LAN / Tailscale URLs are fine.</p>
+          </div>
+          <button @click="loadGlobalVision()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded shrink-0">Reload</button>
+        </div>
+        <div class="space-y-2 mt-2" x-show="globalVision.loaded">
+          <template x-for="(w, idx) in gFleet()" :key="idx">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3">
+              <div class="grid md:grid-cols-12 gap-2">
+                <input :value="w.name" @change="gSetFleet(idx,'name',$event.target.value)" placeholder="Name"
+                       class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
+                <select @change="gSetFleet(idx,'provider',$event.target.value)"
+                        class="md:col-span-2 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+                  <template x-for="p in visionProviders" :key="'gp_'+p">
+                    <option :value="p" :selected="p === w.provider" x-text="visionProviderLabels[p]"></option>
+                  </template>
+                </select>
+                <input :value="w.base_url" @change="gSetFleet(idx,'base_url',$event.target.value)" placeholder="http://host:port"
+                       class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"/>
+                <select @change="gSetFleet(idx,'model',$event.target.value)" title="Run Test to load the model list"
+                        class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+                  <option value="" :selected="!w.model">(auto-detect on connect)</option>
+                  <template x-for="m in gFleetModelOptions(idx)" :key="'gm_'+m">
+                    <option :value="m" :selected="m === w.model" x-text="m"></option>
+                  </template>
+                </select>
+              </div>
+              <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
+                <input type="password" :value="w.api_key" @change="gSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
+                       autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
+                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
+                  <input type="checkbox" :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
+                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                </label>
+                <div class="md:col-span-6 flex items-center gap-2 justify-end">
+                  <span class="text-xs truncate max-w-[16rem]" x-show="globalFleetTest[idx] && !globalFleetTest[idx].testing"
+                        :class="globalFleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="globalFleetTest[idx]?.message"></span>
+                  <button @click="gTestFleet(idx)" :disabled="!!globalFleetTest[idx]?.testing"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                    <span x-text="globalFleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span>
+                  </button>
+                  <button @click="gRemoveFleet(idx)" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Remove</button>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div x-show="!gFleet().length" class="text-xs text-slate-500 italic">No vision workers — add one so images get classified.</div>
+        </div>
+        <button @click="gAddFleet()" x-show="globalVision.loaded" class="mt-2 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
+        <div x-show="!globalVision.loaded" class="text-xs text-slate-500 italic mt-2">Loading…</div>
       </div>
 
       <div class="card rounded-xl p-5">
@@ -5011,6 +5072,10 @@ function dashboard() {
     visionProviderLabels: { lmstudio: 'LM Studio', llamacpp: 'llama.cpp / vLLM', ollama: 'Ollama' },
     fleetTest: {},     // job-tab row idx -> { testing, ok, message, models }
     peFleetTest: {},   // preset-editor row idx -> same
+    // Global vision fleet (Settings tab) — edits the default preset's workers.
+    globalVision: { loaded: false, preset: '', cfg: null },
+    globalFleetTest: {},
+    _gvTimer: null,
     // Global Stats per-job filter (null = all jobs aggregate).
     globalStatsJob: '',
     // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
@@ -5601,6 +5666,12 @@ function dashboard() {
     peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
     // Preset-editor vision fleet (global default fleet jobs inherit).
     peFleet() { const v = this._deepGet(this.presetEditor.cfg, 'vision.workers'); return Array.isArray(v) ? v : []; },
+    peFleetModelOptions(idx) {
+      const w = this.peFleet()[idx] || {};
+      const fetched = (this.peFleetTest[idx] && this.peFleetTest[idx].models) || [];
+      const head = (w.model && !fetched.includes(w.model)) ? [w.model] : [];
+      return head.concat(fetched);
+    },
     peSetFleet(idx, field, val) { const l = this.peFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; this.peSet('vision.workers', l); },
     peAddFleet() { const l = this.peFleet().map(w => ({ ...w })); l.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio', base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true }); this.peSet('vision.workers', l); },
     peRemoveFleet(idx) { const l = this.peFleet().map(w => ({ ...w })); l.splice(idx, 1); this.peFleetTest = {}; this.peSet('vision.workers', l); },
@@ -5613,6 +5684,54 @@ function dashboard() {
           message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`, models: j.models || [] };
         if (j.ok && (j.models || []).length && !(w.model || '').trim()) this.peSetFleet(idx, 'model', j.models[0]);
       } catch (e) { this.peFleetTest[idx] = { testing: false, ok: false, message: '✗ network error', models: [] }; }
+    },
+    // ── Global vision fleet (Settings tab) — edits the DEFAULT preset's workers ──
+    async loadGlobalVision() {
+      try {
+        const lib = await fetch('/api/presets').then(r => r.json());
+        const name = lib.default || 'default';
+        const d = await fetch('/api/presets/' + encodeURIComponent(name)).then(r => r.json());
+        const cfg = d.cfg || {};
+        cfg.vision = cfg.vision || {};
+        if (!Array.isArray(cfg.vision.workers)) cfg.vision.workers = [];
+        this.globalVision = { loaded: true, preset: name, cfg };
+        this.globalFleetTest = {};
+      } catch (e) { /* swallow — card just stays empty */ }
+    },
+    gFleet() { const c = this.globalVision.cfg; return (c && c.vision && Array.isArray(c.vision.workers)) ? c.vision.workers : []; },
+    gFleetModelOptions(idx) {
+      const w = this.gFleet()[idx] || {};
+      const fetched = (this.globalFleetTest[idx] && this.globalFleetTest[idx].models) || [];
+      const head = (w.model && !fetched.includes(w.model)) ? [w.model] : [];
+      return head.concat(fetched);
+    },
+    _gWrite(list) {
+      if (!this.globalVision.cfg) return;
+      this.globalVision.cfg.vision = this.globalVision.cfg.vision || {};
+      this.globalVision.cfg.vision.workers = list;
+      this._scheduleGlobalVisionSave();
+    },
+    gSetFleet(idx, field, val) { const l = this.gFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; this._gWrite(l); },
+    gAddFleet() { const l = this.gFleet().map(w => ({ ...w })); l.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio', base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true }); this._gWrite(l); },
+    gRemoveFleet(idx) { const l = this.gFleet().map(w => ({ ...w })); l.splice(idx, 1); this.globalFleetTest = {}; this._gWrite(l); },
+    async gTestFleet(idx) {
+      const w = this.gFleet()[idx]; if (!w) return;
+      this.globalFleetTest[idx] = { testing: true, ok: null, message: 'Connecting…', models: [] };
+      try {
+        const j = await this._visionTest(w.provider, w.base_url, w.api_key);
+        this.globalFleetTest[idx] = { testing: false, ok: j.ok,
+          message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`, models: j.models || [] };
+        if (j.ok && (j.models || []).length && !(w.model || '').trim()) this.gSetFleet(idx, 'model', j.models[0]);
+      } catch (e) { this.globalFleetTest[idx] = { testing: false, ok: false, message: '✗ network error', models: [] }; }
+    },
+    _scheduleGlobalVisionSave() { if (this._gvTimer) clearTimeout(this._gvTimer); this._gvTimer = setTimeout(() => this._saveGlobalVision(), 700); },
+    async _saveGlobalVision() {
+      if (!this.globalVision.cfg || !this.globalVision.preset) return;
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(this.globalVision.preset),
+          { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cfg: this.globalVision.cfg }) });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); this.notify('Vision fleet save failed: ' + (j.error || r.status), 'error'); }
+      } catch (e) { this.notify('Vision fleet save failed (network)', 'error'); }
     },
     peLocalFolders() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.local_imports'); return Array.isArray(v) ? v : []; },
     peAddLocal() { const l = this.peLocalFolders().slice(); l.push({name:'local'+(l.length||''),dir:'',enabled:false,migrate_from:''}); this.peSet('scrapers.local_imports', l); },
@@ -5693,6 +5812,14 @@ function dashboard() {
     },
     // ── Vision-worker fleet (Job tab: per-job inherit/override of vision.workers) ─
     visionFleet() { const v = this.effVal('vision.workers'); return Array.isArray(v) ? v : []; },
+    // Model <select> options for a row: the current model (if it's a custom value
+    // not in the fetched list) followed by the models Test discovered.
+    fleetModelOptions(idx) {
+      const w = this.visionFleet()[idx] || {};
+      const fetched = (this.fleetTest[idx] && this.fleetTest[idx].models) || [];
+      const head = (w.model && !fetched.includes(w.model)) ? [w.model] : [];
+      return head.concat(fetched);
+    },
     _writeFleet(list) { this.setOverride('vision.workers', list); },
     setFleetField(idx, field, val) {
       const list = this.visionFleet().map(w => ({ ...w }));
@@ -6121,6 +6248,7 @@ function dashboard() {
         if (tab === 'stats') this.loadStats();
         if (tab === 'gstats') this.loadGlobalStats();
         if (tab === 'presets') this.loadPresets();
+        if (tab === 'settings') this.loadGlobalVision();
         if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
           this.loadGallery();
           this.loadGalleryInsights();

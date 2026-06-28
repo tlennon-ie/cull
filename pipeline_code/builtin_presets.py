@@ -65,6 +65,15 @@ _COMMON_RULES = (
 # two-option multiselect (civitai.com / civitai.red), not free text.
 _CIVITAI_BOTH: tuple[str, ...] = ("civitai.com", "civitai.red")
 
+# Promo/spam phrases that are never part of a real generation prompt. Mirrors
+# (in spirit) topic_filter._DEFAULT_BANNED — when a preset seeds its OWN banned
+# list the runtime stops falling back to that default, so every seeded list
+# carries these forward and then adds its theme-specific exclusions on top.
+_SPAM_BANNED: tuple[str, ...] = (
+    "link in bio", "dm me", "onlyfans", "patreon", "subscribe", "follow me",
+    "promo code", "for sale", "commission", "check my",
+)
+
 
 def _preset(
     *,
@@ -146,6 +155,10 @@ def _build_presets() -> dict[str, dict]:
         "default": _preset(
             require_prompt=True,
             ovr_min=40, rel_min=20,
+            banned_keywords=_SPAM_BANNED,
+            # generation_hints intentionally EMPTY: this is the lenient general
+            # triage. Seeding hints turns on a require-a-generation-marker gate
+            # that would drop any prompt lacking those exact words.
             categories=[
                 ("Keep", "Strong on-topic example, no severe AI flaws, no "
                  "watermark/overlay, OVR_Quality_Score >= 60 AND "
@@ -174,6 +187,9 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("aerial", "drone", "overhead", "birds eye", "top-down",
                             "satellite", "from above", "altitude"),
+            banned_keywords=_SPAM_BANNED + ("indoor", "selfie", "anime", "cartoon"),
+            generation_hints=("aerial photograph", "drone shot", "bird's eye view",
+                              "from above", "satellite imagery", "high altitude"),
             reddit_subreddits=("drones", "aerialphotography", "dronephotography",
                                "Multicopter", "SatelliteImages", "fpv", "AerialPorn"),
             x_accounts=("DroneDJ",),
@@ -208,6 +224,10 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("underwater", "scuba", "diving", "reef", "ocean",
                             "marine", "coral", "sea"),
+            banned_keywords=_SPAM_BANNED + ("aquarium", "fish tank", "swimming pool",
+                                            "anime"),
+            generation_hints=("underwater photograph", "scuba diving", "deep sea",
+                              "coral reef", "marine life", "underwater scene"),
             reddit_subreddits=("underwaterphotography", "scuba", "ScubaDiving",
                                "reef", "WaterPorn", "Ocean", "marinebiology"),
             ovr_min=50, rel_min=25,
@@ -242,6 +262,10 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("wildlife", "macro", "insect", "bird", "animal",
                             "nature", "butterfly", "close-up"),
+            banned_keywords=_SPAM_BANNED + ("zoo", "captive", "taxidermy",
+                                            "plush toy", "anime"),
+            generation_hints=("wildlife photography", "macro shot", "telephoto",
+                              "natural habitat", "nature photography", "in the wild"),
             reddit_subreddits=("macro", "wildlifephotography", "macrophotography",
                                "naturephotography", "birdphotography", "insects"),
             x_accounts=("NatGeoPhotos",),
@@ -276,6 +300,10 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("product", "packshot", "studio", "catalog",
                             "e-commerce", "white background", "product photography"),
+            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot"),
+            generation_hints=("product photography", "studio lighting",
+                              "white background", "commercial shot", "packshot",
+                              "catalog photo"),
             reddit_subreddits=("productphotography", "commercialphotography"),
             ovr_min=50, rel_min=25,
             categories=[
@@ -309,6 +337,8 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=True,
             keywords_extra=("anime", "illustration", "manga", "digital art",
                             "character"),
+            banned_keywords=_SPAM_BANNED + ("photograph", "photorealistic",
+                                            "3d render"),
             generation_hints=("anime", "illustration", "masterpiece",
                               "best quality", "detailed"),
             reddit_subreddits=("anime", "awwnime", "Animewallpaper",
@@ -348,8 +378,8 @@ def _build_presets() -> dict[str, dict]:
             theme_rules="",
             keywords_extra=("woman", "model", "portrait", "fashion", "editorial",
                             "photoshoot"),
-            banned_keywords=("onlyfans", "linktr.ee", "telegram", "snapchat",
-                             "cashapp", "promo code"),
+            banned_keywords=_SPAM_BANNED + ("linktr.ee", "telegram", "snapchat",
+                                            "cashapp"),
             generation_hints=("photorealistic", "skin texture", "portrait",
                               "natural light", "studio light", "bokeh", "85mm"),
             reddit_subreddits=("portraits",),
@@ -380,6 +410,9 @@ def _build_presets() -> dict[str, dict]:
         "quality_only": _preset(
             require_prompt=False,
             ovr_min=40, rel_min=0,
+            banned_keywords=_SPAM_BANNED,
+            # generation_hints intentionally EMPTY: topic-agnostic quality triage
+            # — it routes on craft, not on whether the prompt looks AI-generated.
             categories=[
                 ("Top", "OVR_Quality_Score >= 80, no severe AI flaws, no overlay"),
                 ("Mid", "OVR_Quality_Score 60-79"),
