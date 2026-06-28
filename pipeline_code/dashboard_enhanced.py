@@ -2774,7 +2774,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
   <!-- Generic toast stack — top-right. Replaces window.alert(): success/error/
        warn/info messages, auto-dismissing. Driven by notify(message, type). -->
-  <div class="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-none" x-cloak>
+  <div class="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-none">
     <template x-for="t in toasts" :key="t.id">
       <div x-transition.opacity.duration.200ms
            class="pointer-events-auto flex items-start gap-2 rounded-lg shadow-2xl p-3 text-sm border bg-slate-900"
@@ -4685,6 +4685,8 @@ function dashboard() {
     },
     dismissToast(id) { this.toasts = this.toasts.filter(t => t.id !== id); },
     askConfirm(message, opts = {}) {
+      // Cancel-resolve any dialog already open so its awaiter can't hang.
+      if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -4699,6 +4701,7 @@ function dashboard() {
     },
     // Styled replacement for window.prompt(): resolves to the string, or null on cancel.
     askPrompt(message, defaultValue = '', opts = {}) {
+      if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -4722,10 +4725,16 @@ function dashboard() {
     // form values (server skips masked secrets, falling back to the stored env).
     async testScraper(name, config = null) {
       this.scraperTest = { ...this.scraperTest, [name]: { pending: true } };
+      // Send only the credential keys the tester reads — not paths/other settings.
+      const credKeys = ['CIVITAI_API_KEY','CIVITAI_API_RED_KEY','TWITTER_COOKIES',
+                        'DISCORD_BOT_TOKEN','DISCORD_AUTH_MODE',
+                        'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT'];
+      const settings = {};
+      for (const k of credKeys) if (this.settings && this.settings[k] !== undefined) settings[k] = this.settings[k];
       try {
         const r = await fetch('/api/scrapers/test', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scraper: name, settings: this.settings, config }),
+          body: JSON.stringify({ scraper: name, settings, config }),
         });
         const j = await r.json();
         this.scraperTest = { ...this.scraperTest, [name]: {
