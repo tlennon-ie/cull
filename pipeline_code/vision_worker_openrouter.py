@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import BaseVisionWorker, run_subclass
 from vision_worker_openai import OpenAICompatibleClient, _resolve_timeout
@@ -52,12 +53,16 @@ class OpenRouterVisionWorker(BaseVisionWorker):
                 "No OPENROUTER_API_KEY configured. Set it in .env or via the "
                 "dashboard Settings tab."
             )
-        self.model_id: str = os.environ.get(
-            "OPENROUTER_VISION_MODEL", DEFAULT_OPENROUTER_MODEL
-        ).strip() or DEFAULT_OPENROUTER_MODEL
         self.base_url: str = os.environ.get(
             "OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL
         ).strip() or DEFAULT_OPENROUTER_BASE_URL
+        # Autodetect a vision model from OpenRouter's catalogue when none is set;
+        # the frozen default is only the last-resort fallback.
+        model_env = os.environ.get("OPENROUTER_VISION_MODEL", "").strip()
+        self.model_id: str = model_env or catalog.autodetect_model(
+            "openrouter", base_url=self.base_url, api_key=api_key,
+            fallback=DEFAULT_OPENROUTER_MODEL,
+        )
         self._client = OpenAICompatibleClient(
             api_key=api_key,
             base_url=self.base_url,

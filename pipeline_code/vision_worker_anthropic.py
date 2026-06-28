@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
     BaseVisionWorker,
@@ -110,9 +111,12 @@ class AnthropicVisionWorker(BaseVisionWorker):
                 "No ANTHROPIC_API_KEY configured. Set it in .env or via the "
                 "dashboard Settings tab."
             )
-        self.model_id: str = os.environ.get(
-            "ANTHROPIC_VISION_MODEL", DEFAULT_ANTHROPIC_MODEL
-        ).strip() or DEFAULT_ANTHROPIC_MODEL
+        # Autodetect from Anthropic's /v1/models when no model is configured;
+        # the frozen default is only the last-resort fallback.
+        model_env = os.environ.get("ANTHROPIC_VISION_MODEL", "").strip()
+        self.model_id: str = model_env or catalog.autodetect_model(
+            "anthropic", api_key=api_key, fallback=DEFAULT_ANTHROPIC_MODEL,
+        )
         try:
             self.max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "2000"))
         except ValueError:

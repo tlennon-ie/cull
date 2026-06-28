@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
     BaseVisionWorker,
@@ -143,12 +144,16 @@ class OpenAIVisionWorker(BaseVisionWorker):
                 "No OPENAI_API_KEY configured. Set it in .env or via the "
                 "dashboard Settings tab."
             )
-        self.model_id: str = os.environ.get(
-            "OPENAI_VISION_MODEL", DEFAULT_OPENAI_MODEL
-        ).strip() or DEFAULT_OPENAI_MODEL
         self.base_url: str = os.environ.get(
             "OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL
         ).strip() or DEFAULT_OPENAI_BASE_URL
+        # When no model is configured, fetch the provider's catalogue and pick a
+        # vision-capable id; only fall back to the frozen default as a last resort.
+        model_env = os.environ.get("OPENAI_VISION_MODEL", "").strip()
+        self.model_id: str = model_env or catalog.autodetect_model(
+            "openai", base_url=self.base_url, api_key=api_key,
+            fallback=DEFAULT_OPENAI_MODEL,
+        )
         self._client = OpenAICompatibleClient(
             api_key=api_key,
             base_url=self.base_url,

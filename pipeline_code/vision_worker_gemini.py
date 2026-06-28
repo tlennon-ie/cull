@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
     BaseVisionWorker,
@@ -108,9 +109,12 @@ class GeminiVisionWorker(BaseVisionWorker):
                 "No GEMINI_API_KEY / GOOGLE_API_KEY configured. Set one in .env "
                 "or via the dashboard Settings tab."
             )
-        self.model_id: str = os.environ.get(
-            "GEMINI_VISION_MODEL", DEFAULT_GEMINI_MODEL
-        ).strip() or DEFAULT_GEMINI_MODEL
+        # Autodetect from Gemini's model list when none is configured; the
+        # frozen default is only the last-resort fallback.
+        model_env = os.environ.get("GEMINI_VISION_MODEL", "").strip()
+        self.model_id: str = model_env or catalog.autodetect_model(
+            "gemini", api_key=api_key, fallback=DEFAULT_GEMINI_MODEL,
+        )
 
         genai, genai_types = _import_genai()
         self._genai_types = genai_types
