@@ -168,7 +168,15 @@ class BaseVisionWorker(ABC):
         if ctx is None:
             return _Outcome.SKIPPED
 
-        img_bytes = processing_path.read_bytes()
+        # Acquire the bytes to CLASSIFY. For a still that's the file's own bytes.
+        # For a video clip (only when VIDEO_CLASSIFY_ENABLED), we extract a
+        # representative frame and classify the FRAME's bytes — the CLIP itself is
+        # what _finalise then sorts. ``None`` means "skip this clip gracefully"
+        # (no extraction backend / no frame): we leave it claimed as .processing
+        # so it isn't re-popped (no hot loop) and the stale-sweep can recover it.
+        img_bytes = self._acquire_classify_bytes(ctx, processing_path)
+        if img_bytes is None:
+            return _Outcome.SKIPPED
         if not img_bytes:
             processing_path.unlink(missing_ok=True)
             return _Outcome.SKIPPED
@@ -176,6 +184,16 @@ class BaseVisionWorker(ABC):
         small = self._resize_jpeg(img_bytes)
         if small is None:
             return self._finalise_discard(ctx, reason="Image corrupt/invalid format/truncated")
+
+        # Optional cheap pre-stage (gated PREFILTER_ENABLED, default OFF): score
+        # the image's technical quality BEFORE the expensive VLM call and route
+        # obvious rejects (blurry / near-black / tiny / banner-ratio) straight to
+        # DISCARD, saving tokens. Runs on the ORIGINAL bytes (correct resolution /
+        # aspect gates) and is fully fail-open — any prefilter error falls through
+        # to normal classification. NOT inside the .processing rename.
+        prefilter_reason = self._prefilter_reject(img_bytes)
+        if prefilter_reason is not None:
+            return self._finalise_discard(ctx, reason=prefilter_reason)
 
         b64 = base64.standard_b64encode(small).decode()
         prompt_instruction = build_classification_prompt()
@@ -227,6 +245,51 @@ class BaseVisionWorker(ABC):
             metadata=metadata,
         )
 
+    def _acquire_classify_bytes(
+        self, ctx: ClassifyContext, processing_path: Path,
+    ) -> bytes | None:
+        """Return the bytes to classify, or ``None`` to skip the item gracefully.
+
+        * A still image → its own bytes (read from the claimed ``.processing``
+          file). This is the unchanged default path.
+        * A video clip, ONLY when ``VIDEO_CLASSIFY_ENABLED`` → bytes of a single
+          extracted representative frame (the CLIP is sorted later by
+          ``_finalise``; we only classify the frame). ``video_frames`` is imported
+          lazily + defensively so a missing optional dep never crashes the worker.
+
+        Returns ``None`` when a video yields no frame (no backend / extraction
+        failure) so the caller skips that clip without crashing or hot-looping.
+        Never touches the atomic ``.processing`` rename — operates on the
+        already-claimed path.
+        """
+        try:
+            import video_frames
+            is_video = video_frames.is_video(ctx.image_path) and video_frames.is_enabled()
+        except Exception as exc:  # noqa: BLE001 - optional module; fall back to still path
+            logger.debug("video_frames unavailable (%s); treating %s as a still",
+                         exc, ctx.image_path.name)
+            is_video = False
+
+        if not is_video:
+            return processing_path.read_bytes()
+
+        # Video lane: extract one representative frame and classify its bytes.
+        frames: list[Path] = []
+        try:
+            frames = video_frames.extract_keyframes(processing_path, max_frames=1)
+            if not frames:
+                logger.info("no frame extracted from clip %s; skipping",
+                            ctx.image_path.name)
+                return None
+            return frames[0].read_bytes()
+        except Exception as exc:  # noqa: BLE001 - extraction is best-effort; skip the clip
+            logger.warning("frame extraction failed for %s (%s); skipping",
+                           ctx.image_path.name, exc)
+            return None
+        finally:
+            if frames:
+                video_frames.cleanup_frames(frames)
+
     def _resize_jpeg(self, data: bytes) -> bytes | None:
         if not data:
             return None
@@ -246,6 +309,32 @@ class BaseVisionWorker(ABC):
             return buf.getvalue()
         except (OSError, ValueError) as exc:
             logger.debug("resize failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _prefilter_reject(img_bytes: bytes) -> str | None:
+        """Pre-VLM quality gate. Returns a DISCARD reason when the image should
+        be rejected before the model call, or ``None`` to proceed.
+
+        Gated behind ``PREFILTER_ENABLED`` (default OFF) — a no-op returning
+        ``None`` unless explicitly enabled, so default behaviour is unchanged.
+        Lazily imports ``prefilter_aesthetic`` so the worker still runs if the
+        optional module/deps are absent, and is fully FAIL-OPEN: any error (or a
+        passing score) returns ``None`` so the image continues to normal
+        classification rather than being wrongly dropped."""
+        try:
+            import prefilter_aesthetic
+            if not prefilter_aesthetic.is_enabled():
+                return None
+            verdict = prefilter_aesthetic.assess(
+                img_bytes, min_score=prefilter_aesthetic.env_min_score(),
+            )
+            if verdict.get("passed"):
+                return None
+            reasons = verdict.get("reasons") or ["prefilter quality gate failed"]
+            return "Prefilter rejected: " + "; ".join(str(r) for r in reasons)
+        except Exception as exc:  # noqa: BLE001 - fail-open: never drop on prefilter error
+            logger.debug("prefilter skipped (fail-open): %s", exc)
             return None
 
     def _finalise(self, ctx: ClassifyContext, result: dict[str, Any]) -> str:
@@ -294,12 +383,33 @@ class BaseVisionWorker(ABC):
             json.dumps(result, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        # Perceptual-hash the just-sorted image so the Duplicates view has data.
+        # Deferred Wave-1 call-site; purely additive — runs only after the image
+        # is safely in its final sorted path and never breaks finalize.
+        self._store_phash(final_img)
         ovr = result.get("OVR_Quality_Score", 0)
         rel = result.get("REL_Quality_Score", 0)
         logger.info(
             "[%s] OVR:%s REL:%s | %s", final_category, ovr, rel, ctx.image_path.name,
         )
         return final_category
+
+    @staticmethod
+    def _store_phash(final_img: Path) -> None:
+        """Compute + persist the perceptual hash of an already-sorted image.
+
+        Lazily imported so the worker still starts if ``phash_dedup`` /
+        ``index_store`` (or Pillow features they need) are unavailable, and fully
+        swallowed: a perceptual-hash failure must NEVER break finalize. The index
+        row is upserted by the background indexer; ``set_phash`` only annotates it
+        (a no-op when the row isn't indexed yet — the next scan backfills it)."""
+        try:
+            import index_store
+            import phash_dedup
+            phash = phash_dedup.compute_phash(final_img)
+            index_store.set_phash(str(final_img), phash)
+        except Exception as exc:  # noqa: BLE001 - phash is best-effort, never fatal
+            logger.debug("phash store skipped for %s: %s", final_img.name, exc)
 
     def _finalise_discard(self, ctx: ClassifyContext, reason: str) -> str:
         """Special-case: image bytes are unreadable. Skip the API and route
