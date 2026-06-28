@@ -1098,74 +1098,82 @@ def api_settings_post():
 
 @app.route("/api/vision/test", methods=["POST"])
 def api_vision_test():
-    """Verify the user's stored credentials hit a real backend.
+    """Probe one vision endpoint and (for local providers) return its model list.
 
-    Caller passes ``{"provider": "groq"|"lmstudio"}``. We do the
-    cheapest possible probe per provider and return ``{ok, message, latency_ms}``
-    so the Settings UI can surface a working/broken indicator next to each
-    credential field without forcing the user to start the whole pipeline.
+    Body: ``{provider, url?, api_key?}``. ``provider`` is one of groq, lmstudio,
+    llamacpp, ollama, openai-compat. For local providers the caller-supplied
+    ``url``/``api_key`` are probed directly so a worker can be verified BEFORE it
+    is saved, and the discovered models are returned so the UI can fill the model
+    dropdown. Returns ``{ok, message, models, latency_ms, provider}``.
+
+    Security: this is a localhost single-user admin tool whose job is to test
+    user-entered GPU endpoints — which live on private / LAN / Tailscale / link-
+    local addresses. We therefore do NOT block private IPs (that would defeat the
+    feature); the only guard is an http(s) scheme check.
     """
     import time as _t
     data = request.get_json() or {}
     provider = (data.get("provider") or "").strip().lower()
+    body_url = (data.get("url") or "").strip()
+    body_key = (data.get("api_key") or "").strip()
     started = _t.time()
 
-    def _done(ok: bool, message: str, status: int = 200) -> Any:
+    def _done(ok: bool, message: str, status: int = 200, models: list | None = None) -> Any:
         return jsonify({
-            "ok": ok, "message": message,
-            "latency_ms": int((_t.time() - started) * 1000),
-            "provider": provider,
+            "ok": ok, "message": message, "models": models or [],
+            "latency_ms": int((_t.time() - started) * 1000), "provider": provider,
         }), status
+
+    def _http(u: str) -> bool:
+        return bool(re.match(r"^https?://", u, re.I))
 
     try:
         import requests
-        if provider == "lmstudio":
-            url = (data.get("url") or os.environ.get("LMSTUDIO_PRIMARY_URL", "")).rstrip("/")
-            if not url:
-                return _done(False, "no LMSTUDIO_PRIMARY_URL configured", 400)
-            r = requests.get(f"{url}/v1/models", timeout=5)
-            if r.status_code != 200:
-                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
-            payload = r.json()
-            n = len(payload.get("data") or [])
-            return _done(True, f"connected, {n} model(s) loaded")
         if provider == "groq":
-            key = os.environ.get("GROQ_API_KEY", "") or (
-                os.environ.get("GROQ_API_KEYS", "").split(",")[0].strip()
-            )
+            key = body_key or os.environ.get("GROQ_API_KEY", "") or (
+                os.environ.get("GROQ_API_KEYS", "").split(",")[0].strip())
             if not key:
                 return _done(False, "no GROQ_API_KEY configured", 400)
-            r = requests.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=10,
-            )
+            r = requests.get("https://api.groq.com/openai/v1/models",
+                             headers={"Authorization": f"Bearer {key}"}, timeout=10)
             if r.status_code == 401:
                 return _done(False, "401 Unauthorized - key invalid")
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
             return _done(True, "Groq key accepted")
+
         if provider == "ollama":
-            # URL from env only (never the request body) — avoids an SSRF probe.
-            url = (os.environ.get("OLLAMA_URL", "") or "http://127.0.0.1:11434").rstrip("/")
-            r = requests.get(f"{url}/api/tags", timeout=5)
-            if r.status_code != 200:
-                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
-            n = len(r.json().get("models") or [])
-            return _done(True, f"connected, {n} model(s) available")
-        if provider in ("openai-compat", "openai_compat"):
-            url = os.environ.get("OPENAI_COMPAT_URL", "").rstrip("/")  # env only (no SSRF)
-            if not url:
-                return _done(False, "no OPENAI_COMPAT_URL configured", 400)
-            key = os.environ.get("OPENAI_COMPAT_API_KEY", "")
-            headers = {"Authorization": f"Bearer {key}"} if key else {}
-            r = requests.get(f"{url}/v1/models", headers=headers, timeout=5)
+            url = (body_url or os.environ.get("OLLAMA_URL", "") or "http://127.0.0.1:11434").rstrip("/")
+            if not _http(url):
+                return _done(False, "url must be an http(s) address", 400)
+            headers = {"Authorization": f"Bearer {body_key}"} if body_key else {}
+            r = requests.get(f"{url}/api/tags", headers=headers, timeout=6)
             if r.status_code in (401, 403):
-                return _done(False, f"auth rejected (HTTP {r.status_code}) - check OPENAI_COMPAT_API_KEY")
+                return _done(False, f"auth rejected (HTTP {r.status_code}) - check the API key")
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
-            n = len(r.json().get("data") or [])
-            return _done(True, f"connected, {n} model(s)")
+            models = [m.get("name", "") for m in (r.json().get("models") or [])
+                      if isinstance(m, dict) and m.get("name")]
+            return _done(True, f"connected, {len(models)} model(s) available", models=models)
+
+        if provider in ("lmstudio", "llamacpp", "openai-compat", "openai_compat"):
+            default_env = "LMSTUDIO_PRIMARY_URL" if provider == "lmstudio" else "OPENAI_COMPAT_URL"
+            url = (body_url or os.environ.get(default_env, "")).rstrip("/")
+            if not url:
+                return _done(False, "no endpoint URL provided", 400)
+            if not _http(url):
+                return _done(False, "url must be an http(s) address", 400)
+            key = body_key or os.environ.get("OPENAI_COMPAT_API_KEY", "")
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            r = requests.get(f"{url}/v1/models", headers=headers, timeout=6)
+            if r.status_code in (401, 403):
+                return _done(False, f"auth rejected (HTTP {r.status_code}) - check the API key")
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            models = [m.get("id", "") for m in (r.json().get("data") or [])
+                      if isinstance(m, dict) and m.get("id")]
+            return _done(True, f"connected, {len(models)} model(s) loaded", models=models)
+
         return _done(False, f"unknown provider: {provider!r}", 400)
     except (requests.RequestException, ValueError) as exc:
         # ValueError covers JSONDecodeError on a 200-but-non-JSON response.
@@ -3707,45 +3715,80 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- VISION (global endpoints readout + this job's captioning/scoring) -->
     <section x-show="view === 'job' && active === 'vision'" class="space-y-4">
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="card rounded-xl p-5">
-          <h3 class="font-semibold mb-3">Vision workers</h3>
-          <p class="text-xs text-slate-400 mb-3">
-            <strong class="text-slate-200">Enable just one provider unless you genuinely have parallel hardware.</strong>
-            Each enabled worker runs as its own subprocess against the shared queue, so toggling two local LLMs on the same
-            GPU will thrash VRAM and slow everything down. The intended multi-worker case is a second LM Studio host on a
-            different machine (<code>balanced-lm-secondary</code>), or cloud + local in parallel (e.g. Groq + LM Studio).
-            Writes <code>PIPELINE_VISION_WORKERS</code>. Restart pipeline to apply changes.
-          </p>
-          <div class="grid gap-2">
-            <template x-for="w in visionWorkers" :key="w.name">
-              <div class="flex items-center justify-between bg-slate-900/60 border border-slate-800 rounded px-3 py-2">
-                <div>
-                  <div class="font-medium" x-text="w.name"></div>
-                  <div class="text-xs text-slate-400" x-text="workerDescriptions[w.name] || ''"></div>
-                  <div x-show="workerProvider(w.name) && providerTest[workerProvider(w.name)] && !providerTest[workerProvider(w.name)].testing"
-                       class="text-xs mt-0.5" :class="providerTest[workerProvider(w.name)]?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                       x-text="providerTest[workerProvider(w.name)]?.message"></div>
-                </div>
-                <div class="flex items-center gap-3 shrink-0">
-                  <button type="button" x-show="workerProvider(w.name)" @click="testProvider(workerProvider(w.name))"
-                          :disabled="!!providerTest[workerProvider(w.name)]?.testing"
-                          class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                    <span x-text="providerTest[workerProvider(w.name)]?.testing ? 'Testing…' : 'Test'"></span>
+      <!-- Vision workers — the local-LLM fleet (per-job inherit/override). One
+           row per GPU/host; lmstudio + llamacpp speak the OpenAI /v1 API, ollama
+           its native API. Inherits the preset's global fleet until overridden. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Vision workers{{ tip('The local LLM endpoints that classify images. Add one row per GPU/host: LM Studio, llama.cpp / vLLM / koboldcpp / LocalAI (OpenAI-compatible), or Ollama. Each enabled worker runs as its own subprocess against the shared queue, so a fleet of hosts scales throughput for a big backlog.', 'one row per GPU box across a local mesh / RunPod cluster') }}</h3>
+          <div class="flex items-center gap-2">
+            <span x-show="!isOver('vision.workers')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400" title="inherited from the preset / global fleet">global</span>
+            <button x-show="isOver('vision.workers')" @click="resetOverride('vision.workers')" class="text-xs link-btn" title="reset to the global fleet">reset ↺</button>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">Inherits the preset's global fleet until you customise it for this job. Leave <b>Model</b> blank to auto-detect on connect; <b>Test</b> fills the model list. Private / LAN / Tailscale URLs are fine. Restart the pipeline (or Apply) to launch changes.</p>
+        <div class="space-y-2">
+          <template x-for="(w, idx) in visionFleet()" :key="idx">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3">
+              <div class="grid md:grid-cols-12 gap-2">
+                <input :value="w.name" @change="setFleetField(idx,'name',$event.target.value)" placeholder="Name"
+                       class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
+                <select @change="setFleetField(idx,'provider',$event.target.value)"
+                        class="md:col-span-2 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+                  <template x-for="p in visionProviders" :key="p">
+                    <option :value="p" :selected="p === w.provider" x-text="visionProviderLabels[p]"></option>
+                  </template>
+                </select>
+                <input :value="w.base_url" @change="setFleetField(idx,'base_url',$event.target.value)" placeholder="http://host:port"
+                       class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"/>
+                <input :value="w.model" @change="setFleetField(idx,'model',$event.target.value)" placeholder="Model (blank = auto)"
+                       :list="'fleet-models-'+idx"
+                       class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
+                <datalist :id="'fleet-models-'+idx">
+                  <template x-for="m in (fleetTest[idx]?.models || [])" :key="m"><option :value="m"></option></template>
+                </datalist>
+              </div>
+              <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
+                <input type="password" :value="w.api_key" @change="setFleetField(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
+                       autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
+                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
+                  <input type="checkbox" :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
+                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                </label>
+                <div class="md:col-span-6 flex items-center gap-2 justify-end">
+                  <span class="text-xs truncate max-w-[16rem]" x-show="fleetTest[idx] && !fleetTest[idx].testing"
+                        :class="fleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="fleetTest[idx]?.message"></span>
+                  <button @click="testFleetWorker(idx)" :disabled="!!fleetTest[idx]?.testing"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                    <span x-text="fleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span>
                   </button>
-                  <label class="inline-flex items-center cursor-pointer gap-2">
-                    <span class="text-xs" x-text="w.enabled ? 'On' : 'Off'"></span>
-                    <input type="checkbox" :checked="w.enabled" :aria-label="'Toggle worker ' + w.name" @change="toggleVisionWorker(w.name, $event.target.checked)"
-                      class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                        checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                        before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                        checked:before:translate-x-5"/>
-                  </label>
+                  <button @click="removeFleetWorker(idx)" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Remove</button>
                 </div>
               </div>
-            </template>
+            </div>
+          </template>
+          <div x-show="!visionFleet().length" class="text-xs text-slate-500 italic">No vision workers — add one so images get classified.</div>
+        </div>
+        <button @click="addFleetWorker()" class="mt-2 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
+        <div class="text-xs text-slate-500 mt-3" x-text="'Running: ' + ((status.pipeline?.vision_workers || []).join(', ') || '(none)')"></div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <!-- Cloud worker (Groq) — global toggle, runs alongside the local fleet. -->
+        <div class="card rounded-xl p-5">
+          <h3 class="font-semibold mb-2">Cloud worker — Groq{{ tip('Optional cloud vision worker (Llama-4 Scout): fast, handles NSFW, runs in parallel with your local fleet. Uses GROQ_API_KEY(S) from Settings. Global, not per-job.') }}</h3>
+          <div class="flex items-center justify-between">
+            <label class="inline-flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" :checked="groqEnabled()" @change="toggleVisionWorker('balanced-groq', $event.target.checked)" class="accent-indigo-500"/>
+              <span class="text-sm" x-text="groqEnabled() ? 'Enabled' : 'Disabled'"></span>
+            </label>
+            <div class="flex items-center gap-2">
+              <span class="text-xs" x-show="providerTest.groq?.message" :class="providerTest.groq?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="providerTest.groq?.message"></span>
+              <button @click="testProvider('groq')" :disabled="!!providerTest.groq?.testing" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                <span x-text="providerTest.groq?.testing ? 'Testing…' : 'Test'"></span>
+              </button>
+            </div>
           </div>
-          <div class="text-xs text-slate-500 mt-3" x-text="'Active: ' + ((status.pipeline?.vision_workers || []).join(', ') || '(none)')"></div>
         </div>
         <div class="card rounded-xl p-5">
           <h3 class="font-semibold mb-3">Throttle (<span x-text="throttle + '%'"></span>)</h3>
@@ -3851,27 +3894,6 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </div>
         </div>
         </template>
-      </div>
-
-      <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">LMStudio endpoints <span class="text-xs font-normal text-slate-500">(global)</span></h3>
-        <div class="grid md:grid-cols-2 gap-6">
-          <template x-for="inst in ['primary', 'secondary']" :key="inst">
-            <div>
-              <div class="pill mb-2 text-indigo-300" x-text="inst + ' - ' + (models.instances?.[inst]?.status || 'unknown')"></div>
-              <label class="block text-xs text-slate-400 mb-1">URL</label>
-              <input :value="models.current?.[inst]?.url" @change="setEndpoint(inst, $event.target.value)"
-                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mb-2"/>
-              <label class="block text-xs text-slate-400 mb-1">Model</label>
-              <select @change="setModel(inst, $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2">
-                <option :value="models.current?.[inst]?.model || ''" x-text="models.current?.[inst]?.model || '-'"></option>
-                <template x-for="m in (models.instances?.[inst]?.models ?? [])" :key="m.id">
-                  <option :value="m.id" x-text="m.name"></option>
-                </template>
-              </select>
-            </div>
-          </template>
-        </div>
       </div>
 
       <div class="card rounded-xl p-5">
@@ -4439,6 +4461,37 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
           </div>
+
+          <!-- Vision workers: the global default fleet jobs inheriting this preset use. -->
+          <div class="mt-5">
+            <div class="text-xs text-slate-400 mb-1">Vision workers{{ tip('The local LLM endpoints jobs inheriting this preset use to classify images. Add one per GPU/host — LM Studio, llama.cpp / vLLM / koboldcpp / LocalAI (OpenAI-compatible), or Ollama. Leave Model blank to auto-detect on Test. Private / LAN / Tailscale URLs are fine.') }}</div>
+            <div class="space-y-2">
+              <template x-for="(w, idx) in (presetEditor.cfg.vision?.workers || [])" :key="'pew_'+idx">
+                <div class="bg-slate-800/60 border border-slate-700 rounded p-2">
+                  <div class="grid md:grid-cols-12 gap-2">
+                    <input :value="w.name" @change="peSetFleet(idx,'name',$event.target.value)" placeholder="Name" class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+                    <select @change="peSetFleet(idx,'provider',$event.target.value)" class="md:col-span-2 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                      <template x-for="p in visionProviders" :key="'pep_'+p"><option :value="p" :selected="p === w.provider" x-text="visionProviderLabels[p]"></option></template>
+                    </select>
+                    <input :value="w.base_url" @change="peSetFleet(idx,'base_url',$event.target.value)" placeholder="http://host:port" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono"/>
+                    <input :value="w.model" @change="peSetFleet(idx,'model',$event.target.value)" placeholder="Model (blank = auto)" :list="'pe-fleet-models-'+idx" class="md:col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+                    <datalist :id="'pe-fleet-models-'+idx"><template x-for="m in (peFleetTest[idx]?.models || [])" :key="'pem_'+m"><option :value="m"></option></template></datalist>
+                  </div>
+                  <div class="grid md:grid-cols-12 gap-2 mt-1 items-center">
+                    <input type="password" :value="w.api_key" @change="peSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)" autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+                    <label class="md:col-span-2 inline-flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/><span x-text="w.enabled ? 'On' : 'Off'"></span></label>
+                    <div class="md:col-span-6 flex items-center gap-2 justify-end">
+                      <span class="text-[11px] truncate max-w-[12rem]" x-show="peFleetTest[idx] && !peFleetTest[idx].testing" :class="peFleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="peFleetTest[idx]?.message"></span>
+                      <button @click="peTestFleet(idx)" :disabled="!!peFleetTest[idx]?.testing" class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="peFleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span></button>
+                      <button @click="peRemoveFleet(idx)" class="px-2 py-0.5 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Remove</button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <div x-show="!(presetEditor.cfg.vision?.workers || []).length" class="text-xs text-slate-500 italic">No vision workers in this preset.</div>
+            </div>
+            <button @click="peAddFleet()" class="mt-2 px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
+          </div>
         </div>
         </template>
       </div>
@@ -4949,6 +5002,11 @@ function dashboard() {
                     referencedBy: [], savedFlash: '', error: '', saving: false },
     _peTimer: null,
     newPreset: { name: '', base_on: '' },
+    // Dynamic vision-worker fleet (per-job + preset editor).
+    visionProviders: ['lmstudio', 'llamacpp', 'ollama'],
+    visionProviderLabels: { lmstudio: 'LM Studio', llamacpp: 'llama.cpp / vLLM', ollama: 'Ollama' },
+    fleetTest: {},     // job-tab row idx -> { testing, ok, message, models }
+    peFleetTest: {},   // preset-editor row idx -> same
     // Global Stats per-job filter (null = all jobs aggregate).
     globalStatsJob: '',
     // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
@@ -5287,6 +5345,7 @@ function dashboard() {
       this.active = 'logs';            // default tab: Historical
       this.sidebarOpen = false;
       // Reset per-job tab data so we don't show the previous job's rows.
+      this.fleetTest = {};             // drop stale vision-worker test results
       this.history = []; this.queueFiles = []; this.activity = [];
       this.gallery = { ...this.gallery, page: 1, items: [] };
       this.stats = { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] };
@@ -5521,6 +5580,9 @@ function dashboard() {
         cfg.scoring = cfg.scoring || {};
         cfg.captioning = cfg.captioning || {};
         cfg.categories = Array.isArray(cfg.categories) ? cfg.categories : [];
+        cfg.vision = cfg.vision || {};
+        if (!Array.isArray(cfg.vision.workers)) cfg.vision.workers = [];
+        this.peFleetTest = {};
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
       } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
@@ -5533,6 +5595,21 @@ function dashboard() {
     peUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     peSetUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
     peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
+    // Preset-editor vision fleet (global default fleet jobs inherit).
+    peFleet() { const v = this._deepGet(this.presetEditor.cfg, 'vision.workers'); return Array.isArray(v) ? v : []; },
+    peSetFleet(idx, field, val) { const l = this.peFleet().map(w => ({ ...w })); if (!l[idx]) return; l[idx][field] = val; this.peSet('vision.workers', l); },
+    peAddFleet() { const l = this.peFleet().map(w => ({ ...w })); l.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio', base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true }); this.peSet('vision.workers', l); },
+    peRemoveFleet(idx) { const l = this.peFleet().map(w => ({ ...w })); l.splice(idx, 1); this.peFleetTest = {}; this.peSet('vision.workers', l); },
+    async peTestFleet(idx) {
+      const w = this.peFleet()[idx]; if (!w) return;
+      this.peFleetTest[idx] = { testing: true, ok: null, message: 'Connecting…', models: [] };
+      try {
+        const j = await this._visionTest(w.provider, w.base_url, w.api_key);
+        this.peFleetTest[idx] = { testing: false, ok: j.ok,
+          message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`, models: j.models || [] };
+        if (j.ok && (j.models || []).length && !(w.model || '').trim()) this.peSetFleet(idx, 'model', j.models[0]);
+      } catch (e) { this.peFleetTest[idx] = { testing: false, ok: false, message: '✗ network error', models: [] }; }
+    },
     peLocalFolders() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.local_imports'); return Array.isArray(v) ? v : []; },
     peAddLocal() { const l = this.peLocalFolders().slice(); l.push({name:'local'+(l.length||''),dir:'',enabled:false,migrate_from:''}); this.peSet('scrapers.local_imports', l); },
     peUpdateLocal(i, key, value) { const l = this.peLocalFolders().map(f=>({...f})); if (l[i]) { l[i][key]=value; this.peSet('scrapers.local_imports', l); } },
@@ -5610,6 +5687,48 @@ function dashboard() {
         this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
       }
     },
+    // ── Vision-worker fleet (Job tab: per-job inherit/override of vision.workers) ─
+    visionFleet() { const v = this.effVal('vision.workers'); return Array.isArray(v) ? v : []; },
+    _writeFleet(list) { this.setOverride('vision.workers', list); },
+    setFleetField(idx, field, val) {
+      const list = this.visionFleet().map(w => ({ ...w }));
+      if (!list[idx]) return;
+      list[idx][field] = val;
+      this._writeFleet(list);
+    },
+    addFleetWorker() {
+      const list = this.visionFleet().map(w => ({ ...w }));
+      list.push({ id: 'w' + Date.now().toString(36), name: 'New worker', provider: 'lmstudio',
+                  base_url: 'http://127.0.0.1:1234', model: '', api_key: '', enabled: true });
+      this._writeFleet(list);
+    },
+    removeFleetWorker(idx) {
+      const list = this.visionFleet().map(w => ({ ...w }));
+      list.splice(idx, 1);
+      this.fleetTest = {};          // indices shift; drop stale per-row results
+      this._writeFleet(list);
+    },
+    async _visionTest(provider, url, api_key) {
+      const r = await fetch('/api/vision/test', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, url, api_key }) });
+      return r.json();
+    },
+    async testFleetWorker(idx) {
+      const w = this.visionFleet()[idx]; if (!w) return;
+      this.fleetTest[idx] = { testing: true, ok: null, message: 'Connecting…', models: [] };
+      try {
+        const j = await this._visionTest(w.provider, w.base_url, w.api_key);
+        this.fleetTest[idx] = { testing: false, ok: j.ok,
+          message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`,
+          models: j.models || [] };
+        if (j.ok && (j.models || []).length && !(w.model || '').trim()) {
+          this.setFleetField(idx, 'model', j.models[0]);   // auto-fill a blank model
+        }
+      } catch (e) {
+        this.fleetTest[idx] = { testing: false, ok: false, message: '✗ network error', models: [] };
+      }
+    },
+    groqEnabled() { return !!(this.visionWorkers.find(w => w.name === 'balanced-groq') || {}).enabled; },
     async unloadLmStudio() {
       this.lmstudioUnload = { busy: true, ok: null, message: 'Unloading...' };
       try {

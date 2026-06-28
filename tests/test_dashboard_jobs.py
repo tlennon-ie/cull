@@ -743,5 +743,91 @@ def test_imported_job_status_reset_to_idle(client):
     assert jc.get_job("wasrunning").status == "idle"
 
 
+# ── /api/vision/test (per-instance probe + model list for the fleet UI) ───────
+
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+def test_vision_test_unknown_provider(client):
+    c, _jc, _ = client
+    r = c.post("/api/vision/test", json={"provider": "nope"})
+    assert r.status_code == 400
+    assert r.get_json()["ok"] is False
+
+
+def test_vision_test_rejects_non_http_url(client):
+    c, _jc, _ = client
+    r = c.post("/api/vision/test", json={"provider": "lmstudio", "url": "file:///etc/passwd"})
+    assert r.status_code == 400
+    assert "http" in r.get_json()["message"]
+
+
+def test_vision_test_lmstudio_probes_body_url_and_returns_models(client, monkeypatch):
+    c, _jc, _ = client
+    import requests
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url
+        seen["headers"] = kw.get("headers") or {}
+        return _FakeResp(200, {"data": [{"id": "qwen-vl"}, {"id": "llama"}]})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    r = c.post("/api/vision/test",
+               json={"provider": "lmstudio", "url": "http://10.0.0.5:1234", "api_key": "sk"})
+    j = r.get_json()
+    assert j["ok"] is True
+    assert j["models"] == ["qwen-vl", "llama"]
+    assert seen["url"] == "http://10.0.0.5:1234/v1/models"      # caller URL, not env
+    assert seen["headers"].get("Authorization") == "Bearer sk"
+
+
+def test_vision_test_ollama_returns_models(client, monkeypatch):
+    c, _jc, _ = client
+    import requests
+
+    def fake_get(url, **kw):
+        assert url.endswith("/api/tags")
+        return _FakeResp(200, {"models": [{"name": "llama3.2-vision"}]})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    j = c.post("/api/vision/test",
+               json={"provider": "ollama", "url": "http://10.0.0.6:11434"}).get_json()
+    assert j["ok"] is True and j["models"] == ["llama3.2-vision"]
+
+
+def test_preset_put_accepts_vision_workers(client):
+    c, jc, _ = client
+    cfg = jc.get_preset("default")                 # full cfg (carries categories)
+    cfg["vision"] = {"workers": [
+        {"id": "a", "name": "A", "provider": "ollama", "base_url": "http://h:11434",
+         "model": "", "api_key": "", "enabled": True}]}
+    r = c.put("/api/presets/default", json={"cfg": cfg})
+    assert r.status_code == 200
+    assert r.get_json()["cfg"]["vision"]["workers"][0]["provider"] == "ollama"
+
+
+def test_preset_put_rejects_bad_vision_provider(client):
+    c, _jc, _ = client
+    body = {"cfg": {"vision": {"workers": [{"provider": "bogus", "base_url": "http://h:1"}]}}}
+    r = c.put("/api/presets/default", json=body)
+    assert r.status_code == 400
+
+
+def test_preset_put_rejects_non_http_vision_url(client):
+    c, _jc, _ = client
+    body = {"cfg": {"vision": {"workers": [
+        {"provider": "lmstudio", "base_url": "ftp://h:1"}]}}}
+    r = c.put("/api/presets/default", json=body)
+    assert r.status_code == 400
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
