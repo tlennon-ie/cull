@@ -1,9 +1,28 @@
 {
-  "default": "portrait_curation",
+  "default": "general_dataset",
   "presets": {
+    "general_dataset": {
+      "label": "General dataset prep (default)",
+      "description": "Topic-agnostic triage for any dataset: keep the clear wins, send the maybes to Borderline for human review, drop the unrelated. No subject or person gates — works for photos, art, aerial, product, anything.",
+      "global_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image. Anime, illustration, 3D render, digital painting, or a photo of a statue/figurine -> the matching label, NEVER `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face/hands, wrong finger count, melted limbs, warped text, impossible geometry).\n- A SCREENSHOT is the WHOLE frame being a screen capture (UI chrome / browser bars). A photo that merely contains a phone or monitor as a scene object is NOT a screenshot.\n- A COMPOSITE/GRID is 2+ separate images stitched together -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in watermarks, captions, logos, or infographic text.\n- nsfw = TRUE only for explicit nudity or sexual content.\n- The curation topic only informs REL_Quality_Score; do NOT invent details that aren't in the pixels.\nThis is a GENERAL dataset-prep triage. Keep the clear wins, send the maybes to Borderline for human review, and drop the unrelated. Judge quality on sharpness, exposure, composition and absence of artefacts - not on subject matter.",
+      "categories": [
+        {
+          "name": "Keep",
+          "hint": "Strong on-topic example, no severe AI flaws, no watermark/overlay, OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+        },
+        {
+          "name": "Borderline",
+          "hint": "On-topic and usable but average quality, or one minor issue (mild AI flaws, soft focus, light compression). Bucket for human review"
+        },
+        {
+          "name": "OffTopic",
+          "hint": "Unrelated to the curation topic regardless of quality (REL_Quality_Score < 30)"
+        }
+      ]
+    },
     "portrait_curation": {
-      "label": "Portrait curation (default)",
-      "description": "Six-bucket taxonomy tuned for influencer / model photography. Keeps the strict photoreal + real-human gates that ship by default.",
+      "label": "Portrait curation (influencer / model)",
+      "description": "Six-bucket taxonomy tuned for influencer / model photography. Keeps the strict photoreal + real-human gates. Select this preset when you specifically want person/portrait curation.",
       "global_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every binary judgement consistent with that description. Your description and labels MUST agree - if your description says 'boulder smashing a car' you cannot then say woman_present=true.\n- BEFORE describing the subject, scan the WHOLE frame for: phone or browser UI elements, side-by-side panels or comparison grids, large text overlays / watermarks. If you see any of these, set the matching is_screenshot / is_composite_grid / contains_text_overlay field to true and MENTION it in `description`. These images are NEVER valid influencer photographs and category MUST be DISCARD.\n- An image is a SCREENSHOT only when the WHOLE FRAME is a screen capture. A normal photograph that happens to CONTAIN a phone, monitor, or screen as objects in the scene is NOT a screenshot.\n- An image is a COMPOSITE/GRID if it contains 2+ separate images, even if they all show similar subjects.\n- art_medium = `photograph` ONLY for an actual camera-captured (or AI-generated photoreal) image of a real-looking subject. Anime, cel-shaded art, hand-drawn illustration, oil/watercolour painting, comic, manga, stylised 3D, concept art -> the matching label, NEVER `photograph`.\n- A photograph of a STATUE, BUST, MANNEQUIN, DOLL, or SCULPTURE is NOT a photograph of a real human. is_human_photograph is FALSE in those cases, and woman_present is FALSE even if the sculpture depicts a female form.\n- photorealistic_style = TRUE ONLY when art_medium = `photograph` AND the subject reads as a real-world scene/person. Visible brush strokes, line art, cel shading, painterly textures, exaggerated proportions, or stylised lighting all force FALSE.\n- woman_present = TRUE ONLY if a real human female face or body is clearly visible as the primary OR co-primary subject of the image. Background pedestrians do NOT count. Sculpted/illustrated/animated figures do NOT count. DO NOT INFER a woman from the topic, caption, prompt, or context.\n- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face, wrong finger count, melted limbs, warped text).\n- nsfw = TRUE only for explicit nudity or sexual content.",
       "categories": [
         {

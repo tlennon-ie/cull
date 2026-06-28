@@ -113,6 +113,7 @@ from lmstudio_admin import unload_all as _lmstudio_unload_all
 import index_store
 import thumb_cache
 import job_config
+import scraper_test
 import paths as _paths
 
 # Now that job_config is importable, derive the canonical scraper toggle list
@@ -1144,6 +1145,31 @@ def api_vision_test():
         return _done(False, f"unknown provider: {provider!r}", 400)
     except requests.RequestException as exc:
         return _done(False, f"connection error: {exc}")
+
+
+@app.route("/api/scrapers/test", methods=["POST"])
+def api_scrapers_test():
+    """Live connectivity + auth probe for one scraper.
+
+    Body: ``{"scraper": "<name>", "settings": {<cred form values>}?, "config": {<targets>}?}``
+    Credentials resolve from the live process env, overlaid with any NON-MASKED
+    values the user has typed in the Settings form — so an unsaved key can be
+    tested immediately, while a masked secret falls back to the stored value.
+    Returns scraper_test.test_scraper's ``{ok, message, latency_ms, detail}``.
+    """
+    data = request.get_json() or {}
+    name = (data.get("scraper") or "").strip()
+    if name not in scraper_test.SUPPORTED:
+        return jsonify({"ok": False, "message": f"unsupported scraper: {name}",
+                        "latency_ms": None, "detail": ""}), 400
+    env = dict(os.environ)
+    form = data.get("settings")
+    if isinstance(form, dict):
+        for key, val in form.items():
+            if key in SETTINGS_KEYS and isinstance(val, str) and val != SECRET_MASK:
+                env[key] = val
+    config = data.get("config") if isinstance(data.get("config"), dict) else None
+    return jsonify(scraper_test.test_scraper(name, config=config, env=env))
 
 
 @app.route("/api/vision/provider", methods=["POST"])
@@ -2604,7 +2630,21 @@ def api_gallery_download():
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
-HTML_TEMPLATE = r"""<!doctype html>
+HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
+<span class="tip" tabindex="0" aria-label="Help"><span class="tip-i" aria-hidden="true">i</span><span class="tip-pop" role="tooltip">{{ body|safe }}{% if example %}<span class="ex">{{ example|safe }}</span>{% endif %}</span></span>
+{%- endmacro -%}
+{% macro testbtn(scraper, label='Test connection') -%}
+<div class="mt-1.5 flex items-center gap-2 flex-wrap">
+  <button type="button" @click="testScraper('{{ scraper }}')" :disabled="scraperTest['{{ scraper }}']?.pending"
+    class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+    <span x-text="scraperTest['{{ scraper }}']?.pending ? 'Testing…' : '{{ label }}'"></span>
+  </button>
+  <span x-show="scraperTest['{{ scraper }}'] && !scraperTest['{{ scraper }}'].pending" class="text-xs"
+    :class="scraperTest['{{ scraper }}']?.ok ? 'text-emerald-400' : 'text-rose-400'"
+    x-text="(scraperTest['{{ scraper }}']?.ok ? '✓ ' : '✕ ') + (scraperTest['{{ scraper }}']?.message || '') + (scraperTest['{{ scraper }}']?.latency_ms != null ? ' (' + scraperTest['{{ scraper }}'].latency_ms + 'ms)' : '')"></span>
+</div>
+{%- endmacro -%}
+<!doctype html>
 <html lang="en" class="dark">
 <head>
 <meta charset="utf-8"/>
@@ -2655,6 +2695,23 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
   .nsfw-eye:hover { background: rgba(15,23,42,0.65); color:#fde68a; }
   .nsfw-eye svg { width:60%; height:60%; max-width:34px; max-height:34px; opacity:.95; }
+  /* Field help tooltips — an "i" trigger; hover/focus reveals a positioned
+     popover. CSS-only so it needs no per-instance Alpine state. See tip() macro. */
+  .tip { position:relative; display:inline-flex; align-items:center; vertical-align:middle; margin-left:.3rem; }
+  .tip-i { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+           border-radius:9999px; border:1px solid #64748b; color:#94a3b8; font-size:10px; line-height:1;
+           font-style:normal; font-weight:700; cursor:help; user-select:none; }
+  .tip:hover .tip-i, .tip:focus-within .tip-i { border-color:#38bdf8; color:#7dd3fc; }
+  .tip-pop { visibility:hidden; opacity:0; transition:opacity .12s ease; position:absolute; z-index:80;
+             left:0; top:1.5em; width:18rem; max-width:min(18rem,70vw); padding:.55rem .65rem;
+             border-radius:.4rem; background:#1e293b; border:1px solid #475569; color:#e2e8f0;
+             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.45);
+             text-transform:none; letter-spacing:normal; font-weight:400; white-space:normal; }
+  .tip:hover .tip-pop, .tip:focus-within .tip-pop { visibility:visible; opacity:1; }
+  .tip.tip-r .tip-pop { left:auto; right:0; }
+  .tip-pop b { color:#f1f5f9; font-weight:600; }
+  .tip-pop code { background:#0f172a; border:1px solid #334155; border-radius:3px; padding:0 .25rem; color:#fcd34d; }
+  .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -2711,6 +2768,50 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div x-show="update.running" class="text-xs text-slate-400 mt-2">
           Pulling, reinstalling deps if needed, and relaunching. Dashboard will restart — refresh in a moment.
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic toast stack — top-right. Replaces window.alert(): success/error/
+       warn/info messages, auto-dismissing. Driven by notify(message, type). -->
+  <div class="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-none">
+    <template x-for="t in toasts" :key="t.id">
+      <div x-transition.opacity.duration.200ms
+           class="pointer-events-auto flex items-start gap-2 rounded-lg shadow-2xl p-3 text-sm border bg-slate-900"
+           :class="{
+             'border-emerald-600 text-emerald-50': t.type === 'success',
+             'border-rose-600 text-rose-50': t.type === 'error',
+             'border-amber-600 text-amber-50': t.type === 'warn',
+             'border-sky-700 text-slate-100': t.type === 'info' || !t.type,
+           }">
+        <span class="mt-0.5 shrink-0 font-bold" x-text="({success:'✓', error:'✕', warn:'⚠', info:'ℹ'})[t.type] || 'ℹ'"></span>
+        <div class="flex-1 whitespace-pre-line break-words" x-text="t.message"></div>
+        <button @click="dismissToast(t.id)" class="shrink-0 text-slate-400 hover:text-slate-100 leading-none" aria-label="Dismiss">✕</button>
+      </div>
+    </template>
+  </div>
+
+  <!-- Styled confirm dialog — replaces window.confirm() for destructive actions.
+       askConfirm(message, {title, confirmLabel, danger}) resolves to a boolean. -->
+  <div x-show="confirmDialog.open" x-cloak x-transition.opacity
+       class="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 p-4"
+       @click.self="_closeConfirm(false)"
+       @keydown.escape.window="confirmDialog.open && _closeConfirm(false)">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl max-w-md w-full p-5">
+      <div class="font-semibold text-base mb-2" x-text="confirmDialog.title"></div>
+      <div class="text-sm text-slate-300 mb-4 whitespace-pre-line" x-text="confirmDialog.message"></div>
+      <input x-show="confirmDialog.input" x-ref="dialogInput" type="text"
+             x-model="confirmDialog.inputValue" :placeholder="confirmDialog.inputPlaceholder"
+             @keydown.enter.prevent="_closeConfirm(true)"
+             class="w-full mb-4 px-3 py-2 bg-slate-800 border border-slate-600 rounded text-sm focus:outline-none focus:border-sky-500">
+      <div class="flex justify-end gap-2">
+        <button @click="_closeConfirm(false)"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm"
+                x-text="confirmDialog.cancelLabel"></button>
+        <button @click="_closeConfirm(true)" x-ref="confirmBtn"
+                class="px-3 py-1.5 rounded text-sm font-semibold text-white"
+                :class="confirmDialog.danger ? 'bg-rose-600 hover:bg-rose-500' : 'bg-sky-600 hover:bg-sky-500'"
+                x-text="confirmDialog.confirmLabel"></button>
       </div>
     </div>
   </div>
@@ -3361,17 +3462,26 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div>
               <div class="font-medium" x-text="s.name"></div>
               <div class="text-xs text-slate-400" x-text="s.description"></div>
+              <div x-show="scraperTest[s.name] && !scraperTest[s.name].pending" class="text-xs mt-0.5"
+                :class="scraperTest[s.name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                x-text="(scraperTest[s.name]?.ok ? '✓ ' : '✕ ') + (scraperTest[s.name]?.message || '') + (scraperTest[s.name]?.latency_ms != null ? ' (' + scraperTest[s.name].latency_ms + 'ms)' : '')"></div>
             </div>
             <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
             <template x-if="s.kind !== 'local'">
-              <label class="inline-flex items-center cursor-pointer gap-2">
-                <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-                <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
-                  class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                    checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                    before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                    checked:before:translate-x-5"/>
-              </label>
+              <div class="flex items-center gap-3 shrink-0">
+                <button type="button" @click="testScraper(s.name)" :disabled="scraperTest[s.name]?.pending"
+                  class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="scraperTest[s.name]?.pending ? 'Testing…' : 'Test'"></span>
+                </button>
+                <label class="inline-flex items-center cursor-pointer gap-2">
+                  <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
+                  <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
+                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                      checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                      before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                      checked:before:translate-x-5"/>
+                </label>
+              </div>
             </template>
             <template x-if="s.kind === 'local'">
               <span class="pill px-2 py-0.5 rounded" :class="s.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'" x-text="s.enabled ? 'enabled' : 'disabled'"></span>
@@ -3437,7 +3547,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('captioning.enabled')"
                        @change="setOverride('captioning.enabled', $event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Enable auto-captioning</span>
+                <span class="text-sm">Enable auto-captioning{{ tip('Writes a training caption <code>.txt</code> next to each kept image, produced by the same vision call in the chosen style. Off by default — it adds output tokens per image.') }}</span>
               </label>
               <span x-show="!isOver('captioning.enabled')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400" title="inherited from preset">global</span>
               <button x-show="isOver('captioning.enabled')" @click="resetOverride('captioning.enabled')" class="text-xs link-btn" title="reset to preset">reset ↺</button>
@@ -3447,7 +3557,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('captioning.overwrite')" :disabled="!effVal('captioning.enabled')"
                        @change="setOverride('captioning.overwrite', $event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Overwrite existing captions</span>
+                <span class="text-sm">Overwrite existing captions{{ tip('When on, replaces any caption a scraper already saved. Off keeps the source-side prompt and only fills in gaps.') }}</span>
               </label>
               <span x-show="!isOver('captioning.overwrite')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('captioning.overwrite')" @click="resetOverride('captioning.overwrite')" class="text-xs link-btn">reset ↺</button>
@@ -3457,7 +3567,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                 <input type="checkbox" :checked="effVal('topic_filters.require_prompt') === false"
                        @change="setOverride('topic_filters.require_prompt', !$event.target.checked)"
                        class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-                <span class="text-sm">Ingest images without a prompt</span>
+                <span class="text-sm">Ingest images without a prompt{{ tip('Accept images that have no generation prompt/caption (e.g. plain photos). Off = require a prompt — right for AI-art, wrong for real-photo datasets.') }}</span>
               </label>
               <span x-show="!isOver('topic_filters.require_prompt')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.require_prompt')" @click="resetOverride('topic_filters.require_prompt')" class="text-xs link-btn">reset ↺</button>
@@ -3465,7 +3575,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <label class="text-xs text-slate-400">Caption style</label>
+              <label class="text-xs text-slate-400">Caption style{{ tip('Format of the generated caption. <b>SD/Flux</b>: comma-separated tag phrases. <b>Booru tags</b>: underscored tags. <b>Natural language</b>: a descriptive sentence.', 'booru tags suit anime; natural language suits photos') }}</label>
               <span x-show="!isOver('captioning.style')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('captioning.style')" @click="resetOverride('captioning.style')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3489,7 +3599,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-2 gap-4">
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
+              <span class="text-xs text-slate-400">Minimum OVR score{{ tip('Hard floor on the model&#39;s <b>overall</b> quality score (0-100). Images below this go straight to DISCARD before category routing.', 'e.g. 0 disables the gate; 60 drops weak shots') }}</span>
               <span x-show="!isOver('scoring.ovr_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.ovr_min')" @click="resetOverride('scoring.ovr_min')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3498,7 +3608,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
+              <span class="text-xs text-slate-400">Minimum REL score{{ tip('Hard floor on the <b>relevance</b> score — how well the image matches this job&#39;s subject (0-100).', 'e.g. 0 disables; 50-60 trims off-topic scrapes') }}</span>
               <span x-show="!isOver('scoring.rel_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.rel_min')" @click="resetOverride('scoring.rel_min')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3507,7 +3617,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Scoring notes (appended to the rubric)</span>
+              <span class="text-xs text-slate-400">Scoring notes{{ tip('Free text appended to the vision model&#39;s scoring rubric for this job — steer what &quot;quality&quot; means here.', 'e.g. Reward golden-hour light; penalise harsh on-camera flash') }}</span>
               <span x-show="!isOver('scoring.notes')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.notes')" @click="resetOverride('scoring.notes')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3740,7 +3850,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-2 gap-4">
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
+              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. When a source has a prompt/caption it must contain at least one of these, or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
               <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3749,7 +3859,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
+              <span class="text-xs text-slate-400">Banned keywords{{ tip('Comma-separated. Any match in the prompt/caption rejects the image.', 'e.g. nsfw, watermark, meme') }}</span>
               <span x-show="!isOver('topic_filters.banned_keywords')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.banned_keywords')" @click="resetOverride('topic_filters.banned_keywords')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3759,7 +3869,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
+              <span class="text-xs text-slate-400">Generation hints{{ tip('Comma-separated. Like required keywords, but matched against the generation prompt specifically.', 'e.g. 35mm, f/1.8, golden hour') }}</span>
               <span x-show="!isOver('topic_filters.generation_hints')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.generation_hints')" @click="resetOverride('topic_filters.generation_hints')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3769,7 +3879,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
+              <span class="text-xs text-slate-400">Minimum prompt length{{ tip('Reject images whose prompt/caption is shorter than this many characters — filters out junk one-word captions.', 'e.g. 0 = no minimum; 40 is a sane floor') }}</span>
               <span x-show="!isOver('topic_filters.min_prompt_length')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.min_prompt_length')" @click="resetOverride('topic_filters.min_prompt_length')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3796,7 +3906,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="grid md:grid-cols-1 gap-4">
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
+              <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
               <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3805,7 +3915,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
+              <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
               <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3814,7 +3924,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+              <span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
               <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3823,7 +3933,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Discord channels JSON</span>
+              <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
               <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -3852,23 +3962,23 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span class="text-sm">Enable gallery-dl for this job</span>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Images per URL (limit)</span>
+            <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
             <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
+            <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="effUrls()" @input="setOverrideUrls($event.target.value)" rows="4"
                       placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
+            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
             <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Custom config path (advanced)</span>
+            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
             <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
@@ -3981,9 +4091,11 @@ HTML_TEMPLATE = r"""<!doctype html>
             <div class="text-sm font-semibold mb-2">New preset</div>
             <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
+            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
             <select x-model="newPreset.base_on" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
-              <option value="">Clone the default</option>
-              <template x-for="p in presetsList" :key="'b_'+p"><option :value="p" x-text="'Clone: ' + p"></option></template>
+              <template x-for="p in presetsList" :key="'b_'+p">
+                <option :value="p" x-text="p === presetsDefault ? (p + '  (default)') : p"></option>
+              </template>
             </select>
             <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
           </div>
@@ -4005,21 +4117,21 @@ HTML_TEMPLATE = r"""<!doctype html>
         <template x-if="presetEditor.cfg">
         <div class="space-y-4">
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">Required keywords (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. A source prompt/caption must contain at least one of these or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
               <input :value="peList('topic_filters.keywords_extra')" @input="peSetList('topic_filters.keywords_extra', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Banned keywords (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Banned keywords{{ tip('Comma-separated. Any match in the prompt/caption rejects the image.', 'e.g. nsfw, watermark, meme') }}</span>
               <input :value="peList('topic_filters.banned_keywords')" @input="peSetList('topic_filters.banned_keywords', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Generation hints (comma-sep)</span>
+            <label class="block"><span class="text-xs text-slate-400">Generation hints{{ tip('Comma-separated. Like required keywords, but matched against the generation prompt specifically.', 'e.g. 35mm, f/1.8, golden hour') }}</span>
               <input :value="peList('topic_filters.generation_hints')" @input="peSetList('topic_filters.generation_hints', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block"><span class="text-xs text-slate-400">Minimum prompt length</span>
               <input type="number" min="0" :value="presetEditor.cfg.topic_filters.min_prompt_length" @input="peSet('topic_filters.min_prompt_length', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
           </div>
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles, <b>without</b> the @. Empty scrapes search results only.', 'e.g. dronefeed, natureshots') }}</span>
               <input :value="peList('scrapers.x_accounts')" @input="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
               <input :value="peList('scrapers.reddit_subreddits')" @input="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains{{ tip('Which Civitai hosts to scrape from.', 'e.g. civitai.com, civitai.red') }}</span>
               <input :value="peList('scrapers.civitai_domains')" @input="peSetList('scrapers.civitai_domains', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
           </div>
           <div class="grid md:grid-cols-2 gap-3">
@@ -4036,7 +4148,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             </label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
           </div>
-          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs (one per line)</span>
+          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
 
           <div>
@@ -4071,9 +4183,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
 
           <div class="grid md:grid-cols-3 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">Min OVR (0-100)</span>
+            <label class="block"><span class="text-xs text-slate-400">Min OVR{{ tip('Hard floor on the <b>overall</b> quality score (0-100); below this goes to DISCARD. 0 disables.', 'e.g. 60') }}</span>
               <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.ovr_min" @input="peSet('scoring.ovr_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="block"><span class="text-xs text-slate-400">Min REL (0-100)</span>
+            <label class="block"><span class="text-xs text-slate-400">Min REL{{ tip('Hard floor on the <b>relevance</b> score to the subject (0-100). 0 disables.', 'e.g. 50') }}</span>
               <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
           </div>
@@ -4138,13 +4250,14 @@ HTML_TEMPLATE = r"""<!doctype html>
         </p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Discord token (bot or user account)</span>
+            <span class="text-xs text-slate-400">Discord token{{ tip('A bot token (from a Discord application) or a user account token. Bot tokens are safer and more rate-limit friendly; user tokens see exactly what that account sees.') }}</span>
             <input x-model="settings.DISCORD_BOT_TOKEN" type="password"
                    placeholder="paste token, no quotes"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Discord-1') }}
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Auth mode</span>
+            <span class="text-xs text-slate-400">Auth mode{{ tip('How the token is sent: <b>auto</b> tries a Bot prefix then falls back, <b>bot</b> forces <code>Bot &lt;token&gt;</code>, <b>user</b> sends a raw user token.') }}</span>
             <select x-model="settings.DISCORD_AUTH_MODE"
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
               <option value="auto">auto (try bot → fall back to user on 401)</option>
@@ -4170,7 +4283,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             <span x-show="settingsErrors.GROQ_API_KEY" class="text-xs text-rose-300 mt-1 block" x-text="settingsErrors.GROQ_API_KEY"></span>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">GROQ_API_KEYS (comma-sep, rotated round-robin)</span>
+            <span class="text-xs text-slate-400">GROQ_API_KEYS{{ tip('One or more Groq API keys, comma-separated. cull rotates them round-robin to spread rate limits across keys.', 'gsk_one, gsk_two, gsk_three') }}</span>
             <input x-model="settings.GROQ_API_KEYS" type="password" placeholder="gsk_one,gsk_two,gsk_three"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
@@ -4225,35 +4338,39 @@ HTML_TEMPLATE = r"""<!doctype html>
         <p class="text-xs text-slate-400 mb-3">Required only for the scrapers you've enabled on the <strong>Scrapers</strong> tab.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
-            <span class="text-xs text-slate-400">CIVITAI_API_KEY (civitai.com)</span>
+            <span class="text-xs text-slate-400">CIVITAI_API_KEY{{ tip('API key for civitai.com — get one at civitai.com under Account settings &rarr; API Keys. Needed for the Civitai-Com scraper.') }}</span>
             <input x-model="settings.CIVITAI_API_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Civitai-Com') }}
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY (civitai.red)</span>
+            <span class="text-xs text-slate-400">CIVITAI_API_RED_KEY{{ tip('API key for the civitai.red mirror. Falls back to CIVITAI_API_KEY when left blank.') }}</span>
             <input x-model="settings.CIVITAI_API_RED_KEY" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Civitai-Red') }}
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">TWITTER_COOKIES (full cookie string from a logged-in browser)</span>
+            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}</span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            {{ testbtn('X.com') }}
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">REDDIT_CLIENT_ID (optional)</span>
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_ID{{ tip('Optional. Create a &quot;script&quot; app at reddit.com/prefs/apps for higher rate limits; the scraper still works unauthenticated without it.') }}</span>
             <input x-model="settings.REDDIT_CLIENT_ID"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">REDDIT_CLIENT_SECRET (optional)</span>
+            <span class="text-xs text-slate-400">REDDIT_CLIENT_SECRET{{ tip('Optional. The secret paired with REDDIT_CLIENT_ID from reddit.com/prefs/apps.') }}</span>
             <input x-model="settings.REDDIT_CLIENT_SECRET" type="password"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">REDDIT_USER_AGENT</span>
+            <span class="text-xs text-slate-400">REDDIT_USER_AGENT{{ tip('Identifies your client to Reddit — use a unique, descriptive string.', 'e.g. cull/0.1 by your_username') }}</span>
             <input x-model="settings.REDDIT_USER_AGENT" placeholder="cull/0.1"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+            {{ testbtn('Reddit') }}
           </label>
         </div>
       </div>
@@ -4552,6 +4669,80 @@ function dashboard() {
     update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
     indexer: { in_progress: false, files_seen: 0, files_added: 0, queue_total: 0, sorted_total: 0, last_scan_at: null, scan_started_at: null },
     indexerToast: { show: false, dismissed: false },
+    // ── Generic toasts + styled confirm dialog (replace window.alert/confirm) ──
+    toasts: [],
+    _toastSeq: 0,
+    confirmDialog: { open: false, title: 'Please confirm', message: '',
+                     confirmLabel: 'Confirm', cancelLabel: 'Cancel', danger: false,
+                     input: false, inputValue: '', inputPlaceholder: '', _resolve: null },
+    scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
+    notify(message, type = 'info', timeout) {
+      const id = ++this._toastSeq;
+      if (timeout === undefined) timeout = (type === 'error') ? 6500 : 3800;
+      this.toasts.push({ id, message: String(message), type });
+      if (timeout > 0) setTimeout(() => this.dismissToast(id), timeout);
+      return id;
+    },
+    dismissToast(id) { this.toasts = this.toasts.filter(t => t.id !== id); },
+    askConfirm(message, opts = {}) {
+      // Cancel-resolve any dialog already open so its awaiter can't hang.
+      if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      return new Promise(resolve => {
+        this.confirmDialog = {
+          open: true, message: String(message),
+          title: opts.title || 'Please confirm',
+          confirmLabel: opts.confirmLabel || 'Confirm',
+          cancelLabel: opts.cancelLabel || 'Cancel',
+          danger: !!opts.danger, input: false, inputValue: '', inputPlaceholder: '',
+          _resolve: resolve,
+        };
+        this.$nextTick(() => { try { this.$refs.confirmBtn?.focus(); } catch (e) {} });
+      });
+    },
+    // Styled replacement for window.prompt(): resolves to the string, or null on cancel.
+    askPrompt(message, defaultValue = '', opts = {}) {
+      if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      return new Promise(resolve => {
+        this.confirmDialog = {
+          open: true, message: String(message),
+          title: opts.title || 'Enter a value',
+          confirmLabel: opts.confirmLabel || 'OK',
+          cancelLabel: opts.cancelLabel || 'Cancel',
+          danger: !!opts.danger, input: true, inputValue: String(defaultValue || ''),
+          inputPlaceholder: opts.placeholder || '', _resolve: resolve,
+        };
+        this.$nextTick(() => { try { this.$refs.dialogInput?.focus(); this.$refs.dialogInput?.select(); } catch (e) {} });
+      });
+    },
+    _closeConfirm(result) {
+      const d = this.confirmDialog;
+      const resolve = d._resolve;
+      const value = d.input ? (result ? d.inputValue : null) : result;
+      this.confirmDialog = { ...d, open: false, _resolve: null };
+      if (resolve) resolve(value);
+    },
+    // Live connectivity/auth test for one scraper. Sends the current Settings
+    // form values (server skips masked secrets, falling back to the stored env).
+    async testScraper(name, config = null) {
+      this.scraperTest = { ...this.scraperTest, [name]: { pending: true } };
+      // Send only the credential keys the tester reads — not paths/other settings.
+      const credKeys = ['CIVITAI_API_KEY','CIVITAI_API_RED_KEY','TWITTER_COOKIES',
+                        'DISCORD_BOT_TOKEN','DISCORD_AUTH_MODE',
+                        'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT'];
+      const settings = {};
+      for (const k of credKeys) if (this.settings && this.settings[k] !== undefined) settings[k] = this.settings[k];
+      try {
+        const r = await fetch('/api/scrapers/test', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scraper: name, settings, config }),
+        });
+        const j = await r.json();
+        this.scraperTest = { ...this.scraperTest, [name]: {
+          pending: false, ok: !!j.ok, message: j.message || '', latency_ms: j.latency_ms } };
+      } catch (e) {
+        this.scraperTest = { ...this.scraperTest, [name]: { pending: false, ok: false, message: 'request failed' } };
+      }
+    },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':            'LMStudio PRIMARY endpoint',
@@ -4679,14 +4870,14 @@ function dashboard() {
     },
     async createJob() {
       const name = (this.newJob.name || '').trim();
-      if (!name) { alert('Give the job a name.'); return; }
+      if (!name) { this.notify('Give the job a name.', 'warn'); return; }
       const body = { name };
       if (this.newJob.base_on) body.base_on = this.newJob.base_on;
       else if (this.newJob.preset) body.preset = this.newJob.preset;
       const r = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify(body)});
       const j = await r.json();
-      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newJob = { name: '', base_on: '', preset: '' };
       await this.loadJobs();
       // The create response is the v2 job detail ({job:{slug,...}}).
@@ -4694,29 +4885,35 @@ function dashboard() {
     },
     async activateJob(slug) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
-      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Activate failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Activate failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
       await this.refresh();
+      this.notify('Activated "' + slug + '".', 'success');
     },
     async cloneJob(slug) {
-      const name = prompt('Name for the clone of "' + slug + '":', slug + ' copy');
-      if (!name) return;
+      const name = await this.askPrompt('Name for the clone of "' + slug + '":', slug + ' copy',
+                                        { title: 'Clone job', confirmLabel: 'Clone' });
+      if (!name || !name.trim()) return;
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/clone', {
         method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
       const j = await r.json();
-      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Clone failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
+      this.notify('Cloned to "' + name.trim() + '".', 'success');
     },
     async deleteJob(slug) {
-      if (!confirm('Delete job "' + slug + '"? Its config is removed. (Data folders are kept unless you confirm again.)')) return;
+      if (!(await this.askConfirm('Delete job "' + slug + '"? Its config is removed. You\'ll be asked separately about data folders.',
+                                  { title: 'Delete job', confirmLabel: 'Delete', danger: true }))) return;
       let url = '/api/jobs/' + encodeURIComponent(slug);
-      if (confirm('Also delete this job\'s queue + sorted data folders on disk? This cannot be undone.\n\nOK = delete data too · Cancel = keep data.')) {
+      if (await this.askConfirm('Also delete this job\'s queue + sorted data folders on disk? This cannot be undone.',
+                                { title: 'Delete data too?', confirmLabel: 'Delete data', cancelLabel: 'Keep data', danger: true })) {
         url += '?force=1';
       }
       const r = await fetch(url, {method:'DELETE'});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Delete failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
+      this.notify('Job "' + slug + '" deleted.', 'success');
     },
     async enqueueJob(slug) {
       await fetch('/api/jobs/' + encodeURIComponent(slug) + '/enqueue', {method:'POST'});
@@ -4915,41 +5112,51 @@ function dashboard() {
         const p = await fetch('/api/presets').then(r => r.json());
         this.presetsList = p.presets || [];
         this.presetsDefault = p.default || '';
+        // Default the "Start from" picker to the library default (no more
+        // redundant empty "Clone the default" option). Keep a valid selection.
+        if (!this.presetsList.includes(this.newPreset.base_on)) {
+          this.newPreset.base_on = this.presetsDefault || (this.presetsList[0] || '');
+        }
       } catch (e) { /* swallow */ }
     },
     async createPreset() {
       const name = (this.newPreset.name || '').trim();
-      if (!name) { alert('Give the preset a name.'); return; }
+      if (!name) { this.notify('Give the preset a name.', 'warn'); return; }
       const body = { name };
       if (this.newPreset.base_on) body.base_on = this.newPreset.base_on;
       const r = await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       const j = await r.json();
-      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newPreset = { name: '', base_on: '' };
       await this.loadPresets();
       this.openPreset(j.name);
     },
     async clonePreset(name) {
-      const nn = prompt('Name for the clone of "' + name + '":', name + ' copy');
-      if (!nn) return;
+      const nn = await this.askPrompt('Name for the clone of "' + name + '":', name + ' copy',
+                                      { title: 'Clone preset', confirmLabel: 'Clone' });
+      if (!nn || !nn.trim()) return;
       const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/clone', {
         method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: nn})});
       const j = await r.json();
-      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Clone failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadPresets();
+      this.notify('Cloned preset to "' + nn.trim() + '".', 'success');
     },
     async deletePreset(name) {
-      if (!confirm('Delete preset "' + name + '"?')) return;
+      if (!(await this.askConfirm('Delete preset "' + name + '"?',
+                                  { title: 'Delete preset', confirmLabel: 'Delete', danger: true }))) return;
       const r = await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Delete failed: ' + (j.error || r.status), 'error'); return; }
       if (this.presetEditor.name === name) this.presetEditor.open = false;
       await this.loadPresets();
+      this.notify('Preset "' + name + '" deleted.', 'success');
     },
     async setDefaultPreset(name) {
       const r = await fetch('/api/presets/default', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
-      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadPresets();
+      this.notify('"' + name + '" is now the default preset.', 'success');
     },
     async openPreset(name) {
       try {
@@ -4965,7 +5172,7 @@ function dashboard() {
         cfg.categories = Array.isArray(cfg.categories) ? cfg.categories : [];
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
-      } catch (e) { alert('Failed to load preset: ' + e.message); }
+      } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
     },
     closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
     // Preset list editors mirror the job editor list helpers but write straight
@@ -5081,7 +5288,8 @@ function dashboard() {
       this.update.available = false;
     },
     async runUpdate() {
-      if (!confirm('cull will pull the latest version, reinstall dependencies if needed, and restart. Continue?')) return;
+      if (!(await this.askConfirm('cull will pull the latest version, reinstall dependencies if needed, and restart. Continue?',
+                                  { title: 'Update cull', confirmLabel: 'Update' }))) return;
       this.update.running = true;
       try {
         const r = await fetch('/api/update/run', { method: 'POST' });
@@ -5096,8 +5304,9 @@ function dashboard() {
         // Connection drop is expected once the dashboard restarts.
       }
     },
-    reloadSettings() {
-      if (this.settingsDirty && !window.confirm('Discard your unsaved settings changes?')) return;
+    async reloadSettings() {
+      if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
+                                  { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
       this.settingsDirty = false;
       this.settingsErrors = {};
@@ -5147,7 +5356,7 @@ function dashboard() {
       const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert(j.error || ('toggle failed: ' + r.status)); return; }
+      if (!r.ok) { this.notify(j.error || ('toggle failed: ' + r.status), 'error'); return; }
       // Resync je.overrides from the server's fresh map so a subsequent flush
       // PUTs the post-toggle overrides, never a stale snapshot.
       if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
@@ -5238,10 +5447,11 @@ function dashboard() {
         path: c.path, meta: c,
       });
     },
-    closeModal() {
+    async closeModal() {
       // Warn on unsaved prompt edits before discarding the modal.
       if (this.modal.editing && this.modal.prompt !== this.modal.promptOriginal) {
-        if (!window.confirm('You have unsaved prompt edits. Discard them?')) return;
+        if (!(await this.askConfirm('You have unsaved prompt edits. Discard them?',
+                                    { title: 'Discard edits', confirmLabel: 'Discard', danger: true }))) return;
       }
       this.modal.open = false;
       this.modal.editing = false;

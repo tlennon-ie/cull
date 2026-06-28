@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import builtin_presets
 import categories
 import paths
 from pipeline_logging import get_logger
@@ -187,17 +188,39 @@ def _default_preset_cfg() -> dict:
 
 # ── Preset library ───────────────────────────────────────────────────────────
 
+def _merge_builtin_presets(lib: dict) -> dict:
+    """Additively ensure every shipped builtin preset exists in ``lib`` so an
+    older install picks up newly-added themed presets on upgrade — WITHOUT
+    clobbering any preset the user created or edited (``setdefault`` only)."""
+    presets = lib.setdefault("presets", {})
+    for name, cfg in builtin_presets.builtin_library()["presets"].items():
+        presets.setdefault(name, copy.deepcopy(cfg))
+    lib.setdefault("default", builtin_presets.DEFAULT_PRESET)
+    return lib
+
+
+def _read_presets_raw(path: Path) -> dict | None:
+    """Parse the on-disk presets file ONCE. Returns the raw dict, or None when
+    the file is absent/unreadable/structurally invalid (caller falls back to the
+    builtin library). Read exactly once per call to avoid a TOCTOU re-read."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("presets file %s is unreadable; using built-in defaults", path)
+        return None
+    if isinstance(data, dict) and isinstance(data.get("presets"), dict) and data["presets"]:
+        return data
+    return None
+
+
 def _read_presets() -> dict:
-    p = _presets_path()
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("presets"), dict) and data["presets"]:
-                data.setdefault("default", next(iter(data["presets"])))
-                return data
-        except (OSError, json.JSONDecodeError):
-            logger.warning("presets file %s is unreadable; using built-in defaults", p)
-    return {"default": "default", "presets": {"default": _default_preset_cfg()}}
+    data = _read_presets_raw(_presets_path())
+    if data is None:
+        return builtin_presets.builtin_library()
+    data.setdefault("default", next(iter(data["presets"])))
+    return _merge_builtin_presets(data)
 
 
 def _write_presets(lib: dict) -> None:
@@ -205,9 +228,19 @@ def _write_presets(lib: dict) -> None:
 
 
 def list_presets() -> dict:
-    lib = _read_presets()
-    if not _presets_path().is_file():
+    # Single read of the file (no TOCTOU re-read): seed on first access, else
+    # durably persist any builtin presets merged into an older library.
+    path = _presets_path()
+    raw = _read_presets_raw(path)
+    if raw is None:
+        lib = builtin_presets.builtin_library()
         _write_presets(lib)                    # seed on first access
+        return lib
+    before = set(raw.get("presets", {}))
+    raw.setdefault("default", next(iter(raw["presets"])))
+    lib = _merge_builtin_presets(raw)
+    if set(lib.get("presets", {})) != before:
+        _write_presets(lib)                    # persist newly-merged builtins
     return lib
 
 
