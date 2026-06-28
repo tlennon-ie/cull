@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -158,7 +158,7 @@ def process_one(img_path: Path, seen: SeenStore) -> bool:
             "source_guild": f"local:{SRC_DIR}",
             "author": "local",
             "timestamp": "",
-            "queued_at": datetime.utcnow().isoformat(),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
             "pipeline_topic": get_optional("PIPELINE_TOPIC"),
         }
         saved = save_to_queue(SOURCE_NAME, tmp_path, prompt, metadata)

@@ -1,41 +1,43 @@
-# Image-classification pipeline runtime dependencies.
-# Install with: pip install -r requirements.txt
+# cull runtime dependencies.
+# Install with:  pip install -r requirements.txt
+# (or `pip install -e .` to pull the pyproject extras: cloud / video / ml / dev)
 #
-# Python 3.10+ recommended (uses union-type syntax `int | None` etc).
+# Python 3.10+ required (uses `int | None` union syntax etc).
+# Versions current as of 2026-06.
 
 # ── Web dashboard ────────────────────────────────────────────────────────
-Flask>=3.0
-Flask-Cors>=4.0
+Flask>=3.1
+Flask-Cors>=6.0                   # 4.x/5.x carried CORS CVEs; 6.x is the secure line
 
 # ── Image handling ───────────────────────────────────────────────────────
-Pillow>=10.0
+Pillow>=11.0
 
 # ── Environment loading ──────────────────────────────────────────────────
-python-dotenv>=1.0
+python-dotenv>=1.0.1
 
 # ── HTTP clients ─────────────────────────────────────────────────────────
-requests>=2.31
+requests>=2.32                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.32
 
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
-groq>=0.11                        # Groq cloud worker
-openai>=1.0                       # OpenAI + OpenRouter cloud vision workers
-anthropic>=0.39                   # Anthropic Claude cloud vision worker
+groq>=0.20                        # Groq cloud worker
+openai>=1.40                      # OpenAI + OpenRouter cloud vision workers
+anthropic>=0.40                   # Anthropic Claude cloud vision worker
 google-genai>=1.0                 # Gemini cloud vision worker (NEW SDK, not google-generativeai)
 
 # ── Scrapers ─────────────────────────────────────────────────────────────
-playwright>=1.46                  # X.com / web scrapers - run `playwright install` after pip install
-schedule>=1.2                     # vision_worker_lm_keepalive.py
-# gallery-dl now lives on Codeberg (mikf moved his canonical mirror in 2024).
-# Pinned to a specific tag so cull's behaviour doesn't drift when upstream
-# breaks an extractor. Bump deliberately after smoke-testing the relevant
-# scrapers.
-gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.1
-yt-dlp>=2024.8                    # video scraping lane (scraper_yt_dlp.py)
+playwright>=1.49                  # X.com / web scrapers - run `playwright install` after pip install
+schedule>=1.2                     # keepalive worker + per-job scheduling
+# gallery-dl lives on Codeberg (mikf's canonical mirror). Pinned to a tag so
+# extractor behaviour doesn't drift mid-release; bump deliberately after a
+# scraper smoke test.
+gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.4
+yt-dlp>=2026.6.9                  # video scraping lane (scraper_yt_dlp.py)
 
 # ── Dataset export ───────────────────────────────────────────────────────
-huggingface_hub>=0.24             # push curated sets to a private HF dataset repo (hf_export.py)
+huggingface_hub>=0.34             # push curated sets to a private HF dataset repo (hf_export.py)
 
-# ── Optional dev tools (uncomment for development) ───────────────────────
-# pytest>=8.0
-# black>=24.0
-# ruff>=0.5
+# ── Optional feature extras (NOT installed by base; see pyproject extras) ──
+# Heavy/optional capabilities import-guard their deps so the base stays lean:
+#   video lane (frame extraction)  →  pip install -e .[video]   (scenedetect, ffmpeg-python)
+#   embeddings / aesthetic / ML    →  pip install -e .[ml]      (torch, open_clip_torch)
+#   dev / CI                       →  pip install -e .[dev]     (pytest, ruff, pip-audit)

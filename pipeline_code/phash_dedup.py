@@ -93,7 +93,7 @@ def compute_phash(image: "Path | str | bytes | bytearray") -> str | None:
         small = img.convert("L").resize(
             (HASH_SIZE + 1, HASH_SIZE), Image.LANCZOS,
         )
-        pixels = list(small.getdata())  # row-major, len == (HASH_SIZE+1)*HASH_SIZE
+        pixels = list(small.tobytes())  # row-major L bytes (1/px); avoids deprecated getdata()
     except (OSError, ValueError) as exc:
         logger.debug("phash: failed to reduce image (%r): %s", _describe(image), exc)
         return None
