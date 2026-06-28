@@ -332,6 +332,25 @@ class TestXCom:
         )
         assert isinstance(result["latency_ms"], int)
 
+    def test_live_call_sends_bearer_and_csrf_from_ct0(self, st, monkeypatch):
+        """The probe must carry the web bearer + x-csrf-token(=ct0) + cookies —
+        a cookie-only request always 401s, which broke the old test."""
+        calls = _patch_http(monkeypatch, st, 200)
+        st.test_scraper("X.com",
+                        env={"TWITTER_COOKIES": "auth_token=abc; ct0=DEFCSRF; twid=u123"})
+        assert len(calls) == 1
+        h = calls[0]["headers"]
+        assert h["Authorization"].startswith("Bearer ")
+        assert h["x-csrf-token"] == "DEFCSRF"          # taken from the ct0 cookie
+        assert "auth_token=abc" in h["Cookie"]
+
+    def test_expired_cookies_report_auth_rejected(self, st, monkeypatch):
+        _patch_http(monkeypatch, st, 401)
+        result = st.test_scraper("X.com",
+                                 env={"TWITTER_COOKIES": "auth_token=abc; ct0=def"})
+        assert result["ok"] is False
+        assert "auth rejected" in result["message"]
+
 
 # ===========================================================================
 # 7. Discord — bot vs user mode Authorization header

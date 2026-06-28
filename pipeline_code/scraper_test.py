@@ -245,53 +245,67 @@ def _check_civitai_red(config: dict, env: dict | None) -> dict:
     )
 
 
-def _check_x_com(config: dict, env: dict | None) -> dict:
-    """X.com — requires TWITTER_COOKIES containing both auth_token and ct0.
+# Public web bearer token embedded in x.com's own JavaScript. NOT a secret — it
+# is sent by every browser on every request — but the v1.1 API rejects a request
+# that carries only the auth cookies. The authenticated web call needs all three:
+# this bearer, the x-csrf-token header (== the ct0 cookie value), and the cookies.
+_TWITTER_WEB_BEARER = (
+    "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs="
+    "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
 
-    Stage 1 (offline): cookie string must contain 'auth_token' and 'ct0'.
-    Stage 2 (live): GET https://api.twitter.com/1.1/account/verify_credentials.json
-    with Cookie header (best-effort; may return 401 without Playwright context).
-    We report the structural check as the primary signal since Playwright cookies
-    are not injectable via plain HTTP.
+
+def _parse_cookie_pairs(raw: str) -> dict[str, str]:
+    """Parse a raw ``name=value; name2=value2`` Cookie header into a dict."""
+    out: dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" in part:
+            name, value = part.split("=", 1)
+            out[name.strip()] = value.strip()
+    return out
+
+
+def _check_x_com(config: dict, env: dict | None) -> dict:
+    """X.com — verify a logged-in cookie string actually authenticates.
+
+    Stage 1 (offline): the cookie string must contain both ``auth_token`` and
+    ``ct0`` (paste the FULL ``Cookie:`` header from a logged-in x.com request).
+    Stage 2 (live): GET v1.1 ``account/verify_credentials.json`` with the public
+    web bearer + ``x-csrf-token: <ct0>`` + the cookies. A cookie-ONLY request
+    always 401s, which is why the old check failed for valid cookies; with the
+    bearer + csrf, 200 == the session is live, 401/403 == expired/invalid.
     """
     raw_cookies = _get("TWITTER_COOKIES", env)
     if raw_cookies is None:
         return _fail("TWITTER_COOKIES not set")
 
-    # Structural validation: both auth_token and ct0 must be present.
-    cookie_names = {
-        part.split("=", 1)[0].strip()
-        for part in raw_cookies.split(";")
-        if "=" in part
-    }
-    if "auth_token" not in cookie_names:
+    cookies = _parse_cookie_pairs(raw_cookies)
+    if "auth_token" not in cookies:
         return _fail(
-            "TWITTER_COOKIES missing 'auth_token' — cookie string appears incomplete"
+            "TWITTER_COOKIES missing 'auth_token' — paste the FULL Cookie header "
+            "from a logged-in x.com request (auth_token=...; ct0=...; ...)"
         )
-    if "ct0" not in cookie_names:
+    if not cookies.get("ct0"):
         return _fail(
-            "TWITTER_COOKIES missing 'ct0' — cookie string appears incomplete"
+            "TWITTER_COOKIES missing 'ct0' — paste the FULL Cookie header from a "
+            "logged-in x.com request (auth_token=...; ct0=...; ...)"
         )
 
-    # Live call with Cookie header (best-effort; Twitter requires full browser context
-    # in practice, but a 200 here means the cookies are structurally accepted).
     headers = {
+        "Authorization": _TWITTER_WEB_BEARER,
+        "x-csrf-token": cookies["ct0"],
         "Cookie": raw_cookies,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
         ),
     }
-    result = _live_call(
+    return _live_call(
         "GET",
         "https://api.twitter.com/1.1/account/verify_credentials.json",
         headers=headers,
         detail="twitter verify_credentials",
     )
-    # Twitter's API often 400s with a JSON error on plain HTTP (not Playwright).
-    # Treat 200 as fully ok; anything else as a warning but return ok if credentials
-    # are structurally valid (the scraper uses Playwright, not plain HTTP).
-    return result
 
 
 def _check_discord(config: dict, env: dict | None) -> dict:
