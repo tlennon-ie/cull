@@ -57,6 +57,11 @@ _COMMON_RULES = (
 )
 
 
+# Both Civitai hosts are seeded by default — the dashboard exposes them as a
+# two-option multiselect (civitai.com / civitai.red), not free text.
+_CIVITAI_BOTH: tuple[str, ...] = ("civitai.com", "civitai.red")
+
+
 def _preset(
     *,
     require_prompt: bool,
@@ -70,9 +75,21 @@ def _preset(
     min_prompt_length: int = 0,
     ovr_min: int = 0,
     rel_min: int = 0,
+    x_accounts: tuple[str, ...] = (),
+    reddit_subreddits: tuple[str, ...] = (),
+    civitai_domains: tuple[str, ...] = _CIVITAI_BOTH,
     rules_preamble: str = _COMMON_RULES,
 ) -> dict:
-    """Build one sparse preset bundle. `categories` is [(name, hint), ...]."""
+    """Build one sparse preset bundle. `categories` is [(name, hint), ...].
+
+    `keywords_extra` is a generous synonym list: the required-keyword gate is
+    always on (when empty it auto-derives from the subject), so a broad list
+    only *widens* what a prompt-based scraper accepts. `generation_hints` only
+    gate when require_prompt=True. `x_accounts` / `reddit_subreddits` are
+    starter scraper targets (verify/extend per job); `civitai_domains` defaults
+    to both hosts. Scraper enable/disable + gallery-dl + local imports inherit
+    the default shape via get_preset's deep-merge.
+    """
     rules = f"{rules_preamble}\n{theme_rules}".strip() if theme_rules else rules_preamble
     return {
         "topic_filters": {
@@ -81,6 +98,11 @@ def _preset(
             "generation_hints": list(generation_hints),
             "min_prompt_length": int(min_prompt_length),
             "require_prompt": bool(require_prompt),
+        },
+        "scrapers": {
+            "x_accounts": list(x_accounts),
+            "reddit_subreddits": list(reddit_subreddits),
+            "civitai_domains": list(civitai_domains),
         },
         "categories": [{"name": n, "hint": h} for n, h in categories],
         "category_rules": rules,
@@ -119,6 +141,7 @@ def _build_presets() -> dict[str, dict]:
         # ── general dataset-prep triage — the new shipped DEFAULT ───────────
         "default": _preset(
             require_prompt=True,
+            ovr_min=40, rel_min=20,
             categories=[
                 ("Keep", "Strong on-topic example, no severe AI flaws, no "
                  "watermark/overlay, OVR_Quality_Score >= 60 AND "
@@ -145,6 +168,12 @@ def _build_presets() -> dict[str, dict]:
         # ── aerial / drone / satellite imagery ──────────────────────────────
         "aerial_drone": _preset(
             require_prompt=False,
+            keywords_extra=("aerial", "drone", "overhead", "birds eye", "top-down",
+                            "satellite", "from above", "altitude"),
+            reddit_subreddits=("drones", "aerialphotography", "dronephotography",
+                               "Multicopter", "SatelliteImages"),
+            x_accounts=("DroneDJ",),
+            ovr_min=50, rel_min=25,
             categories=[
                 ("Keep", "Clear aerial / drone / satellite shot of the subject, "
                  "sharp, minimal haze or cloud obstruction, OVR>=60 and REL>=60"),
@@ -173,6 +202,11 @@ def _build_presets() -> dict[str, dict]:
         # ── underwater / marine ─────────────────────────────────────────────
         "underwater_marine": _preset(
             require_prompt=False,
+            keywords_extra=("underwater", "scuba", "diving", "reef", "ocean",
+                            "marine", "coral", "sea"),
+            reddit_subreddits=("underwaterphotography", "scuba", "reef",
+                               "WaterPorn", "Ocean"),
+            ovr_min=50, rel_min=25,
             categories=[
                 ("Keep", "Clearly underwater/marine subject, good visibility, "
                  "sharp, on-topic, natural or well-corrected colour"),
@@ -202,6 +236,12 @@ def _build_presets() -> dict[str, dict]:
         # ── wildlife & macro nature ─────────────────────────────────────────
         "wildlife_macro": _preset(
             require_prompt=False,
+            keywords_extra=("wildlife", "macro", "insect", "bird", "animal",
+                            "nature", "butterfly", "close-up"),
+            reddit_subreddits=("macro", "wildlifephotography", "macrophotography",
+                               "naturephotography", "birdphotography", "insects"),
+            x_accounts=("NatGeoPhotos",),
+            ovr_min=50, rel_min=25,
             categories=[
                 ("Keep", "Sharp wildlife or macro-nature subject with the eye/key "
                  "plane in focus, natural habitat, clean subject separation, "
@@ -230,6 +270,10 @@ def _build_presets() -> dict[str, dict]:
         # ── product / e-commerce ────────────────────────────────────────────
         "product_ecommerce": _preset(
             require_prompt=False,
+            keywords_extra=("product", "packshot", "studio", "catalog",
+                            "e-commerce", "white background", "product photography"),
+            reddit_subreddits=("productphotography", "commercialphotography"),
+            ovr_min=50, rel_min=25,
             categories=[
                 ("Keep", "Single clearly-presented product, clean/seamless "
                  "background, sharp, well-lit, accurate colour, no distracting "
@@ -259,6 +303,13 @@ def _build_presets() -> dict[str, dict]:
         # ── anime / illustration (drops the photoreal gates) ────────────────
         "anime_illustration": _preset(
             require_prompt=True,
+            keywords_extra=("anime", "illustration", "manga", "digital art",
+                            "character"),
+            generation_hints=("anime", "illustration", "masterpiece",
+                              "best quality", "detailed"),
+            reddit_subreddits=("anime", "awwnime", "Animewallpaper",
+                               "ImaginaryCharacters", "DigitalArt"),
+            ovr_min=45, rel_min=25,
             categories=[
                 ("Keep", "Clean anime/illustration artwork, on-topic, no severe AI "
                  "flaws, no watermark/signature overlay"),
@@ -290,6 +341,11 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=True,
             rules_preamble=_PORTRAIT_RULES,
             theme_rules="",
+            keywords_extra=("woman", "model", "portrait", "fashion", "editorial",
+                            "photoshoot"),
+            generation_hints=("photorealistic", "skin texture", "portrait",
+                              "natural light", "studio light", "bokeh", "85mm"),
+            ovr_min=55, rel_min=0,
             categories=[
                 ("InstagramInfluencer", "photorealistic person, social-media "
                  "aesthetic, no nudity, no overlay"),
@@ -315,6 +371,7 @@ def _build_presets() -> dict[str, dict]:
         # ── retained: topic-agnostic quality triage ─────────────────────────
         "quality_only": _preset(
             require_prompt=False,
+            ovr_min=40, rel_min=0,
             categories=[
                 ("Top", "OVR_Quality_Score >= 80, no severe AI flaws, no overlay"),
                 ("Mid", "OVR_Quality_Score 60-79"),

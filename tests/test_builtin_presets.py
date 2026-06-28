@@ -187,5 +187,36 @@ def test_list_presets_merges_builtins_into_existing_library(isolated):
     assert lib["presets"]["default"]["scoring"]["notes"] == "user customised"
 
 
+# ── seeded scraper targets / keywords / scoring floors ───────────────────────
+
+def test_presets_seed_both_civitai_domains():
+    for name, cfg in bp.builtin_library()["presets"].items():
+        assert cfg["scrapers"]["civitai_domains"] == ["civitai.com", "civitai.red"], name
+
+
+def test_themed_presets_seed_subreddits_and_keywords():
+    presets = bp.builtin_library()["presets"]
+    for name in ("aerial_drone", "underwater_marine", "wildlife_macro",
+                 "product_ecommerce", "anime_illustration"):
+        assert presets[name]["scrapers"]["reddit_subreddits"], name
+        assert presets[name]["topic_filters"]["keywords_extra"], name
+
+
+def test_all_presets_have_a_nonzero_ovr_floor():
+    # The user asked for Min OVR/REL configured to suitable (non-zero) values.
+    for name, cfg in bp.builtin_library()["presets"].items():
+        assert cfg["scoring"]["ovr_min"] > 0, name
+
+
+def test_resolve_env_projects_seeded_scraper_targets(isolated):
+    jc, _ = isolated
+    job = jc.create_job("Aerial Set", preset="aerial_drone")
+    env = jc.resolve_env(job)
+    assert env["CIVITAI_DOMAINS"] == "civitai.com,civitai.red"
+    assert "drones" in env["REDDIT_SUBREDDITS"]
+    assert "DroneDJ" in env["X_ACCOUNTS"]
+    assert int(env["VISION_OVR_MIN_SCORE"]) == 50
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
