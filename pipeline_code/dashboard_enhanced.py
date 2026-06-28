@@ -4244,6 +4244,42 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          Writes to .env via /api/settings. -->
     <section x-show="view === 'jobs' && active === 'settings'" class="space-y-4"
       @input="markSettingsDirty()" @change="markSettingsDirty()">
+
+      <!-- Software updates — pull origin/main + restart. Mirrors the update toast. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-2">
+          <div>
+            <h3 class="font-semibold">Software updates</h3>
+            <p class="text-xs text-slate-400">Pull the latest cull from <code>origin/main</code> and restart. Needs a clean git checkout.</p>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button @click="checkUpdate(true)" :disabled="!!update.checking"
+              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
+              <span x-text="update.checking ? 'Checking…' : 'Check for updates'"></span>
+            </button>
+            <button @click="runUpdate()" :disabled="!!update.running || update.behind === 0 || !!update.dirty"
+              class="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded text-sm disabled:opacity-50"
+              :title="update.dirty ? 'Commit or stash local changes first' : (update.behind === 0 ? 'Already up to date' : '')">
+              <span x-text="update.running ? 'Updating…' : 'Update to latest &amp; restart'"></span>
+            </button>
+          </div>
+        </div>
+        <div class="text-xs text-slate-400 space-y-1">
+          <div>Installed: <span class="font-mono text-slate-200" x-text="update.local_sha || '—'"></span>
+            <template x-if="update.checked">
+              <span>· latest <span class="font-mono text-slate-200" x-text="update.remote_sha || '—'"></span>
+                <span x-show="update.behind > 0" class="text-amber-300" x-text="'· ' + update.behind + ' behind'"></span>
+                <span x-show="update.checked && update.behind === 0 && !update.error" class="text-emerald-300">· up to date</span>
+              </span>
+            </template>
+          </div>
+          <div x-show="update.remote_subject" class="truncate text-slate-500" x-text="'→ ' + update.remote_subject"></div>
+          <div x-show="update.dirty" class="text-rose-300">Working tree has uncommitted changes — commit or stash before updating.</div>
+          <div x-show="update.error" class="text-rose-300" x-text="'⚠ ' + update.error"></div>
+          <div x-show="update.running" class="text-slate-400">Pulling, reinstalling deps if needed, and relaunching. The dashboard will restart — refresh in a moment.</div>
+        </div>
+      </div>
+
       <div class="card rounded-xl p-5">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
@@ -4710,7 +4746,7 @@ function dashboard() {
     settingsDirty: false, settingsErrors: {},
     providerTest: {},
     lmstudioUnload: { busy: false, ok: null, message: '' },
-    update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
+    update: { available: false, behind: 0, local_sha: '', remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '', dirty: false, checking: false, checked: false },
     indexer: { in_progress: false, files_seen: 0, files_added: 0, queue_total: 0, sorted_total: 0, last_scan_at: null, scan_started_at: null },
     indexerToast: { show: false, dismissed: false },
     // ── Generic toasts + styled confirm dialog (replace window.alert/confirm) ──
@@ -5330,23 +5366,37 @@ function dashboard() {
         this.lmstudioUnload = { busy: false, ok: false, message: '✗ network error' };
       }
     },
-    async checkUpdate() {
+    async checkUpdate(manual = false) {
+      if (manual) this.update.checking = true;
       try {
         const r = await fetch('/api/update/check');
         const j = await r.json();
-        if (!j.ok) { this.update.error = j.error || ''; return; }
+        if (!j.ok) {
+          this.update.error = j.error || ''; this.update.checking = false; this.update.checked = true;
+          if (manual) this.notify('Update check failed: ' + (j.error || 'unknown'), 'error');
+          return;
+        }
         const dismissed = localStorage.getItem('cull_update_dismissed_sha') || '';
         this.update = {
+          ...this.update,
           available: j.behind > 0 && j.remote_sha !== dismissed,
           behind: j.behind || 0,
+          local_sha: j.local_sha || '',
           remote_sha: j.remote_sha || '',
           remote_subject: j.remote_subject || '',
+          dirty: !!j.dirty,
           dismissed_sha: dismissed,
           running: false,
           error: '',
+          checking: false,
+          checked: true,
         };
+        if (manual) this.notify(j.behind > 0
+          ? (j.behind + ' update' + (j.behind === 1 ? '' : 's') + ' available')
+          : 'cull is up to date', j.behind > 0 ? 'info' : 'success');
       } catch (e) {
-        // Silent — updater is best-effort.
+        this.update.checking = false;
+        if (manual) this.notify('Update check failed (network)', 'error');
       }
     },
     dismissUpdate() {
