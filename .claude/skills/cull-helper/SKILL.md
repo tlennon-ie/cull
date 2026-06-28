@@ -15,6 +15,7 @@ cull is a single-machine curation engine for AI-generated images. Pulls from man
 
    | Concern | Module |
    |---|---|
+   | Job state (config / queue / active) | `pipeline_code/job_config.py` |
    | Categories | `pipeline_code/categories.py` |
    | Vision worker registration | `pipeline_code/vision_workers.py` |
    | Vision worker scaffolding | `pipeline_code/vision_worker_base.py` |
@@ -34,6 +35,17 @@ cull is a single-machine curation engine for AI-generated images. Pulls from man
 5. **Subprocess workers print, library code logs.** Scrapers and vision workers run as subprocess children of the supervisor; their `print(..., flush=True)` lines end up in `pipeline_<slug>.log` with `[label]` prefixes and that's the format humans tail. Library code (queue_manager, seen_store, etc.) uses `pipeline_logging.get_logger(__name__)`.
 
 ## Common tasks
+
+### Work on jobs / per-job config
+
+cull runs one **active job** at a time. A job is a named curation target whose config is a JSON bundle at `data/jobs/<slug>.json` (queue order + active pointer in `data/jobs/_index.json`). `pipeline_code/job_config.py` is the single source of truth — never scatter job state elsewhere.
+
+1. **Projection, not rewiring.** A job is the source of truth; *activating* it projects down into the contracts the runtime already consumes. `job_config.resolve_env(job)` flattens the JSON into the existing env-var names (`PIPELINE_TOPIC`, `X_ACCOUNTS`, `SCRAPER_DISABLED`, `VISION_OVR_MIN_SCORE`, `AUTO_CAPTION_*`, …) that the supervisor merges over the global `.env` when spawning children, and `job_config.project_categories(job)` writes the taxonomy into `data/cull_categories.json`. `job_config.activate(slug)` does both. **Scrapers and vision workers stay env-driven and unchanged — they still read `os.environ`.**
+2. **Add/rename a job field:** edit the `Job` dataclass + `_default_job_data` in `job_config.py`, then extend `resolve_env` so it projects to an env var, and add the input to the dashboard's job editor. Keep the three in lockstep — a field with no `resolve_env` mapping never reaches the workers.
+3. **Global vs per-job:** credentials + model endpoints + vision worker selection + base paths + throttle stay GLOBAL in `.env`. Topic, scraper targets/toggles, categories, scoring, and captioning are PER-JOB. (Scraper *credentials* are global; scraper *targets* are per-job.)
+4. **Slug safety:** `JOB_SLUG_RE = ^[a-z0-9_]+$` is the identity + the path guard. `_job_path` rejects anything else so a bad slug can't escape `jobs_dir()`. Use `job_config.slugify(name)` to derive slugs (mirrors `run_pipeline.topic_slug`).
+5. **Atomic writes:** `<slug>.json` and `_index.json` are written temp + `os.replace` (see `_atomic_write_json`). Don't hand-roll a non-atomic write.
+6. **Migration:** upgraders run `python tools/migrate_to_jobs.py` → `job_config.migrate_existing_data()`. It adopts `PIPELINE_SLUG` + on-disk slugs (`discover_data_slugs`) WITHOUT moving `data/queue/<slug>` or `data/sorted/<slug>`. Idempotent. The dashboard/supervisor auto-create a `default` job via `migrate_env_to_default_job()` on first run.
 
 ### Add a new scraper source
 

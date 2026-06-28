@@ -49,6 +49,14 @@ def log_dir() -> Path:
     return Path(raw) if raw else (base_dir() / "logs")
 
 
+def jobs_dir() -> Path:
+    """Directory holding per-job config bundles (`<slug>.json`) and `_index.json`.
+
+    Always under the global base dir — jobs are a global registry, not per-slug.
+    """
+    return base_dir() / "jobs"
+
+
 def queue_root() -> Path:
     """Parent of all per-slug queue folders (i.e. without the slug suffix)."""
     raw = os.environ.get("PIPELINE_QUEUE", "").strip()
@@ -84,6 +92,7 @@ __all__ = [
     "queue_root",
     "sorted_root",
     "log_dir",
+    "jobs_dir",
     "local_import_dir",
     "local_import_name",
 ]

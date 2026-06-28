@@ -1,10 +1,27 @@
 """
-run_pipeline.py - Topic-driven pipeline orchestrator.
+run_pipeline.py - Job-driven pipeline orchestrator.
 
-Now supervised: a background loop reconciles *desired* state (derived from .env)
-with *actual* state (spawned subprocesses) every few seconds. Toggle a scraper
-or vision worker on in the dashboard -> its process starts within the next
-reconcile tick. Toggle off -> process gets terminated. No pipeline restart.
+Now supervised: a background loop reconciles *desired* state with *actual* state
+(spawned subprocesses) every few seconds. Toggle a scraper or vision worker on in
+the dashboard -> its process starts within the next reconcile tick. Toggle off ->
+process gets terminated. No pipeline restart.
+
+Jobs model (see docs/jobs-model-design.md §7): the supervisor runs the ACTIVE job
+from ``job_config``. A job is the source of truth; *activating* it projects its
+config down into the two contracts the runtime already consumes —
+
+  1. env vars (``job_config.resolve_env``) merged over the global ``.env`` when we
+     spawn children, and
+  2. the active taxonomy file ``cull_categories.json`` (``project_categories``).
+
+Switching the active job reuses the EXISTING hot-reload machinery: we watch
+``data/jobs/_index.json`` mtime alongside ``.env`` and ``cull_categories.json``,
+and when the active slug changes we re-resolve env + re-project categories and
+trigger the same structural restart the supervisor already does on a structural
+``.env`` change (the resolved keys are already in STRUCTURAL_ENV_KEYS).
+
+Global concerns (credentials, model endpoints, vision worker selection, throttle)
+still come from ``.env`` and keep their own mtime watch.
 
 All paths resolved from .env via paths.py. No hardcodes.
 """
@@ -26,6 +43,7 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 
+import job_config
 from paths import base_dir
 
 load_dotenv()
@@ -40,6 +58,14 @@ BASE_DIR: Path = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 RECONCILE_SECONDS: int = int(os.environ.get("PIPELINE_RECONCILE_SECONDS", 2))
 
 ENV_PATH: Path = Path(os.environ.get("WORKSPACE_ROOT", PIPELINE_CODE_DIR.parent)) / ".env"
+
+# The jobs index — its mtime bumps whenever the dashboard activates / advances a
+# job. Watched alongside ENV_PATH so a job switch triggers a structural restart.
+JOBS_INDEX_PATH: Path = job_config.jobs_dir() / "_index.json"
+
+# How long the idle loop waits between checks when no job is active. Kept short so
+# activating a job from the dashboard starts the pipeline within ~1s.
+IDLE_POLL_SECONDS: float = 1.0
 
 # Env vars whose CHANGE means in-flight children read stale config and must
 # be respawned. Toggling SCRAPER_DISABLED or PIPELINE_VISION_WORKERS isn't
@@ -118,6 +144,39 @@ def vision_worker_list() -> list[str]:
         return [w.strip() for w in raw.split(",") if w.strip()]
     single = os.environ.get("PIPELINE_VISION_WORKER", "").strip()
     return [single] if single else []
+
+
+# ── Jobs model: active-job resolution (pure helpers, unit-tested) ──────────────
+
+def desired_active_slug() -> str | None:
+    """The slug of the job the supervisor SHOULD be running, or None to idle.
+
+    Thin wrapper over ``job_config.get_active_slug`` so the supervisor's
+    active-slug change detection has one named seam to test/mock.
+    """
+    return job_config.get_active_slug()
+
+
+def active_job_env(slug: str | None = None) -> dict[str, str] | None:
+    """Build the spawn/base environment for the active (or given) job.
+
+    Returns ``{**os.environ, **job_config.resolve_env(job)}`` — the job's
+    resolved env-var names overlaid on the process env so scrapers + vision
+    workers receive the job's PIPELINE_TOPIC/SLUG, SCRAPER_DISABLED, X_ACCOUNTS,
+    scoring, captioning, etc. while still inheriting global ``.env`` values
+    (credentials, model endpoints) that the job never stores.
+
+    Returns ``None`` when there is no active job, or when the active slug points
+    at a job file that no longer exists — the caller idles instead of spawning
+    children against a stale global config.
+    """
+    slug = slug if slug is not None else desired_active_slug()
+    if not slug:
+        return None
+    job = job_config.get_job(slug)
+    if job is None:
+        return None
+    return {**os.environ, **job_config.resolve_env(job)}
 
 
 # ── Desired-state computation ─────────────────────────────────────────────────
@@ -200,10 +259,15 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
 class Supervisor:
     """Reconciles desired agents with actually-running subprocesses."""
 
-    def __init__(self, topic: str, base_env: dict[str, str], log_file) -> None:
+    def __init__(self, topic: str, base_env: dict[str, str], log_file,
+                 job_slug: str | None = None) -> None:
         self.topic = topic
         self.base_env = base_env
         self.log_file = log_file
+        # The job slug this supervisor is currently running. None in the legacy
+        # CLI/topic path; set in the jobs path so we can detect when the
+        # dashboard switches the active job and restart into the new one.
+        self.job_slug = job_slug
         self._lock = threading.Lock()
         self._active: dict[str, subprocess.Popen] = {}  # label -> proc
         self._desired_snapshot: dict[str, AgentSpec] = {}
@@ -218,6 +282,10 @@ class Supervisor:
         # and use to trigger a soft restart so every child picks up fresh env.
         self._env_mtime: float = self._current_env_mtime()
         self._categories_mtime: float = self._current_categories_mtime()
+        # mtime of data/jobs/_index.json — bumps when the dashboard activates /
+        # advances a job. A change whose active slug differs from job_slug means
+        # we must re-project the new job and structurally restart into it.
+        self._jobs_index_mtime: float = self._current_jobs_index_mtime()
         self._struct_snapshot: dict[str, str] = _structural_env_snapshot()
         self._queue_dir: Path | None = None  # set by run_topic before start()
 
@@ -238,6 +306,52 @@ class Supervisor:
             return ACTIVE_PATH.stat().st_mtime
         except OSError:
             return 0.0
+
+    @staticmethod
+    def _current_jobs_index_mtime() -> float:
+        """mtime of data/jobs/_index.json. Bumps when the dashboard activates or
+        advances a job; we use it to detect active-slug switches cheaply (no
+        JSON read on the hot poll path)."""
+        try:
+            return JOBS_INDEX_PATH.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _apply_active_job(self, slug: str) -> bool:
+        """Project the job ``slug`` into the runtime env + taxonomy.
+
+        Resolves the job's env over ``os.environ`` (so ``compute_desired_agents``
+        and the next ``_spawn`` both see PIPELINE_TOPIC/SLUG, SCRAPER_DISABLED,
+        scoring, captioning, …) and writes its categories into
+        ``cull_categories.json``. Returns True on success. On a missing job file
+        (orphaned active pointer) returns False so the caller can idle rather
+        than spawn against stale config.
+
+        We intentionally update ``os.environ`` rather than threading a separate
+        dict through ``compute_desired_agents``: that function already reads the
+        process env for every toggle (SCRAPER_DISABLED, GALLERY_DL_*, …), so
+        overlaying the resolved job env is the smallest correct wiring and keeps
+        the legacy CLI/topic path untouched.
+        """
+        job = job_config.get_job(slug)
+        if job is None:
+            return False
+        resolved = job_config.resolve_env(job)
+        os.environ.update(resolved)
+        self.topic = resolved.get("PIPELINE_TOPIC", self.topic) or self.topic
+        self.job_slug = slug
+        # Project the new taxonomy BEFORE pre-creating folders so the new job's
+        # category dirs exist for the about-to-respawn workers.
+        job_config.project_categories(job)
+        queue_dir, sorted_dir = _prepare_slug_dirs(slug)
+        # Point spawn env + the stale-.processing sweep at the new job's dirs.
+        self.base_env = {
+            **self.base_env, **resolved,
+            "PIPELINE_QUEUE": str(queue_dir),
+            "PIPELINE_SORTED": str(sorted_dir),
+        }
+        self._queue_dir = queue_dir
+        return True
 
     def _spawn(self, spec: AgentSpec) -> None:
         script_path = PIPELINE_CODE_DIR / spec.script
@@ -333,6 +447,57 @@ class Supervisor:
             structural_changed = True
             print("  [env-reload] categories file changed; soft-restarting children", flush=True)
 
+        # Jobs index edits (dashboard activated / advanced a job, or edited the
+        # ACTIVE job's config and bumped the index — see design §8). We re-apply
+        # the active job's projection in two cases:
+        #   * the active slug CHANGED → force a structural restart into the new
+        #     job's env + taxonomy (reuse the structural-restart path), or
+        #   * the active slug is the SAME → re-resolve env + re-project so per-job
+        #     edits (scraper toggles, scoring, captioning, categories) on the
+        #     running job take effect. Whether that warrants a restart is then
+        #     decided by the existing struct-snapshot / categories-mtime diffs
+        #     below, so a mere SCRAPER_DISABLED change flows through the normal
+        #     start/stop reconcile without a disruptive restart.
+        idx_mtime = self._current_jobs_index_mtime()
+        if idx_mtime != self._jobs_index_mtime:
+            self._jobs_index_mtime = idx_mtime
+            new_slug = desired_active_slug()
+            if not new_slug and self.job_slug:
+                # Active job cleared (dashboard stop / advance past end). Signal
+                # the run loop to exit so the top-level jobs driver terminates
+                # the children and returns to its idle wait. We do NOT auto-
+                # advance — the dashboard owns the queue.
+                self.job_slug = None
+                self._stop.set()
+                print("  [job-switch] active job cleared; stopping pipeline and idling",
+                      flush=True)
+                return
+            if new_slug:
+                slug_changed = new_slug != self.job_slug
+                if self._apply_active_job(new_slug):
+                    if slug_changed:
+                        structural_changed = True
+                        print(f"  [job-switch] active job -> {new_slug!r}; "
+                              "restarting children with its env + categories", flush=True)
+                    else:
+                        print(f"  [job-reload] active job {new_slug!r} config changed; "
+                              "re-projected env + categories", flush=True)
+                    # Re-baseline the categories mtime so re-projecting (which
+                    # rewrote cull_categories.json with identical-or-new content)
+                    # doesn't double-trigger the categories watch below; the diff
+                    # against the OLD struct snapshot still drives a restart when
+                    # a structural key actually changed.
+                    self._categories_mtime = self._current_categories_mtime()
+                    new_struct = _structural_env_snapshot()
+                    if not slug_changed and new_struct != self._struct_snapshot:
+                        structural_changed = True
+                        print("  [job-reload] structural key changed; soft-restarting children",
+                              flush=True)
+                    self._struct_snapshot = new_struct
+                elif slug_changed:
+                    print(f"  [job-switch] active slug {new_slug!r} has no job file; "
+                          "ignoring", flush=True)
+
         desired = compute_desired_agents(self.topic)
         self._desired_snapshot = desired
 
@@ -394,7 +559,8 @@ class Supervisor:
                 now = time.monotonic()
                 env_bumped = self._current_env_mtime() != self._env_mtime
                 cats_bumped = self._current_categories_mtime() != self._categories_mtime
-                if env_bumped or cats_bumped or (now - last_full) >= RECONCILE_SECONDS:
+                idx_bumped = self._current_jobs_index_mtime() != self._jobs_index_mtime
+                if env_bumped or cats_bumped or idx_bumped or (now - last_full) >= RECONCILE_SECONDS:
                     self.reconcile()
                     last_full = now
         except KeyboardInterrupt:
@@ -408,7 +574,37 @@ class Supervisor:
             self._terminate(label)
 
 
-# ── Topic runner ──────────────────────────────────────────────────────────────
+# ── Slug directory setup (shared by the topic + jobs runners) ──────────────────
+
+def _prepare_slug_dirs(slug: str) -> tuple[Path, Path]:
+    """Create the queue + sorted (incl. category) folders for ``slug`` and return
+    ``(queue_dir, sorted_dir)``. Reads the taxonomy live so a (re)start picks up
+    the active job's categories; workers also mkdir lazily as a belt-and-braces."""
+    queue_root = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
+    sorted_root = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
+    queue_dir = queue_root if queue_root.name == slug else queue_root / slug
+    sorted_dir = sorted_root if sorted_root.name == slug else sorted_root / slug
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    from categories import get_all_categories
+    for cat in get_all_categories():
+        (sorted_dir / cat).mkdir(parents=True, exist_ok=True)
+    return queue_dir, sorted_dir
+
+
+def _open_slug_log(slug: str):
+    log_dir = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs_test")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return open(log_dir / f"pipeline_{slug}.log", "w", encoding="utf-8")
+
+
+def _install_sigint(supervisor: "Supervisor") -> None:
+    def _handle_sigint(_sig, _frame):
+        supervisor.shutdown()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+
+# ── Topic runner (legacy CLI path) ─────────────────────────────────────────────
 
 def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
     slug = topic_slug(topic)
@@ -417,23 +613,8 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
     print(f"=== VISION WORKER LIST: {vision_worker_list() or [vision_worker]} ===", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
-    queue_root = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
-    sorted_root = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
-    queue_dir = queue_root if queue_root.name == slug else queue_root / slug
-    sorted_dir = sorted_root if sorted_root.name == slug else sorted_root / slug
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    # Pre-create category folders so the first vision-worker write doesn't
-    # race against mkdir. Read live so user-edited taxonomy is picked up at
-    # supervisor (re)start. Workers also mkdir lazily in _finalise as a
-    # belt-and-braces guard against new categories added mid-run.
-    from categories import get_all_categories
-    for cat in get_all_categories():
-        (sorted_dir / cat).mkdir(parents=True, exist_ok=True)
-
-    log_dir = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs_test")))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"pipeline_{slug}.log"
-    log_file = open(log_path, "w", encoding="utf-8")
+    queue_dir, sorted_dir = _prepare_slug_dirs(slug)
+    log_file = _open_slug_log(slug)
 
     base_env = {
         "PYTHONUTF8": "1",
@@ -452,11 +633,7 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
 
     supervisor = Supervisor(topic=topic, base_env=base_env, log_file=log_file)
     supervisor._queue_dir = queue_dir  # so stale .processing cleanup knows where to look
-
-    def _handle_sigint(_sig, _frame):
-        supervisor.shutdown()
-        sys.exit(0)
-    signal.signal(signal.SIGINT, _handle_sigint)
+    _install_sigint(supervisor)
 
     try:
         supervisor.run()
@@ -464,27 +641,125 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
         log_file.close()
 
 
+# ── Jobs runner (default path) ─────────────────────────────────────────────────
+
+def run_active_job(slug: str, vision_worker: str = "balanced-groq") -> None:
+    """Run the active job ``slug`` under the supervisor.
+
+    Projects the job into env + taxonomy, sets up its slug dirs, then hands the
+    Supervisor a ``job_slug`` so it watches ``_index.json`` and restarts itself
+    into a different job when the dashboard switches the active pointer — no
+    return to the idle loop needed for a job→job switch.
+    """
+    job = job_config.get_job(slug)
+    if job is None:
+        print(f"  [jobs] active slug {slug!r} has no job file; skipping", flush=True)
+        return
+
+    # Project the job down into the runtime contracts BEFORE we read env/taxonomy.
+    resolved = job_config.resolve_env(job)
+    os.environ.update(resolved)
+    job_config.project_categories(job)
+
+    topic = resolved.get("PIPELINE_TOPIC", "") or job.name
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"=== JOB: {job.name} (slug: {slug}) ===", flush=True)
+    print(f"=== TOPIC: {topic} ===", flush=True)
+    print(f"=== VISION WORKER LIST: {vision_worker_list() or [vision_worker]} ===", flush=True)
+    print(f"{'=' * 60}\n", flush=True)
+
+    queue_dir, sorted_dir = _prepare_slug_dirs(slug)
+    log_file = _open_slug_log(slug)
+
+    base_env = {
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PIPELINE_QUEUE": str(queue_dir),
+        "PIPELINE_SORTED": str(sorted_dir),
+        **os.environ,  # already carries the resolved job env (PIPELINE_TOPIC/SLUG/…)
+    }
+
+    if not vision_worker_list() and vision_worker:
+        os.environ["PIPELINE_VISION_WORKERS"] = vision_worker
+
+    supervisor = Supervisor(topic=topic, base_env=base_env, log_file=log_file, job_slug=slug)
+    supervisor._queue_dir = queue_dir
+    _install_sigint(supervisor)
+
+    try:
+        supervisor.run()
+    finally:
+        log_file.close()
+
+
+def run_jobs_loop(vision_worker: str = "balanced-groq") -> None:
+    """Top-level driver for the jobs model.
+
+    Idles gracefully while no job is active (watching ``_index.json`` for one to
+    appear), then runs the active job. ``run_active_job`` handles job→job
+    switches internally via the supervisor's index watch; this loop only regains
+    control when the active job is *cleared* (stop / advance-past-end), at which
+    point it idles again. The dashboard drives advance — we never auto-advance.
+    """
+    announced_idle = False
+    while True:
+        slug = desired_active_slug()
+        if not slug:
+            if not announced_idle:
+                print("  [jobs] no active job; waiting for the dashboard to "
+                      "activate one...", flush=True)
+                announced_idle = True
+            try:
+                time.sleep(IDLE_POLL_SECONDS)
+            except KeyboardInterrupt:
+                print("\nPipeline stopped by user.", flush=True)
+                return
+            continue
+        announced_idle = False
+        if job_config.get_job(slug) is None:
+            # Orphaned active pointer — don't spin hot; wait for the dashboard to
+            # fix it (advance() skips orphans, so this is a transient state).
+            print(f"  [jobs] active slug {slug!r} has no job file; waiting...", flush=True)
+            try:
+                time.sleep(IDLE_POLL_SECONDS)
+            except KeyboardInterrupt:
+                return
+            continue
+        run_active_job(slug, vision_worker=vision_worker)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Topic-driven image prompt pipeline")
+    parser = argparse.ArgumentParser(description="Job-driven image prompt pipeline")
     parser.add_argument("--topic", action="append", dest="topics",
-                        help="Topic to scrape (can be repeated for multiple topics)")
+                        help="Legacy: run a specific topic instead of the active job "
+                             "(can be repeated). Bypasses the jobs model.")
     parser.add_argument("--vision-worker", dest="vision_worker",
                         default=os.environ.get("PIPELINE_VISION_WORKER", "balanced-groq"),
                         help="Default vision worker (used only if PIPELINE_VISION_WORKERS is empty)")
     args = parser.parse_args()
 
-    topics = args.topics or [os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")]
+    # Idempotent — safe even though the dashboard may also call it on startup.
+    try:
+        job_config.migrate_env_to_default_job()
+    except Exception as exc:  # never let migration block the supervisor booting
+        logger.warning("migrate_env_to_default_job failed: %s", exc)
 
     print("=== Pipeline Orchestrator ===", flush=True)
     print(f"Pipeline code dir: {PIPELINE_CODE_DIR}", flush=True)
-    print(f"Topics: {topics}", flush=True)
 
-    for topic in topics:
-        run_topic(topic, vision_worker=args.vision_worker)
+    # Legacy escape hatch: an explicit --topic bypasses the jobs model entirely
+    # (ad-hoc CLI runs). The default path runs the active job.
+    if args.topics:
+        print(f"Topics (legacy CLI mode): {args.topics}", flush=True)
+        for topic in args.topics:
+            run_topic(topic, vision_worker=args.vision_worker)
+        print("\n=== All topics complete ===", flush=True)
+        return
 
-    print("\n=== All topics complete ===", flush=True)
+    print(f"Active job: {desired_active_slug() or '(none yet)'}", flush=True)
+    run_jobs_loop(vision_worker=args.vision_worker)
 
 
 if __name__ == "__main__":
