@@ -2715,6 +2715,50 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Generic toast stack — top-right. Replaces window.alert(): success/error/
+       warn/info messages, auto-dismissing. Driven by notify(message, type). -->
+  <div class="fixed top-4 right-4 z-[60] flex flex-col gap-2 w-[22rem] max-w-[calc(100vw-2rem)] pointer-events-none" x-cloak>
+    <template x-for="t in toasts" :key="t.id">
+      <div x-transition.opacity.duration.200ms
+           class="pointer-events-auto flex items-start gap-2 rounded-lg shadow-2xl p-3 text-sm border bg-slate-900"
+           :class="{
+             'border-emerald-600 text-emerald-50': t.type === 'success',
+             'border-rose-600 text-rose-50': t.type === 'error',
+             'border-amber-600 text-amber-50': t.type === 'warn',
+             'border-sky-700 text-slate-100': t.type === 'info' || !t.type,
+           }">
+        <span class="mt-0.5 shrink-0 font-bold" x-text="({success:'✓', error:'✕', warn:'⚠', info:'ℹ'})[t.type] || 'ℹ'"></span>
+        <div class="flex-1 whitespace-pre-line break-words" x-text="t.message"></div>
+        <button @click="dismissToast(t.id)" class="shrink-0 text-slate-400 hover:text-slate-100 leading-none" aria-label="Dismiss">✕</button>
+      </div>
+    </template>
+  </div>
+
+  <!-- Styled confirm dialog — replaces window.confirm() for destructive actions.
+       askConfirm(message, {title, confirmLabel, danger}) resolves to a boolean. -->
+  <div x-show="confirmDialog.open" x-cloak x-transition.opacity
+       class="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 p-4"
+       @click.self="_closeConfirm(false)"
+       @keydown.escape.window="confirmDialog.open && _closeConfirm(false)">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl max-w-md w-full p-5">
+      <div class="font-semibold text-base mb-2" x-text="confirmDialog.title"></div>
+      <div class="text-sm text-slate-300 mb-4 whitespace-pre-line" x-text="confirmDialog.message"></div>
+      <input x-show="confirmDialog.input" x-ref="dialogInput" type="text"
+             x-model="confirmDialog.inputValue" :placeholder="confirmDialog.inputPlaceholder"
+             @keydown.enter.prevent="_closeConfirm(true)"
+             class="w-full mb-4 px-3 py-2 bg-slate-800 border border-slate-600 rounded text-sm focus:outline-none focus:border-sky-500">
+      <div class="flex justify-end gap-2">
+        <button @click="_closeConfirm(false)"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm"
+                x-text="confirmDialog.cancelLabel"></button>
+        <button @click="_closeConfirm(true)" x-ref="confirmBtn"
+                class="px-3 py-1.5 rounded text-sm font-semibold text-white"
+                :class="confirmDialog.danger ? 'bg-rose-600 hover:bg-rose-500' : 'bg-sky-600 hover:bg-sky-500'"
+                x-text="confirmDialog.confirmLabel"></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Mobile hamburger - hidden on lg+ where the sidebar is always visible. -->
   <button @click="sidebarOpen = !sidebarOpen" aria-label="Toggle navigation"
     class="lg:hidden fixed top-3 left-3 z-40 bg-slate-800 hover:bg-slate-700 rounded p-2">
@@ -4552,6 +4596,55 @@ function dashboard() {
     update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
     indexer: { in_progress: false, files_seen: 0, files_added: 0, queue_total: 0, sorted_total: 0, last_scan_at: null, scan_started_at: null },
     indexerToast: { show: false, dismissed: false },
+    // ── Generic toasts + styled confirm dialog (replace window.alert/confirm) ──
+    toasts: [],
+    _toastSeq: 0,
+    confirmDialog: { open: false, title: 'Please confirm', message: '',
+                     confirmLabel: 'Confirm', cancelLabel: 'Cancel', danger: false,
+                     input: false, inputValue: '', inputPlaceholder: '', _resolve: null },
+    scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
+    notify(message, type = 'info', timeout) {
+      const id = ++this._toastSeq;
+      if (timeout === undefined) timeout = (type === 'error') ? 6500 : 3800;
+      this.toasts.push({ id, message: String(message), type });
+      if (timeout > 0) setTimeout(() => this.dismissToast(id), timeout);
+      return id;
+    },
+    dismissToast(id) { this.toasts = this.toasts.filter(t => t.id !== id); },
+    askConfirm(message, opts = {}) {
+      return new Promise(resolve => {
+        this.confirmDialog = {
+          open: true, message: String(message),
+          title: opts.title || 'Please confirm',
+          confirmLabel: opts.confirmLabel || 'Confirm',
+          cancelLabel: opts.cancelLabel || 'Cancel',
+          danger: !!opts.danger, input: false, inputValue: '', inputPlaceholder: '',
+          _resolve: resolve,
+        };
+        this.$nextTick(() => { try { this.$refs.confirmBtn?.focus(); } catch (e) {} });
+      });
+    },
+    // Styled replacement for window.prompt(): resolves to the string, or null on cancel.
+    askPrompt(message, defaultValue = '', opts = {}) {
+      return new Promise(resolve => {
+        this.confirmDialog = {
+          open: true, message: String(message),
+          title: opts.title || 'Enter a value',
+          confirmLabel: opts.confirmLabel || 'OK',
+          cancelLabel: opts.cancelLabel || 'Cancel',
+          danger: !!opts.danger, input: true, inputValue: String(defaultValue || ''),
+          inputPlaceholder: opts.placeholder || '', _resolve: resolve,
+        };
+        this.$nextTick(() => { try { this.$refs.dialogInput?.focus(); this.$refs.dialogInput?.select(); } catch (e) {} });
+      });
+    },
+    _closeConfirm(result) {
+      const d = this.confirmDialog;
+      const resolve = d._resolve;
+      const value = d.input ? (result ? d.inputValue : null) : result;
+      this.confirmDialog = { ...d, open: false, _resolve: null };
+      if (resolve) resolve(value);
+    },
     workerDescriptions: {
       'balanced-groq':          'Groq cloud, llama-4-scout - fast, handles NSFW',
       'balanced-lm':            'LMStudio PRIMARY endpoint',
@@ -4679,14 +4772,14 @@ function dashboard() {
     },
     async createJob() {
       const name = (this.newJob.name || '').trim();
-      if (!name) { alert('Give the job a name.'); return; }
+      if (!name) { this.notify('Give the job a name.', 'warn'); return; }
       const body = { name };
       if (this.newJob.base_on) body.base_on = this.newJob.base_on;
       else if (this.newJob.preset) body.preset = this.newJob.preset;
       const r = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify(body)});
       const j = await r.json();
-      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newJob = { name: '', base_on: '', preset: '' };
       await this.loadJobs();
       // The create response is the v2 job detail ({job:{slug,...}}).
@@ -4694,29 +4787,35 @@ function dashboard() {
     },
     async activateJob(slug) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
-      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Activate failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Activate failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
       await this.refresh();
+      this.notify('Activated "' + slug + '".', 'success');
     },
     async cloneJob(slug) {
-      const name = prompt('Name for the clone of "' + slug + '":', slug + ' copy');
-      if (!name) return;
+      const name = await this.askPrompt('Name for the clone of "' + slug + '":', slug + ' copy',
+                                        { title: 'Clone job', confirmLabel: 'Clone' });
+      if (!name || !name.trim()) return;
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/clone', {
         method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
       const j = await r.json();
-      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Clone failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
+      this.notify('Cloned to "' + name.trim() + '".', 'success');
     },
     async deleteJob(slug) {
-      if (!confirm('Delete job "' + slug + '"? Its config is removed. (Data folders are kept unless you confirm again.)')) return;
+      if (!(await this.askConfirm('Delete job "' + slug + '"? Its config is removed. You\'ll be asked separately about data folders.',
+                                  { title: 'Delete job', confirmLabel: 'Delete', danger: true }))) return;
       let url = '/api/jobs/' + encodeURIComponent(slug);
-      if (confirm('Also delete this job\'s queue + sorted data folders on disk? This cannot be undone.\n\nOK = delete data too · Cancel = keep data.')) {
+      if (await this.askConfirm('Also delete this job\'s queue + sorted data folders on disk? This cannot be undone.',
+                                { title: 'Delete data too?', confirmLabel: 'Delete data', cancelLabel: 'Keep data', danger: true })) {
         url += '?force=1';
       }
       const r = await fetch(url, {method:'DELETE'});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Delete failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
+      this.notify('Job "' + slug + '" deleted.', 'success');
     },
     async enqueueJob(slug) {
       await fetch('/api/jobs/' + encodeURIComponent(slug) + '/enqueue', {method:'POST'});
@@ -4919,37 +5018,42 @@ function dashboard() {
     },
     async createPreset() {
       const name = (this.newPreset.name || '').trim();
-      if (!name) { alert('Give the preset a name.'); return; }
+      if (!name) { this.notify('Give the preset a name.', 'warn'); return; }
       const body = { name };
       if (this.newPreset.base_on) body.base_on = this.newPreset.base_on;
       const r = await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       const j = await r.json();
-      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newPreset = { name: '', base_on: '' };
       await this.loadPresets();
       this.openPreset(j.name);
     },
     async clonePreset(name) {
-      const nn = prompt('Name for the clone of "' + name + '":', name + ' copy');
-      if (!nn) return;
+      const nn = await this.askPrompt('Name for the clone of "' + name + '":', name + ' copy',
+                                      { title: 'Clone preset', confirmLabel: 'Clone' });
+      if (!nn || !nn.trim()) return;
       const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/clone', {
         method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: nn})});
       const j = await r.json();
-      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Clone failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadPresets();
+      this.notify('Cloned preset to "' + nn.trim() + '".', 'success');
     },
     async deletePreset(name) {
-      if (!confirm('Delete preset "' + name + '"?')) return;
+      if (!(await this.askConfirm('Delete preset "' + name + '"?',
+                                  { title: 'Delete preset', confirmLabel: 'Delete', danger: true }))) return;
       const r = await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { this.notify('Delete failed: ' + (j.error || r.status), 'error'); return; }
       if (this.presetEditor.name === name) this.presetEditor.open = false;
       await this.loadPresets();
+      this.notify('Preset "' + name + '" deleted.', 'success');
     },
     async setDefaultPreset(name) {
       const r = await fetch('/api/presets/default', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
-      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Failed: ' + (j.error || r.status)); return; }
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadPresets();
+      this.notify('"' + name + '" is now the default preset.', 'success');
     },
     async openPreset(name) {
       try {
@@ -4965,7 +5069,7 @@ function dashboard() {
         cfg.categories = Array.isArray(cfg.categories) ? cfg.categories : [];
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
-      } catch (e) { alert('Failed to load preset: ' + e.message); }
+      } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
     },
     closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
     // Preset list editors mirror the job editor list helpers but write straight
@@ -5081,7 +5185,8 @@ function dashboard() {
       this.update.available = false;
     },
     async runUpdate() {
-      if (!confirm('cull will pull the latest version, reinstall dependencies if needed, and restart. Continue?')) return;
+      if (!(await this.askConfirm('cull will pull the latest version, reinstall dependencies if needed, and restart. Continue?',
+                                  { title: 'Update cull', confirmLabel: 'Update' }))) return;
       this.update.running = true;
       try {
         const r = await fetch('/api/update/run', { method: 'POST' });
@@ -5096,8 +5201,9 @@ function dashboard() {
         // Connection drop is expected once the dashboard restarts.
       }
     },
-    reloadSettings() {
-      if (this.settingsDirty && !window.confirm('Discard your unsaved settings changes?')) return;
+    async reloadSettings() {
+      if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
+                                  { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
       this.settingsDirty = false;
       this.settingsErrors = {};
@@ -5147,7 +5253,7 @@ function dashboard() {
       const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})});
       const j = await r.json().catch(()=>({}));
-      if (!r.ok) { alert(j.error || ('toggle failed: ' + r.status)); return; }
+      if (!r.ok) { this.notify(j.error || ('toggle failed: ' + r.status), 'error'); return; }
       // Resync je.overrides from the server's fresh map so a subsequent flush
       // PUTs the post-toggle overrides, never a stale snapshot.
       if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
@@ -5238,10 +5344,11 @@ function dashboard() {
         path: c.path, meta: c,
       });
     },
-    closeModal() {
+    async closeModal() {
       // Warn on unsaved prompt edits before discarding the modal.
       if (this.modal.editing && this.modal.prompt !== this.modal.promptOriginal) {
-        if (!window.confirm('You have unsaved prompt edits. Discard them?')) return;
+        if (!(await this.askConfirm('You have unsaved prompt edits. Discard them?',
+                                    { title: 'Discard edits', confirmLabel: 'Discard', danger: true }))) return;
       }
       this.modal.open = false;
       this.modal.editing = false;
