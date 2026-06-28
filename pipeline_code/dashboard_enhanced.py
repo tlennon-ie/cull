@@ -85,30 +85,17 @@ _SCRAPER_DESCRIPTIONS: dict[str, str] = {
     "Civitai-Com": "Civitai (civitai.com)",
     "Civitai-Red": "Civitai (civitai.red)",
     "Web":         "Reddit / ZforFree.com / promptsref",
-    "ZFF-Local":   "ZforFree local folder (legacy)",
     "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
 }
 
 # _STATIC_SCRAPERS is derived from job_config.SCRAPER_NAMES (built just below,
 # once job_config is importable) so the dashboard toggle list and the job
-# config's scrapers.enabled map can never drift apart.
+# config's scrapers.enabled map can never drift apart. Local-import folders are
+# NOT here — they're a per-job list (scrapers.local_imports) surfaced as
+# read-only Local-<name> rows by _scraper_enabled_response.
+
+
 _STATIC_SCRAPERS: list[dict[str, str]] = []
-
-
-def _scraper_definitions() -> list[dict[str, str]]:
-    """Compute the live scraper list.
-
-    The admin-configurable local folder runs under the label `Local-<LOCAL_IMPORT_NAME>`,
-    so the toggle here must follow whatever the user set in Settings - otherwise
-    toggling `Local-local` has no effect when the feeder actually ran as e.g.
-    `Local-my_dataset`.
-    """
-    local_name = (os.environ.get("LOCAL_IMPORT_NAME") or "local").strip() or "local"
-    local_entry = {
-        "name": f"Local-{local_name}",
-        "description": f"Admin-configured local folder ({os.environ.get('LOCAL_IMPORT_DIR') or '(LOCAL_IMPORT_DIR unset)'})",
-    }
-    return [*_STATIC_SCRAPERS, local_entry]
 
 
 sys.path.insert(0, str(PIPELINE_CODE_DIR))
@@ -449,27 +436,61 @@ def _job_for_scope(slug: str | None) -> job_config.Job | None:
     return job_config.get_job(slug)
 
 
-def _save_scraper_enabled(job: job_config.Job, enabled_map: dict[str, bool]) -> None:
-    """Persist a job's scrapers.enabled map immutably, then re-project if it is
-    the active job so the running supervisor re-resolves SCRAPER_DISABLED."""
-    merged = job.to_dict()
-    merged["scrapers"] = {**job.scrapers, "enabled": enabled_map}
-    saved = job_config.save_job(job_config.Job.from_dict(merged))
-    if saved.slug == job_config.get_active_slug():
-        job_config.activate(saved.slug)
+def _job_effective_scrapers(job: job_config.Job) -> dict[str, Any]:
+    eff = job_config.effective_config(job)
+    s = eff.get("scrapers")
+    return s if isinstance(s, dict) else {}
+
+
+def _save_scraper_enabled(job: job_config.Job, enabled_map: dict[str, bool]) -> job_config.Job:
+    """Persist the job's ``scrapers.enabled`` as an OVERRIDE (v2) and return the
+    saved Job. We do NOT re-project here — consistent with the auto-save model,
+    the active job is re-projected once on apply/leave (POST .../activate)."""
+    updated = job_config.set_override(job, "scrapers.enabled", enabled_map)
+    return job_config.save_job(updated)
+
+
+def _existing_enabled_override(job: job_config.Job) -> dict[str, bool]:
+    """The job's SPARSE ``scrapers.enabled`` override map (only keys the user has
+    actually overridden), or ``{}`` when the scrapers are fully inherited. Reads
+    the override map — NOT the effective map — so toggling one scraper doesn't
+    drag the other five into the override and lose their inherit 'global' chip."""
+    cur = (job.overrides or {}).get("scrapers", {})
+    enabled = cur.get("enabled") if isinstance(cur, dict) else None
+    if not isinstance(enabled, dict):
+        return {}
+    return {n: bool(v) for n, v in enabled.items()
+            if n in job_config.SCRAPER_NAMES and isinstance(v, bool)}
 
 
 def _scraper_enabled_response(job: job_config.Job | None) -> list[dict[str, Any]]:
-    """[{name, description, enabled}] for the Scrapers tab, sourced from the
-    job's enabled map (falling back to the legacy env when no job is in scope)."""
+    """[{name, description, enabled}] for the Scrapers tab. v2: the canonical
+    scraper rows come from the job's EFFECTIVE enabled map, plus one read-only
+    ``Local-<name>`` row per enabled local-import folder. Pre-migration falls
+    back to the legacy env."""
     if job is not None:
-        enabled = job.scrapers.get("enabled", {})
-        return [
-            {**s, "enabled": bool(enabled.get(s["name"], True))}
-            for s in _scraper_definitions()
+        scr = _job_effective_scrapers(job)
+        enabled = scr.get("enabled", {}) if isinstance(scr.get("enabled"), dict) else {}
+        rows = [
+            {"name": s["name"], "description": s["description"],
+             "enabled": bool(enabled.get(s["name"], True)), "kind": "scraper"}
+            for s in _STATIC_SCRAPERS
         ]
+        local_list = scr.get("local_imports") if isinstance(scr.get("local_imports"), list) else []
+        for folder in local_list:
+            if not isinstance(folder, dict):
+                continue
+            nm = str(folder.get("name", "local") or "local")
+            rows.append({
+                "name": f"Local-{nm}",
+                "description": f"Local folder ({folder.get('dir') or '(no dir set)'})",
+                "enabled": bool(folder.get("enabled", False)),
+                "kind": "local",          # read-only; managed in Job Settings
+            })
+        return rows
     disabled = disabled_set()
-    return [{**s, "enabled": s["name"] not in disabled} for s in _scraper_definitions()]
+    return [{**s, "enabled": s["name"] not in disabled, "kind": "scraper"}
+            for s in _STATIC_SCRAPERS]
 
 
 @app.route("/api/scrapers")
@@ -488,15 +509,17 @@ def api_scrapers_bulk():
 
     job = _job_for_scope(_resolve_job_slug())
     if job is not None:
-        # Only flip the canonical scraper names the job tracks; the dynamic
-        # Local-<name> toggle isn't part of the job's enabled map.
+        # "All on/off" is a deliberate full override of the 6 canonical
+        # scrapers; the dynamic Local-<name> rows are read-only and untouched.
         enabled_map = {n: want_enabled for n in job_config.SCRAPER_NAMES}
-        _save_scraper_enabled(job, enabled_map)
+        saved = _save_scraper_enabled(job, enabled_map)
         disabled = sorted(n for n, on in enabled_map.items() if not on)
-        return jsonify({"success": True, "job": job.slug, "disabled": disabled})
+        # Return fresh overrides so the JS can resync je.overrides (clobber-safe).
+        return jsonify({"success": True, "job": job.slug, "disabled": disabled,
+                        "overrides": saved.overrides or {}})
 
     # No job in scope (pre-migration): fall back to the legacy global env.
-    names = [s["name"] for s in _scraper_definitions()]
+    names = list(job_config.SCRAPER_NAMES)
     if want_enabled:
         update_env("SCRAPER_DISABLED", "")
         return jsonify({"success": True, "disabled": []})
@@ -509,27 +532,30 @@ def api_scraper_toggle():
     data = request.get_json() or {}
     name = data.get("name")
     enabled = bool(data.get("enabled"))
-    if name not in {s["name"] for s in _scraper_definitions()}:
-        return jsonify({"error": "Unknown scraper"}), 400
 
     job = _job_for_scope(_resolve_job_slug())
     if job is not None:
-        if name in job_config.SCRAPER_NAMES:
-            enabled_map = {**{n: True for n in job_config.SCRAPER_NAMES},
-                           **job.scrapers.get("enabled", {})}
-            enabled_map[name] = enabled
-            _save_scraper_enabled(job, enabled_map)
-            return jsonify({"success": True, "name": name, "enabled": enabled, "job": job.slug})
-        # The dynamic Local-<name> entry is not part of the job's enabled map;
-        # the local feeder is gated by the job's scrapers.local_import.enabled.
-        # Writing SCRAPER_DISABLED here would be clobbered by the active job's
-        # projection, so we refuse rather than silently lose the toggle.
-        return jsonify({
-            "error": "local import is controlled per-job via Job Settings → Local import",
-            "name": name,
-        }), 400
+        # Only the 6 canonical scrapers are togglable; Local-<name> rows are
+        # read-only status (configure folders in Job Settings → Local folders).
+        if name not in job_config.SCRAPER_NAMES:
+            return jsonify({
+                "error": "local folders are configured in Job Settings → Local folders",
+                "name": name,
+            }), 400
+        # SPARSE override: merge only the toggled key into the EXISTING override
+        # map (not the effective map), so untouched scrapers keep inheriting from
+        # the preset (their 'global' chip stays). The first toggle stores exactly
+        # one key under overrides.scrapers.enabled.
+        enabled_map = {**_existing_enabled_override(job), name: enabled}
+        saved = _save_scraper_enabled(job, enabled_map)
+        # Return fresh overrides so the JS resyncs je.overrides and a later
+        # debounced job-editor PUT can't overwrite this toggle with a stale map.
+        return jsonify({"success": True, "name": name, "enabled": enabled,
+                        "job": job.slug, "overrides": saved.overrides or {}})
 
     # Pre-migration (no jobs yet): fall back to the legacy global env.
+    if name not in job_config.SCRAPER_NAMES:
+        return jsonify({"error": "Unknown scraper"}), 400
     current = disabled_set()
     (current.discard if enabled else current.add)(name)
     update_env("SCRAPER_DISABLED", ",".join(sorted(current)))
@@ -631,6 +657,8 @@ def _validate_categories_payload(payload: Any) -> tuple[dict[str, Any] | None, s
             return None, f"invalid category name {name!r} (letters/digits/_ only, must start with letter, max 32 chars)"
         if name in {"DISCARD", "CORRUPT"}:
             return None, f"{name!r} is reserved for the system"
+        if len(hint) > 2000:
+            return None, f"hint for {name!r} too long (max 2000 chars)"
         if name in seen:
             return None, f"duplicate category name {name!r}"
         seen.add(name)
@@ -645,15 +673,17 @@ def _validate_categories_payload(payload: Any) -> tuple[dict[str, Any] | None, s
 
 
 def _job_active_taxonomy(job: job_config.Job | None) -> dict[str, Any]:
-    """Shape the ``active`` taxonomy block for the categories editor.
+    """Shape the ``active`` taxonomy block for the categories editor (v2).
 
-    Per-job: read the job's own categories + rules. Pre-migration (no job in
-    scope): fall back to the global active taxonomy file as before."""
+    Per-job: the EFFECTIVE categories + rules (preset ⊕ overrides). Pre-migration
+    (no job in scope): the global active taxonomy file as before."""
     if job is not None:
+        eff = job_config.effective_config(job)
+        cats = eff.get("categories")
         return {
             "preset": "custom",
-            "categories": [dict(c) for c in (job.categories or [])],
-            "global_rules": job.category_rules or "",
+            "categories": [dict(c) for c in (cats or []) if isinstance(c, dict)],
+            "global_rules": str(eff.get("category_rules", "") or ""),
         }
     return _categories_mod.get_active()
 
@@ -661,12 +691,17 @@ def _job_active_taxonomy(job: job_config.Job | None) -> dict[str, Any]:
 @app.route("/api/categories")
 def api_categories_get():
     job = _job_for_scope(_resolve_job_slug())
+    overridden = {
+        "categories": job_config.is_overridden(job, "categories") if job else False,
+        "category_rules": job_config.is_overridden(job, "category_rules") if job else False,
+    }
     return jsonify({
         "active": _job_active_taxonomy(job),
         "presets": _categories_mod.get_presets()["presets"],
         "default_preset": _categories_mod.get_presets().get("default"),
         "system_terminal": list(_categories_mod.SYSTEM_TERMINAL),
         "job": job.slug if job is not None else None,
+        "overridden": overridden,
     })
 
 
@@ -701,13 +736,13 @@ def api_categories_set():
     new_names = {c["name"] for c in cleaned["categories"]}
 
     # Warn before dropping a category that still has sorted images. Scope the
-    # count + current-name comparison to the slug of the job we actually loaded
-    # for this request (NOT the active-default), so editing an INACTIVE job
-    # reflects that job's data, never the active job's. Index-backed; honours
-    # ?force=1 to proceed anyway.
+    # count + current-name comparison to the EFFECTIVE categories of the job we
+    # actually loaded (NOT the active-default), so editing an INACTIVE job
+    # reflects that job's data. Index-backed; honours ?force=1 to proceed.
     count_slug = job.slug if job is not None else None
     if job is not None:
-        current_names = {c.get("name") for c in (job.categories or [])}
+        eff_cats = job_config.effective_config(job).get("categories") or []
+        current_names = {c.get("name") for c in eff_cats if isinstance(c, dict)}
     else:
         current_names = set(_categories_mod.get_categories())
     removed = {n for n in (current_names - new_names) if n}
@@ -722,17 +757,12 @@ def api_categories_set():
             }), 409
 
     if job is not None:
-        merged = job.to_dict()
-        merged["categories"] = cleaned["categories"]
-        merged["category_rules"] = cleaned["global_rules"]
-        saved = job_config.save_job(job_config.Job.from_dict(merged))
-        # POST to the active job must re-project AND bump _index.json so the
-        # supervisor's mtime watch (env-reload + struct-snapshot) fires.
-        # activate() does both (set_active + project_categories); a bare
-        # project_categories writes cull_categories.json but never touches
-        # _index.json, so the supervisor wouldn't re-resolve.
-        if saved.slug == job_config.get_active_slug():
-            job_config.activate(saved.slug)
+        # v2: categories + rules become job OVERRIDES. Consistent with the
+        # auto-save model, we do NOT re-project here — the active job applies on
+        # leave (POST /api/jobs/<slug>/activate).
+        updated = job_config.set_override(job, "categories", cleaned["categories"])
+        updated = job_config.set_override(updated, "category_rules", cleaned["global_rules"])
+        saved = job_config.save_job(updated)
         return jsonify({"ok": True, "active": _job_active_taxonomy(saved), "job": saved.slug})
 
     # Pre-migration fallback: write the global active taxonomy file directly.
@@ -1192,6 +1222,248 @@ def _valid_slug_or_400(slug: str) -> bool:
     return bool(job_config.JOB_SLUG_RE.match(slug or ""))
 
 
+def _preset_exists(name: str) -> bool:
+    return name in job_config.list_presets().get("presets", {})
+
+
+def _validate_job_scoring(raw: Any) -> tuple[dict | None, str]:
+    """Validate a scoring block. ``ovr_min`` / ``rel_min`` must be integers in
+    [0, 100] (same gate the old /api/settings applied to VISION_*_MIN_SCORE);
+    ``notes`` is free text. Returns (clean_scoring, error)."""
+    if not isinstance(raw, dict):
+        return None, "scoring must be an object"
+    out: dict[str, Any] = {}
+    for key in ("ovr_min", "rel_min"):
+        if key not in raw:
+            continue
+        try:
+            val = int(raw[key])
+        except (TypeError, ValueError):
+            return None, f"scoring.{key} must be an integer 0-100"
+        if val < 0 or val > 100:
+            return None, f"scoring.{key} must be an integer 0-100"
+        out[key] = val
+    if "notes" in raw:
+        if not isinstance(raw["notes"], str):
+            return None, "scoring.notes must be a string"
+        # Injected verbatim into the vision prompt (VISION_SCORE_NOTES); cap it
+        # like the per-category hint so a direct PUT can't bloat every request.
+        if len(raw["notes"]) > 2000:
+            return None, "scoring.notes too long (max 2000 chars)"
+        out["notes"] = raw["notes"]
+    return out, ""
+
+
+# The inheritable-config namespace (a preset's shape, and a job's sparse
+# overrides). Both job overrides and preset bodies flow through the same
+# validators so a bad value can't reach the projection layer from either path.
+_INHERITABLE_KEYS = frozenset({
+    "topic_filters", "scrapers", "categories", "category_rules", "scoring", "captioning",
+})
+_CAPTION_STYLES = frozenset({"sd_prompt", "booru_tags", "natural_language"})
+_MAX_LOCAL_FOLDERS = 32
+# A local-import folder's ``name`` is used downstream as the ``Local-<name>``
+# queue subfolder + SeenStore name, i.e. a filesystem path component. Restrict
+# it to a safe slug so it can never contain a separator or traversal sequence.
+# (The folder's ``dir`` IS a real absolute fs path and is intentionally allowed
+# to be absolute — only ``name`` is path-component-restricted.)
+_LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _bad_path_str(v: Any) -> bool:
+    """A user-supplied path-ish string we refuse to store: must be a str and
+    must not contain traversal (``..``), NUL, or newlines. We don't resolve it
+    here (the supervisor consumes it per-agent), but we keep obviously-hostile
+    values out of the config file."""
+    return (not isinstance(v, str)) or (".." in v) or ("\x00" in v) or ("\n" in v) or ("\r" in v)
+
+
+def _validate_topic_filters(tf: Any) -> tuple[dict | None, str]:
+    if not isinstance(tf, dict):
+        return None, "topic_filters must be an object"
+    allowed = {"keywords_extra", "banned_keywords", "generation_hints",
+               "min_prompt_length", "require_prompt"}
+    out: dict[str, Any] = {}
+    for k, v in tf.items():
+        if k not in allowed:
+            return None, f"unknown topic_filters key: {k!r}"
+        if k in ("keywords_extra", "banned_keywords", "generation_hints"):
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                return None, f"topic_filters.{k} must be a list of strings"
+            out[k] = v
+        elif k == "min_prompt_length":
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return None, "topic_filters.min_prompt_length must be an integer"
+            if iv < 0 or iv > 10000:
+                return None, "topic_filters.min_prompt_length out of range (0-10000)"
+            out[k] = iv
+        else:  # require_prompt
+            out[k] = bool(v)
+    return out, ""
+
+
+def _validate_scrapers_cfg(s: Any) -> tuple[dict | None, str]:
+    if not isinstance(s, dict):
+        return None, "scrapers must be an object"
+    allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
+               "civitai_domains", "gallery_dl", "local_imports"}
+    out: dict[str, Any] = {}
+    for k, v in s.items():
+        if k not in allowed:
+            return None, f"unknown scrapers key: {k!r}"
+        if k == "enabled":
+            if not isinstance(v, dict) or any(not isinstance(val, bool) for val in v.values()):
+                return None, "scrapers.enabled must be a name→bool map"
+            # Drop unknown scraper names so stale keys can't accumulate.
+            out[k] = {n: bool(v[n]) for n in job_config.SCRAPER_NAMES if n in v}
+        elif k in ("x_accounts", "reddit_subreddits", "civitai_domains"):
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                return None, f"scrapers.{k} must be a list of strings"
+            out[k] = v
+        elif k == "discord_channels_json":
+            if not isinstance(v, str) or len(v) > 20000:
+                return None, "scrapers.discord_channels_json must be a string (max 20000)"
+            out[k] = v
+        elif k == "gallery_dl":
+            clean_gd, err = _validate_gallery_dl(v)
+            if err:
+                return None, err
+            out[k] = clean_gd
+        else:  # local_imports
+            clean_li, err = _validate_local_imports(v)
+            if err:
+                return None, err
+            out[k] = clean_li
+    return out, ""
+
+
+def _validate_gallery_dl(gd: Any) -> tuple[dict | None, str]:
+    if not isinstance(gd, dict):
+        return None, "scrapers.gallery_dl must be an object"
+    allowed = {"enabled", "urls", "limit_per_url", "cookies_file", "config_path"}
+    out: dict[str, Any] = {}
+    for k, v in gd.items():
+        if k not in allowed:
+            return None, f"unknown gallery_dl key: {k!r}"
+        if k == "enabled":
+            out[k] = bool(v)
+        elif k == "urls":
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                return None, "gallery_dl.urls must be a list of strings"
+            if any("\x00" in x for x in v):
+                return None, "gallery_dl.urls contains a NUL byte"
+            out[k] = v
+        elif k == "limit_per_url":
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return None, "gallery_dl.limit_per_url must be an integer"
+            out[k] = max(1, min(5000, iv))
+        else:  # cookies_file / config_path
+            if _bad_path_str(v):
+                return None, f"gallery_dl.{k} is not a valid path string"
+            out[k] = v
+    return out, ""
+
+
+def _validate_local_imports(li: Any) -> tuple[list | None, str]:
+    if not isinstance(li, list):
+        return None, "scrapers.local_imports must be a list"
+    if len(li) > _MAX_LOCAL_FOLDERS:
+        return None, f"too many local folders (max {_MAX_LOCAL_FOLDERS})"
+    out: list[dict] = []
+    for f in li:
+        if not isinstance(f, dict):
+            return None, "each local folder must be an object"
+        name = f.get("name", "local")
+        # name becomes a filesystem path component (Local-<name> subfolder +
+        # SeenStore key) → must be a strict slug, never a separator/traversal.
+        if not isinstance(name, str) or not _LOCAL_NAME_RE.match(name):
+            return None, "local folder name must match [A-Za-z0-9_-] (1-40 chars)"
+        if _bad_path_str(f.get("dir", "")):
+            return None, "local folder dir is not a valid path string"
+        mf = f.get("migrate_from", "")
+        if not isinstance(mf, str):
+            return None, "local folder migrate_from must be a string"
+        out.append({
+            "name": name, "dir": f.get("dir", "") or "",
+            "enabled": bool(f.get("enabled", False)), "migrate_from": mf,
+        })
+    return out, ""
+
+
+def _validate_captioning(cap: Any) -> tuple[dict | None, str]:
+    if not isinstance(cap, dict):
+        return None, "captioning must be an object"
+    allowed = {"enabled", "style", "overwrite"}
+    out: dict[str, Any] = {}
+    for k, v in cap.items():
+        if k not in allowed:
+            return None, f"unknown captioning key: {k!r}"
+        if k == "style":
+            if v not in _CAPTION_STYLES:
+                return None, f"captioning.style must be one of {sorted(_CAPTION_STYLES)}"
+            out[k] = v
+        else:
+            out[k] = bool(v)
+    return out, ""
+
+
+def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, str]:
+    """Validate a preset cfg (``partial=False``) or a job override map
+    (``partial=True``). Returns (clean_cfg, error).
+
+    Every top-level block is structurally validated so a bad value can never
+    reach the projection layer (resolve_env / project_categories) from either
+    the job-override PUT or the preset PUT. Unknown keys are rejected.
+    """
+    if not isinstance(cfg, dict):
+        return None, "config must be an object"
+    out: dict[str, Any] = {}
+    for key, value in cfg.items():
+        if key not in _INHERITABLE_KEYS:
+            return None, f"unknown config key: {key!r}"
+        if key == "categories":
+            payload = {"categories": value, "global_rules": cfg.get("category_rules", "") or ""}
+            cleaned, err = _validate_categories_payload(payload)
+            if err:
+                return None, f"invalid categories: {err}"
+            out["categories"] = cleaned["categories"]
+        elif key == "category_rules":
+            if not isinstance(value, str):
+                return None, "category_rules must be a string"
+            if len(value) > 8000:
+                return None, "category_rules too long (max 8000 chars)"
+            out["category_rules"] = value
+        elif key == "scoring":
+            clean_scoring, err = _validate_job_scoring(value)
+            if err:
+                return None, err
+            out["scoring"] = clean_scoring
+        elif key == "topic_filters":
+            clean_tf, err = _validate_topic_filters(value)
+            if err:
+                return None, err
+            out["topic_filters"] = clean_tf
+        elif key == "scrapers":
+            clean_s, err = _validate_scrapers_cfg(value)
+            if err:
+                return None, err
+            out["scrapers"] = clean_s
+        else:  # captioning
+            clean_cap, err = _validate_captioning(value)
+            if err:
+                return None, err
+            out["captioning"] = clean_cap
+    if not partial:
+        # A full preset must carry valid categories (they drive the schema enum).
+        if "categories" not in out:
+            return None, "categories is required for a preset"
+    return out, ""
+
+
 @app.route("/api/jobs")
 def api_jobs_list():
     """List jobs with status, queue position, and queued/sorted counts, plus the
@@ -1213,18 +1485,44 @@ def api_jobs_create():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
     base_on = (data.get("base_on") or "").strip() or None
+    subject = data.get("subject")
+    preset = (data.get("preset") or "").strip() or None
     if not name:
         return jsonify({"error": "name is required"}), 400
     if base_on and not _valid_slug_or_400(base_on):
         return jsonify({"error": "invalid base_on slug"}), 400
     if job_config.slugify(name) in RESERVED_JOB_SLUGS:
         return jsonify({"error": f"'{job_config.slugify(name)}' is a reserved slug"}), 400
+    if preset is not None and not _preset_exists(preset):
+        return jsonify({"error": f"unknown preset: {preset}"}), 400
     try:
-        job = job_config.create_job(name, base_on=base_on)
+        job = job_config.create_job(
+            name,
+            subject=(str(subject).strip() if subject is not None else None),
+            preset=preset,
+            base_on=base_on,
+        )
     except ValueError as exc:
         # Duplicate slug / empty slug / unknown base_on all surface here.
         return jsonify({"error": str(exc)}), 400
-    return jsonify({"success": True, "job": job.to_dict()}), 201
+    return jsonify({"success": True, "job": _job_detail(job)}), 201
+
+
+def _job_detail(job: job_config.Job) -> dict[str, Any]:
+    """v2 GET shape: identity + effective (resolved) config + the sparse override
+    map + the preset library names. The UI needs effective values to display and
+    the overrides map to decide chip-vs-reset per field."""
+    lib = job_config.list_presets()
+    return {
+        "job": {
+            "slug": job.slug, "name": job.name, "status": job.status,
+            "subject": job.subject, "preset": job.preset,
+        },
+        "effective": job_config.effective_config(job),
+        "overrides": job.overrides or {},
+        "presets": sorted(lib.get("presets", {}).keys()),
+        "default_preset": lib.get("default", "default"),
+    }
 
 
 @app.route("/api/jobs/<slug>")
@@ -1234,44 +1532,16 @@ def api_jobs_get(slug: str):
     job = job_config.get_job(slug)
     if job is None:
         return jsonify({"error": "job not found"}), 404
-    return jsonify(job.to_dict())
-
-
-# Fields a PUT may patch. Identity (slug) + timestamps are owned by job_config;
-# ``status`` is a runtime projection (derived by _job_status_label from the
-# index + active/queue state), so it is intentionally NOT user-editable here.
-_JOB_EDITABLE_FIELDS = (
-    "name", "topic", "scrapers",
-    "categories", "category_rules", "scoring", "captioning",
-)
-
-
-def _validate_job_scoring(raw: Any) -> tuple[dict | None, str]:
-    """Validate a job's scoring block. ``ovr_min`` / ``rel_min`` must be integers
-    in [0, 100] (same gate the old /api/settings applied to VISION_*_MIN_SCORE);
-    ``notes`` is free text. Returns (clean_scoring, error)."""
-    if not isinstance(raw, dict):
-        return None, "scoring must be an object"
-    out: dict[str, Any] = {}
-    for key in ("ovr_min", "rel_min"):
-        if key not in raw:
-            continue
-        try:
-            val = int(raw[key])
-        except (TypeError, ValueError):
-            return None, f"scoring.{key} must be an integer 0-100"
-        if val < 0 or val > 100:
-            return None, f"scoring.{key} must be an integer 0-100"
-        out[key] = val
-    if "notes" in raw:
-        if not isinstance(raw["notes"], str):
-            return None, "scoring.notes must be a string"
-        out["notes"] = raw["notes"]
-    return out, ""
+    return jsonify(_job_detail(job))
 
 
 @app.route("/api/jobs/<slug>", methods=["PUT"])
 def api_jobs_update(slug: str):
+    """Persist {subject?, preset?, overrides?}. Validates the preset exists and
+    runs the inheritable-config validators (categories, scoring) over any
+    overrides present. Does NOT auto-activate — the UI applies on leave via
+    POST /api/jobs/<slug>/activate, so the active job isn't re-projected and
+    restarted on every keystroke."""
     if not _valid_slug_or_400(slug):
         return jsonify({"error": "invalid slug"}), 400
     existing = job_config.get_job(slug)
@@ -1281,45 +1551,29 @@ def api_jobs_update(slug: str):
     if not isinstance(data, dict):
         return jsonify({"error": "body must be an object"}), 400
 
-    # Merge the submitted fields over the existing job; slug is immutable.
     merged = existing.to_dict()
-    for key in _JOB_EDITABLE_FIELDS:
-        if key in data:
-            merged[key] = data[key]
-    merged["slug"] = slug
-
-    # Validate category names at the write boundary — they become folder paths
-    # (sorted_dir/<cat>), so a name like "../../x" must be rejected. Reuse the
-    # same validator the /api/categories POST uses. Only runs when the PUT
-    # actually touches categories/rules.
-    if "categories" in data or "category_rules" in data:
-        cat_payload = {
-            "categories": merged.get("categories", []),
-            "global_rules": merged.get("category_rules", ""),
-        }
-        cleaned, cat_err = _validate_categories_payload(cat_payload)
-        if cat_err:
-            return jsonify({"error": f"invalid categories: {cat_err}"}), 400
-        merged["categories"] = cleaned["categories"]
-        merged["category_rules"] = cleaned["global_rules"]
-
-    # Validate / clamp scoring thresholds when present.
-    if "scoring" in data:
-        clean_scoring, score_err = _validate_job_scoring(data["scoring"])
-        if score_err:
-            return jsonify({"error": score_err}), 400
-        merged["scoring"] = {**(existing.scoring or {}), **clean_scoring}
+    if "subject" in data:
+        merged["subject"] = str(data["subject"] or "").strip()
+    if "preset" in data:
+        preset = (str(data["preset"]) or "").strip()
+        if not _preset_exists(preset):
+            return jsonify({"error": f"unknown preset: {preset}"}), 400
+        merged["preset"] = preset
+    if "overrides" in data:
+        ov = data["overrides"]
+        if not isinstance(ov, dict):
+            return jsonify({"error": "overrides must be an object"}), 400
+        clean_ov, err = _validate_inheritable_cfg(ov, partial=True)
+        if err:
+            return jsonify({"error": err}), 400
+        merged["overrides"] = clean_ov
 
     try:
         saved = job_config.save_job(job_config.Job.from_dict(merged))
     except (ValueError, TypeError) as exc:
         return jsonify({"error": f"invalid job config: {exc}"}), 400
 
-    # If this is the active job, re-project so the running supervisor re-resolves
-    # env + taxonomy (categories projection + _index.json mtime bump).
-    if saved.slug == job_config.get_active_slug():
-        job_config.activate(saved.slug)
-    return jsonify({"success": True, "job": saved.to_dict()})
+    return jsonify({"success": True, "job": _job_detail(saved)})
 
 
 @app.route("/api/jobs/<slug>", methods=["DELETE"])
@@ -1422,6 +1676,129 @@ def api_jobs_advance(slug: str | None = None):
         return jsonify({"error": "invalid slug"}), 400
     new_active = job_config.advance()
     return jsonify({"success": True, "active": new_active})
+
+
+# ── API: presets (global inheritable-config library) ──────────────────────────
+#
+# Presets are the named defaults a job inherits from. job_config owns the
+# library (data/jobs/_presets.json); these routes are a thin HTTP surface. Every
+# <name> is validated against PRESET_NAME_RE at the boundary.
+
+def _valid_preset_name(name: str) -> bool:
+    return bool(job_config.PRESET_NAME_RE.match(name or ""))
+
+
+@app.route("/api/presets")
+def api_presets_list():
+    lib = job_config.list_presets()
+    return jsonify({
+        "default": lib.get("default", "default"),
+        "presets": sorted(lib.get("presets", {}).keys()),
+    })
+
+
+@app.route("/api/presets", methods=["POST"])
+def api_presets_create():
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    base_on = (data.get("base_on") or "").strip() or None
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name (letters/digits/space/_/- , max 40)"}), 400
+    if _preset_exists(name):
+        return jsonify({"error": f"preset already exists: {name}"}), 400
+    if base_on is not None and not _preset_exists(base_on):
+        return jsonify({"error": f"unknown base_on preset: {base_on}"}), 400
+    # Seed from base_on (or the default preset) so a new preset is a full cfg.
+    seed = job_config.get_preset(base_on) if base_on else job_config.get_preset(
+        job_config.default_preset_name())
+    try:
+        job_config.save_preset(name, seed)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "name": name, "cfg": job_config.get_preset(name)}), 201
+
+
+@app.route("/api/presets/<name>")
+def api_presets_get(name: str):
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    if not _preset_exists(name):
+        return jsonify({"error": "preset not found"}), 404
+    lib = job_config.list_presets()
+    return jsonify({
+        "name": name,
+        "cfg": job_config.get_preset(name),
+        "is_default": name == lib.get("default"),
+        "referenced_by": sorted(j.slug for j in job_config.list_jobs() if j.preset == name),
+    })
+
+
+@app.route("/api/presets/<name>", methods=["PUT"])
+def api_presets_update(name: str):
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    if not _preset_exists(name):
+        return jsonify({"error": "preset not found"}), 404
+    data = request.get_json() or {}
+    cfg = data.get("cfg", data)          # accept {cfg:{...}} or a bare cfg body
+    clean, err = _validate_inheritable_cfg(cfg, partial=False)
+    if err:
+        return jsonify({"error": err}), 400
+    # Deep-merge onto the existing TOTAL preset so a partial PUT keeps untouched
+    # nested leaves (a shallow update would wipe e.g. scrapers.local_imports when
+    # the body includes only scrapers.enabled). Lists still replace wholesale.
+    merged = job_config._deep_merge(job_config.get_preset(name), clean)
+    try:
+        job_config.save_preset(name, merged)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "name": name, "cfg": job_config.get_preset(name)})
+
+
+@app.route("/api/presets/<name>", methods=["DELETE"])
+def api_presets_delete(name: str):
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    if not _preset_exists(name):
+        return jsonify({"error": "preset not found"}), 404
+    try:
+        job_config.delete_preset(name)
+    except ValueError as exc:
+        # default / referenced-by-a-job → 409 conflict.
+        return jsonify({"error": str(exc)}), 409
+    return jsonify({"success": True, "name": name})
+
+
+@app.route("/api/presets/<name>/clone", methods=["POST"])
+def api_presets_clone(name: str):
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    if not _preset_exists(name):
+        return jsonify({"error": "preset not found"}), 404
+    data = request.get_json() or {}
+    new_name = (data.get("name") or "").strip()
+    if not _valid_preset_name(new_name):
+        return jsonify({"error": "invalid new preset name"}), 400
+    if _preset_exists(new_name):
+        return jsonify({"error": f"preset already exists: {new_name}"}), 400
+    try:
+        job_config.save_preset(new_name, job_config.get_preset(name))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "name": new_name, "cfg": job_config.get_preset(new_name)}), 201
+
+
+@app.route("/api/presets/default", methods=["POST"])
+def api_presets_set_default():
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    if not _valid_preset_name(name):
+        return jsonify({"error": "invalid preset name"}), 400
+    try:
+        job_config.set_default_preset(name)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "default": name})
 
 
 # ── API: queue / thumbnails / prompts ─────────────────────────────────────────
@@ -2517,11 +2894,18 @@ HTML_TEMPLATE = r"""<!doctype html>
           <input x-model="newJob.name" @keydown.enter="createJob()"
             placeholder="Job name (e.g. Car Ads)"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2"/>
+          <select x-model="newJob.preset" :disabled="!!newJob.base_on"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2 disabled:opacity-50">
+            <option value="">Preset: default</option>
+            <template x-for="p in presetsList" :key="'np_'+p">
+              <option :value="p" x-text="'Preset: ' + p"></option>
+            </template>
+          </select>
           <select x-model="newJob.base_on"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-3">
-            <option value="">Start from defaults</option>
+            <option value="">Start fresh from preset</option>
             <template x-for="jb in jobsList" :key="'base_'+jb.slug">
-              <option :value="jb.slug" x-text="'Clone: ' + jb.name"></option>
+              <option :value="jb.slug" x-text="'Clone job: ' + jb.name"></option>
             </template>
           </select>
           <button @click="createJob()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Create job</button>
@@ -2959,12 +3343,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
 
-    <!-- SCRAPERS (per-job toggles) -->
+    <!-- SCRAPERS (per-job toggles via overrides; Local-<name> rows read-only) -->
     <section x-show="view === 'job' && active === 'scrapers'" class="card rounded-xl p-5">
       <div class="flex items-start justify-between gap-4 mb-3">
         <div>
           <h3 class="font-semibold">Scraper controls</h3>
-          <p class="text-xs text-slate-400 mt-1">Per-job toggles, saved into this job's config. The active job re-projects on save so a running supervisor re-resolves which scrapers to spawn.</p>
+          <p class="text-xs text-slate-400 mt-1">Per-job toggles (overrides on <code>scrapers.enabled</code>). The active job applies on leave / Apply. Local folders are managed in <button class="link-btn" @click="active='jobSettings'">Job Settings → Local folders</button>.</p>
         </div>
         <div class="flex gap-2">
           <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off (vision only)</button>
@@ -2978,14 +3362,20 @@ HTML_TEMPLATE = r"""<!doctype html>
               <div class="font-medium" x-text="s.name"></div>
               <div class="text-xs text-slate-400" x-text="s.description"></div>
             </div>
-            <label class="inline-flex items-center cursor-pointer gap-2">
-              <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-              <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
-                class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                  checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                  before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                  checked:before:translate-x-5"/>
-            </label>
+            <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
+            <template x-if="s.kind !== 'local'">
+              <label class="inline-flex items-center cursor-pointer gap-2">
+                <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
+                <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
+                  class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                    checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                    before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                    checked:before:translate-x-5"/>
+              </label>
+            </template>
+            <template x-if="s.kind === 'local'">
+              <span class="pill px-2 py-0.5 rounded" :class="s.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'" x-text="s.enabled ? 'enabled' : 'disabled'"></span>
+            </template>
           </div>
         </template>
       </div>
@@ -3029,111 +3419,102 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- Auto-captioning + prompt-required toggles — PER JOB. These live in
-           this job's config (captioning + topic.require_prompt); saving the
-           active job re-projects so the worker pool picks them up. -->
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+      <!-- Auto-captioning + scoring — PER JOB, inherit/override (v2). Each
+           field shows its EFFECTIVE value; a 'global' chip means inherited,
+           'reset ↺' removes the override. Auto-saves; the active job applies
+           on leave / Apply. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-center justify-between mb-1">
-          <h3 class="font-semibold">Auto-captioning <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
-          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
-            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
-            <span x-text="jobEditor.saving ? 'Saving…' : 'Save'"></span>
-          </button>
+          <h3 class="font-semibold">Auto-captioning</h3>
+          <span class="text-xs text-emerald-300" x-text="je.savedFlash"></span>
         </div>
-        <div x-show="jobEditor.banner" x-cloak class="border text-xs px-3 py-2 rounded mb-3"
-             :class="jobEditor.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200' : 'bg-rose-950/60 border-rose-700 text-rose-200'"
-             x-text="jobEditor.banner"></div>
-        <p class="text-xs text-slate-400 mb-3">
-          When enabled, the vision worker writes a training-ready caption to
-          <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">&lt;image&gt;.txt</code>
-          alongside the existing <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">.vision.json</code>.
-          The same LLM call that classifies the image also returns the caption,
-          so there's no extra request. Captions never overwrite an existing
-          source-side prompt unless the overwrite toggle is also on.
-        </p>
-        <template x-if="jobEditor.cfg">
+        <div x-show="je.error" x-cloak class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="je.error"></div>
+        <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
-          <div>
-            <label class="flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" x-model="jobEditor.cfg.captioning.enabled"
-                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                       checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                       checked:before:translate-x-5"/>
-              <span class="text-sm">Enable auto-captioning</span>
-            </label>
-            <label class="flex items-center gap-3 cursor-pointer mt-3">
-              <input type="checkbox" x-model="jobEditor.cfg.captioning.overwrite"
-                     :disabled="!jobEditor.cfg.captioning.enabled"
-                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                       checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                       checked:before:translate-x-5"/>
-              <span class="text-sm">Overwrite any existing captions found</span>
-            </label>
-            <label class="flex items-center gap-3 cursor-pointer mt-3">
-              <input type="checkbox" :checked="jobEditor.cfg.topic.require_prompt === false"
-                     @change="jobEditor.cfg.topic.require_prompt = !$event.target.checked"
-                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                       checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                       before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                       checked:before:translate-x-5"/>
-              <span class="text-sm">Allow scrapers to ingest images without a prompt
-                <span class="block text-xs text-slate-500">(off = require min prompt length chars)</span>
-              </span>
-            </label>
+          <div class="space-y-3">
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 cursor-pointer flex-1">
+                <input type="checkbox" :checked="effVal('captioning.enabled')"
+                       @change="setOverride('captioning.enabled', $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                <span class="text-sm">Enable auto-captioning</span>
+              </label>
+              <span x-show="!isOver('captioning.enabled')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400" title="inherited from preset">global</span>
+              <button x-show="isOver('captioning.enabled')" @click="resetOverride('captioning.enabled')" class="text-xs link-btn" title="reset to preset">reset ↺</button>
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 cursor-pointer flex-1">
+                <input type="checkbox" :checked="effVal('captioning.overwrite')" :disabled="!effVal('captioning.enabled')"
+                       @change="setOverride('captioning.overwrite', $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 disabled:opacity-40 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                <span class="text-sm">Overwrite existing captions</span>
+              </label>
+              <span x-show="!isOver('captioning.overwrite')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('captioning.overwrite')" @click="resetOverride('captioning.overwrite')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 cursor-pointer flex-1">
+                <input type="checkbox" :checked="effVal('topic_filters.require_prompt') === false"
+                       @change="setOverride('topic_filters.require_prompt', !$event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                <span class="text-sm">Ingest images without a prompt</span>
+              </label>
+              <span x-show="!isOver('topic_filters.require_prompt')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('topic_filters.require_prompt')" @click="resetOverride('topic_filters.require_prompt')" class="text-xs link-btn">reset ↺</button>
+            </div>
           </div>
           <div>
-            <label class="text-xs text-slate-400 block mb-1">Caption style</label>
-            <select x-model="jobEditor.cfg.captioning.style"
-                    :disabled="!jobEditor.cfg.captioning.enabled"
-                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 disabled:opacity-50">
-              <option value="sd_prompt">SD / Flux prompt (comma-separated descriptive phrases)</option>
-              <option value="booru_tags">Booru tags (lowercase_underscored, comma-separated)</option>
-              <option value="natural_language">Natural-language description (1-3 sentences)</option>
+            <div class="flex items-center justify-between mb-1">
+              <label class="text-xs text-slate-400">Caption style</label>
+              <span x-show="!isOver('captioning.style')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('captioning.style')" @click="resetOverride('captioning.style')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <select :value="effVal('captioning.style')" @change="setOverride('captioning.style', $event.target.value)"
+                    :disabled="!effVal('captioning.enabled')"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 disabled:opacity-50"
+                    :class="!isOver('captioning.style') ? 'text-slate-400' : ''">
+              <option value="sd_prompt">SD / Flux prompt</option>
+              <option value="booru_tags">Booru tags</option>
+              <option value="natural_language">Natural-language</option>
             </select>
-            <p class="text-xs text-slate-500 mt-2">
-              Pick the style your downstream trainer expects. SD/Flux for general
-              photo LoRAs, booru tags for anime LoRAs, natural-language for
-              CLIP/BLIP-style image-text models.
-            </p>
           </div>
         </div>
         </template>
       </div>
 
-      <!-- Per-job quality scoring. OVR/REL gates + scoring notes live in this
-           job's config; saving the active job re-projects them. -->
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
-        <div class="flex items-center justify-between mb-1">
-          <h3 class="font-semibold">Quality scoring <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
-          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
-            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
-            <span x-text="jobEditor.saving ? 'Saving…' : 'Save'"></span>
-          </button>
-        </div>
-        <p class="text-xs text-slate-400 mb-3">
-          Every classification emits two 0-100 scores. <code>OVR</code> judges absolute craft;
-          <code>REL</code> judges topic relevance. Either threshold forces a DISCARD when not met; set 0 to disable.
-        </p>
-        <template x-if="jobEditor.cfg">
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <h3 class="font-semibold mb-3">Quality scoring</h3>
+        <p class="text-xs text-slate-400 mb-3">Two 0-100 scores. <code>OVR</code> = craft, <code>REL</code> = topic relevance. Either threshold forces DISCARD when not met; 0 disables.</p>
+        <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
-            <input type="number" min="0" max="100" x-model.number="jobEditor.cfg.scoring.ovr_min"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
-            <input type="number" min="0" max="100" x-model.number="jobEditor.cfg.scoring.rel_min"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Scoring notes (appended to the rubric)</span>
-            <textarea x-model="jobEditor.cfg.scoring.notes" rows="3"
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Minimum OVR score (0-100)</span>
+              <span x-show="!isOver('scoring.ovr_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scoring.ovr_min')" @click="resetOverride('scoring.ovr_min')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input type="number" min="0" max="100" :value="effVal('scoring.ovr_min')" @input="setOverride('scoring.ovr_min', Number($event.target.value))"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scoring.ovr_min') ? 'text-slate-400' : ''"/>
+          </div>
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Minimum REL score (0-100)</span>
+              <span x-show="!isOver('scoring.rel_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scoring.rel_min')" @click="resetOverride('scoring.rel_min')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input type="number" min="0" max="100" :value="effVal('scoring.rel_min')" @input="setOverride('scoring.rel_min', Number($event.target.value))"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scoring.rel_min') ? 'text-slate-400' : ''"/>
+          </div>
+          <div class="md:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Scoring notes (appended to the rubric)</span>
+              <span x-show="!isOver('scoring.notes')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scoring.notes')" @click="resetOverride('scoring.notes')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <textarea :value="effVal('scoring.notes')" @input="setOverride('scoring.notes', $event.target.value)" rows="3"
                       placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scoring.notes') ? 'text-slate-400' : ''"></textarea>
+          </div>
         </div>
         </template>
       </div>
@@ -3307,291 +3688,397 @@ HTML_TEMPLATE = r"""<!doctype html>
       </table></div>
     </section>
 
-    <!-- JOB SETTINGS (per-job config editor) ──────────────────────────────
-         Everything that defines what THIS job scrapes and how it's judged.
-         Bound to jobEditor.cfg; PUT /api/jobs/<slug> persists it and (if active)
-         re-projects so the supervisor re-resolves env + taxonomy. -->
+    <!-- JOB SETTINGS (v2 inherit/override editor) ───────────────────────────
+         subject is job-owned; everything else inherits from the job's preset
+         and is edited as a sparse override. Each field shows its EFFECTIVE
+         value with a 'global' chip (inherited) or 'reset ↺' (overridden).
+         Auto-saves (debounced); the active job applies on leave / Apply. -->
     <section x-show="view === 'job' && active === 'jobSettings'" class="space-y-4">
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
+      <!-- Header: subject + preset + save/apply state. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
-            <h3 class="font-semibold">Topic &amp; targets <span class="text-xs font-normal text-slate-500" x-text="'(' + currentJob + ')'"></span></h3>
-            <p class="text-xs text-slate-400">Saved into this job's config. The active job re-projects on save.</p>
+            <h3 class="font-semibold" x-text="je.name"></h3>
+            <p class="text-xs text-slate-400">
+              Subject is this job's; other fields inherit from the
+              <span class="font-mono text-slate-300" x-text="je.preset"></span> preset until you override them. Changes save automatically.
+            </p>
           </div>
-          <div class="flex gap-2">
-            <button @click="loadJobEditor()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-            <button @click="saveJobEditor()" :disabled="jobEditor.saving"
-              class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
-              <span x-text="jobEditor.saving ? 'Saving…' : 'Save job'"></span>
-            </button>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-emerald-300" x-text="je.savedFlash"></span>
+            <template x-if="currentJob === jobsActive && je.applyPending">
+              <button @click="applyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
+                title="Re-project + restart the running supervisor with these edits">Apply &amp; restart</button>
+            </template>
           </div>
         </div>
-        <div x-show="jobEditor.banner" x-cloak class="border text-xs px-3 py-2 rounded mb-3"
-             :class="jobEditor.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200' : 'bg-rose-950/60 border-rose-700 text-rose-200'"
-             x-text="jobEditor.banner"></div>
-        <template x-if="jobEditor.cfg">
+        <div x-show="je.error" x-cloak class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="je.error"></div>
+        <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
-            <span class="text-xs text-slate-400">Display name</span>
-            <input x-model="jobEditor.cfg.name" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Slug (immutable)</span>
-            <input :value="jobEditor.cfg.slug" disabled
-                   class="w-full bg-slate-900 border border-slate-800 rounded px-3 py-2 mt-1 font-mono text-xs text-slate-500"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Topic</span>
-            <input x-model="jobEditor.cfg.topic.topic" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
-            <input :value="jobList('topic.keywords_extra')" @input="setJobList('topic.keywords_extra', $event.target.value)"
-                   placeholder="leave empty = auto-derive from topic"
+            <span class="text-xs text-slate-400">Subject (what this job is about — always per-job)</span>
+            <input :value="je.subject" @input="setSubject($event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
-            <input :value="jobList('topic.banned_keywords')" @input="setJobList('topic.banned_keywords', $event.target.value)"
+          <label class="block">
+            <span class="text-xs text-slate-400">Preset (inherited defaults)</span>
+            <select :value="je.preset" @change="setPreset($event.target.value)"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <template x-for="p in je.presets" :key="p">
+                <option :value="p" x-text="p + (p === je.default_preset ? ' (default)' : '')"></option>
+              </template>
+            </select>
+          </label>
+        </div>
+        </template>
+      </div>
+
+      <!-- Topic filters (inheritable). -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <h3 class="font-semibold mb-3">Topic filters</h3>
+        <template x-if="je.eff">
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="md:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Required keywords (comma-sep — post must contain at least one)</span>
+              <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('topic_filters.keywords_extra')" @input="setOverrideList('topic_filters.keywords_extra', $event.target.value)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.keywords_extra') ? 'text-slate-400' : ''"/>
+          </div>
+          <div class="md:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Banned keywords (comma-sep — any match rejects)</span>
+              <span x-show="!isOver('topic_filters.banned_keywords')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('topic_filters.banned_keywords')" @click="resetOverride('topic_filters.banned_keywords')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('topic_filters.banned_keywords')" @input="setOverrideList('topic_filters.banned_keywords', $event.target.value)"
                    placeholder="link in bio, dm me, patreon, onlyfans..."
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
-            <input :value="jobList('topic.generation_hints')" @input="setJobList('topic.generation_hints', $event.target.value)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.banned_keywords') ? 'text-slate-400' : ''"/>
+          </div>
+          <div class="md:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Generation hints (prompt must contain at least one)</span>
+              <span x-show="!isOver('topic_filters.generation_hints')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('topic_filters.generation_hints')" @click="resetOverride('topic_filters.generation_hints')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('topic_filters.generation_hints')" @input="setOverrideList('topic_filters.generation_hints', $event.target.value)"
                    placeholder="photorealistic, cinematic, cfg, lora..."
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
-            <input type="number" min="0" x-model.number="jobEditor.cfg.topic.min_prompt_length"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="flex items-center gap-3 cursor-pointer mt-6">
-            <input type="checkbox" x-model="jobEditor.cfg.topic.require_prompt"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                     checked:before:translate-x-5"/>
-            <span class="text-sm">Require a prompt (reject promptless images)</span>
-          </label>
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.generation_hints') ? 'text-slate-400' : ''"/>
+          </div>
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Minimum prompt length (chars)</span>
+              <span x-show="!isOver('topic_filters.min_prompt_length')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('topic_filters.min_prompt_length')" @click="resetOverride('topic_filters.min_prompt_length')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input type="number" min="0" :value="effVal('topic_filters.min_prompt_length')" @input="setOverride('topic_filters.min_prompt_length', Number($event.target.value))"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.min_prompt_length') ? 'text-slate-400' : ''"/>
+          </div>
+          <div class="flex items-center gap-2 mt-6">
+            <label class="flex items-center gap-3 cursor-pointer flex-1">
+              <input type="checkbox" :checked="effVal('topic_filters.require_prompt')" @change="setOverride('topic_filters.require_prompt', $event.target.checked)"
+                     class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+              <span class="text-sm">Require a prompt</span>
+            </label>
+            <span x-show="!isOver('topic_filters.require_prompt')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('topic_filters.require_prompt')" @click="resetOverride('topic_filters.require_prompt')" class="text-xs link-btn">reset ↺</button>
+          </div>
         </div>
         </template>
       </div>
 
-      <!-- Scraper targets (per job): accounts, subreddits, channels, domains,
-           gallery-dl, local import, zforfree. -->
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">Scraper targets</h3>
-          <button @click="saveJobEditor()" :disabled="jobEditor.saving"
-            class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
-            <span x-text="jobEditor.saving ? 'Saving…' : 'Save job'"></span>
-          </button>
-        </div>
-        <template x-if="jobEditor.cfg">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
-            <input :value="jobList('scrapers.x_accounts')" @input="setJobList('scrapers.x_accounts', $event.target.value)"
-                   placeholder="account1,account2,account3"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
-            <input :value="jobList('scrapers.reddit_subreddits')" @input="setJobList('scrapers.reddit_subreddits', $event.target.value)"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
-            <input :value="jobList('scrapers.civitai_domains')" @input="setJobList('scrapers.civitai_domains', $event.target.value)"
-                   placeholder="civitai.com,civitai.red"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Discord channels JSON</span>
-            <textarea x-model="jobEditor.cfg.scrapers.discord_channels_json" rows="3"
+      <!-- Scraper targets (inheritable lists + Discord JSON). -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <h3 class="font-semibold mb-3">Scraper targets</h3>
+        <template x-if="je.eff">
+        <div class="grid md:grid-cols-1 gap-4">
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">X.com accounts (comma-sep, no @). Empty = search-only.</span>
+              <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('scrapers.x_accounts')" @input="setOverrideList('scrapers.x_accounts', $event.target.value)"
+                   placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
+          </div>
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Reddit subreddit allowlist (comma-sep)</span>
+              <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('scrapers.reddit_subreddits')" @input="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
+          </div>
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+              <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <input :value="effList('scrapers.civitai_domains')" @input="setOverrideList('scrapers.civitai_domains', $event.target.value)"
+                   placeholder="civitai.com,civitai.red" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.civitai_domains') ? 'text-slate-400' : ''"/>
+          </div>
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs text-slate-400">Discord channels JSON</span>
+              <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <textarea :value="effVal('scrapers.discord_channels_json')" @input="setOverride('scrapers.discord_channels_json', $event.target.value)" rows="3"
               placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scrapers.discord_channels_json') ? 'text-slate-400' : ''"></textarea>
+          </div>
         </div>
         </template>
       </div>
 
-      <!-- gallery-dl (per job) -->
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
-        <h3 class="font-semibold mb-3">gallery-dl</h3>
-        <template x-if="jobEditor.cfg">
+      <!-- gallery-dl (overridden wholesale as scrapers.gallery_dl). -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">gallery-dl</h3>
+          <div>
+            <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
           <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" x-model="jobEditor.cfg.scrapers.gallery_dl.enabled"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                     checked:before:translate-x-5"/>
+            <input type="checkbox" :checked="effVal('scrapers.gallery_dl.enabled')" @change="setOverride('scrapers.gallery_dl.enabled', $event.target.checked)"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
             <span class="text-sm">Enable gallery-dl for this job</span>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Images per URL (limit)</span>
-            <input type="number" min="1" max="5000" x-model.number="jobEditor.cfg.scrapers.gallery_dl.limit_per_url"
+            <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">URLs (one per line, # comments OK)</span>
-            <textarea :value="jobUrls()" @input="setJobUrls($event.target.value)" rows="4"
+            <textarea :value="effUrls()" @input="setOverrideUrls($event.target.value)" rows="4"
                       placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Cookies file (Netscape cookies.txt)</span>
-            <input x-model="jobEditor.cfg.scrapers.gallery_dl.cookies_file" placeholder="C:\\Users\\you\\cookies.txt"
+            <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Custom config path (advanced)</span>
-            <input x-model="jobEditor.cfg.scrapers.gallery_dl.config_path"
+            <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
         </div>
         </template>
       </div>
 
-      <!-- Local import + ZForFree (per job) -->
-      <div class="card rounded-xl p-5" x-show="jobEditor.cfg">
-        <h3 class="font-semibold mb-3">Local import &amp; ZForFree</h3>
-        <template x-if="jobEditor.cfg">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" x-model="jobEditor.cfg.scrapers.local_import.enabled"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                     checked:before:translate-x-5"/>
-            <span class="text-sm">Enable local folder import</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Source label (queue subfolder)</span>
-            <input x-model="jobEditor.cfg.scrapers.local_import.name" placeholder="local"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Local import folder (absolute path)</span>
-            <input x-model="jobEditor.cfg.scrapers.local_import.dir" placeholder="D:\\my-dataset"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Migrate dedup from (optional, comma-sep)</span>
-            <input x-model="jobEditor.cfg.scrapers.local_import.migrate_from" placeholder="zff_local:zff:zforfree"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" x-model="jobEditor.cfg.scrapers.zforfree.local_enabled"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                     checked:before:translate-x-5"/>
-            <span class="text-sm">ZForFree local feeder</span>
-          </label>
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" x-model="jobEditor.cfg.scrapers.zforfree.web_enabled"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                     checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                     before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                     checked:before:translate-x-5"/>
-            <span class="text-sm">ZForFree web feeder</span>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">ZForFree local source folder</span>
-            <input x-model="jobEditor.cfg.scrapers.zforfree.local_src"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
+      <!-- Local folders (multi): scrapers.local_imports list. Each row is its
+           own concurrent source. ZForFree-local is gone — migrate it here. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Local folders</h3>
+            <p class="text-xs text-slate-400">Each enabled folder is a concurrent source, surfaced on the Scrapers tab as <code>Local-&lt;name&gt;</code>.</p>
+          </div>
+          <div>
+            <span x-show="!isOver('scrapers.local_imports')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.local_imports')" @click="resetOverride('scrapers.local_imports')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
+        <div class="space-y-2">
+          <template x-for="(f, i) in localFolders()" :key="i">
+            <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
+              <input :value="f.name" @input="updateLocalFolder(i, 'name', $event.target.value)" placeholder="name"
+                     class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+              <input :value="f.dir" @input="updateLocalFolder(i, 'dir', $event.target.value)" placeholder="absolute folder path"
+                     class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+              <label class="col-span-2 flex items-center gap-1 text-xs">
+                <input type="checkbox" :checked="f.enabled" @change="updateLocalFolder(i, 'enabled', $event.target.checked)"/> on
+              </label>
+              <button @click="removeLocalFolder(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
+            </div>
+          </template>
+          <button @click="addLocalFolder()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
         </div>
         </template>
       </div>
 
-      <!-- Categories: per-job taxonomy. Projected into data/cull_categories.json
-           when this is the active job; the supervisor watches that file. -->
-      <div class="card rounded-xl p-5">
+      <!-- Categories (inheritable; reject traversal/reserved at the boundary). -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-start justify-between gap-4 mb-3">
           <div>
             <h3 class="font-semibold">Categories</h3>
-            <p class="text-xs text-slate-400">
-              The classification taxonomy: keep-buckets, per-bucket prompt hints, and the global judgement rules
-              that get injected into every vision call. Saved to <code>data/cull_categories.json</code>;
-              workers soft-restart automatically on save. <code>DISCARD</code> and <code>CORRUPT</code> are reserved.
-            </p>
+            <p class="text-xs text-slate-400">Keep-buckets + hints + global judgement rules. <code>DISCARD</code>/<code>CORRUPT</code> reserved.</p>
           </div>
-          <div class="flex gap-2 shrink-0">
-            <button @click="loadCategories()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-            <button @click="saveCategories()" :disabled="cats.saving"
-                    class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-50">
-              <span x-text="cats.saving ? 'Saving...' : 'Save categories'"></span>
-            </button>
+          <div class="flex items-center gap-2">
+            <span x-show="!isOver('categories')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('categories')" @click="resetOverride('categories')" class="text-xs link-btn">reset categories ↺</button>
           </div>
         </div>
-        <div x-show="cats.banner" x-cloak
-             class="border text-xs px-3 py-2 rounded mb-3"
-             :class="cats.bannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
-                                   : 'bg-rose-950/60 border-rose-700 text-rose-200'"
-             x-text="cats.banner"></div>
-
-        <div class="flex flex-wrap items-center gap-2 mb-4">
-          <label class="text-xs text-slate-400">Load preset:</label>
-          <select x-model="cats.presetSelect"
-                  class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
-            <template x-for="(preset, key) in cats.presets" :key="key">
-              <option :value="key" x-text="preset.label || key"></option>
+        <template x-if="je.eff">
+        <div>
+          <div class="space-y-2 mb-4">
+            <template x-for="(cat, idx) in (effVal('categories') || [])" :key="idx">
+              <div class="flex items-start gap-2 bg-slate-900/40 border border-slate-800 rounded p-2">
+                <div class="flex-1 grid md:grid-cols-3 gap-2">
+                  <input :value="cat.name" @input="(() => { const l = (effVal('categories')||[]).map(c=>({...c})); l[idx].name = $event.target.value; setOverride('categories', l); })()"
+                         placeholder="CategoryName" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+                  <textarea :value="cat.hint" @input="(() => { const l = (effVal('categories')||[]).map(c=>({...c})); l[idx].hint = $event.target.value; setOverride('categories', l); })()"
+                            rows="2" placeholder="when should the model pick this?" class="md:col-span-2 w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs leading-snug"></textarea>
+                </div>
+                <button @click="(() => setOverride('categories', (effVal('categories')||[]).filter((_,i2)=>i2!==idx)))()"
+                        class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded shrink-0">✕</button>
+              </div>
             </template>
-          </select>
-          <button @click="applyPreset()"
-                  class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">
-            Apply preset (replaces current edits)
-          </button>
-          <span class="text-[11px] text-slate-500 ml-auto" x-text="'Active preset: ' + (cats.draft.preset || 'custom')"></span>
+            <button @click="(() => { const l = (effVal('categories')||[]).slice(); if (l.length>=12) return; l.push({name:'',hint:''}); setOverride('categories', l); })()"
+                    class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add category</button>
+          </div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs text-slate-400">Global judgement rules</span>
+            <span x-show="!isOver('category_rules')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('category_rules')" @click="resetOverride('category_rules')" class="text-xs link-btn">reset ↺</button>
+          </div>
+          <textarea :value="effVal('category_rules')" @input="setOverride('category_rules', $event.target.value)" rows="6"
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-[11px] leading-snug" :class="!isOver('category_rules') ? 'text-slate-400' : ''"></textarea>
         </div>
+        </template>
+      </div>
+    </section>
 
-        <div class="space-y-2 mb-4">
-          <template x-for="(cat, idx) in cats.draft.categories" :key="idx">
-            <div class="flex items-start gap-2 bg-slate-900/40 border border-slate-800 rounded p-2">
-              <div class="flex flex-col gap-1 shrink-0">
-                <button @click="moveCategory(idx, -1)" :disabled="idx === 0"
-                        class="px-1.5 py-0.5 text-[10px] bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-30"
-                        title="Move up">↑</button>
-                <button @click="moveCategory(idx, 1)" :disabled="idx === cats.draft.categories.length - 1"
-                        class="px-1.5 py-0.5 text-[10px] bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-30"
-                        title="Move down">↓</button>
+    <!-- PRESETS MANAGER (global) ─────────────────────────────────────────────
+         List/create/clone/delete/set-default + a preset editor over the same
+         inheritable field set. Presets have no inheritance — values are absolute. -->
+    <section x-show="view === 'jobs' && active === 'presets'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Presets</h3>
+            <p class="text-xs text-slate-400">Named default bundles a job inherits from. Edits auto-save.</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="p in presetsList" :key="p">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 flex items-center justify-between gap-2"
+                 :class="presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : ''">
+              <div class="min-w-0">
+                <div class="font-mono text-sm truncate" x-text="p"></div>
+                <div class="text-[11px] text-amber-300" x-show="p === presetsDefault">default</div>
               </div>
-              <div class="flex-1 grid md:grid-cols-3 gap-2">
-                <label class="block">
-                  <span class="text-[10px] text-slate-500 uppercase tracking-wider">Name</span>
-                  <input x-model="cat.name" placeholder="CategoryName"
-                         class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 mt-0.5 font-mono text-xs"/>
-                </label>
-                <label class="block md:col-span-2">
-                  <span class="text-[10px] text-slate-500 uppercase tracking-wider">Hint (injected into the prompt)</span>
-                  <textarea x-model="cat.hint" rows="2"
-                            placeholder="when should the model pick this category?"
-                            class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 mt-0.5 text-xs leading-snug"></textarea>
-                </label>
+              <div class="flex flex-wrap gap-1 shrink-0">
+                <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
+                <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+                <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
+                <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
               </div>
-              <button @click="removeCategory(idx)"
-                      class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded shrink-0"
-                      title="Remove this category">✕</button>
             </div>
           </template>
-          <button @click="addCategory()"
-                  :disabled="cats.draft.categories.length >= 12"
-                  class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">
-            + Add category <span class="text-slate-500" x-text="'(' + cats.draft.categories.length + '/12)'"></span>
-          </button>
+          <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
+            <div class="text-sm font-semibold mb-2">New preset</div>
+            <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
+            <select x-model="newPreset.base_on" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
+              <option value="">Clone the default</option>
+              <template x-for="p in presetsList" :key="'b_'+p"><option :value="p" x-text="'Clone: ' + p"></option></template>
+            </select>
+            <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
+          </div>
         </div>
+      </div>
 
-        <label class="block">
-          <span class="text-xs text-slate-400">Global judgement rules (prepended to CATEGORY ASSIGNMENT in the prompt)</span>
-          <textarea x-model="cats.draft.global_rules" rows="6"
-                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-[11px] leading-snug"></textarea>
-          <span class="text-[10px] text-slate-500">Free-text. Used verbatim by every vision worker. Keep portrait-specific gates here when using the default taxonomy; relax them when sorting by art-style or quality only.</span>
-        </label>
+      <!-- Preset editor -->
+      <div class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-emerald-300" x-text="presetEditor.savedFlash"></span>
+            <button @click="closePreset()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Close</button>
+          </div>
+        </div>
+        <div x-show="presetEditor.error" x-cloak class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="presetEditor.error"></div>
+        <div class="text-[11px] text-slate-500 mb-3" x-show="presetEditor.referencedBy.length"
+             x-text="'Used by ' + presetEditor.referencedBy.length + ' job(s): ' + presetEditor.referencedBy.join(', ')"></div>
+        <template x-if="presetEditor.cfg">
+        <div class="space-y-4">
+          <div class="grid md:grid-cols-2 gap-3">
+            <label class="block"><span class="text-xs text-slate-400">Required keywords (comma-sep)</span>
+              <input :value="peList('topic_filters.keywords_extra')" @input="peSetList('topic_filters.keywords_extra', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block"><span class="text-xs text-slate-400">Banned keywords (comma-sep)</span>
+              <input :value="peList('topic_filters.banned_keywords')" @input="peSetList('topic_filters.banned_keywords', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block"><span class="text-xs text-slate-400">Generation hints (comma-sep)</span>
+              <input :value="peList('topic_filters.generation_hints')" @input="peSetList('topic_filters.generation_hints', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block"><span class="text-xs text-slate-400">Minimum prompt length</span>
+              <input type="number" min="0" :value="presetEditor.cfg.topic_filters.min_prompt_length" @input="peSet('topic_filters.min_prompt_length', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+          </div>
+          <div class="grid md:grid-cols-2 gap-3">
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts (comma-sep)</span>
+              <input :value="peList('scrapers.x_accounts')" @input="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits (comma-sep)</span>
+              <input :value="peList('scrapers.reddit_subreddits')" @input="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains (comma-sep)</span>
+              <input :value="peList('scrapers.civitai_domains')" @input="peSetList('scrapers.civitai_domains', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+          </div>
+          <div class="grid md:grid-cols-2 gap-3">
+            <label class="block"><span class="text-xs text-slate-400">Scrapers enabled (toggles)</span>
+              <div class="mt-1 flex flex-wrap gap-2">
+                <template x-for="nm in scraperNames" :key="'pe_'+nm">
+                  <label class="flex items-center gap-1 text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1">
+                    <input type="checkbox" :checked="(presetEditor.cfg.scrapers.enabled||{})[nm] !== false"
+                           @change="(() => { const e = {...(presetEditor.cfg.scrapers.enabled||{})}; e[nm] = $event.target.checked; peSet('scrapers.enabled', e); })()"/>
+                    <span x-text="nm"></span>
+                  </label>
+                </template>
+              </div>
+            </label>
+            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
+          </div>
+          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs (one per line)</span>
+            <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+
+          <div>
+            <div class="text-xs text-slate-400 mb-1">Local folders</div>
+            <div class="space-y-2">
+              <template x-for="(f, i) in peLocalFolders()" :key="'pel_'+i">
+                <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
+                  <input :value="f.name" @input="peUpdateLocal(i, 'name', $event.target.value)" placeholder="name" class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+                  <input :value="f.dir" @input="peUpdateLocal(i, 'dir', $event.target.value)" placeholder="path" class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+                  <label class="col-span-2 flex items-center gap-1 text-xs"><input type="checkbox" :checked="f.enabled" @change="peUpdateLocal(i, 'enabled', $event.target.checked)"/> on</label>
+                  <button @click="peRemoveLocal(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
+                </div>
+              </template>
+              <button @click="peAddLocal()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
+            </div>
+          </div>
+
+          <div>
+            <div class="text-xs text-slate-400 mb-1">Categories</div>
+            <div class="space-y-2 mb-2">
+              <template x-for="(cat, idx) in (presetEditor.cfg.categories || [])" :key="'pec_'+idx">
+                <div class="flex items-start gap-2 bg-slate-900/40 border border-slate-800 rounded p-2">
+                  <input :value="cat.name" @input="(() => { const l = presetEditor.cfg.categories.map(c=>({...c})); l[idx].name = $event.target.value; peSet('categories', l); })()" placeholder="Name" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+                  <textarea :value="cat.hint" @input="(() => { const l = presetEditor.cfg.categories.map(c=>({...c})); l[idx].hint = $event.target.value; peSet('categories', l); })()" rows="2" placeholder="hint" class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"></textarea>
+                  <button @click="peRemoveCategory(idx)" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
+                </div>
+              </template>
+              <button @click="peAddCategory()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add category</button>
+            </div>
+            <label class="block"><span class="text-xs text-slate-400">Global judgement rules</span>
+              <textarea :value="presetEditor.cfg.category_rules" @input="peSet('category_rules', $event.target.value)" rows="5" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-[11px]"></textarea></label>
+          </div>
+
+          <div class="grid md:grid-cols-3 gap-3">
+            <label class="block"><span class="text-xs text-slate-400">Min OVR (0-100)</span>
+              <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.ovr_min" @input="peSet('scoring.ovr_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="block"><span class="text-xs text-slate-400">Min REL (0-100)</span>
+              <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
+          </div>
+        </div>
+        </template>
       </div>
     </section>
 
@@ -4024,6 +4511,7 @@ function dashboard() {
     // Global sections (shown when view==='jobs').
     globalTabs: [
       {id:'jobs',     label:'Jobs'},
+      {id:'presets',  label:'Presets'},
       {id:'gstats',   label:'Global Stats'},
       {id:'settings', label:'Global Settings'},
       {id:'faq',      label:'FAQ'},
@@ -4031,11 +4519,28 @@ function dashboard() {
     ],
     // Jobs landing state.
     jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
-    newJob: { name: '', base_on: '' },
-    // Per-job config editor (Job Settings tab).
-    jobEditor: { loaded: false, saving: false, banner: '', bannerOk: true, cfg: null, slug: null },
+    newJob: { name: '', base_on: '', preset: '' },
+    presetsList: [], presetsDefault: '',
+    // Per-job config editor (Job Settings tab) — v2 inherit/override model.
+    // eff = effective (resolved) cfg; overrides = the sparse override map.
+    je: {
+      loaded: false, slug: null, name: '', subject: '', preset: '',
+      eff: null, overrides: {}, presets: [], default_preset: '',
+      savedFlash: '', saving: false, error: '', applyPending: false,
+    },
+    _jeTimer: null,
+    _jeSaving: null,
+    // Global presets manager state.
+    presetEditor: { open: false, name: null, cfg: null, isDefault: false,
+                    referencedBy: [], savedFlash: '', error: '', saving: false },
+    _peTimer: null,
+    newPreset: { name: '', base_on: '' },
     // Global Stats per-job filter (null = all jobs aggregate).
     globalStatsJob: '',
+    // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
+    // so this can never drift from the Python source of truth. Used by the
+    // preset editor's enabled-toggles.
+    scraperNames: {{ scraper_names_json|safe }},
     providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',
     throttle: 100,
@@ -4043,12 +4548,6 @@ function dashboard() {
     settings: {}, settingsBanner: '', settingsBannerOk: true,
     settingsDirty: false, settingsErrors: {},
     providerTest: {},
-    cats: {
-      draft: { preset: 'portrait_curation', categories: [], global_rules: '' },
-      presets: {},
-      presetSelect: 'portrait_curation',
-      banner: '', bannerOk: true, saving: false, loaded: false,
-    },
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '' },
     indexer: { in_progress: false, files_seen: 0, files_added: 0, queue_total: 0, sorted_total: 0, last_scan_at: null, scan_started_at: null },
@@ -4183,14 +4682,15 @@ function dashboard() {
       if (!name) { alert('Give the job a name.'); return; }
       const body = { name };
       if (this.newJob.base_on) body.base_on = this.newJob.base_on;
+      else if (this.newJob.preset) body.preset = this.newJob.preset;
       const r = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify(body)});
       const j = await r.json();
       if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
-      this.newJob = { name: '', base_on: '' };
+      this.newJob = { name: '', base_on: '', preset: '' };
       await this.loadJobs();
-      // Drop straight into the new job's workspace.
-      this.openJob(j.job.slug);
+      // The create response is the v2 job detail ({job:{slug,...}}).
+      this.openJob(j.job.job.slug);
     },
     async activateJob(slug) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
@@ -4239,7 +4739,12 @@ function dashboard() {
     },
 
     // ── Job view navigation ──────────────────────────────────────────────
-    openJob(slug) {
+    async openJob(slug) {
+      // Commit any pending edits on the job we're leaving before switching, so a
+      // dangling debounce timer can't fire against the NEW slug and lose data.
+      if (this.currentJob && this.currentJob !== slug && this.je.loaded) {
+        await this.leaveJobEditor();
+      }
       this.view = 'job';
       this.currentJob = slug;
       this.active = 'logs';            // default tab: Historical
@@ -4248,12 +4753,24 @@ function dashboard() {
       this.history = []; this.queueFiles = []; this.activity = [];
       this.gallery = { ...this.gallery, page: 1, items: [] };
       this.stats = { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] };
-      this.jobEditor = { loaded: false, saving: false, banner: '', bannerOk: true, cfg: null, slug: null };
-      this.cats.loaded = false;
+      this.je = { loaded: false, slug: null, name: '', subject: '', preset: '',
+                  eff: null, overrides: {}, presets: [], default_preset: '',
+                  savedFlash: '', saving: false, error: '', applyPending: false };
       this.refresh();
       this.loadJobEditor();
     },
-    backToJobs() {
+    // Flush pending edits + apply once if the (active) job has unapplied changes.
+    // Cancels the debounce timer first so it can't fire after we've moved on.
+    async leaveJobEditor() {
+      if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      if (this.currentJob && this.currentJob === this.jobsActive && this.je.applyPending) {
+        await this.applyActiveJob();     // flushes + activates once
+      } else {
+        await this.flushJobSave();
+      }
+    },
+    async backToJobs() {
+      await this.leaveJobEditor();
       this.view = 'jobs';
       this.currentJob = null;
       this.active = 'jobs';
@@ -4262,94 +4779,221 @@ function dashboard() {
       this.refresh();
     },
 
-    // ── Job Settings (per-job config editor) ─────────────────────────────
+    // ── Job Settings (v2 inherit/override + auto-save) ───────────────────
+    // The override namespace uses topic_filters.* / scrapers.* / categories /
+    // category_rules / scoring / captioning. The effective cfg exposes a v1
+    // topic block, so reads map topic_filters.X → eff.topic.X. `subject` is
+    // job-owned (always editable), not an override.
     async loadJobEditor() {
       if (!this.currentJob) return;
-      this.jobEditor.banner = '';
+      this.je.error = '';
       try {
-        const cfg = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob)).then(r => r.json());
-        // Defensive defaults so v-models never bind to undefined.
-        cfg.topic = cfg.topic || {};
-        cfg.scrapers = cfg.scrapers || {};
-        cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
-        cfg.scrapers.local_import = cfg.scrapers.local_import || {};
-        cfg.scrapers.zforfree = cfg.scrapers.zforfree || {};
-        cfg.scoring = cfg.scoring || {};
-        cfg.captioning = cfg.captioning || {};
-        this.jobEditor.cfg = cfg;
-        this.jobEditor.slug = this.currentJob;
-        this.jobEditor.loaded = true;
+        const d = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob)).then(r => r.json());
+        this.je = {
+          loaded: true, slug: d.job.slug, name: d.job.name,
+          subject: d.job.subject || '', preset: d.job.preset || '',
+          eff: d.effective || {}, overrides: d.overrides || {},
+          presets: d.presets || [], default_preset: d.default_preset || '',
+          savedFlash: '', saving: false, error: '', applyPending: this.je.applyPending,
+        };
       } catch (e) {
-        this.jobEditor.banner = 'Failed to load job config: ' + e.message;
-        this.jobEditor.bannerOk = false;
+        this.je.error = 'Failed to load job: ' + e.message;
       }
     },
-    // Helpers to edit list fields as comma-separated text without losing the
-    // array shape the API expects.
-    jobList(path) {
-      const v = this._jobGet(path);
-      return Array.isArray(v) ? v.join(', ') : (v || '');
+    // Map an override-namespace path to its effective-cfg location.
+    _effPathFor(path) {
+      if (path.startsWith('topic_filters.')) return 'topic.' + path.slice('topic_filters.'.length);
+      return path;   // scrapers.* / categories / category_rules / scoring / captioning map 1:1
     },
-    setJobList(path, text) {
-      const arr = (text || '').split(',').map(s => s.trim()).filter(Boolean);
-      this._jobSet(path, arr);
+    _deepGet(obj, path) {
+      return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
     },
-    jobUrls() {
-      const v = this._jobGet('scrapers.gallery_dl.urls');
-      return Array.isArray(v) ? v.join('\n') : (v || '');
-    },
-    setJobUrls(text) {
-      const arr = (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
-      this._jobSet('scrapers.gallery_dl.urls', arr);
-    },
-    _jobGet(path) {
-      return path.split('.').reduce((o, k) => (o == null ? o : o[k]), this.jobEditor.cfg);
-    },
-    _jobSet(path, value) {
-      const keys = path.split('.');
-      let o = this.jobEditor.cfg;
-      for (let i = 0; i < keys.length - 1; i++) {
-        if (o[keys[i]] == null) o[keys[i]] = {};
-        o = o[keys[i]];
-      }
+    _deepSet(obj, path, value) {
+      const keys = path.split('.'); let o = obj;
+      for (let i = 0; i < keys.length - 1; i++) { if (o[keys[i]] == null || typeof o[keys[i]] !== 'object') o[keys[i]] = {}; o = o[keys[i]]; }
       o[keys[keys.length - 1]] = value;
     },
-    async saveJobEditor() {
-      if (!this.jobEditor.cfg || !this.currentJob) return;
-      this.jobEditor.saving = true;
-      this.jobEditor.banner = '';
-      try {
-        const r = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob), {
-          method: 'PUT', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(this.jobEditor.cfg)});
-        const j = await r.json();
-        if (r.ok && j.success) {
-          // Re-apply the same defensive nested defaults loadJobEditor uses, so
-          // the editor's deep v-model binds never hit an undefined branch.
-          const cfg = j.job;
-          cfg.topic = cfg.topic || {};
-          cfg.scrapers = cfg.scrapers || {};
-          cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
-          cfg.scrapers.local_import = cfg.scrapers.local_import || {};
-          cfg.scrapers.zforfree = cfg.scrapers.zforfree || {};
-          cfg.scoring = cfg.scoring || {};
-          cfg.captioning = cfg.captioning || {};
-          this.jobEditor.cfg = cfg;
-          this.jobEditor.banner = (this.currentJob === this.jobsActive)
-            ? 'Saved. Active job re-projected — workers pick it up on the next reconcile tick.'
-            : 'Saved.';
-          this.jobEditor.bannerOk = true;
-          this.loadJobs();
-          setTimeout(() => this.jobEditor.banner = '', 6000);
-        } else {
-          this.jobEditor.banner = 'Save failed: ' + (j.error || r.status);
-          this.jobEditor.bannerOk = false;
+    _deepDel(obj, path) {
+      const keys = path.split('.'); const stack = []; let o = obj;
+      for (let i = 0; i < keys.length - 1; i++) { if (o == null || !(keys[i] in o)) return; stack.push([o, keys[i]]); o = o[keys[i]]; }
+      if (o && typeof o === 'object') delete o[keys[keys.length - 1]];
+      for (let i = stack.length - 1; i >= 0; i--) { const [p, k] = stack[i]; if (p[k] && typeof p[k] === 'object' && Object.keys(p[k]).length === 0) delete p[k]; }
+    },
+    // EFFECTIVE value at an override path (what the field displays).
+    effVal(path) { return this._deepGet(this.je.eff, this._effPathFor(path)); },
+    // Is this path overridden (vs inherited from the preset)?
+    isOver(path) { return this._deepGet(this.je.overrides, path) !== undefined; },
+    // List/url convenience views.
+    effList(path) { const v = this.effVal(path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
+    effUrls() { const v = this.effVal('scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    // Set an override (and optimistically update the effective view), debounce PUT.
+    setOverride(path, value) {
+      this._deepSet(this.je.overrides, path, value);
+      this._deepSet(this.je.eff, this._effPathFor(path), value);
+      this.scheduleJobSave();
+    },
+    setOverrideList(path, text) { this.setOverride(path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); },
+    setOverrideUrls(text) { this.setOverride('scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
+    // Reset a field back to the preset (remove the override). Re-fetch to get the
+    // recomputed effective value from the preset.
+    async resetOverride(path) {
+      this._deepDel(this.je.overrides, path);
+      await this.flushJobSave();        // persist the removal
+      await this.loadJobEditor();       // refresh effective from preset
+    },
+    setSubject(v) { this.je.subject = v; this.scheduleJobSave(); },
+    async setPreset(v) {
+      this.je.preset = v;
+      await this.flushJobSave();
+      await this.loadJobEditor();        // effective recomputes against the new preset
+    },
+    // Local-imports list manager (overrides scrapers.local_imports wholesale).
+    localFolders() { const v = this.effVal('scrapers.local_imports'); return Array.isArray(v) ? v : []; },
+    addLocalFolder() {
+      const list = (this.localFolders() || []).slice();
+      list.push({ name: 'local' + (list.length || ''), dir: '', enabled: false, migrate_from: '' });
+      this.setOverride('scrapers.local_imports', list);
+    },
+    updateLocalFolder(i, key, value) {
+      const list = (this.localFolders() || []).map(f => ({ ...f }));
+      if (!list[i]) return;
+      list[i][key] = value;
+      this.setOverride('scrapers.local_imports', list);
+    },
+    removeLocalFolder(i) {
+      const list = (this.localFolders() || []).filter((_, idx) => idx !== i);
+      this.setOverride('scrapers.local_imports', list);
+    },
+    // Debounced auto-save (~700ms). Marks the active job's apply as pending.
+    scheduleJobSave() {
+      if (this.currentJob === this.jobsActive) this.je.applyPending = true;
+      if (this._jeTimer) clearTimeout(this._jeTimer);
+      this._jeTimer = setTimeout(() => this.flushJobSave(), 700);
+    },
+    async flushJobSave() {
+      if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      if (!this.je.loaded || !this.currentJob) return;
+      // Serialise saves: if one is in flight, wait for it and re-run once so a
+      // change made during the request isn't lost and two PUTs can't race.
+      if (this._jeSaving) { await this._jeSaving; }
+      const slug = this.currentJob;
+      const payload = { subject: this.je.subject, preset: this.je.preset, overrides: this.je.overrides };
+      this.je.saving = true; this.je.error = '';
+      this._jeSaving = (async () => {
+        try {
+          const r = await fetch('/api/jobs/' + encodeURIComponent(slug), {
+            method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+          const j = await r.json();
+          // Ignore the result if the user navigated to a different job meanwhile.
+          if (this.currentJob !== slug) return;
+          if (r.ok && j.success) {
+            this.je.savedFlash = 'saved ✓';
+            setTimeout(() => this.je.savedFlash = '', 1800);
+            this.loadJobs();
+          } else {
+            this.je.error = 'Save failed: ' + (j.error || r.status);
+          }
+        } catch (e) {
+          if (this.currentJob === slug) this.je.error = 'Network error: ' + e.message;
         }
-      } catch (e) {
-        this.jobEditor.banner = 'Network error: ' + e.message;
-        this.jobEditor.bannerOk = false;
-      }
-      this.jobEditor.saving = false;
+      })();
+      try { await this._jeSaving; } finally { this._jeSaving = null; this.je.saving = false; }
+    },
+    // Apply pending edits to the ACTIVE job: flush then re-project + restart once.
+    async applyActiveJob() {
+      await this.flushJobSave();
+      if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/activate', { method: 'POST' });
+      this.je.applyPending = false;
+      this.loadJobs();
+      this.refresh();
+    },
+
+    // ── Presets manager (global) ─────────────────────────────────────────
+    async loadPresets() {
+      try {
+        const p = await fetch('/api/presets').then(r => r.json());
+        this.presetsList = p.presets || [];
+        this.presetsDefault = p.default || '';
+      } catch (e) { /* swallow */ }
+    },
+    async createPreset() {
+      const name = (this.newPreset.name || '').trim();
+      if (!name) { alert('Give the preset a name.'); return; }
+      const body = { name };
+      if (this.newPreset.base_on) body.base_on = this.newPreset.base_on;
+      const r = await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+      const j = await r.json();
+      if (!r.ok) { alert('Create failed: ' + (j.error || r.status)); return; }
+      this.newPreset = { name: '', base_on: '' };
+      await this.loadPresets();
+      this.openPreset(j.name);
+    },
+    async clonePreset(name) {
+      const nn = prompt('Name for the clone of "' + name + '":', name + ' copy');
+      if (!nn) return;
+      const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/clone', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name: nn})});
+      const j = await r.json();
+      if (!r.ok) { alert('Clone failed: ' + (j.error || r.status)); return; }
+      await this.loadPresets();
+    },
+    async deletePreset(name) {
+      if (!confirm('Delete preset "' + name + '"?')) return;
+      const r = await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) { alert('Delete failed: ' + (j.error || r.status)); return; }
+      if (this.presetEditor.name === name) this.presetEditor.open = false;
+      await this.loadPresets();
+    },
+    async setDefaultPreset(name) {
+      const r = await fetch('/api/presets/default', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+      if (!r.ok) { const j = await r.json().catch(()=>({})); alert('Failed: ' + (j.error || r.status)); return; }
+      await this.loadPresets();
+    },
+    async openPreset(name) {
+      try {
+        const d = await fetch('/api/presets/' + encodeURIComponent(name)).then(r => r.json());
+        // Defensive nested defaults for deep binds.
+        const cfg = d.cfg || {};
+        cfg.topic_filters = cfg.topic_filters || {};
+        cfg.scrapers = cfg.scrapers || {};
+        cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
+        if (!Array.isArray(cfg.scrapers.local_imports)) cfg.scrapers.local_imports = [];
+        cfg.scoring = cfg.scoring || {};
+        cfg.captioning = cfg.captioning || {};
+        cfg.categories = Array.isArray(cfg.categories) ? cfg.categories : [];
+        this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
+                              referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
+      } catch (e) { alert('Failed to load preset: ' + e.message); }
+    },
+    closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
+    // Preset list editors mirror the job editor list helpers but write straight
+    // into presetEditor.cfg (a preset has no inheritance — values are absolute).
+    peList(path) { const v = this._deepGet(this.presetEditor.cfg, path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
+    peSetList(path, text) { this._deepSet(this.presetEditor.cfg, path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); this.schedulePresetSave(); },
+    peUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    peSetUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
+    peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
+    peLocalFolders() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.local_imports'); return Array.isArray(v) ? v : []; },
+    peAddLocal() { const l = this.peLocalFolders().slice(); l.push({name:'local'+(l.length||''),dir:'',enabled:false,migrate_from:''}); this.peSet('scrapers.local_imports', l); },
+    peUpdateLocal(i, key, value) { const l = this.peLocalFolders().map(f=>({...f})); if (l[i]) { l[i][key]=value; this.peSet('scrapers.local_imports', l); } },
+    peRemoveLocal(i) { this.peSet('scrapers.local_imports', this.peLocalFolders().filter((_,idx)=>idx!==i)); },
+    peAddCategory() { const c = (this.presetEditor.cfg.categories || []).slice(); if (c.length >= 12) return; c.push({name:'',hint:''}); this.peSet('categories', c); },
+    peRemoveCategory(i) { this.peSet('categories', (this.presetEditor.cfg.categories || []).filter((_,idx)=>idx!==i)); },
+    schedulePresetSave() { if (this._peTimer) clearTimeout(this._peTimer); this._peTimer = setTimeout(() => this.flushPresetSave(), 700); },
+    async flushPresetSave() {
+      if (this._peTimer) { clearTimeout(this._peTimer); this._peTimer = null; }
+      if (!this.presetEditor.open || !this.presetEditor.name) return;
+      this.presetEditor.saving = true; this.presetEditor.error = '';
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(this.presetEditor.name), {
+          method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cfg: this.presetEditor.cfg})});
+        const j = await r.json();
+        if (r.ok && j.success) { this.presetEditor.savedFlash = 'saved ✓'; setTimeout(() => this.presetEditor.savedFlash = '', 1800); }
+        else { this.presetEditor.error = 'Save failed: ' + (j.error || r.status); }
+      } catch (e) { this.presetEditor.error = 'Network error: ' + e.message; }
+      this.presetEditor.saving = false;
     },
     async saveSettings() {
       this.settingsBanner = 'Saving...';
@@ -4397,79 +5041,6 @@ function dashboard() {
       } catch (e) {
         this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
       }
-    },
-    async loadCategories() {
-      try {
-        const r = await fetch('/api/categories' + this.jobParam('?'));
-        const j = await r.json();
-        this.cats.presets = j.presets || {};
-        this.cats.draft = JSON.parse(JSON.stringify(j.active || { preset: 'custom', categories: [], global_rules: '' }));
-        this.cats.presetSelect = this.cats.draft.preset in this.cats.presets ? this.cats.draft.preset : (j.default_preset || Object.keys(this.cats.presets)[0] || 'portrait_curation');
-        this.cats.loaded = true;
-        this.cats.banner = '';
-      } catch (e) {
-        this.cats.banner = 'Failed to load categories: ' + e.message;
-        this.cats.bannerOk = false;
-      }
-    },
-    applyPreset() {
-      const preset = this.cats.presets[this.cats.presetSelect];
-      if (!preset) return;
-      if (this.cats.draft.categories.length && !confirm('Replace current categories + rules with the "' + (preset.label || this.cats.presetSelect) + '" preset?')) return;
-      this.cats.draft = {
-        preset: this.cats.presetSelect,
-        categories: JSON.parse(JSON.stringify(preset.categories || [])),
-        global_rules: preset.global_rules || '',
-      };
-    },
-    addCategory() {
-      if (this.cats.draft.categories.length >= 12) return;
-      this.cats.draft.categories.push({ name: '', hint: '' });
-    },
-    removeCategory(idx) {
-      this.cats.draft.categories.splice(idx, 1);
-    },
-    moveCategory(idx, delta) {
-      const target = idx + delta;
-      if (target < 0 || target >= this.cats.draft.categories.length) return;
-      const list = this.cats.draft.categories;
-      [list[idx], list[target]] = [list[target], list[idx]];
-    },
-    async saveCategories(force) {
-      this.cats.saving = true;
-      this.cats.banner = '';
-      // Scope to the current job; append force as a second param when present.
-      let url = '/api/categories' + this.jobParam('?');
-      if (force) url += (url.includes('?') ? '&' : '?') + 'force=1';
-      try {
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(this.cats.draft),
-        });
-        const j = await r.json();
-        if (r.ok && j.ok) {
-          this.cats.banner = 'Saved. Workers will soft-restart on the next reconcile tick (~1s).';
-          this.cats.bannerOk = true;
-          this.cats.draft = JSON.parse(JSON.stringify(j.active));
-          setTimeout(() => this.cats.banner = '', 6000);
-        } else if (r.status === 409 && j.error === 'removing_populated_categories') {
-          const list = Object.entries(j.legacy).map(([k, v]) => `${k} (${v})`).join(', ');
-          if (confirm(`These categories still have sorted images: ${list}.\n\nRequeue them via tools/requeue_sorted.py first if you want them reclassified.\n\nProceed anyway? Folders stay on disk.`)) {
-            await this.saveCategories(true);
-            return;
-          }
-          this.cats.banner = 'Save cancelled — populated categories not removed.';
-          this.cats.bannerOk = false;
-        } else {
-          this.cats.banner = 'Save failed: ' + (j.error || 'unknown error');
-          this.cats.bannerOk = false;
-        }
-      } catch (e) {
-        this.cats.banner = 'Network error: ' + e.message;
-        this.cats.bannerOk = false;
-      }
-      this.cats.saving = false;
     },
     async unloadLmStudio() {
       this.lmstudioUnload = { busy: true, ok: null, message: 'Unloading...' };
@@ -4570,12 +5141,28 @@ function dashboard() {
     },
 
     async toggleScraper(name, enabled) {
-      await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({name, enabled})}); this.refresh();
+      // Cancel any pending job-editor auto-save so its (pre-toggle) overrides
+      // can't clobber the toggle we're about to write server-side.
+      if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, enabled})});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) { alert(j.error || ('toggle failed: ' + r.status)); return; }
+      // Resync je.overrides from the server's fresh map so a subsequent flush
+      // PUTs the post-toggle overrides, never a stale snapshot.
+      if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
+      // Toggles write an override; the active job applies on leave / Apply.
+      if (this.currentJob === this.jobsActive) this.je.applyPending = true;
+      this.refresh(); this.loadJobEditor();
     },
     async scrapersBulk(action) {
-      await fetch('/api/scrapers/bulk' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({action})}); this.refresh();
+      if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      const r = await fetch('/api/scrapers/bulk' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action})});
+      const j = await r.json().catch(()=>({}));
+      if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
+      if (this.currentJob === this.jobsActive) this.je.applyPending = true;
+      this.refresh(); this.loadJobEditor();
     },
     async setProvider() {
       await fetch('/api/vision/provider', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -4816,6 +5403,7 @@ function dashboard() {
 
     start() {
       this.loadJobs();
+      this.loadPresets();
       this.refresh();
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
@@ -4824,18 +5412,14 @@ function dashboard() {
       this.$watch('active', (tab) => {
         if (tab === 'stats') this.loadStats();
         if (tab === 'gstats') this.loadGlobalStats();
+        if (tab === 'presets') this.loadPresets();
         if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
           this.loadGallery();
           this.loadGalleryInsights();
         }
-        // Job-scoped categories editor now lives under Job Settings.
-        if (tab === 'jobSettings') {
-          if (!this.jobEditor.loaded) this.loadJobEditor();
-          if (!this.cats.loaded) this.loadCategories();
-        }
-        // Vision tab edits this job's captioning + scoring, so it needs the
-        // job config too (alongside the global endpoint readout).
-        if (tab === 'vision' && !this.jobEditor.loaded) this.loadJobEditor();
+        // Job Settings + Vision both edit this job's inheritable config (v2),
+        // so they need the effective cfg + overrides loaded.
+        if ((tab === 'jobSettings' || tab === 'vision') && !this.je.loaded) this.loadJobEditor();
       });
       setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
       // Self-update: check on load, then every 30 minutes. The endpoint is
@@ -4853,7 +5437,14 @@ function dashboard() {
 
 @app.route("/")
 def dashboard():
-    return render_template_string(HTML_TEMPLATE)
+    # Inject the canonical scraper-name list so the Alpine `scraperNames` state
+    # is sourced from job_config.SCRAPER_NAMES and can never drift from it (the
+    # template is server-rendered Python). The template has no other Jinja
+    # mustaches; single-brace Alpine object literals are untouched by Jinja.
+    return render_template_string(
+        HTML_TEMPLATE,
+        scraper_names_json=json.dumps(list(job_config.SCRAPER_NAMES)),
+    )
 
 
 # ── Idle LM Studio unloader ───────────────────────────────────────────────────
