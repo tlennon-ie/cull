@@ -12,6 +12,17 @@ This module turns that KEPT set into the layouts trainers actually consume:
                      are split at ``max_samples_per_shard`` (default 1000) into
                      ``shard-000000.tar``, ``shard-000001.tar`` …
   * ``folders``    — a cleaned per-category copy of the sorted set.
+  * ``clip_caption`` — clip + ``.txt`` caption pairs for VIDEO-model trainers
+                     (LTX-Video, Wan, Hunyuan-Video, Mochi, CogVideoX). With
+                     ``video_bucketing`` (``"duration"`` / ``"fps"`` /
+                     ``"resolution"``) clips are grouped into per-bucket subdirs
+                     probed from their container metadata.
+
+Samples are media files — images (:data:`IMAGE_EXT`) and video clips
+(:data:`VIDEO_EXT`). Every profile copies source bytes verbatim, so the image
+profiles pack video too. Clip metadata is read via a *gated* prober
+(:func:`probe_video` — ``av`` / ``ffmpeg-python`` if importable, else ``None``);
+an unreadable clip buckets as ``"unknown"`` and never crashes the export.
 
 Cross-cutting options apply to every profile:
 
@@ -63,15 +74,31 @@ logger = get_logger(__name__)
 # Image extensions the sorter is known to produce (mirrors requeue_sorted).
 IMAGE_EXT: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
 
+# Video containers the sorter / scrapers (gallery-dl, yt-dlp) can land. Clips
+# are exported as first-class samples alongside images; the prober reads their
+# resolution / fps / duration for bucketing.
+VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi")
+
+# Everything iter_samples treats as an exportable sample.
+MEDIA_EXT: tuple[str, ...] = IMAGE_EXT + VIDEO_EXT
+
 VISION_SUFFIX: str = ".vision.json"
 
-PROFILES: tuple[str, ...] = ("kohya", "webdataset", "folders")
+PROFILES: tuple[str, ...] = ("kohya", "webdataset", "folders", "clip_caption")
+
+# Video-bucketing modes for the clip_caption profile.
+VIDEO_BUCKET_MODES: tuple[str, ...] = ("duration", "fps", "resolution")
 
 # Defaults for cross-cutting / profile options.
 _DEFAULT_SHARD_SIZE: int = 1000
 _DEFAULT_CONCEPT: str = "concept"
 _TRAIN_DIR: str = "train"
 _VAL_DIR: str = "val"
+_UNKNOWN_BUCKET: str = "unknown"
+
+# Coarse duration buckets (seconds) for grouping clips by length. Edges are
+# inclusive-low / exclusive-high; anything past the last edge is "16s+".
+_DURATION_EDGES: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
 
 
 # ── Sample model ─────────────────────────────────────────────────────────────
@@ -79,10 +106,11 @@ _VAL_DIR: str = "val"
 
 @dataclass(frozen=True)
 class Sample:
-    """One exportable unit: an image plus its caption and optional audit meta.
+    """One exportable unit: a media file plus its caption and optional audit meta.
 
     ``image_path`` always points at the original file under ``data/sorted`` —
-    callers must copy, never move it.
+    callers must copy, never move it. The field keeps the historical name even
+    though it may now reference a video clip; :meth:`is_video` distinguishes.
     """
 
     image_path: Path
@@ -91,6 +119,121 @@ class Sample:
     category: str
     source: str
     stem: str
+
+    @property
+    def is_video(self) -> bool:
+        """True when the underlying media is a video container, not a still."""
+        return self.image_path.suffix.lower() in VIDEO_EXT
+
+
+# ── Video metadata probing (gated) ───────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class VideoMeta:
+    """Probed container metadata for one clip. ``fps`` / ``duration`` are
+    floats (seconds, frames-per-second); ``width`` / ``height`` are pixels.
+    Any field the prober couldn't determine is left at 0."""
+
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    duration: float = 0.0
+
+
+def _probe_with_av(path: Path) -> VideoMeta | None:
+    """Probe via PyAV (``av``) if it's importable. Returns None otherwise."""
+    try:
+        import av  # type: ignore
+    except Exception:  # noqa: BLE001 — optional dep, any import error => skip
+        return None
+    try:
+        with av.open(str(path)) as container:
+            stream = next(
+                (s for s in container.streams if s.type == "video"), None
+            )
+            if stream is None:
+                return None
+            width = int(getattr(stream, "width", 0) or 0)
+            height = int(getattr(stream, "height", 0) or 0)
+            rate = stream.average_rate or stream.base_rate
+            fps = float(rate) if rate else 0.0
+            duration = 0.0
+            if stream.duration is not None and stream.time_base:
+                duration = float(stream.duration * stream.time_base)
+            elif container.duration:
+                duration = float(container.duration) / 1_000_000.0  # microseconds
+        return VideoMeta(width=width, height=height, fps=fps, duration=duration)
+    except Exception as exc:  # noqa: BLE001 — corrupt clip / codec gap
+        logger.warning("av probe failed for %s: %s", path, exc)
+        return None
+
+
+def _probe_with_ffmpeg(path: Path) -> VideoMeta | None:
+    """Probe via the ``ffmpeg-python`` package (which invokes ffprobe). Returns
+    None if the package is missing or the probe fails."""
+    try:
+        import ffmpeg  # type: ignore
+
+        probe_json = ffmpeg.probe(str(path))
+    except Exception:  # noqa: BLE001 — package missing or probe error => skip
+        return None
+    try:
+        streams = probe_json.get("streams") or []
+        video = next(
+            (s for s in streams if s.get("codec_type") == "video"), None
+        )
+        if video is None:
+            return None
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+        fps = _parse_fraction(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+        duration = 0.0
+        for source in (video, probe_json.get("format") or {}):
+            raw = source.get("duration")
+            if raw:
+                try:
+                    duration = float(raw)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        return VideoMeta(width=width, height=height, fps=fps, duration=duration)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ffmpeg probe parse failed for %s: %s", path, exc)
+        return None
+
+
+def _parse_fraction(value: Any) -> float:
+    """Parse an ffprobe frame-rate string like ``"24000/1001"`` -> float."""
+    if not value:
+        return 0.0
+    text = str(value).strip()
+    try:
+        if "/" in text:
+            num, den = text.split("/", 1)
+            den_f = float(den)
+            return float(num) / den_f if den_f else 0.0
+        return float(text)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def probe_video(path: Path) -> VideoMeta | None:
+    """Best-effort container probe for a clip — gated behind optional deps.
+
+    Tries PyAV first, then ffmpeg-python. Returns a :class:`VideoMeta`, or
+    ``None`` when no prober is installed or the probe fails. NEVER raises —
+    callers fall back to the ``"unknown"`` bucket. This is the single seam tests
+    patch to exercise bucketing without ffmpeg.
+    """
+    try:
+        meta = _probe_with_av(path)
+        if meta is not None:
+            return meta
+        return _probe_with_ffmpeg(path)
+    except Exception as exc:  # noqa: BLE001 — belt-and-braces; never crash export
+        logger.warning("video probe unexpectedly failed for %s: %s", path, exc)
+        return None
 
 
 # ── Category resolution ──────────────────────────────────────────────────────
@@ -151,9 +294,10 @@ def iter_samples(
 ) -> Iterator[Sample]:
     """Yield ``Sample`` tuples for the KEPT categories under ``data/sorted/<slug>``.
 
-    Deterministic: categories, sources, and images are walked in sorted order.
-    Terminal buckets are never yielded. Hidden dirs (``.quarantine`` etc.) and
-    the ``.vision.json``/``.txt`` sidecars are skipped — only image files seed a
+    Deterministic: categories, sources, and media files are walked in sorted
+    order. Terminal buckets are never yielded. Hidden dirs (``.quarantine``
+    etc.) and the ``.vision.json``/``.txt`` sidecars are skipped — only media
+    files (images :data:`IMAGE_EXT` + video clips :data:`VIDEO_EXT`) seed a
     sample.
     """
     root = sorted_dir(slug)
@@ -174,7 +318,7 @@ def iter_samples(
             source = source_dir.name
             images = sorted(
                 p for p in source_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in IMAGE_EXT
+                if p.is_file() and p.suffix.lower() in MEDIA_EXT
             )
             for img in images:
                 stem = img.stem
@@ -232,6 +376,52 @@ def _resolution_bucket(image_path: Path) -> str:
     except (OSError, ValueError) as exc:
         logger.warning("could not read dimensions for %s: %s", image_path, exc)
         return "unknown"
+
+
+def _duration_label(duration: float) -> str:
+    """Coarse, human-readable length bucket from a clip's duration (seconds)."""
+    if duration <= 0:
+        return _UNKNOWN_BUCKET
+    lo = 0.0
+    for edge in _DURATION_EDGES:
+        if duration < edge:
+            return f"dur_{int(lo)}-{int(edge)}s"
+        lo = edge
+    return f"dur_{int(_DURATION_EDGES[-1])}s+"
+
+
+def _meta_to_bucket(meta: "VideoMeta | None", mode: str) -> str:
+    """Map probed :class:`VideoMeta` to a bucket label for ``mode``.
+
+    Returns :data:`_UNKNOWN_BUCKET` when ``meta`` is missing or the relevant
+    dimension is unknown (zero) — the graceful no-prober / probe-fail path.
+    """
+    if meta is None:
+        return _UNKNOWN_BUCKET
+    if mode == "duration":
+        return _duration_label(meta.duration)
+    if mode == "fps":
+        return f"fps_{int(round(meta.fps))}" if meta.fps > 0 else _UNKNOWN_BUCKET
+    if mode == "resolution" and meta.width > 0 and meta.height > 0:
+        return f"{meta.width}x{meta.height}"
+    return _UNKNOWN_BUCKET
+
+
+def _video_bucket(sample: Sample, mode: str | None) -> str | None:
+    """Bucket label for one sample's clip, or ``None`` when bucketing is off.
+
+    Probes via :func:`probe_video` and never propagates an exception: a prober
+    that crashes (corrupt clip, ffmpeg fault) is treated as ``"unknown"`` so the
+    export always completes.
+    """
+    if not mode:
+        return None
+    try:
+        meta = probe_video(sample.image_path)
+    except Exception as exc:  # noqa: BLE001 — defensive; prober promised not to
+        logger.warning("probe_video raised for %s: %s", sample.image_path, exc)
+        meta = None
+    return _meta_to_bucket(meta, mode)
 
 
 # ── Path assembly ────────────────────────────────────────────────────────────
@@ -442,10 +632,50 @@ def _add_bytes(tar: tarfile.TarFile, arcname: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
+def _export_clip_caption(
+    samples: list[Sample],
+    out_dir: Path,
+    opts: "_Options",
+) -> dict[str, Any]:
+    """Clip + ``.txt`` caption pairs for video-model trainers.
+
+    The trainer convention is one media file beside one same-stem caption file
+    (``clip.mp4`` + ``clip.txt``). With ``opts.video_bucketing`` set, clips are
+    grouped into per-bucket subdirs (``dur_2-4s`` / ``fps_24`` / ``1920x1080``)
+    probed from container metadata, after an optional ``train/val`` split. Image
+    samples pair the same way and bucket as ``"unknown"`` under a video mode.
+    """
+    used_by_dir: dict[Path, set[str]] = defaultdict(set)
+    splits: Counter[str] = Counter()
+    buckets: Counter[str] = Counter()
+
+    for sample in samples:
+        split = _split_bucket(sample.stem, opts.train_val_split)
+        bucket = _video_bucket(sample, opts.video_bucketing)
+        if split:
+            splits[split] += 1
+        if bucket:
+            buckets[bucket] += 1
+        dest_dir = out_dir.joinpath(*_segments(split=split, bucket=bucket, leaf=None))
+        stem = _unique_stem(used_by_dir[dest_dir], sample.stem)
+        caption = _apply_trigger_word(sample.caption, opts.trigger_word)
+        _copy_pair(sample, dest_dir, stem, caption, write_json=False)
+
+    summary: dict[str, Any] = {}
+    if opts.video_bucketing:
+        summary["video_bucketing"] = opts.video_bucketing
+    if splits:
+        summary["splits"] = dict(splits)
+    if buckets:
+        summary["buckets"] = dict(buckets)
+    return summary
+
+
 _WRITERS = {
     "kohya": _export_kohya,
     "webdataset": _export_webdataset,
     "folders": _export_folders,
+    "clip_caption": _export_clip_caption,
 }
 
 
@@ -463,6 +693,7 @@ class _Options:
     repeats: int | None
     concept: str | None
     max_samples_per_shard: int | None
+    video_bucketing: str | None
 
 
 def _parse_options(opts: dict[str, Any]) -> _Options:
@@ -500,6 +731,14 @@ def _parse_options(opts: dict[str, Any]) -> _Options:
     if concept is not None:
         concept = str(concept).strip() or None
 
+    video_bucketing = opts.get("video_bucketing")
+    if video_bucketing is not None:
+        video_bucketing = str(video_bucketing).strip().lower() or None
+        if video_bucketing is not None and video_bucketing not in VIDEO_BUCKET_MODES:
+            raise ValueError(
+                f"video_bucketing must be one of {VIDEO_BUCKET_MODES}"
+            )
+
     return _Options(
         categories=categories,
         trigger_word=trigger_word,
@@ -508,6 +747,7 @@ def _parse_options(opts: dict[str, Any]) -> _Options:
         repeats=repeats,
         concept=concept,
         max_samples_per_shard=max_samples_per_shard,
+        video_bucketing=video_bucketing,
     )
 
 
@@ -524,13 +764,15 @@ def export_dataset(
 
     Args:
         slug: Job slug whose sorted library to export.
-        profile: One of :data:`PROFILES` (``kohya`` / ``webdataset`` / ``folders``).
+        profile: One of :data:`PROFILES` (``kohya`` / ``webdataset`` /
+            ``folders`` / ``clip_caption``).
         out_dir: Destination directory (created if absent). Existing files there
             are not cleaned — pass a fresh dir for a clean export.
         **opts: Cross-cutting + profile options. See module docstring.
             ``categories``, ``trigger_word``, ``train_val_split``,
             ``resolution_bucketing``, ``repeats``, ``concept``,
-            ``max_samples_per_shard``.
+            ``max_samples_per_shard``, ``video_bucketing`` (``"duration"`` /
+            ``"fps"`` / ``"resolution"``, used by ``clip_caption``).
 
     Returns:
         A summary dict: ``slug``, ``profile``, ``out_dir``, ``sample_count``,
@@ -570,7 +812,13 @@ def export_dataset(
 
 __all__ = [
     "Sample",
+    "VideoMeta",
     "PROFILES",
+    "IMAGE_EXT",
+    "VIDEO_EXT",
+    "MEDIA_EXT",
+    "VIDEO_BUCKET_MODES",
     "iter_samples",
+    "probe_video",
     "export_dataset",
 ]
