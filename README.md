@@ -12,13 +12,16 @@
   <a href="#the-dashboard"><img alt="Dashboard included" src="https://img.shields.io/badge/dashboard-flask%20%2B%20alpine-1f1f1f.svg"></a>
 </p>
 
+![cull — job-based curation](assets/cull-jobs-demo.svg)
+<p align="center"><em>Spin up a job per dataset, queue them, and let cull work down the list.</em></p>
+
 ![cull dashboard preview — gallery, stats, scrapers](docs/screenshots/gallery.png)
 
 ## What it is
 
-cull is a single-machine curation engine for AI-generated images. It pulls from seven dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
+cull is a single-machine curation engine for AI-generated images. It pulls from a handful of dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
 
-- Pulls from 7+ dedicated sources plus any URL gallery-dl knows (Pixiv, DeviantArt, the booru family, ArtStation, Tumblr, Newgrounds, FurAffinity / e621, Imgur, Flickr, …). Dedupes, queues, and runs vision in one process tree.
+- Pulls from dedicated sources (Civitai, X/Twitter, Reddit, Discord, local folders) plus any URL gallery-dl knows (Pixiv, DeviantArt, the booru family, ArtStation, Tumblr, Newgrounds, FurAffinity / e621, Imgur, Flickr, …). Dedupes, queues, and runs vision in one process tree.
 - Forces every backend (LM Studio, Groq, anything OpenAI-compatible) into the same JSON schema so output never drifts.
 - Auto-captions images that arrive without a prompt — SD/Flux prompt, Booru tags, or natural language, your pick — using the same vision call that classifies them.
 - Keeps the prompt next to every image. Nothing goes through a database you don't own.
@@ -78,7 +81,7 @@ Every image keeps its `.txt` prompt and gains a `.vision.json` audit record. The
 
 **Curating LoRA training data.** Point the Civitai + X scrapers at your topic, set OVR/REL minimums in the dashboard, let the keepers land in `Professional/` and `InstagramInfluencer/`. ZIP-export the filtered view straight into your trainer.
 
-**Deduping a scraped archive across sources.** The seven scrapers share dedup state through a per-source `seen_*.json`. Add a `LOCAL_IMPORT_DIR` and the same image showing up on civitai and a twitter repost gets caught by content hash, not filename.
+**Deduping a scraped archive across sources.** Every scraper shares dedup state through a per-source `seen_*.json`. Add a local folder to the job and the same image showing up on civitai and a twitter repost gets caught by content hash, not filename.
 
 **Building a tagged personal library.** Edit prompts inline from the gallery modal — overwrites the `.txt` next to the image, invalidates the keyword cache, refreshes stats. Filter by score, date, source, resolution. Click any chip to jump straight to a filtered view.
 
@@ -108,11 +111,17 @@ For URL-based sources, you don't need to write a scraper at all — paste the UR
 
 ## Jobs
 
-cull is **job-centric**. A *job* is a named curation target — one topic, its scraper targets, its categories and judgement rules, its scoring and captioning. You can keep several around (a LoRA dataset, a personal archive, an ad-image pull) and run them one at a time.
+cull is **job-centric**. A *job* is a named curation target — one subject, its scraper targets, its categories and judgement rules, its scoring and captioning. Keep several around (a LoRA dataset, a personal archive, an ad-image pull) and run them one at a time.
 
-The dashboard opens on a grid of **job cards** (name, status, queue position, queued/sorted counts). Open a job to get its own workspace — **Historical**, **Queue**, **Scrapers** (per-job on/off + targets), **Vision** (this job's captioning + score gates), **Stats**, and **Settings** (the job editor: topic, keywords, subreddits, X accounts, Discord channels, gallery-dl URLs, local folders, categories, scoring, captioning). Jobs run sequentially: activate one, queue the rest, and cull advances down the queue.
+**Presets + inherit-by-default.** Shared config lives in a **preset library** (`data/jobs/_presets.json`). A job picks a preset and **inherits everything**; you only override the fields you want to change for that job. Every field in the editor shows its effective value with a "global" chip when it's inherited and a "reset to global" affordance once you override it — so a job file stays tiny (just its `subject` + the handful of overridden leaves). Edit the preset to change the default for every job that inherits it.
 
-Each job's config is a plain JSON file at `data/jobs/<slug>.json` (queue order + the active pointer in `data/jobs/_index.json`) — diff-able, version-able, nothing in a database you don't own.
+**Auto-saving.** Job and preset settings save themselves as you type — there are no Save buttons. For the job that's currently running, your edits are held and **applied when you leave the editor** (or hit Apply), so the pipeline re-projects and restarts once instead of on every keystroke.
+
+The dashboard opens on a grid of **job cards** (name, status, queue position, queued/sorted counts). Open a job to get its own workspace — **Historical**, **Queue**, **Scrapers** (per-job on/off + targets), **Vision** (this job's captioning + score gates), **Stats**, and **Settings** (the job editor: subject, keywords, subreddits, X accounts, Discord channels, gallery-dl URLs, local folders, categories, scoring, captioning). Jobs run sequentially: activate one, queue the rest, and cull advances down the queue.
+
+**Multiple local folders.** A job can pull from any number of local folders at once — add them as a list in the job's Scrapers/Settings (each with its own name and optional dedup-migration). The old single-folder importer and the separate ZForFree-local source are folded into this one list.
+
+Each job is a plain JSON file at `data/jobs/<slug>.json` — just `subject`, the chosen `preset`, and a sparse `overrides` map (queue order + active pointer in `data/jobs/_index.json`, the preset library in `data/jobs/_presets.json`). Diff-able, version-able, nothing in a database you don't own.
 
 **Global Settings** (reached from the jobs grid) holds the things shared across every job: credentials (Groq / Civitai / Twitter cookies / Discord token / Reddit), model endpoints (LM Studio / OpenAI-compatible / Ollama / Groq), which vision worker runs, throttle, and storage paths.
 
@@ -124,7 +133,7 @@ If you're coming from an older cull where everything lived in a flat `.env`, run
 python tools/migrate_to_jobs.py
 ```
 
-It captures your current `.env` as a `default` job and adopts any other slug already on disk as its own job. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
+It seeds a `default` preset, captures your current `.env` as a `default` job (its settings stored as that job's overrides), and adopts any other slug already on disk as its own job — folding any legacy local-folder / ZForFree-local settings into the new local-folders list. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job/preset JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script, and old v1 job files auto-upgrade when read. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
 
 ## The dashboard
 
@@ -159,7 +168,7 @@ Every concern has exactly one canonical module. Adding categories, vision provid
 
 ## Configuration
 
-Global settings (credentials, model endpoints, vision worker selection, throttle, storage paths) live in `.env` — the dashboard's **Global Settings** edits the same file from the browser. Everything else is **per-job** and lives in each job's config (`data/jobs/<slug>.json`), edited in the job's own Settings/Vision tabs; the keys below are the env names those per-job fields project to (and the legacy `.env` seeds the `default` job adopts on first upgrade).
+Global settings (credentials, model endpoints, vision worker selection, throttle, storage paths) live in `.env` — the dashboard's **Global Settings** edits the same file from the browser. Everything else is **per-job**: a job inherits a preset (`data/jobs/_presets.json`) and stores only its overrides (`data/jobs/<slug>.json`), edited in the job's own Settings/Vision tabs. The keys below are the env names those per-job fields project to at runtime (and the legacy `.env` values that seed the `default` job/preset on first upgrade).
 
 Global credentials — required only for the providers you'll use:
 
