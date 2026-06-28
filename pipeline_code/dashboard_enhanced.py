@@ -1142,6 +1142,27 @@ def api_vision_test():
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
             return _done(True, "Groq key accepted")
+        if provider == "ollama":
+            url = (data.get("url") or os.environ.get("OLLAMA_URL", "")
+                   or "http://127.0.0.1:11434").rstrip("/")
+            r = requests.get(f"{url}/api/tags", timeout=5)
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            n = len(r.json().get("models") or [])
+            return _done(True, f"connected, {n} model(s) available")
+        if provider in ("openai-compat", "openai_compat"):
+            url = (data.get("url") or os.environ.get("OPENAI_COMPAT_URL", "")).rstrip("/")
+            if not url:
+                return _done(False, "no OPENAI_COMPAT_URL configured", 400)
+            key = os.environ.get("OPENAI_COMPAT_API_KEY", "")
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            r = requests.get(f"{url}/v1/models", headers=headers, timeout=5)
+            if r.status_code in (401, 403):
+                return _done(False, f"auth rejected (HTTP {r.status_code}) - check OPENAI_COMPAT_API_KEY")
+            if r.status_code != 200:
+                return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
+            n = len(r.json().get("data") or [])
+            return _done(True, f"connected, {n} model(s)")
         return _done(False, f"unknown provider: {provider!r}", 400)
     except requests.RequestException as exc:
         return _done(False, f"connection error: {exc}")
@@ -2635,7 +2656,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 {%- endmacro -%}
 {% macro testbtn(scraper, label='Test connection') -%}
 <div class="mt-1.5 flex items-center gap-2 flex-wrap">
-  <button type="button" @click="testScraper('{{ scraper }}')" :disabled="scraperTest['{{ scraper }}']?.pending"
+  <button type="button" @click="testScraper('{{ scraper }}')" :disabled="!!scraperTest['{{ scraper }}']?.pending"
     class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
     <span x-text="scraperTest['{{ scraper }}']?.pending ? 'Testing…' : '{{ label }}'"></span>
   </button>
@@ -3469,7 +3490,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
             <template x-if="s.kind !== 'local'">
               <div class="flex items-center gap-3 shrink-0">
-                <button type="button" @click="testScraper(s.name)" :disabled="scraperTest[s.name]?.pending"
+                <button type="button" @click="testScraper(s.name)" :disabled="!!scraperTest[s.name]?.pending"
                   class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
                   <span x-text="scraperTest[s.name]?.pending ? 'Testing…' : 'Test'"></span>
                 </button>
@@ -3509,15 +3530,25 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <div>
                   <div class="font-medium" x-text="w.name"></div>
                   <div class="text-xs text-slate-400" x-text="workerDescriptions[w.name] || ''"></div>
+                  <div x-show="workerProvider(w.name) && providerTest[workerProvider(w.name)] && !providerTest[workerProvider(w.name)].testing"
+                       class="text-xs mt-0.5" :class="providerTest[workerProvider(w.name)]?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                       x-text="providerTest[workerProvider(w.name)]?.message"></div>
                 </div>
-                <label class="inline-flex items-center cursor-pointer gap-2">
-                  <span class="text-xs" x-text="w.enabled ? 'On' : 'Off'"></span>
-                  <input type="checkbox" :checked="w.enabled" :aria-label="'Toggle worker ' + w.name" @change="toggleVisionWorker(w.name, $event.target.checked)"
-                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                      checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                      before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                      checked:before:translate-x-5"/>
-                </label>
+                <div class="flex items-center gap-3 shrink-0">
+                  <button type="button" x-show="workerProvider(w.name)" @click="testProvider(workerProvider(w.name))"
+                          :disabled="!!providerTest[workerProvider(w.name)]?.testing"
+                          class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                    <span x-text="providerTest[workerProvider(w.name)]?.testing ? 'Testing…' : 'Test'"></span>
+                  </button>
+                  <label class="inline-flex items-center cursor-pointer gap-2">
+                    <span class="text-xs" x-text="w.enabled ? 'On' : 'Off'"></span>
+                    <input type="checkbox" :checked="w.enabled" :aria-label="'Toggle worker ' + w.name" @change="toggleVisionWorker(w.name, $event.target.checked)"
+                      class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                        checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                        before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                        checked:before:translate-x-5"/>
+                  </label>
+                </div>
               </div>
             </template>
           </div>
@@ -4293,7 +4324,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <div class="flex items-end">
-            <button @click="testProvider('groq')" :disabled="providerTest.groq?.testing"
+            <button @click="testProvider('groq')" :disabled="!!providerTest.groq?.testing"
               class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
               <span x-text="providerTest.groq?.testing ? 'Testing...' : 'Test Groq'"></span>
             </button>
@@ -4303,7 +4334,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </div>
 
           <div class="md:col-span-2 flex items-center gap-3">
-            <button @click="testProvider('lmstudio')" :disabled="providerTest.lmstudio?.testing"
+            <button @click="testProvider('lmstudio')" :disabled="!!providerTest.lmstudio?.testing"
               class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
               <span x-text="providerTest.lmstudio?.testing ? 'Testing...' : 'Test LM Studio'"></span>
             </button>
@@ -5232,7 +5263,17 @@ function dashboard() {
       this.refresh();
     },
     markSettingsDirty() { this.settingsDirty = true; },
+    // Map a vision worker name to the provider its /api/vision/test probe uses.
+    workerProvider(name) {
+      const n = (name || '').toLowerCase();
+      if (n.includes('groq')) return 'groq';
+      if (n.includes('ollama')) return 'ollama';
+      if (n.includes('openai') || n.includes('compat')) return 'openai-compat';
+      if (n.includes('lm')) return 'lmstudio';
+      return null;
+    },
     async testProvider(name) {
+      if (!name) return;
       this.providerTest[name] = { testing: true, message: 'Connecting...', ok: null };
       try {
         const r = await fetch('/api/vision/test', {
