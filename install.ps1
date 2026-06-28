@@ -66,13 +66,17 @@ $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 if (-not (Test-Path $VenvPython)) {
     Write-Step "creating virtualenv in .venv"
     & $pyCmd[0] @($pyCmd[1..($pyCmd.Length - 1)] + @("-m", "venv", $VenvPath))
+    if (-not (Test-Path $VenvPython)) {
+        Write-Err "failed to create virtualenv. Is the full Python (not the Store stub) installed?"
+        exit 1
+    }
 } else {
     Write-Step "reusing existing .venv"
 }
 
-# Use the venv's pip/python directly. Avoids `Activate.ps1`'s execution-policy
+# Drive the venv's python directly. Avoids `Activate.ps1`'s execution-policy
 # prompt and the side-effect of leaving the venv active in the user's session.
-$VenvPip = Join-Path $VenvPath "Scripts\pip.exe"
+# Always go through `python -m pip` rather than the pip.exe shim.
 
 # ── Bootstrap pip ──────────────────────────────────────────────────────────
 Write-Step "upgrading pip / setuptools / wheel"
@@ -86,7 +90,7 @@ $OldHash = if (Test-Path $HashFile) { (Get-Content $HashFile -Raw).Trim() } else
 
 if ($NewHash -ne $OldHash) {
     Write-Step "installing requirements (this includes gallery-dl from codeberg)"
-    & $VenvPip install -r $ReqPath
+    & $VenvPython -m pip install -r $ReqPath
     if ($LASTEXITCODE -ne 0) {
         Write-Err "pip install failed. See the output above."
         exit 1
@@ -117,9 +121,13 @@ if ($env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD -ne "1") {
 $EnvPath = Join-Path $ScriptDir ".env"
 $EnvExample = Join-Path $ScriptDir ".env.example"
 if (-not (Test-Path $EnvPath)) {
-    Copy-Item $EnvExample $EnvPath
-    Write-Step "created .env from .env.example"
-    Write-Step ">>> edit .env to add your API keys (Civitai, Groq, Discord, etc.) <<<"
+    if (Test-Path $EnvExample) {
+        Copy-Item $EnvExample $EnvPath
+        Write-Step "created .env from .env.example"
+        Write-Step ">>> edit .env to add your API keys (Civitai, Groq, Discord, etc.) <<<"
+    } else {
+        Write-Host "WARN: no .env.example found; create a .env manually before launching." -ForegroundColor Yellow
+    }
 } else {
     Write-Step "reusing existing .env"
 }
@@ -127,4 +135,4 @@ if (-not (Test-Path $EnvPath)) {
 Write-Host ""
 Write-Step "done. Next steps:"
 Write-Host "  1. (optional) edit .env to add API keys"
-Write-Host "  2. .\launch.bat    # boots the dashboard at http://localhost:5000"
+Write-Host "  2. .\launch.bat    # boots the dashboard (default http://localhost:5000, override with FLASK_PORT)"

@@ -47,7 +47,7 @@ if not errorlevel 1 (
   if exist ".venv\Scripts\activate.bat" (
     echo [update] requirements.txt changed - reinstalling
     call ".venv\Scripts\activate.bat"
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
     REM Refresh the launcher's hash file so launch.bat doesn't re-do the work.
     for /f "delims=" %%H in ('certutil -hashfile requirements.txt SHA256 ^| find /v ":"') do set "REQ_HASH=%%H"
     set "REQ_HASH=!REQ_HASH: =!"

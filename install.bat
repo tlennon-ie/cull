@@ -49,6 +49,10 @@ REM ── Virtualenv ───────────────────�
 if not exist ".venv\Scripts\python.exe" (
   echo [install] creating virtualenv in .venv
   %PY_LAUNCHER% -m venv .venv
+  if errorlevel 1 (
+    echo ERROR: failed to create virtualenv. Is the full Python ^(not the Store stub^) installed?
+    popd ^& exit /b 1
+  )
 ) else (
   echo [install] reusing existing .venv
 )
@@ -68,7 +72,7 @@ if exist "!HASH_FILE!" set /p PREV_HASH=<"!HASH_FILE!"
 
 if "!REQ_HASH!" neq "!PREV_HASH!" (
   echo [install] installing requirements ^(this includes gallery-dl from codeberg^)
-  pip install -r requirements.txt
+  python -m pip install -r requirements.txt
   if errorlevel 1 (
     echo ERROR: pip install failed. See the output above.
     popd & exit /b 1
@@ -96,9 +100,13 @@ if /i "%PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD%" neq "1" (
 
 REM ── .env seed ──────────────────────────────────────────────────────────
 if not exist ".env" (
-  copy /Y ".env.example" ".env" >nul
-  echo [install] created .env from .env.example
-  echo [install] ^>^>^> edit .env to add your API keys ^(Civitai, Groq, Discord, etc.^) ^<^<^<
+  if exist ".env.example" (
+    copy /Y ".env.example" ".env" >nul
+    echo [install] created .env from .env.example
+    echo [install] ^>^>^> edit .env to add your API keys ^(Civitai, Groq, Discord, etc.^) ^<^<^<
+  ) else (
+    echo WARN: no .env.example found; create a .env manually before launching.
+  )
 ) else (
   echo [install] reusing existing .env
 )

@@ -1,0 +1,20 @@
+# Keep shell scripts LF on every platform. A CRLF on the `#!/usr/bin/env bash`
+# line makes Linux/RunPod fail with "bad interpreter: No such file or directory",
+# so these MUST stay LF even when core.autocrlf=true on a Windows checkout.
+*.sh    text eol=lf
+
+# launch.sh / install.sh / update.sh are entrypoints invoked directly.
+launch.sh   text eol=lf
+install.sh  text eol=lf
+update.sh   text eol=lf
+
+# Windows batch + PowerShell scripts want CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Python and other text files: normalize to LF in the repo.
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf

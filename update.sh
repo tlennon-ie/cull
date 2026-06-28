@@ -35,20 +35,38 @@ echo "[update] $BEFORE_SHA -> $AFTER_SHA"
 
 # Reinstall deps only if requirements.txt changed in the pull range.
 if git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | grep -q '^requirements\.txt$'; then
+  echo "[update] requirements.txt changed - reinstalling"
   if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
-    echo "[update] requirements.txt changed - reinstalling"
     # shellcheck disable=SC1091
     . "$SCRIPT_DIR/.venv/bin/activate"
-    pip install -r "$SCRIPT_DIR/requirements.txt"
-    # Refresh the launcher's hash file so launch.sh doesn't re-do the work.
-    sha256sum "$SCRIPT_DIR/requirements.txt" | awk '{print $1}' > "$SCRIPT_DIR/.venv/.requirements.hash"
+    PY=python
+    FLAG_DIR="$SCRIPT_DIR/.venv"
   else
-    echo "[update] no .venv found - launch.sh will create one on next launch."
+    # No venv (e.g. CULL_NO_VENV install). Reinstall into whatever Python runs.
+    PY=""
+    for candidate in "${PYTHON:-}" python3 python; do
+      [ -n "$candidate" ] || continue
+      if command -v "$candidate" >/dev/null 2>&1; then PY="$candidate"; break; fi
+    done
+    FLAG_DIR="$SCRIPT_DIR/.venv_state"
+  fi
+
+  if [ -n "$PY" ]; then
+    "$PY" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+    # Refresh the launcher's hash file so launch.sh doesn't re-do the work.
+    mkdir -p "$FLAG_DIR"
+    "$PY" - "$SCRIPT_DIR/requirements.txt" > "$FLAG_DIR/.requirements.hash" <<'PYHASH'
+import hashlib, sys
+with open(sys.argv[1], "rb") as fh:
+    print(hashlib.sha256(fh.read()).hexdigest())
+PYHASH
+  else
+    echo "[update] no Python found - launch.sh will reinstall on next launch." >&2
   fi
 fi
 
 echo "[update] relaunching cull"
 # Detach so the parent dashboard process can exit cleanly.
 nohup "$SCRIPT_DIR/launch.sh" >/dev/null 2>&1 &
-disown || true
+disown 2>/dev/null || true
 exit 0
