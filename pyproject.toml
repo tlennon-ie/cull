@@ -82,7 +82,7 @@ cloud = [
 ]
 # Video lane — frame extraction / scene detection.
 video = [
-    "scenedetect>=0.6",
+    "scenedetect>=0.7",
     "ffmpeg-python>=0.2",
 ]
 # Embeddings / aesthetic prefilter / ML.
