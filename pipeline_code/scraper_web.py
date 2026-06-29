@@ -10,6 +10,7 @@ Sources:
 import re, json, os, html, time, hashlib, requests, tempfile
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -199,7 +200,8 @@ def reddit_image_urls(post_data: dict) -> list:
                 urls.append(clean_html(img_url))
 
     # i.redd.it or i.imgur direct
-    if "i.redd.it" in url or "i.imgur.com" in url:
+    host = (urlparse(url).hostname or "").lower()
+    if host in ("i.redd.it", "i.imgur.com") or host.endswith((".i.redd.it", ".i.imgur.com")):
         urls.append(url)
 
     return list(dict.fromkeys(urls))  # dedup preserving order

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from paths import base_dir as _default_base_dir
+from paths import validate_slug as _validate_slug
 from pipeline_logging import get_logger
 
 try:  # taxonomy-aware terminal set; degrade gracefully if unavailable
@@ -81,7 +82,10 @@ def _store_dir() -> Path:
 
 
 def _store_path(slug: str) -> Path:
-    return _store_dir() / f"{slug}.json"
+    # Sanitise the slug at the single point where it becomes a filesystem path —
+    # the charset barrier rejects '/', '\\' and '.' so no traversal is possible.
+    safe_slug = _validate_slug(slug)
+    return _store_dir() / f"{safe_slug}.json"
 
 
 def _empty_state() -> dict[str, Any]:

@@ -45,6 +45,7 @@ from dotenv import load_dotenv
 
 import job_config
 from paths import base_dir
+from paths import validate_slug as _validate_slug
 
 load_dotenv()
 
@@ -840,6 +841,9 @@ def _prepare_slug_dirs(slug: str) -> tuple[Path, Path]:
     """Create the queue + sorted (incl. category) folders for ``slug`` and return
     ``(queue_dir, sorted_dir)``. Reads the taxonomy live so a (re)start picks up
     the active job's categories; workers also mkdir lazily as a belt-and-braces."""
+    # Sanitise the slug before it becomes a per-slug queue/sorted path component;
+    # the charset barrier rejects '/', '\\' and '.' so no traversal is possible.
+    slug = _validate_slug(slug)
     queue_root = Path(os.environ.get("PIPELINE_QUEUE", str(BASE_DIR / "queue")))
     sorted_root = Path(os.environ.get("PIPELINE_SORTED", str(BASE_DIR / "sorted")))
     queue_dir = queue_root if queue_root.name == slug else queue_root / slug

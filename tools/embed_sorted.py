@@ -42,6 +42,7 @@ import categories  # noqa: E402  (after sys.path insert)
 import embeddings  # noqa: E402
 from embeddings_index import EmbeddingIndex  # noqa: E402
 from paths import sorted_dir  # noqa: E402
+from paths import validate_slug as _validate_slug  # noqa: E402
 
 # Image extensions cull curates. Mirrors feed_local_folder.IMAGE_SUFFIXES /
 # hf_export.IMAGE_EXTENSIONS — the sorted tree only ever holds these for images.
@@ -73,7 +74,8 @@ def iter_kept_images(slug: str) -> Iterator[Path]:
     and non-image files are skipped. Ordering is deterministic (sorted) so a
     ``--limit`` run is reproducible.
     """
-    root = sorted_dir(slug)
+    # Sanitise the slug before it selects the sorted-tree root to walk.
+    root = sorted_dir(_validate_slug(slug))
     for category in categories.get_categories():
         category_dir = root / category
         if not category_dir.is_dir():
@@ -180,6 +182,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.limit is not None and args.limit < 0:
         print("--limit must be >= 0", file=sys.stderr, flush=True)
+        return 2
+
+    # Reject a malformed slug up front with a clear, actionable CLI error rather
+    # than letting it reach a path builder.
+    try:
+        _validate_slug(args.slug)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr, flush=True)
         return 2
 
     embed_slug(args.slug, limit=args.limit, force=args.force)
