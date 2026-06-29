@@ -171,12 +171,14 @@ class BaseVisionWorker(ABC):
         # Acquire the bytes to CLASSIFY. For a still that's the file's own bytes.
         # For a video clip (only when VIDEO_CLASSIFY_ENABLED), we extract a
         # representative frame and classify the FRAME's bytes — the CLIP itself is
-        # what _finalise then sorts. ``None`` means "skip this clip gracefully"
-        # (no extraction backend / no frame): we leave it claimed as .processing
-        # so it isn't re-popped (no hot loop) and the stale-sweep can recover it.
+        # what _finalise then sorts. ``None`` means "video frame extraction failed"
+        # (no extraction backend / no decodable frame): route the clip to terminal
+        # DISCARD rather than re-queue it (re-queuing would hot-loop on an
+        # undecodable clip) or orphan it forever as a stray ``.processing`` file.
         img_bytes = self._acquire_classify_bytes(ctx, processing_path)
         if img_bytes is None:
-            return _Outcome.SKIPPED
+            return self._finalise_discard(
+                ctx, reason="video frame extraction failed (install cull[video])")
         if not img_bytes:
             processing_path.unlink(missing_ok=True)
             return _Outcome.SKIPPED
@@ -258,7 +260,8 @@ class BaseVisionWorker(ABC):
           lazily + defensively so a missing optional dep never crashes the worker.
 
         Returns ``None`` when a video yields no frame (no backend / extraction
-        failure) so the caller skips that clip without crashing or hot-looping.
+        failure); the caller then routes the clip to terminal DISCARD (it can't
+        be classified, and re-queuing would hot-loop on an undecodable clip).
         Never touches the atomic ``.processing`` rename — operates on the
         already-claimed path.
         """

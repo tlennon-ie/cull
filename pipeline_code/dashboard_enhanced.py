@@ -1182,6 +1182,12 @@ def api_vision_test():
     provider = (data.get("provider") or "").strip().lower()
     body_url = (data.get("url") or "").strip()
     body_key = (data.get("api_key") or "").strip()
+    # A masked sentinel means "the field still shows the stored secret, I didn't
+    # type a new key" — treat it as empty so the key falls back to the env var
+    # rather than literally sending "********" to the provider (mirrors the
+    # scraper-test guard against SECRET_MASK).
+    if body_key == SECRET_MASK:
+        body_key = ""
     started = _t.time()
 
     def _done(ok: bool, message: str, status: int = 200, models: list | None = None) -> Any:
@@ -1201,7 +1207,8 @@ def api_vision_test():
             if not key:
                 return _done(False, "no GROQ_API_KEY configured", 400)
             r = requests.get("https://api.groq.com/openai/v1/models",
-                             headers={"Authorization": f"Bearer {key}"}, timeout=10)
+                             headers={"Authorization": f"Bearer {key}"}, timeout=10,
+                             allow_redirects=False)  # no 302-bounce to metadata
             if r.status_code == 401:
                 return _done(False, "401 Unauthorized - key invalid")
             if r.status_code != 200:
@@ -3049,6 +3056,11 @@ def api_export_dataset():
         if key in ("trigger_word", "video_bucketing") and not isinstance(val, str):
             return jsonify({"success": False, "data": None,
                             "error": f"{key} must be a string"}), 400
+        # bool is a subclass of int, so check it explicitly (and before any int
+        # coercion) so a stray dict/str for the bucketing flag is a clean 400.
+        if key == "resolution_bucketing" and not isinstance(val, bool):
+            return jsonify({"success": False, "data": None,
+                            "error": "resolution_bucketing must be a boolean"}), 400
         if key == "categories" and not isinstance(val, list):
             return jsonify({"success": False, "data": None,
                             "error": "categories must be a list"}), 400
@@ -3149,6 +3161,12 @@ def api_schedules_delete():
     if not slug or not action:
         return jsonify({"success": False, "data": None,
                         "error": "slug and action are required"}), 400
+    # Validate the slug shape (mirrors the POST handler) so a malformed slug can
+    # never reach the persistence layer. We deliberately don't require the job to
+    # still exist, so an orphaned schedule remains deletable.
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"success": False, "data": None,
+                        "error": "invalid job slug"}), 400
     try:
         removed = scheduler.remove_schedule(slug, action)
     except OSError as exc:  # disk write failure on the rewrite
@@ -3157,6 +3175,23 @@ def api_schedules_delete():
 
 
 # ── API: vision fleet health telemetry ────────────────────────────────────────
+
+def _scrub_fleet(fleet: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the raw ``api_key`` from each fleet worker before it leaves the box.
+
+    The health panel echoes the fleet so the UI can label probes, but the worker
+    dicts carry the per-instance API key. Replace it with a ``has_key`` bool so
+    the browser learns whether a key is set without ever receiving the secret.
+    """
+    scrubbed: list[dict[str, Any]] = []
+    for worker in fleet:
+        if not isinstance(worker, dict):
+            continue
+        safe = {k: v for k, v in worker.items() if k != "api_key"}
+        safe["has_key"] = bool(str(worker.get("api_key", "") or "").strip())
+        scrubbed.append(safe)
+    return scrubbed
+
 
 @app.route("/api/vision/health")
 def api_vision_health():
@@ -3178,8 +3213,9 @@ def api_vision_health():
     except Exception as exc:  # noqa: BLE001 - probe must never 500 the panel
         logger.warning("fleet health probe failed: %s", exc)
         return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+    # Never ship raw per-worker api_keys to the browser — replace with has_key.
     return jsonify({"success": True,
-                    "data": {"probes": probes, "fleet": fleet},
+                    "data": {"probes": probes, "fleet": _scrub_fleet(fleet)},
                     "error": None})
 
 
@@ -7125,7 +7161,8 @@ function dashboard() {
         if (tab === 'presets') this.loadPresets();
         if (tab === 'settings') this.loadGlobalVision();
         if (tab === 'schedules') { this.loadSchedules(); if (!this.jobsList.length) this.loadJobs(); }
-        if (tab === 'duplicates' && !this.dup.scanned && !this.dup.loading) this.loadDuplicates();
+        // Duplicates is on-demand: the "Scan for duplicates" button is the only
+        // trigger (a perceptual-hash sweep is too expensive to auto-fire).
         if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
           this.loadGallery();
           this.loadGalleryInsights();

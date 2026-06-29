@@ -622,5 +622,54 @@ def test_process_image_sorts_clip_via_frame_classification(monkeypatch, tmp_path
     assert not list((tmp_path / "sorted").glob("**/*.jpg"))
 
 
+def test_process_image_routes_undecodable_clip_to_discard(monkeypatch, tmp_path):
+    """End-to-end: with the video lane on but extraction yielding NO frame, the
+    clip must land in terminal DISCARD — never orphaned as a stray .processing
+    file and never re-queued (re-queuing would hot-loop on an undecodable clip).
+    The VLM must not be consulted (there's no frame to classify)."""
+    vwb, worker = _make_worker(monkeypatch, tmp_path)
+    monkeypatch.setenv("VIDEO_CLASSIFY_ENABLED", "true")
+
+    # Avoid real phash/index work at finalize.
+    fake_phash = types.ModuleType("phash_dedup")
+    fake_phash.compute_phash = lambda p: None  # type: ignore[attr-defined]
+    fake_index = types.ModuleType("index_store")
+    fake_index.set_phash = lambda k, v: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "phash_dedup", fake_phash)
+    monkeypatch.setitem(sys.modules, "index_store", fake_index)
+
+    # Extraction backend present but yields no frame (e.g. undecodable clip).
+    fake_vf = types.ModuleType("video_frames")
+    fake_vf.VIDEO_EXT = (".mp4",)  # type: ignore[attr-defined]
+    fake_vf.is_video = lambda p: Path(p).suffix.lower() in fake_vf.VIDEO_EXT  # type: ignore[attr-defined]
+    fake_vf.is_enabled = lambda: True  # type: ignore[attr-defined]
+    fake_vf.extract_keyframes = lambda path, max_frames=1: []  # type: ignore[attr-defined]
+    fake_vf.cleanup_frames = lambda frames: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "video_frames", fake_vf)
+
+    # The VLM must never be reached — there is no frame to classify.
+    def _must_not_call(*a, **k):  # pragma: no cover
+        raise AssertionError("classify_image_bytes called despite no extracted frame")
+
+    monkeypatch.setattr(worker, "classify_image_bytes", _must_not_call)
+
+    clip = tmp_path / "queue" / "civitai" / "clip.mp4"
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42undecodable")
+    (clip.parent / "clip.txt").write_text("a clip prompt", encoding="utf-8")
+
+    outcome = worker._process_image(clip, "civitai")
+    assert outcome == "DISCARD"
+
+    # The CLIP itself lands in sorted/DISCARD/<source>/ — not orphaned, not requeued.
+    sorted_clips = list((tmp_path / "sorted").glob("**/*.mp4"))
+    assert len(sorted_clips) == 1
+    assert "DISCARD" in str(sorted_clips[0])
+    assert sorted_clips[0].read_bytes() == b"\x00\x00\x00\x18ftypmp42undecodable"
+    # No stray .processing left behind, and the clip didn't bounce back to the queue.
+    assert not list((tmp_path / "queue").glob("**/*.processing"))
+    assert not (tmp_path / "queue" / "civitai" / "clip.mp4").exists()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

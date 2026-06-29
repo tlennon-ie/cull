@@ -155,6 +155,26 @@ def test_vision_test_cloud_empty_models_is_not_ok(client, monkeypatch):
     assert j["models"] == []
 
 
+def test_vision_test_cloud_mask_sentinel_falls_back_to_env_key(client, monkeypatch):
+    """Clicking Test Connection without editing the key sends the masked sentinel
+    (SECRET_MASK). It must be treated as 'unchanged' → the env key is used and the
+    literal mask is never passed to list_models."""
+    c, dash, _ = client
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    seen = {}
+
+    def fake_list(provider, base_url=None, api_key=None, timeout=10):
+        seen["api_key"] = api_key
+        return ["gpt-4o"]
+
+    monkeypatch.setattr(dash.vision_model_catalog, "list_models", fake_list)
+    j = c.post("/api/vision/test",
+               json={"provider": "openai", "api_key": dash.SECRET_MASK}).get_json()
+    assert j["ok"] is True
+    assert seen["api_key"] == "sk-env"               # env key, not the sentinel
+    assert seen["api_key"] != dash.SECRET_MASK
+
+
 # ── /api/duplicates ───────────────────────────────────────────────────────────
 
 def test_duplicates_envelope_and_threshold(client, monkeypatch):
@@ -281,6 +301,22 @@ def test_export_dataset_rejects_malformed_option_type(client, monkeypatch):
     assert r.get_json()["success"] is False
 
 
+def test_export_dataset_rejects_non_bool_resolution_bucketing(client, monkeypatch):
+    """resolution_bucketing must be a real bool — a string/dict is a clean 400,
+    not a TypeError that falls through to the 500 branch."""
+    c, dash, _ = client
+    dash.job_config.create_job("Exp4", subject="x")
+    dash.job_config.activate("exp4")
+    monkeypatch.setattr(dash.export_profiles, "export_dataset",
+                        lambda *a, **k: pytest.fail("should not export with a bad bucketing flag"))
+    r = c.post("/api/export/dataset",
+               json={"profile": "kohya", "resolution_bucketing": "yes"})
+    assert r.status_code == 400
+    body = r.get_json()
+    assert body["success"] is False
+    assert "resolution_bucketing" in body["error"]
+
+
 def test_duplicates_thumb_url_is_url_encoded(client, monkeypatch):
     """A sorted path with a space must come back percent-encoded in thumb_url."""
     c, dash, _ = client
@@ -391,6 +427,17 @@ def test_schedules_add_rejects_unknown_job(client):
     assert r.status_code == 400
 
 
+def test_schedules_delete_rejects_malformed_slug(client, monkeypatch):
+    """DELETE must validate the slug shape (mirroring POST) so a malformed slug
+    never reaches the persistence layer."""
+    c, dash, _ = client
+    monkeypatch.setattr(dash.scheduler, "remove_schedule",
+                        lambda *a, **k: pytest.fail("must not reach persistence with a bad slug"))
+    r = c.delete("/api/schedules?slug=Bad/Slug&action=scrape")
+    assert r.status_code == 400
+    assert r.get_json()["success"] is False
+
+
 def test_schedules_add_rejects_bad_cadence(client):
     c, dash, _ = client
     dash.job_config.create_job("Sb", subject="x")
@@ -438,6 +485,38 @@ def test_vision_health_probes_clean_fleet(client, monkeypatch):
     assert "probes" in body["data"] and "fleet" in body["data"]
     # The default preset ships one LM Studio worker, so the fleet is non-empty.
     assert isinstance(captured["fleet"], list)
+
+
+def test_vision_health_never_leaks_api_key(client, monkeypatch):
+    """The health panel echoes the fleet for labelling, but the per-worker
+    api_key must be scrubbed (replaced with a has_key bool) before it leaves the
+    box — a localhost admin tool still shouldn't ship secrets to the browser."""
+    c, dash, _ = client
+    dash.job_config.create_job("Vsec", subject="x")
+    dash.job_config.activate("vsec")
+
+    keyed_fleet = [{
+        "id": "w1", "name": "W1", "provider": "lmstudio",
+        "base_url": "http://h:1234", "model": "", "api_key": "sk-super-secret",
+    }]
+    # Force the route to see a fleet that carries a real key.
+    monkeypatch.setattr(dash.job_config, "clean_vision_fleet",
+                        lambda workers: keyed_fleet)
+    monkeypatch.setattr(dash.fleet_health, "probe_fleet",
+                        lambda fleet, timeout=None: {
+                            ep["id"]: {"ok": True, "latency_ms": 5, "error": None}
+                            for ep in fleet})
+
+    resp = c.get("/api/vision/health?job=vsec")
+    body = resp.get_json()
+    assert body["success"] is True
+    # The raw key must appear NOWHERE in the serialised response.
+    assert "sk-super-secret" not in resp.get_data(as_text=True)
+    worker = body["data"]["fleet"][0]
+    assert "api_key" not in worker
+    assert worker["has_key"] is True             # presence signalled, value hidden
+    # Non-secret fields still present so the UI can label the probe.
+    assert worker["base_url"] == "http://h:1234"
 
 
 # ── new SETTINGS_KEYS + caption-style sync ────────────────────────────────────

@@ -165,6 +165,51 @@ class TestProbe:
 
 
 # ===========================================================================
+# 1b. _http_get scheme guard + no-redirect (SSRF hardening)
+# ===========================================================================
+
+class TestHttpGetGuard:
+    """The real ``_http_get`` (not the monkeypatched stub) must reject a non-
+    http(s) scheme and disable redirects so a hostile endpoint can't 302-bounce
+    the probe at a cloud-metadata address (169.254.169.254). Mirrors
+    ``vision_model_catalog._safe_get``."""
+
+    def test_non_http_scheme_raises_valueerror(self, fh, monkeypatch):
+        def boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("requests.get must not be called for a bad scheme")
+
+        monkeypatch.setattr(fh.requests, "get", boom)
+        with pytest.raises(ValueError):
+            fh._http_get("file:///etc/passwd")
+        with pytest.raises(ValueError):
+            fh._http_get("ftp://host/x")
+
+    def test_passes_allow_redirects_false(self, fh, monkeypatch):
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            captured["url"] = url
+            return _Resp()
+
+        monkeypatch.setattr(fh.requests, "get", fake_get)
+        status, latency = fh._http_get("http://h:1234/v1/models")
+        assert status == 200
+        assert isinstance(latency, int) and latency >= 0
+        assert captured["allow_redirects"] is False
+
+    def test_probe_with_non_http_base_url_is_not_ok_never_raises(self, fh):
+        # probe() must surface the _http_get ValueError as a failed probe, not an
+        # exception (it has its own catch-all). No monkeypatch: the real guard runs.
+        result = fh.probe(_ep("a", "lmstudio", "file:///etc/passwd"))
+        assert result["ok"] is False
+        assert result["error"]
+
+
+# ===========================================================================
 # 2. pick_healthy() — order by health then latency, drop failures
 # ===========================================================================
 

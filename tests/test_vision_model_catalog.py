@@ -185,7 +185,11 @@ def test_gemini_rest_filters_generatecontent(monkeypatch: pytest.MonkeyPatch) ->
     models = catalog.list_models("gemini", api_key="gm-test")
     # Only generateContent-capable models, with the "models/" prefix stripped.
     assert models == ["gemini-2.0-flash", "gemini-1.5-pro"]
-    assert "key=gm-test" in rec.calls[0]["url"]
+    # The key travels in the x-goog-api-key header, NOT the URL query string —
+    # _safe_get logs the URL at DEBUG on failure, so a ?key= param would leak it.
+    assert "key=gm-test" not in rec.calls[0]["url"]
+    assert "key=" not in rec.calls[0]["url"]
+    assert rec.calls[0]["headers"]["x-goog-api-key"] == "gm-test"
 
 
 def test_gemini_without_key_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:

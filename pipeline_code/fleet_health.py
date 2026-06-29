@@ -28,6 +28,7 @@ Pure stdlib + ``requests``. No secrets, no runtime pip.
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Any
 
@@ -36,6 +37,11 @@ import requests
 from pipeline_logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _is_http_url(url: str) -> bool:
+    """True only for an ``http(s)://`` URL — blocks ``file://`` and friends."""
+    return bool(re.match(r"^https?://", url.strip(), re.IGNORECASE))
 
 # Provider → the cheap "list models" path used as a liveness probe. Mirrors the
 # auto-detect endpoints the balanced workers already hit on connect.
@@ -60,9 +66,18 @@ def _http_get(
 
     Tests replace this so probing never touches the network. Production measures
     latency around the real ``requests.get`` call.
+
+    Rejects any non-``http(s)`` scheme and passes ``allow_redirects=False`` so a
+    hostile endpoint can't 302-bounce the probe at a cloud metadata address
+    (169.254.169.254) the operator never typed — mirrors
+    ``vision_model_catalog._safe_get``.
     """
+    if not _is_http_url(url):
+        raise ValueError(f"refusing non-http(s) probe url: {url!r}")
     t0 = time.monotonic()
-    resp = requests.get(url, headers=headers or {}, timeout=timeout)
+    resp = requests.get(
+        url, headers=headers or {}, timeout=timeout, allow_redirects=False
+    )
     latency_ms = int((time.monotonic() - t0) * 1000)
     return resp.status_code, latency_ms
 

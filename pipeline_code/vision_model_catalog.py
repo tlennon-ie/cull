@@ -32,8 +32,10 @@ Per-provider wire shapes
         ``anthropic-version`` -> ``data[].id`` (requires a key).
   gemini
         Prefer the ``google-genai`` SDK ``client.models.list()`` (gated import);
-        fall back to GET ``…/v1beta/models?key=<key>`` -> ``models[].name``
-        filtered to ids that advertise ``generateContent`` (requires a key).
+        fall back to GET ``…/v1beta/models`` with an ``x-goog-api-key`` header
+        (NOT a ``?key=`` query param, which would leak into logs) ->
+        ``models[].name`` filtered to ids that advertise ``generateContent``
+        (requires a key).
 
 Security
 --------
@@ -229,8 +231,11 @@ def _list_gemini_sdk(api_key: str) -> list[str] | None:
 
 
 def _list_gemini_rest(api_key: str, timeout: int) -> list[str]:
-    url = f"{_GEMINI_REST_BASE}/models?key={api_key}"
-    payload = _safe_get(url, headers={}, timeout=timeout)
+    # Pass the key via the x-goog-api-key header, NOT the query string: _safe_get
+    # logs the URL at DEBUG on failure, so a ``?key=`` param would leak the key
+    # into the logs.
+    url = f"{_GEMINI_REST_BASE}/models"
+    payload = _safe_get(url, headers={"x-goog-api-key": api_key}, timeout=timeout)
     if not isinstance(payload, dict):
         return []
     models = payload.get("models")
