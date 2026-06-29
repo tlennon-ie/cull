@@ -17,6 +17,23 @@ load_dotenv()
 from topic_filter import load_config as _load_topic_config, passes as _topic_passes
 _TOPIC_CFG = _load_topic_config()
 from paths import base_dir
+from rate_limit import RateLimitConfig, RateLimiter
+
+# Per-source pacing + 429 backoff + optional proxy for the requests-based image
+# downloads (page scraping is Playwright). Opt-in: unthrottled unless
+# RATE_LIMIT_X_* env is set, so existing behaviour is unchanged.
+_LIMITER = RateLimiter(RateLimitConfig.from_mapping("x", os.environ))
+
+
+def _retry_after_seconds(resp) -> float | None:
+    """Parse a Retry-After header (delta-seconds form) into a float, or None."""
+    raw = resp.headers.get("Retry-After") if resp is not None else None
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
@@ -146,8 +163,13 @@ def extract_prompt_from_text(text: str) -> str:
 def download_image(url: str, dest: Path) -> bool:
     try:
         h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"}
-        r = requests.get(url, headers=h, timeout=20)
+        _LIMITER.acquire()
+        r = requests.get(url, headers=h, timeout=20, **_LIMITER.requests_kwargs())
+        if r.status_code == 429:
+            _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+            return False
         if r.ok and len(r.content) > 5000:
+            _LIMITER.note_success()
             dest.write_bytes(r.content)
             return True
     except Exception as e:

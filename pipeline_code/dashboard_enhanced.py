@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1467,7 +1468,7 @@ def _validate_scrapers_cfg(s: Any) -> tuple[dict | None, str]:
     if not isinstance(s, dict):
         return None, "scrapers must be an object"
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -1490,6 +1491,11 @@ def _validate_scrapers_cfg(s: Any) -> tuple[dict | None, str]:
             if err:
                 return None, err
             out[k] = clean_gd
+        elif k == "yt_dlp":
+            clean_yt, err = _validate_yt_dlp(v)
+            if err:
+                return None, err
+            out[k] = clean_yt
         else:  # local_imports
             clean_li, err = _validate_local_imports(v)
             if err:
@@ -1523,6 +1529,36 @@ def _validate_gallery_dl(gd: Any) -> tuple[dict | None, str]:
         else:  # cookies_file / config_path
             if _bad_path_str(v):
                 return None, f"gallery_dl.{k} is not a valid path string"
+            out[k] = v
+    return out, ""
+
+
+def _validate_yt_dlp(yt: Any) -> tuple[dict | None, str]:
+    """Validate the per-job scrapers.yt_dlp block (mirrors _validate_gallery_dl)."""
+    if not isinstance(yt, dict):
+        return None, "scrapers.yt_dlp must be an object"
+    allowed = {"enabled", "urls", "limit", "cookies"}
+    out: dict[str, Any] = {}
+    for k, v in yt.items():
+        if k not in allowed:
+            return None, f"unknown yt_dlp key: {k!r}"
+        if k == "enabled":
+            out[k] = bool(v)
+        elif k == "urls":
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                return None, "yt_dlp.urls must be a list of strings"
+            if any("\x00" in x for x in v):
+                return None, "yt_dlp.urls contains a NUL byte"
+            out[k] = v
+        elif k == "limit":
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return None, "yt_dlp.limit must be an integer"
+            out[k] = max(1, min(5000, iv))
+        else:  # cookies
+            if _bad_path_str(v):
+                return None, "yt_dlp.cookies is not a valid path string"
             out[k] = v
     return out, ""
 
@@ -2244,6 +2280,56 @@ def api_queue_files():
     return jsonify(results)
 
 
+def _read_vision_prediction(image_path: Path) -> tuple[str, dict[str, Any]]:
+    """Best-effort ``(predicted_category, scores)`` for an image being re-labelled.
+
+    Reads the sibling ``<stem>.vision.json`` audit record (the full classifier
+    result, which carries both ``category`` and the score keys). Falls back to
+    the image's current parent-folder name for the predicted category when no
+    audit record exists or it is unparseable. Never raises — a missing/garbage
+    record just yields ``("", {})`` for the scores so the caller can still record
+    the corrected target.
+    """
+    predicted = image_path.parent.name
+    scores: dict[str, Any] = {}
+    meta_path = image_path.with_name(image_path.stem + ".vision.json")
+    try:
+        if meta_path.exists():
+            record = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(record, dict):
+                scores = record
+                cat = str(record.get("category") or "").strip()
+                if cat:
+                    predicted = cat
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return predicted, scores
+
+
+def _record_relabel_correction(
+    stem: str, predicted: str, target_category: str, scores: dict[str, Any],
+) -> None:
+    """Feed a manual queue re-label into the active-learning correction log.
+
+    ``predicted`` / ``scores`` are snapshotted from the image's ORIGINAL location
+    (before the move relocated it). Lazily imports ``active_learning`` and records
+    ``(predicted → target)`` keyed by the image stem so corrections accumulate for
+    the prompt's few-shot block. Wrapped so it can NEVER break the move that
+    already succeeded — and ``active_learning`` is best-effort, including against
+    a ``SystemExit``-subclass error (so we catch ``BaseException``).
+    """
+    if not predicted or predicted == target_category:
+        return  # not a correction — same bucket (or unknown source bucket)
+    try:
+        import active_learning
+        slug = _resolve_job_slug() or "default"
+        active_learning.record_correction(
+            slug, stem, predicted, target_category, scores,
+        )
+    except BaseException as exc:  # noqa: BLE001 - learning is best-effort, never fatal
+        logger.debug("record_correction skipped for %s: %s", stem, exc)
+
+
 @app.route("/api/queue/action", methods=["POST"])
 def api_queue_action():
     data = request.get_json() or {}
@@ -2262,10 +2348,104 @@ def api_queue_action():
             return jsonify({"error": "target required"}), 400
         dest = PIPELINE_QUEUE / target
         dest.mkdir(parents=True, exist_ok=True)
+        # Snapshot the original prediction + scores BEFORE the move relocates the
+        # sidecar (the predicted bucket is the source folder / the .vision.json's
+        # category — both gone once the image lands under <target>).
+        predicted, scores = _read_vision_prediction(path)
         for sibling in path.parent.glob(f"{path.stem}.*"):
             shutil.move(str(sibling), str(dest / sibling.name))
+        # After a SUCCESSFUL move, log the re-label for active learning.
+        # Best-effort — never breaks the move.
+        _record_relabel_correction(path.stem, predicted, target, scores)
         return jsonify({"success": True, "action": "move", "target": str(dest)})
     return jsonify({"error": "unknown action"}), 400
+
+
+# ── API: gallery culling (recategorise a SORTED image) ────────────────────────
+#
+# The gallery shows images that have already been *sorted* into category folders
+# under PIPELINE_SORTED (layout: <sorted>/[<slug>/]<category>/<source>/<file>).
+# api_queue_action only moves within the *queue*, so the keyboard-driven cull
+# needs its own move path for the sorted tree. It mirrors the queue mover's
+# sibling-sweep but recomputes the destination by swapping the category folder,
+# and returns the resolved {from_category, to_category, path} so the client can
+# build a reversible undo entry. safe_inside guards both the source and the
+# (recomputed) destination — neither may escape PIPELINE_SORTED.
+
+def _recategorise_dest_dir(image_path: Path, target_category: str) -> Path | None:
+    """Destination ``<category>/<source>`` folder for recategorising a sorted image.
+
+    The category folder is the image's grandparent (``…/<category>/<source>/<file>``)
+    and the source folder is its parent. We swap only the category segment, keeping
+    the same source sub-folder, so a Civitai image stays under ``civitai/``. Returns
+    None when the image isn't nested under a ``<category>/<source>`` pair (so we never
+    fabricate a bogus destination from a too-shallow path).
+    """
+    source_folder = image_path.parent
+    category_folder = source_folder.parent
+    # category_folder must be a real directory below the sorted root, not the
+    # root itself or a drive anchor — otherwise the layout is unexpected.
+    if category_folder == source_folder or category_folder.parent == category_folder:
+        return None
+    return category_folder.parent / target_category / source_folder.name
+
+
+@app.route("/api/gallery/recategorize", methods=["POST"])
+def api_gallery_recategorize():
+    """Move one sorted image (and its sidecars) into a different category folder.
+
+    Body: ``{path, target, job?}``. ``path`` must resolve inside PIPELINE_SORTED
+    via ``safe_inside``; ``target`` must be a known category (keep bucket or a
+    system-terminal bucket such as DISCARD) so a typo can't spray arbitrary
+    folders across the sorted tree. The recomputed destination is re-checked with
+    ``safe_inside`` before any file is touched. Returns the envelope plus
+    ``{from_category, to_category, path}`` for the client's undo stack.
+    """
+    data = request.get_json() or {}
+    path = safe_inside(data.get("path", ""), [PIPELINE_SORTED])
+    target = (data.get("target") or "").strip()
+    if path is None or not path.exists():
+        return jsonify({"success": False, "error": "path outside sorted roots or missing"}), 400
+    if not target:
+        return jsonify({"success": False, "error": "target category required"}), 400
+    # Validate against the active taxonomy (keep buckets + DISCARD/CORRUPT). This
+    # is the single source of truth — never inline a category list here.
+    allowed = set(_categories_mod.get_all_categories())
+    if target not in allowed:
+        return jsonify({"success": False, "error": f"unknown target category '{target}'"}), 400
+
+    from_category = path.parent.parent.name
+    if from_category == target:
+        # No-op move — report success without churning the filesystem so the
+        # client can skip pushing an undo entry that reverses nothing.
+        return jsonify({"success": True, "data": {
+            "path": str(path), "from_category": from_category, "to_category": target,
+            "moved": False,
+        }, "error": None})
+
+    dest_dir = _recategorise_dest_dir(path, target)
+    if dest_dir is None or safe_inside(str(dest_dir), [PIPELINE_SORTED]) is None:
+        return jsonify({"success": False, "error": "could not resolve a destination inside sorted"}), 400
+
+    predicted, scores = _read_vision_prediction(path)
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        new_image_path = dest_dir / path.name
+        for sibling in path.parent.glob(f"{path.stem}.*"):
+            shutil.move(str(sibling), str(dest_dir / sibling.name))
+    except OSError as exc:
+        return jsonify({"success": False, "error": f"move failed: {exc}"}), 500
+
+    # Best-effort active-learning correction (same contract as the queue mover).
+    _record_relabel_correction(path.stem, predicted, target, scores)
+    # Invalidate the sorted cache so the next gallery/stats read reflects the move.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True, "data": {
+        "path": str(new_image_path), "from_category": from_category,
+        "to_category": target, "moved": True,
+    }, "error": None})
 
 
 # ── Brand assets ──────────────────────────────────────────────────────────────
@@ -2893,6 +3073,80 @@ def api_prompt_save():
     return jsonify({"success": True, "path": str(txt_path), "bytes": len(text)})
 
 
+# ── API: inline caption editor (training .txt next to an image) ───────────────
+#
+# A focused, envelope-returning surface for the gallery's inline caption editor.
+# It is intentionally separate from /api/prompt (which is the modal's free-form
+# prompt editor and predates the envelope convention): the caption editor wants a
+# small, predictable {success,data,error} shape, a hard length cap, and a GET that
+# returns the current sibling .txt. Both verbs are safe_inside-guarded against the
+# queue + sorted roots — the .txt is always written next to the image stem, never
+# at an attacker-chosen location.
+
+_MAX_CAPTION_CHARS: int = 20_000
+
+
+@app.route("/api/caption", methods=["GET"])
+def api_caption_get():
+    """Return the current ``<stem>.txt`` caption for an image (or empty).
+
+    Query: ``?path=<image>``. The path must resolve inside the queue/sorted
+    roots; a traversal or out-of-roots path is a clean 400 (never a file read
+    outside the pipeline). Envelope: ``{success, data:{path,text}, error}``.
+    """
+    raw = request.args.get("path", "")
+    image_path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if image_path is None:
+        return jsonify({"success": False, "data": None,
+                        "error": "path outside pipeline roots"}), 400
+    txt_path = image_path.with_suffix(".txt")
+    text = ""
+    if txt_path.exists():
+        try:
+            text = txt_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return jsonify({"success": False, "data": None,
+                            "error": f"read failed: {exc}"}), 500
+    return jsonify({"success": True,
+                    "data": {"path": str(txt_path), "text": text}, "error": None})
+
+
+@app.route("/api/caption", methods=["POST"])
+def api_caption_save():
+    """Write ``<stem>.txt`` next to an image.
+
+    Body: ``{path, text, job?}``. ``path`` must resolve inside the queue/sorted
+    roots via ``safe_inside`` (traversal / out-of-roots → 400). ``text`` is
+    required and length-capped at ``_MAX_CAPTION_CHARS`` so a runaway client can't
+    write an unbounded file. Envelope: ``{success, data:{path,bytes}, error}``.
+    """
+    data = request.get_json() or {}
+    raw = data.get("path") or ""
+    text = data.get("text")
+    if not isinstance(text, str):
+        return jsonify({"success": False, "data": None,
+                        "error": "missing or non-string 'text' field"}), 400
+    if len(text) > _MAX_CAPTION_CHARS:
+        return jsonify({"success": False, "data": None,
+                        "error": f"caption exceeds {_MAX_CAPTION_CHARS} chars"}), 400
+    image_path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if image_path is None:
+        return jsonify({"success": False, "data": None,
+                        "error": "path outside pipeline roots"}), 400
+    txt_path = image_path.with_suffix(".txt")
+    try:
+        txt_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"success": False, "data": None,
+                        "error": f"write failed: {exc}"}), 500
+    # Invalidate the scan cache so the next /api/stats sees the new caption.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True,
+                    "data": {"path": str(txt_path), "bytes": len(text)}, "error": None})
+
+
 # ── API: zip download of filtered gallery ─────────────────────────────────────
 
 @app.route("/api/gallery/download.zip")
@@ -3082,15 +3336,83 @@ def api_export_dataset():
 
 _HF_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+# Background HF-export jobs, keyed by a generated id. Each value is
+# ``{state: running|done|error, message, data, repo_id, slug}``. The upload runs
+# off the request thread so a large dataset push doesn't block the dashboard; the
+# UI polls the status endpoint below. Guarded by a lock for cross-thread access.
+_HF_JOBS: dict[str, dict[str, Any]] = {}
+_HF_JOBS_LOCK = threading.Lock()
+# How long the POST waits for the worker before handing back a 202 + id. A
+# mocked/instant push (tests) finishes inside this window and returns its terminal
+# result synchronously; a real upload exceeds it and switches to async polling.
+_HF_SYNC_WAIT_SECONDS = 0.5
+# Cap on retained finished jobs so the dict can't grow without bound.
+_HF_JOBS_MAX = 64
+
+
+def _hf_error_status(exc: Exception) -> tuple[str, int]:
+    """Map a ``push_to_hf`` exception to ``(message, http_status)``.
+
+    Mirrors the original synchronous mapping so the terminal envelope (and the
+    status endpoint) report the same actionable messages.
+    """
+    if isinstance(exc, credentials.MissingCredentialError):
+        return "set HF_TOKEN in the environment to push to HuggingFace", 400
+    if isinstance(exc, ValueError):            # nothing to export
+        return str(exc), 400
+    if isinstance(exc, RuntimeError):          # huggingface_hub not installed
+        return str(exc), 400
+    logger.warning("HF push failed: %s", exc)  # upload / network failure
+    return str(exc), 500
+
+
+def _hf_set(job_id: str, **fields: Any) -> None:
+    with _HF_JOBS_LOCK:
+        entry = _HF_JOBS.setdefault(job_id, {})
+        entry.update(fields)
+        # Evict the oldest finished jobs if we're over the cap (insertion order).
+        if len(_HF_JOBS) > _HF_JOBS_MAX:
+            for stale in [k for k, v in _HF_JOBS.items()
+                          if v.get("state") in ("done", "error")][: len(_HF_JOBS) - _HF_JOBS_MAX]:
+                _HF_JOBS.pop(stale, None)
+
+
+def _hf_get(job_id: str) -> dict[str, Any] | None:
+    with _HF_JOBS_LOCK:
+        entry = _HF_JOBS.get(job_id)
+        return dict(entry) if entry is not None else None
+
+
+def _run_hf_push(job_id: str, *, slug: str, repo_id: str, private: bool,
+                 include_video: bool, categories_arg: list | None) -> None:
+    """Thread body: run the push, recording terminal state into ``_HF_JOBS``.
+
+    Catches ``BaseException`` because ``credentials.MissingCredentialError`` is a
+    ``SystemExit`` subclass (so it would otherwise escape a plain ``except
+    Exception`` and kill the worker thread silently).
+    """
+    try:
+        result = hf_export.push_to_hf(
+            slug=slug, repo_id=repo_id, private=private,
+            include_video=include_video, categories=categories_arg)
+    except BaseException as exc:  # noqa: BLE001 - mapped to a friendly status below
+        message, status = _hf_error_status(exc)
+        _hf_set(job_id, state="error", message=message, status=status, data=None)
+        return
+    _hf_set(job_id, state="done", message="upload complete", status=200, data=result)
+
 
 @app.route("/api/jobs/<slug>/export/huggingface", methods=["POST"])
 def api_export_huggingface(slug: str):
-    """Push ``data/sorted/<slug>`` to a (private by default) HF dataset repo.
+    """Kick off a push of ``data/sorted/<slug>`` to a (private by default) HF repo.
 
     Body: ``{repo_id, private?, include_video?, categories?}``. ``repo_id`` must
-    match ``namespace/name``. Upload is BLOCKING (a background-thread improvement
-    is a follow-up). Returns ``{success, data: <result>, error}``; maps the
-    module's typed failures to actionable messages.
+    match ``namespace/name`` (validated synchronously). The upload then runs on a
+    background thread keyed by a generated id; poll
+    ``GET /api/jobs/<slug>/export/huggingface/status?id=`` for progress. If the
+    work finishes within ``_HF_SYNC_WAIT_SECONDS`` (e.g. a fast failure) the
+    terminal ``{success, data, error}`` envelope is returned immediately with the
+    mapped status; otherwise a ``202`` with ``{data: {id, state: "running"}}``.
     """
     if not job_config.JOB_SLUG_RE.match(slug) or job_config.get_job(slug) is None:
         return jsonify({"success": False, "data": None, "error": "unknown job"}), 404
@@ -3102,21 +3424,162 @@ def api_export_huggingface(slug: str):
     private = bool(data.get("private", True))
     include_video = bool(data.get("include_video", False))
     categories_arg = data.get("categories") if isinstance(data.get("categories"), list) else None
-    try:
-        result = hf_export.push_to_hf(
-            slug=slug, repo_id=repo_id, private=private,
-            include_video=include_video, categories=categories_arg)
-    except credentials.MissingCredentialError:
+
+    job_id = uuid.uuid4().hex
+    _hf_set(job_id, state="running", message="upload in progress", status=202,
+            data=None, slug=slug, repo_id=repo_id)
+    thread = threading.Thread(
+        target=_run_hf_push, name=f"hf-push-{job_id[:8]}", daemon=True,
+        kwargs={"job_id": job_id, "slug": slug, "repo_id": repo_id,
+                "private": private, "include_video": include_video,
+                "categories_arg": categories_arg})
+    thread.start()
+    # Give a fast/mocked push a chance to finish so its terminal result (and the
+    # original status-code mapping) is returned inline; real uploads time out
+    # here and hand back a 202 for polling.
+    thread.join(_HF_SYNC_WAIT_SECONDS)
+    entry = _hf_get(job_id) or {}
+    state = entry.get("state")
+    if state == "done":
+        return jsonify({"success": True, "data": entry.get("data"), "error": None})
+    if state == "error":
         return jsonify({"success": False, "data": None,
-                        "error": "set HF_TOKEN in the environment to push to HuggingFace"}), 400
-    except ValueError as exc:  # nothing to export
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
-    except RuntimeError as exc:  # huggingface_hub not installed
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
-    except Exception as exc:  # noqa: BLE001 - upload/network failure
-        logger.warning("HF push failed: %s", exc)
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
-    return jsonify({"success": True, "data": result, "error": None})
+                        "error": entry.get("message")}), int(entry.get("status", 500))
+    # Still running: hand back the id for status polling.
+    return jsonify({"success": True, "error": None,
+                    "data": {"id": job_id, "state": "running", "repo_id": repo_id}}), 202
+
+
+@app.route("/api/jobs/<slug>/export/huggingface/status", methods=["GET"])
+def api_export_huggingface_status(slug: str):
+    """Report the state of a background HF-export job started for ``slug``.
+
+    Query: ``?id=<job id>``. Returns ``{success, data: {id, state, repo_id,
+    result?}, error}`` where ``state`` is ``running|done|error``; ``error`` carries
+    the friendly message when the job failed. Unknown ids are a clean 404.
+    """
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"success": False, "data": None, "error": "invalid job slug"}), 400
+    job_id = (request.args.get("id") or "").strip()
+    entry = _hf_get(job_id) if job_id else None
+    if entry is None:
+        return jsonify({"success": False, "data": None, "error": "unknown export job"}), 404
+    state = entry.get("state")
+    payload = {"id": job_id, "state": state, "repo_id": entry.get("repo_id")}
+    if state == "done":
+        payload["result"] = entry.get("data")
+    return jsonify({
+        "success": state != "error",
+        "data": payload,
+        "error": entry.get("message") if state == "error" else None,
+    })
+
+
+# ── API: CLIP embeddings (status + find-similar) ──────────────────────────────
+#
+# Embeddings are an OPTIONAL feature gated on the ML extra (open_clip + torch).
+# Both endpoints degrade gracefully: when the extra is absent OR the per-slug
+# index is empty they return a friendly, actionable envelope rather than a 500.
+# `embeddings` / `embeddings_index` import cleanly without the ML stack (the
+# heavy deps are lazy inside embed_image), so a plain `import` is safe here, but
+# we keep it lazy to mirror the active_learning pattern and avoid loading them
+# until an embeddings feature is actually used.
+
+_EMBED_HINT = ("Embeddings need the ML extra. Install it with `pip install .[ml]`, "
+               "then build the index with `python tools/embed_sorted.py`.")
+_EMBED_EMPTY_HINT = ("No embeddings indexed for this job yet. Build the index with "
+                     "`python tools/embed_sorted.py`.")
+
+
+@app.route("/api/embeddings/status", methods=["GET"])
+def api_embeddings_status():
+    """Report whether semantic features are usable for ``?job=<slug>``.
+
+    Returns ``{success, data: {available, indexed, slug}, error}`` where
+    ``available`` is ``embeddings.open_clip_available()`` and ``indexed`` is the
+    number of vectors stored for the slug. Never 500s — a missing ML extra just
+    reports ``available: false`` with a hint.
+    """
+    slug = _resolve_job_slug() or "default"
+    try:
+        import embeddings
+        import embeddings_index
+        available = bool(embeddings.open_clip_available())
+        indexed = len(embeddings_index.EmbeddingIndex(slug=slug))
+    except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
+        logger.debug("embeddings status unavailable: %s", exc)
+        return jsonify({"success": True, "error": None,
+                        "data": {"available": False, "indexed": 0, "slug": slug,
+                                 "hint": _EMBED_HINT}})
+    data: dict[str, Any] = {"available": available, "indexed": indexed, "slug": slug}
+    if not available:
+        data["hint"] = _EMBED_HINT
+    elif indexed == 0:
+        data["hint"] = _EMBED_EMPTY_HINT
+    return jsonify({"success": True, "data": data, "error": None})
+
+
+@app.route("/api/embeddings/similar", methods=["GET"])
+def api_embeddings_similar():
+    """Nearest neighbours of an indexed image for ``?job=<slug>``.
+
+    Query: ``?key=<image key>&top_k=&job=``. Looks up the key's stored vector in
+    ``EmbeddingIndex(slug)`` and ranks the rest by cosine similarity. Returns
+    ``{success, data: {results: [{path, thumb_url, score}], ...}, error}`` —
+    paths are ``safe_inside``-guarded against the queue/sorted roots. Degrades
+    gracefully (never 500) when the ML extra is missing, the index is empty, or
+    the key isn't indexed.
+    """
+    slug = _resolve_job_slug() or "default"
+    key = (request.args.get("key") or "").strip()
+    try:
+        top_k = max(1, min(60, int(request.args.get("top_k", 12))))
+    except (TypeError, ValueError):
+        top_k = 12
+    if not key:
+        return jsonify({"success": False, "data": None, "error": "key is required"}), 400
+
+    try:
+        import embeddings
+        import embeddings_index
+        available = bool(embeddings.open_clip_available())
+        index = embeddings_index.EmbeddingIndex(slug=slug)
+    except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
+        logger.debug("embeddings similar unavailable: %s", exc)
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": False, "indexed": 0,
+                                 "message": _EMBED_HINT}})
+
+    indexed = len(index)
+    if not available or indexed == 0:
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": available, "indexed": indexed,
+                                 "message": _EMBED_HINT if not available else _EMBED_EMPTY_HINT}})
+
+    query_vec = index.get(key)
+    if query_vec is None:
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": True, "indexed": indexed,
+                                 "message": "That image isn't in the embeddings index yet."}})
+
+    # Ask for one extra so we can drop the query image itself from the results.
+    neighbours = index.search(query_vec, top_k=top_k + 1)
+    results: list[dict[str, Any]] = []
+    for neighbour_key, score in neighbours:
+        if neighbour_key == key:
+            continue
+        safe = safe_inside(neighbour_key, [PIPELINE_QUEUE, PIPELINE_SORTED])
+        if safe is None:
+            continue  # traversal-guarded out (stale index row pointing elsewhere)
+        results.append({
+            "path": neighbour_key,
+            "thumb_url": f"/api/thumbnail?path={_urlquote(neighbour_key)}",
+            "score": round(float(score), 4),
+        })
+        if len(results) >= top_k:
+            break
+    return jsonify({"success": True, "error": None,
+                    "data": {"results": results, "available": True, "indexed": indexed}})
 
 
 # ── API: per-job schedules ────────────────────────────────────────────────────
@@ -3275,6 +3738,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .prompt-snippet { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .link-btn { color:#818cf8; cursor:pointer; font-size:.75rem; }
   .link-btn:hover { color:#a5b4fc; text-decoration:underline; }
+  /* Keyboard-cull legend key caps. */
+  .kbd { display:inline-block; padding:0 .35em; min-width:1.2em; text-align:center;
+         font-family:ui-monospace,monospace; font-size:.7rem; line-height:1.4;
+         color:#e2e8f0; background:#1e293b; border:1px solid #334155;
+         border-bottom-width:2px; border-radius:.25rem; }
   /* NSFW blur container - the eye button overlays so the user can reveal a single thumb. */
   .nsfw-wrap { position:relative; display:inline-block; line-height:0; }
   .nsfw-blur { filter: blur(18px) saturate(0.7); transition: filter .2s; }
@@ -4015,10 +4483,37 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               :disabled="gallery.page >= Math.max(1, Math.ceil(gallery.total / gallery.pageSize))">Next</button>
           </div>
         </div>
+
+        <!-- Keyboard culling legend (§3a). Click a card to focus it, then drive
+             the keep/reject/recategorize hotkeys without leaving the keyboard. -->
+        <div class="mb-3 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-[11px] text-slate-300">
+          <div class="flex items-center justify-between">
+            <span class="font-semibold text-slate-200">Keyboard culling</span>
+            <button class="link-btn" @click="cullLegendOpen = !cullLegendOpen"
+              x-text="cullLegendOpen ? 'hide' : 'show'"></button>
+          </div>
+          <div x-show="cullLegendOpen" class="mt-2 flex flex-wrap gap-x-3 gap-y-1">
+            <span><kbd class="kbd">←↑↓→</kbd>/<kbd class="kbd">h j k l</kbd> move focus</span>
+            <span><kbd class="kbd">k</kbd> keep <span class="text-slate-500" x-text="'(' + (cullPrimaryKeep() || '—') + ')'"></span></span>
+            <span><kbd class="kbd">x</kbd> reject → DISCARD</span>
+            <span><kbd class="kbd">1</kbd>–<kbd class="kbd">9</kbd> Nth category</span>
+            <span><kbd class="kbd">u</kbd> undo <span class="text-slate-500" x-text="'(' + cullUndo.length + ')'"></span></span>
+            <span><kbd class="kbd">Esc</kbd> clear focus</span>
+          </div>
+          <div x-show="cullLegendOpen && cullCategories.length" class="mt-1 text-slate-500">
+            <template x-for="(cat, i) in cullCategories" :key="cat.name">
+              <span class="mr-2"><span class="text-slate-400" x-text="(i+1)"></span>=<span x-text="cat.name"></span></span>
+            </template>
+          </div>
+        </div>
+
         <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          <template x-for="c in gallery.items" :key="c.path">
-            <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col">
+          <template x-for="(c, idx) in gallery.items" :key="c.path">
+            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow"
+                 :data-cull-idx="idx"
+                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : 'border-slate-800'"
+                 @click="cullFocus = idx">
               <span class="nsfw-wrap block">
                 <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
@@ -4040,7 +4535,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <span class="bg-slate-800/60 rounded px-1" :title="(c.width||'?') + 'x' + (c.height||'?')" x-text="c.resolution_bucket"></span>
               </div>
               <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
-              <span class="link-btn mt-1" @click="openModalFromCard(c)">Open</span>
+              <div class="mt-1 flex items-center gap-3">
+                <span class="link-btn" @click.stop="openModalFromCard(c)">Open</span>
+                <span class="link-btn" @click.stop="findSimilar(c)" title="Find visually similar kept images (CLIP embeddings)">Find similar</span>
+              </div>
             </div>
           </template>
           <template x-if="!galleryLoading && (gallery.items?.length ?? 0) === 0">
@@ -4053,6 +4551,25 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">python tools/seed_demo_data.py</code>
                 from the repo root to populate a synthetic preview.
               </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Find-similar results strip (CLIP embeddings; on-demand). -->
+      <div x-show="sim.open" x-cloak class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">Similar to <span class="font-mono text-xs" x-text="sim.sourceName"></span></h3>
+          <button @click="sim.open = false" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Close</button>
+        </div>
+        <div x-show="sim.loading" class="text-xs text-slate-400">Searching…</div>
+        <div x-show="!sim.loading && sim.message" x-cloak class="text-xs text-amber-300" x-text="sim.message"></div>
+        <div x-show="!sim.loading && !sim.message && sim.results.length === 0" x-cloak class="text-xs text-slate-500">No similar images found.</div>
+        <div class="flex flex-wrap gap-3 mt-2">
+          <template x-for="m in sim.results" :key="m.path">
+            <div class="relative w-32">
+              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700"/>
+              <div class="text-[11px] text-slate-400 mt-1">score <span x-text="m.score"></span></div>
             </div>
           </template>
         </div>
@@ -4193,7 +4710,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-1">Push to HuggingFace</h3>
-        <p class="text-xs text-slate-400 mb-3">Upload the kept set as a HuggingFace dataset repo. Requires <code>HF_TOKEN</code> in the environment and <code>pip install huggingface_hub</code>. Upload is blocking — the page waits until it finishes.</p>
+        <p class="text-xs text-slate-400 mb-3">Upload the kept set as a HuggingFace dataset repo. Requires <code>HF_TOKEN</code> in the environment and <code>pip install huggingface_hub</code>. The upload runs in the background — you can keep working while it finishes.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Repo ID (namespace/name)</span>
@@ -4214,6 +4731,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
             <span x-text="hf.pushing ? 'Uploading…' : 'Push to HuggingFace'"></span>
           </button>
+          <span x-show="hf.status && hf.pushing" x-cloak class="text-xs text-amber-300" x-text="hf.status"></span>
           <span x-show="hf.error" class="text-xs text-rose-300" x-text="hf.error"></span>
         </div>
         <div x-show="hf.result" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="hf.result ? JSON.stringify(hf.result, null, 2) : ''"></div>
@@ -4859,6 +5377,42 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
+      <!-- yt-dlp (overridden wholesale as scrapers.yt_dlp). Mirrors gallery-dl. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">yt-dlp</h3>
+          <div>
+            <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+            <span class="text-sm">Enable yt-dlp for this job</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+            <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+            <textarea :value="ytUrls()" @input="setYtUrls($event.target.value)" rows="4"
+                      placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
+            <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+        </template>
+      </div>
+
       <!-- Local folders (multi): scrapers.local_imports list. Each row is its
            own concurrent source. -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
@@ -5035,9 +5589,20 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
+            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+          <div class="grid md:grid-cols-2 gap-3">
+            <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+              <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+            <div class="grid grid-cols-1 gap-3">
+              <label class="block"><span class="text-xs text-slate-400">yt-dlp frames per URL</span>
+                <input type="number" min="1" max="5000" :value="(presetEditor.cfg.scrapers.yt_dlp||{}).limit" @input="peSet('scrapers.yt_dlp.limit', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <label class="block"><span class="text-xs text-slate-400">yt-dlp cookies file</span>
+                <input :value="(presetEditor.cfg.scrapers.yt_dlp||{}).cookies" @input="peSet('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
+            </div>
+          </div>
 
           <div>
             <div class="text-xs text-slate-400 mb-1">Local folders</div>
@@ -5719,6 +6284,34 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <textarea x-model="modal.prompt" rows="14"
               class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-slate-200"></textarea>
           </template>
+
+          <!-- Inline caption editor (§3d): edits the training <stem>.txt that
+               lives next to the image. Independent of the prompt block above. -->
+          <template x-if="modal.path">
+            <div class="mt-5 border-t border-slate-800 pt-4">
+              <div class="flex items-center justify-between mb-2">
+                <h4 class="text-xs uppercase tracking-wider text-slate-400">Caption (.txt)</h4>
+                <span class="text-[11px] text-slate-500" x-text="'~' + captionTokenCount(modal.caption) + ' tokens'"></span>
+              </div>
+              <div class="flex flex-wrap items-center gap-2 mb-2">
+                <input x-model="triggerWord" placeholder="trigger word"
+                  class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs w-40"
+                  @keydown.enter.prevent="prependTriggerWord()"/>
+                <button @click="prependTriggerWord()"
+                  class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded"
+                  title="Prepend the trigger word to the caption">+ trigger word</button>
+                <button @click="saveCaption()" :disabled="!!modal.captionSaving"
+                  class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded disabled:opacity-50">
+                  <span x-text="modal.captionSaving ? 'Saving…' : 'Save caption'"></span>
+                </button>
+                <span class="text-[11px] text-emerald-300" x-show="modal.captionFlash" x-text="modal.captionFlash"></span>
+              </div>
+              <textarea x-model="modal.caption" rows="5"
+                class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-slate-200"
+                placeholder="No caption yet — type one and Save."></textarea>
+            </div>
+          </template>
+
           <template x-if="modal.summary">
             <div class="mt-4">
               <h4 class="text-xs uppercase tracking-wider text-slate-400 mb-1">Vision summary</h4>
@@ -5830,6 +6423,7 @@ function dashboard() {
     scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
     // Wave-2 surfaces (all on-demand — never on the status poll).
     dup: { loading: false, threshold: 10, groups: [], scanned: false, error: '' },
+    sim: { open: false, loading: false, results: [], message: '', sourceName: '' },
     exportForm: { profile: 'kohya', trigger_word: '', train_val_split: '',
                   resolution_bucketing: false, repeats: '', video_bucketing: '',
                   running: false, summary: null, error: '' },
@@ -5842,7 +6436,7 @@ function dashboard() {
       label: { sd_prompt: 'SD / Flux prompt', booru_tags: 'Booru tags',
                natural_language: 'Natural-language', motion: 'Motion / video' }[id] || id,
     })),
-    hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '' },
+    hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '', status: '' },
     schedules: { loading: false, rows: [], actions: [], error: '',
                  form: { slug: '', cadence: '@daily', action: 'scrape', enabled: true } },
     visionHealth: { loading: false, probes: {}, fleet: [], error: '' },
@@ -5967,7 +6561,11 @@ function dashboard() {
     lastRefresh: '...',
     modal: { open:false, imageUrl:'', prompt:'', promptOriginal:'', editing:false,
              saving:false, savedFlash:'', name:'', source:'', category:'', summary:'',
-             path:'', meta:null },
+             path:'', meta:null,
+             // Inline caption editor (§3d) — independent of the prompt editor above.
+             caption:'', captionOriginal:'', captionSaving:false, captionFlash:'' },
+    // Trigger word the "+ trigger word" button prepends to a caption.
+    triggerWord: '',
     // Stats tab state
     stats: { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] },
     statsLoading: false,
@@ -5984,6 +6582,21 @@ function dashboard() {
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
     modalReturnFocus: null,
+
+    // ── Keyboard-driven culling (§3a) ────────────────────────────────────
+    // cullFocus is an index into gallery.items (-1 = nothing focused). The
+    // focused card gets a visible ring and is the implicit target of the cull
+    // hotkeys. cullCategories is the ordered keep-bucket taxonomy (loaded from
+    // /api/categories) that powers k=keep-primary and 1..9=Nth-category.
+    // cullUndo is a stack of reversible moves: each entry is
+    // {path, fromCategory, toCategory}. Hard deletes are never pushed (not
+    // reversible). cullBusy debounces a hotkey while a move is in flight.
+    cullFocus: -1,
+    cullCategories: [],   // [{name, ...}] keep buckets, in taxonomy order
+    cullTerminal: [],     // ['DISCARD','CORRUPT'] — system terminal buckets
+    cullUndo: [],
+    cullBusy: false,
+    cullLegendOpen: true,
 
     // Label for the active section, resolved across whichever tab set is live.
     currentTabLabel() {
@@ -6237,6 +6850,7 @@ function dashboard() {
     // List/url convenience views.
     effList(path) { const v = this.effVal(path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
     effUrls() { const v = this.effVal('scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    ytUrls() { const v = this.effVal('scrapers.yt_dlp.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     // Set an override (and optimistically update the effective view), debounce PUT.
     setOverride(path, value) {
       this._deepSet(this.je.overrides, path, value);
@@ -6245,6 +6859,7 @@ function dashboard() {
     },
     setOverrideList(path, text) { this.setOverride(path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); },
     setOverrideUrls(text) { this.setOverride('scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
+    setYtUrls(text) { this.setOverride('scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
     // Reset a field back to the preset (remove the override). Re-fetch to get the
     // recomputed effective value from the preset.
     async resetOverride(path) {
@@ -6391,6 +7006,7 @@ function dashboard() {
         cfg.topic_filters = cfg.topic_filters || {};
         cfg.scrapers = cfg.scrapers || {};
         cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
+        cfg.scrapers.yt_dlp = cfg.scrapers.yt_dlp || {};
         if (!Array.isArray(cfg.scrapers.local_imports)) cfg.scrapers.local_imports = [];
         cfg.scoring = cfg.scoring || {};
         cfg.captioning = cfg.captioning || {};
@@ -6409,6 +7025,8 @@ function dashboard() {
     peSetList(path, text) { this._deepSet(this.presetEditor.cfg, path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); this.schedulePresetSave(); },
     peUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     peSetUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
+    peYtUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    peSetYtUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
     peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
     // Preset-editor vision fleet (global default fleet jobs inherit).
     peFleet() { const v = this._deepGet(this.presetEditor.cfg, 'vision.workers'); return Array.isArray(v) ? v : []; },
@@ -6821,6 +7439,7 @@ function dashboard() {
         editing: false, saving: false, savedFlash: '',
         name: name || '', source: source || '', category: category || '',
         summary: summary || '', path: path || '', meta: meta || null,
+        caption: '', captionOriginal: '', captionSaving: false, captionFlash: '',
       };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
@@ -6828,6 +7447,9 @@ function dashboard() {
         this.modal.prompt = value || '(empty)';
         this.modal.promptOriginal = value;
       } catch (e) { this.modal.prompt = '(failed to load prompt)'; }
+      // Load the training caption (.txt) into the inline caption editor. Separate
+      // fetch from the prompt above so the two editors stay independent.
+      this.loadCaption();
     },
     upsize(url) { if (!url) return url; return url + (url.includes('?') ? '&' : '?') + 'size=1600'; },
     openModalFromFile(f) {
@@ -7000,6 +7622,226 @@ function dashboard() {
       window.open('/api/gallery/download.zip?' + qs, '_blank');
     },
 
+    // ── Keyboard-driven culling (§3a) ────────────────────────────────────
+    // The primary keep bucket is the first non-terminal category in taxonomy
+    // order. Falls back to 'Keepers' only if the taxonomy somehow has none.
+    cullPrimaryKeep() {
+      const first = (this.cullCategories || [])[0];
+      return first ? first.name : null;
+    },
+    // Load the ordered taxonomy so 1..9 and k map to real category names. Cheap;
+    // fired once when the gallery tab opens (and refreshed on demand).
+    async loadCullCategories() {
+      try {
+        const j = await fetch('/api/categories' + this.jobParam('?')).then(r => r.json());
+        this.cullCategories = (j.active && j.active.categories) || [];
+        this.cullTerminal = j.system_terminal || [];
+      } catch (e) { /* leave whatever we had; hotkeys degrade gracefully */ }
+    },
+    // True when keyboard culling should respond: gallery tab open, no modal,
+    // and the user isn't typing into a field. Keeps hotkeys from firing while
+    // someone edits a filter or caption.
+    cullHotkeysActive() {
+      if (this.view !== 'job' || this.active !== 'gallery') return false;
+      if (this.modal.open) return false;
+      const el = document.activeElement;
+      if (el) {
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) return false;
+      }
+      return true;
+    },
+    cullFocusCard(idx) {
+      const n = (this.gallery.items || []).length;
+      if (n === 0) { this.cullFocus = -1; return; }
+      // Clamp into range and wrap is not needed; arrow handlers clamp.
+      this.cullFocus = Math.max(0, Math.min(n - 1, idx));
+    },
+    cullClearFocus() { this.cullFocus = -1; },
+    // Move focus by a delta within the flat item list (used by h/j/k/l + arrows).
+    cullMoveFocus(delta) {
+      const n = (this.gallery.items || []).length;
+      if (n === 0) { this.cullFocus = -1; return; }
+      const next = this.cullFocus < 0 ? 0 : this.cullFocus + delta;
+      this.cullFocus = Math.max(0, Math.min(n - 1, next));
+      this.$nextTick(() => {
+        const node = document.querySelector('[data-cull-idx="' + this.cullFocus + '"]');
+        if (node && node.scrollIntoView) node.scrollIntoView({ block: 'nearest' });
+      });
+    },
+    // The currently focused card object, or null.
+    cullFocused() {
+      if (this.cullFocus < 0) return null;
+      return (this.gallery.items || [])[this.cullFocus] || null;
+    },
+    // Recategorise the focused card to `target` via the sorted-move endpoint and
+    // push a reversible entry onto the undo stack. Optimistically drops the card
+    // from the current view so culling feels instant; a failed move re-fetches.
+    async cullRecategorize(target) {
+      const card = this.cullFocused();
+      if (!card || !target || this.cullBusy) return;
+      this.cullBusy = true;
+      const focusedIdx = this.cullFocus;
+      try {
+        const r = await fetch('/api/gallery/recategorize', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: card.path, target, job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.notify((j && j.error) || ('move failed: ' + r.status), 'error');
+          return;
+        }
+        if (j.data && j.data.moved) {
+          // Push undo BEFORE mutating the list. The new path (under the target
+          // folder) is what we'd reverse.
+          this.cullUndo.push({
+            path: j.data.path, fromCategory: j.data.from_category, toCategory: j.data.to_category,
+          });
+          if (this.cullUndo.length > 100) this.cullUndo.shift();
+          // Optimistically remove the card from the view and keep focus sane.
+          this.gallery.items = (this.gallery.items || []).filter(it => it.path !== card.path);
+          this.gallery.total = Math.max(0, (this.gallery.total || 1) - 1);
+          const n = this.gallery.items.length;
+          this.cullFocus = n === 0 ? -1 : Math.min(focusedIdx, n - 1);
+          this.notify(card.name + ' → ' + target, 'success', 1500);
+        } else {
+          this.notify('Already in ' + target, 'info', 1200);
+        }
+      } catch (e) {
+        this.notify('Network error during move', 'error');
+      } finally {
+        this.cullBusy = false;
+      }
+    },
+    cullKeep() {
+      const keep = this.cullPrimaryKeep();
+      if (!keep) { this.notify('No keep bucket in this taxonomy', 'warn'); return; }
+      this.cullRecategorize(keep);
+    },
+    cullReject() { this.cullRecategorize('DISCARD'); },
+    // 1..9 → Nth keep bucket (1-indexed) in taxonomy order.
+    cullRecategorizeNth(n) {
+      const cat = (this.cullCategories || [])[n - 1];
+      if (!cat) { this.notify('No category #' + n, 'warn'); return; }
+      this.cullRecategorize(cat.name);
+    },
+    // Undo the last move by moving the image back (same endpoint, from/to swapped).
+    async cullUndoLast() {
+      if (this.cullBusy) return;
+      const last = this.cullUndo.pop();
+      if (!last) { this.notify('Nothing to undo', 'info', 1200); return; }
+      this.cullBusy = true;
+      try {
+        const r = await fetch('/api/gallery/recategorize', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: last.path, target: last.fromCategory, job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.notify((j && j.error) || 'undo failed', 'error');
+          this.cullUndo.push(last);   // restore so the user can retry
+          return;
+        }
+        this.notify('Undid → ' + last.fromCategory, 'success', 1500);
+        // The card now belongs in the current view again only if the filter
+        // matches; cheapest correct option is a reload.
+        this.loadGallery();
+      } catch (e) {
+        this.notify('Network error during undo', 'error');
+        this.cullUndo.push(last);
+      } finally {
+        this.cullBusy = false;
+      }
+    },
+    // Single keydown entry-point bound to window. Guards against typing in
+    // fields, then dispatches the cull hotkeys. Returns early (no preventDefault)
+    // for unhandled keys so normal browser shortcuts still work.
+    onCullKeydown(ev) {
+      if (!this.cullHotkeysActive()) return;
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;   // don't hijack browser combos
+      const k = ev.key;
+      // Digits 1..9 → Nth category.
+      if (k >= '1' && k <= '9') { ev.preventDefault(); this.cullRecategorizeNth(Number(k)); return; }
+      switch (k) {
+        case 'ArrowRight': case 'l': ev.preventDefault(); this.cullMoveFocus(1); return;
+        case 'ArrowLeft':  case 'h': ev.preventDefault(); this.cullMoveFocus(-1); return;
+        case 'ArrowDown':  case 'j': ev.preventDefault(); this.cullMoveFocus(this.cullRowStride()); return;
+        case 'ArrowUp':              ev.preventDefault(); this.cullMoveFocus(-this.cullRowStride()); return;
+        case 'k': ev.preventDefault(); this.cullKeep(); return;
+        case 'x': ev.preventDefault(); this.cullReject(); return;
+        case 'u': ev.preventDefault(); this.cullUndoLast(); return;
+        case 'Escape': this.cullClearFocus(); return;
+        default: return;
+      }
+    },
+    // 'k' is BOTH "move focus down a row" (vim) AND "keep". We resolve the
+    // ambiguity in favour of keep (the headline action); use ArrowDown/j to move
+    // down a row. cullRowStride approximates the column count of the responsive
+    // grid so j/ArrowDown jump a visual row rather than one card.
+    cullRowStride() {
+      const w = window.innerWidth || 1280;
+      if (w >= 1024) return 6;   // lg:grid-cols-6
+      if (w >= 768) return 4;    // md:grid-cols-4
+      if (w >= 640) return 3;    // sm:grid-cols-3
+      return 2;                  // grid-cols-2
+    },
+
+    // ── Inline caption editor (§3d) ──────────────────────────────────────
+    // Approximate token count: whitespace + comma split (good enough for the UI
+    // hint; not a real tokenizer). Empty/whitespace → 0.
+    captionTokenCount(text) {
+      const t = (text || '').trim();
+      if (!t) return 0;
+      return t.split(/[\s,]+/).filter(Boolean).length;
+    },
+    async loadCaption() {
+      // Pull the current .txt for the modal's image into the caption editor.
+      if (!this.modal.path) { this.modal.caption = ''; this.modal.captionOriginal = ''; return; }
+      try {
+        const enc = encodeURIComponent(this.modal.path);
+        const j = await fetch('/api/caption?path=' + enc).then(r => r.json());
+        const text = (j && j.success && j.data) ? (j.data.text || '') : '';
+        this.modal.caption = text;
+        this.modal.captionOriginal = text;
+      } catch (e) {
+        this.modal.caption = ''; this.modal.captionOriginal = '';
+      }
+    },
+    // Prepend the trigger word to the caption (idempotent-ish: skips if the
+    // caption already starts with it). Comma-separated, the LoRA-tag convention.
+    prependTriggerWord() {
+      const tw = (this.triggerWord || '').trim();
+      if (!tw) { this.notify('Enter a trigger word first', 'warn', 1500); return; }
+      const cur = this.modal.caption || '';
+      if (cur.toLowerCase().startsWith(tw.toLowerCase())) { this.notify('Already prefixed', 'info', 1200); return; }
+      this.modal.caption = cur ? (tw + ', ' + cur) : tw;
+    },
+    async saveCaption() {
+      if (!this.modal.path || this.modal.captionSaving) return;
+      this.modal.captionSaving = true;
+      try {
+        const r = await fetch('/api/caption', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: this.modal.path, text: this.modal.caption || '', job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.modal.captionFlash = 'Error: ' + ((j && j.error) || r.status);
+          return;
+        }
+        this.modal.captionOriginal = this.modal.caption;
+        this.modal.captionFlash = 'Caption saved.';
+        this.notify('Caption saved', 'success', 1500);
+        setTimeout(() => this.modal.captionFlash = '', 2500);
+      } catch (e) {
+        this.modal.captionFlash = 'Network error — check console';
+        console.error('saveCaption failed', e);
+      } finally {
+        this.modal.captionSaving = false;
+      }
+    },
+
     // Scope query string for job-aware endpoints: ?job=<slug> when viewing a
     // job, else '' (server falls back to the active job).
     jobQuery() { return this.currentJob ? ('?job=' + encodeURIComponent(this.currentJob)) : ''; },
@@ -7039,6 +7881,26 @@ function dashboard() {
       for (const p of victims) { await this.deleteDuplicate(p); }
     },
 
+    // ── Find similar (CLIP embeddings) ───────────────────────────────────────
+    async findSimilar(card) {
+      // Open the results strip and fetch nearest neighbours for this image. The
+      // backend degrades gracefully (no ML extra / empty index / un-indexed key)
+      // by returning a friendly message instead of an error.
+      this.sim = { open: true, loading: true, results: [], message: '', sourceName: card.name || '' };
+      const q = this.jobQuery();
+      const sep = q ? '&' : '?';
+      const url = '/api/embeddings/similar' + q + sep
+                + 'key=' + encodeURIComponent(card.path) + '&top_k=12';
+      try {
+        const j = await (await fetch(url)).json();
+        const data = j.data || {};
+        if (!j.success) { this.sim.message = j.error || 'similar search failed'; }
+        else if (data.message && (data.results || []).length === 0) { this.sim.message = data.message; }
+        else { this.sim.results = data.results || []; }
+      } catch (e) { this.sim.message = 'network error'; }
+      this.sim.loading = false;
+    },
+
     // ── Dataset export ───────────────────────────────────────────────────────
     async runDatasetExport() {
       this.exportForm.running = true; this.exportForm.error = ''; this.exportForm.summary = null;
@@ -7063,17 +7925,51 @@ function dashboard() {
     async pushToHuggingFace() {
       const repo = (this.hf.repo_id || '').trim();
       if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { this.hf.error = 'repo_id must look like namespace/name'; return; }
-      this.hf.pushing = true; this.hf.error = ''; this.hf.result = null;
+      this.hf.pushing = true; this.hf.error = ''; this.hf.result = null; this.hf.status = '';
       try {
         const r = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/export/huggingface', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ repo_id: repo, private: !!this.hf.private, include_video: !!this.hf.include_video }),
         });
         const j = await r.json();
-        if (j.success) { this.hf.result = j.data; this.notify('Pushed to HuggingFace', 'info'); }
-        else { this.hf.error = j.error || 'push failed'; }
-      } catch (e) { this.hf.error = 'network error'; }
+        // 202 + an id means the upload is running on a background thread — poll
+        // the status endpoint until it finishes. A terminal result (fast failure
+        // or an already-finished push) comes back inline and skips polling.
+        if (r.status === 202 && j.data && j.data.id) {
+          this.hf.status = 'Uploading…';
+          await this._pollHfStatus(j.data.id);
+        } else if (j.success) {
+          this.hf.result = j.data; this.hf.status = 'done';
+          this.notify('Pushed to HuggingFace', 'info');
+        } else {
+          this.hf.error = j.error || 'push failed'; this.hf.status = '';
+        }
+      } catch (e) { this.hf.error = 'network error'; this.hf.status = ''; }
       this.hf.pushing = false;
+    },
+    async _pollHfStatus(id) {
+      // Poll the HF-export status endpoint every 2s until done/error. Best-effort
+      // polling: a transient network blip just retries on the next tick.
+      const url = '/api/jobs/' + encodeURIComponent(this.currentJob)
+                + '/export/huggingface/status?id=' + encodeURIComponent(id);
+      for (let i = 0; i < 1800; i++) {            // ~1h ceiling at 2s intervals
+        await new Promise(res => setTimeout(res, 2000));
+        let j;
+        try { j = await (await fetch(url)).json(); } catch (e) { continue; }
+        const state = j.data && j.data.state;
+        if (state === 'done') {
+          this.hf.result = (j.data && j.data.result) || null; this.hf.status = 'done';
+          this.notify('Pushed to HuggingFace', 'info');
+          return;
+        }
+        if (state === 'error' || j.success === false) {
+          this.hf.error = j.error || 'push failed'; this.hf.status = '';
+          return;
+        }
+        this.hf.status = 'Uploading…';
+      }
+      this.hf.status = '';
+      this.hf.error = 'upload is taking longer than expected — check HuggingFace directly';
     },
 
     // ── Schedules ────────────────────────────────────────────────────────────
@@ -7151,6 +8047,9 @@ function dashboard() {
       this.loadJobs();
       this.loadPresets();
       this.refresh();
+      // Global keyboard-cull listener. Gated entirely by cullHotkeysActive()
+      // (gallery tab open, no modal, not typing) so it's inert everywhere else.
+      window.addEventListener('keydown', (ev) => this.onCullKeydown(ev));
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
       // auto-refreshes alongside the rest of the dashboard. Gallery stays
@@ -7167,6 +8066,10 @@ function dashboard() {
           this.loadGallery();
           this.loadGalleryInsights();
         }
+        // Keyboard culling needs the ordered taxonomy; load it whenever the
+        // gallery opens and reset focus so a stale index from a prior view
+        // doesn't ring a card the user can't see.
+        if (tab === 'gallery') { this.loadCullCategories(); this.cullFocus = -1; }
         // Job Settings + Vision both edit this job's inheritable config (v2),
         // so they need the effective cfg + overrides loaded.
         if ((tab === 'jobSettings' || tab === 'vision') && !this.je.loaded) this.loadJobEditor();
