@@ -16,6 +16,22 @@ load_dotenv()
 
 from topic_filter import load_config as _load_topic_config, passes as _topic_passes
 from paths import base_dir
+from rate_limit import RateLimitConfig, RateLimiter
+
+# Per-source pacing + 429 backoff + optional proxy. Opt-in: unthrottled unless
+# RATE_LIMIT_WEB_* env is set, so existing behaviour is unchanged.
+_LIMITER = RateLimiter(RateLimitConfig.from_mapping("web", os.environ))
+
+
+def _retry_after_seconds(resp) -> float | None:
+    """Parse a Retry-After header (delta-seconds form) into a float, or None."""
+    raw = resp.headers.get("Retry-After") if resp is not None else None
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
@@ -48,8 +64,13 @@ def url_hash(url: str) -> str:
 
 def download_image(url: str, dest: Path) -> bool:
     try:
-        r = requests.get(url, headers=IMG_HEADERS, timeout=25, stream=True)
+        _LIMITER.acquire()
+        r = requests.get(url, headers=IMG_HEADERS, timeout=25, stream=True, **_LIMITER.requests_kwargs())
+        if r.status_code == 429:
+            _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+            return False
         if r.ok and len(r.content) > 5000:
+            _LIMITER.note_success()
             dest.write_bytes(r.content)
             return True
     except Exception as e:
@@ -243,14 +264,16 @@ def scrape_reddit(seen: "SeenStore") -> int:
         for sort in ["relevance", "new", "top"]:
             try:
                 url = f"https://www.reddit.com/search.json?q={requests.utils.quote(effective_query)}&sort={sort}&t=month&limit=50&type=link"
-                r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=15)
+                _LIMITER.acquire()
+                r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=15, **_LIMITER.requests_kwargs())
                 if r.status_code == 429:
-                    print("  Reddit rate limit, sleeping 15s...")
-                    time.sleep(15)
+                    _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+                    print("  Reddit rate limit, backing off...")
                     continue
                 if not r.ok:
                     continue
 
+                _LIMITER.note_success()
                 posts = r.json().get("data", {}).get("children", [])
                 for post in posts:
                     d = post["data"]
@@ -292,8 +315,12 @@ def scrape_reddit(seen: "SeenStore") -> int:
                         if (QUEUE_DIR / f"{stem}.jpg").exists() or (QUEUE_DIR / f"{stem}.png").exists():
                             continue
                         try:
-                            resp = requests.get(img_url, headers=IMG_HEADERS, timeout=20)
+                            _LIMITER.acquire()
+                            resp = requests.get(img_url, headers=IMG_HEADERS, timeout=20, **_LIMITER.requests_kwargs())
+                            if resp.status_code == 429:
+                                _LIMITER.note_429(retry_after=_retry_after_seconds(resp))
                             if resp.ok:
+                                _LIMITER.note_success()
                                 ok = save_to_queue(stem, img_url, resp.content, prompt, {
                                     "source_channel": f"reddit_search",
                                     "source_guild":   f"reddit.com/r/{subreddit}",
@@ -346,11 +373,17 @@ def scrape_promptsref(seen: set) -> int:
     for page_url, source_label in PROMPTSREF_PAGES:
         print(f"  promptsref: {page_url}", flush=True)
         try:
-            r = requests.get(page_url, headers=HEADERS, timeout=20)
+            _LIMITER.acquire()
+            r = requests.get(page_url, headers=HEADERS, timeout=20, **_LIMITER.requests_kwargs())
+            if r.status_code == 429:
+                _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+                print(f"    Rate limited, backing off...")
+                continue
             if not r.ok:
                 print(f"    Failed: {r.status_code}")
                 continue
 
+            _LIMITER.note_success()
             text = r.text
 
             # Extract JSON prompt blocks - promptsref renders them as JSON in script or pre tags

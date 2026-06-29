@@ -20,7 +20,7 @@ load_dotenv()
 # DISCORD_AUTH_PREFIX (legacy) still works as a manual override.
 from credentials import get_optional, warn_if_missing  # noqa: E402
 
-USER_TOKEN = get_optional("DISCORD_BOT_TOKEN")
+USER_TOKEN = get_optional("DISCORD_BOT_TOKEN") or ""
 if not USER_TOKEN:
     print("[scraper_discord] WARNING: DISCORD_BOT_TOKEN not set in .env", flush=True)
 
@@ -55,6 +55,29 @@ from queue_manager import save_to_queue  # noqa: E402
 from seen_store import SeenStore  # noqa: E402
 
 from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+from rate_limit import RateLimitConfig, RateLimiter  # noqa: E402
+
+# Per-source pacing + 429 backoff + optional proxy. Opt-in: unthrottled unless
+# RATE_LIMIT_DISCORD_* env is set, so existing behaviour is unchanged.
+_LIMITER = RateLimiter(RateLimitConfig.from_mapping("discord", os.environ))
+
+
+def _retry_after_seconds(resp) -> float | None:
+    """Parse Discord's Retry-After (header or JSON ``retry_after`` body) → float."""
+    if resp is None:
+        return None
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        try:
+            raw = resp.json().get("retry_after")
+        except Exception:
+            raw = None
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 MESSAGES_PER_CHANNEL = 400
 _TOPIC_CFG = _load_topic_config()
@@ -96,14 +119,20 @@ def fetch_messages(channel_id, limit=400):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     results, params = [], {"limit": 100}
     while len(results) < limit:
-        resp = requests.get(url, headers=DL_HEADERS, params=params)
+        _LIMITER.acquire()
+        resp = requests.get(url, headers=DL_HEADERS, params=params, **_LIMITER.requests_kwargs())
+        if resp.status_code == 429:
+            _LIMITER.note_429(retry_after=_retry_after_seconds(resp))
+            print(f"  [429] Rate limited on {channel_id}, backing off...")
+            continue
         if resp.status_code == 403:
             print(f"  [SKIP] No access: {channel_id} (token not a member of server / missing intent)")
             return []
         if resp.status_code == 401:
             # Auto mode: flip from Bot -> user once and retry the same request.
             if _flip_auth_to_user():
-                resp = requests.get(url, headers=DL_HEADERS, params=params)
+                _LIMITER.acquire()
+                resp = requests.get(url, headers=DL_HEADERS, params=params, **_LIMITER.requests_kwargs())
                 if resp.status_code == 200:
                     pass  # fall through to normal handling
                 else:
@@ -127,6 +156,7 @@ def fetch_messages(channel_id, limit=400):
         if resp.status_code != 200:
             print(f"  [ERR] {resp.status_code}")
             break
+        _LIMITER.note_success()
         batch = resp.json()
         if not batch: break
         results.extend(batch)
@@ -137,8 +167,15 @@ def fetch_messages(channel_id, limit=400):
 
 def download_bytes(url):
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        return r.content if r.status_code == 200 else None
+        _LIMITER.acquire()
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, **_LIMITER.requests_kwargs())
+        if r.status_code == 429:
+            _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+            return None
+        if r.status_code == 200:
+            _LIMITER.note_success()
+            return r.content
+        return None
     except: return None
 
 def extract_prompt_from_png(data):
