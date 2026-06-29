@@ -109,16 +109,14 @@ config_checks = {}
 def _redact_secret(value: str) -> str:
     """Return a non-sensitive presence indicator for a credential.
 
-    Never echoes the raw secret. Shows only enough to be diagnostic:
-    "(set, ab...yz, len=N)" for a populated value, "(unset)" otherwise.
-    This is a sanitization barrier — the secret never reaches the sink.
+    Never echoes the raw secret OR any slice of it — only whether it is set and
+    its length, neither of which is recoverable secret material: "(set, len=N)"
+    for a populated value, "(unset)" otherwise. This is a sanitization barrier —
+    no character of the secret ever reaches the logging sink.
     """
     if not value or value == "your_":
         return "(unset)"
-    length = len(value)
-    if length <= 8:
-        return f"(set, len={length})"
-    return f"(set, {value[:4]}...{value[-4:]}, len={length})"
+    return f"(set, len={len(value)})"
 
 
 # Discord
