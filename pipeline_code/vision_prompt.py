@@ -334,6 +334,59 @@ def caption_style_instruction(style: str) -> str:
     return _CAPTION_STYLE_INSTRUCTIONS.get(style, _CAPTION_STYLE_INSTRUCTIONS["sd_prompt"])
 
 
+# ── Active-learning few-shot exemplars ───────────────────────────────────────
+# job_config.resolve_env projects the active job's accumulated user corrections
+# into ACTIVE_LEARNING_EXEMPLARS_JSON ({category: [{image_key, caption?, note},
+# ...]}). When present we fold a short few-shot block into the prompt so the
+# model is steered by THIS curator's past calls. The var is an internal
+# projection (never user-set); when absent/empty the prompt is byte-identical.
+_MAX_EXEMPLAR_CATEGORIES = 12
+_MAX_EXEMPLARS_PER_CATEGORY = 3
+
+
+def _active_learning_exemplars_block(raw: str | None) -> str:
+    """Render the few-shot block from ACTIVE_LEARNING_EXEMPLARS_JSON.
+
+    Returns "" (so the prompt is unchanged) when the var is absent, blank,
+    unparseable, or carries no usable exemplars. Tolerant by design — a malformed
+    projection must never corrupt the prompt."""
+    if not raw or not raw.strip():
+        return ""
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+
+    lines: list[str] = []
+    for category in list(data)[:_MAX_EXEMPLAR_CATEGORIES]:
+        items = data.get(category)
+        if not isinstance(items, list) or not items:
+            continue
+        rendered: list[str] = []
+        for ex in items[:_MAX_EXEMPLARS_PER_CATEGORY]:
+            if not isinstance(ex, dict):
+                continue
+            note = str(ex.get("note") or "").strip()
+            caption = str(ex.get("caption") or "").strip()
+            detail = note or str(ex.get("image_key") or "").strip()
+            if caption:
+                detail = f"{detail} — {caption}" if detail else caption
+            if detail:
+                rendered.append(f"    - {detail}")
+        if rendered:
+            lines.append(f"  {category}:")
+            lines.extend(rendered)
+    if not lines:
+        return ""
+    return (
+        "\nExamples from this curator's past corrections (treat as strong "
+        "guidance for borderline calls, NOT as overrides of what the pixels "
+        "show):\n" + "\n".join(lines) + "\n"
+    )
+
+
 def build_classification_prompt(
     cfg: ScoreConfig | None = None,
     caption_cfg: CaptionConfig | None = None,
@@ -389,6 +442,10 @@ def build_classification_prompt(
         "- DISCARD: image fails the gates above OR doesn't fit any keep bucket."
     )
 
+    exemplars_block = _active_learning_exemplars_block(
+        os.environ.get("ACTIVE_LEARNING_EXEMPLARS_JSON")
+    )
+
     return (
         "You are a strict, literal image auditor. You will be told the topic "
         "an admin is curating, but the topic ONLY informs REL_Quality_Score. "
@@ -426,6 +483,7 @@ def build_classification_prompt(
         "CATEGORY ASSIGNMENT (apply in order, first match wins):\n"
         f"{category_bullets}"
         + caption_block
+        + exemplars_block
     )
 
 

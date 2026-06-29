@@ -1467,7 +1467,7 @@ def _validate_scrapers_cfg(s: Any) -> tuple[dict | None, str]:
     if not isinstance(s, dict):
         return None, "scrapers must be an object"
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -1490,6 +1490,11 @@ def _validate_scrapers_cfg(s: Any) -> tuple[dict | None, str]:
             if err:
                 return None, err
             out[k] = clean_gd
+        elif k == "yt_dlp":
+            clean_yt, err = _validate_yt_dlp(v)
+            if err:
+                return None, err
+            out[k] = clean_yt
         else:  # local_imports
             clean_li, err = _validate_local_imports(v)
             if err:
@@ -1523,6 +1528,36 @@ def _validate_gallery_dl(gd: Any) -> tuple[dict | None, str]:
         else:  # cookies_file / config_path
             if _bad_path_str(v):
                 return None, f"gallery_dl.{k} is not a valid path string"
+            out[k] = v
+    return out, ""
+
+
+def _validate_yt_dlp(yt: Any) -> tuple[dict | None, str]:
+    """Validate the per-job scrapers.yt_dlp block (mirrors _validate_gallery_dl)."""
+    if not isinstance(yt, dict):
+        return None, "scrapers.yt_dlp must be an object"
+    allowed = {"enabled", "urls", "limit", "cookies"}
+    out: dict[str, Any] = {}
+    for k, v in yt.items():
+        if k not in allowed:
+            return None, f"unknown yt_dlp key: {k!r}"
+        if k == "enabled":
+            out[k] = bool(v)
+        elif k == "urls":
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                return None, "yt_dlp.urls must be a list of strings"
+            if any("\x00" in x for x in v):
+                return None, "yt_dlp.urls contains a NUL byte"
+            out[k] = v
+        elif k == "limit":
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return None, "yt_dlp.limit must be an integer"
+            out[k] = max(1, min(5000, iv))
+        else:  # cookies
+            if _bad_path_str(v):
+                return None, "yt_dlp.cookies is not a valid path string"
             out[k] = v
     return out, ""
 
