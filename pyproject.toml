@@ -92,7 +92,7 @@ ml = [
 ]
 # Dev / CI tooling.
 dev = [
-    "pytest>=8",
+    "pytest>=9.1.1",
     "ruff>=0.5",
     "pip-audit>=2.7",
 ]
