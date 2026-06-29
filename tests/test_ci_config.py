@@ -95,9 +95,10 @@ class TestCIWorkflow:
         assert "matrix" in _norm(ci_text), "no build matrix declared"
 
     def test_uses_pinned_checkout_and_setup_python(self, ci_text: str) -> None:
-        # Actions must be version-pinned, not floating on a branch.
-        assert "actions/checkout@v4" in ci_text
-        assert "actions/setup-python@v5" in ci_text
+        # Actions must be version-pinned (@vN), not floating on a branch — but the
+        # exact major can move (Dependabot bumps it), so assert the pin shape only.
+        assert re.search(r"actions/checkout@v\d+", ci_text), "checkout not version-pinned"
+        assert re.search(r"actions/setup-python@v\d+", ci_text), "setup-python not version-pinned"
 
     def test_pip_cache_enabled(self, ci_text: str) -> None:
         # setup-python's built-in pip cache keeps the gallery-dl git dep fast-ish.

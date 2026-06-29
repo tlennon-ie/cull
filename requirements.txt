@@ -21,7 +21,7 @@ requests>=2.32                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.3
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
 groq>=0.20                        # Groq cloud worker
 openai>=1.40                      # OpenAI + OpenRouter cloud vision workers
-anthropic>=0.40                   # Anthropic Claude cloud vision worker
+anthropic>=0.112.0                # Anthropic Claude cloud vision worker
 google-genai>=1.0                 # Gemini cloud vision worker (NEW SDK, not google-generativeai)
 
 # ── Scrapers ─────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.4
 yt-dlp>=2026.6.9                  # video scraping lane (scraper_yt_dlp.py)
 
 # ── Dataset export ───────────────────────────────────────────────────────
-huggingface_hub>=0.34             # push curated sets to a private HF dataset repo (hf_export.py)
+huggingface_hub>=1.21.0           # push curated sets to a private HF dataset repo (hf_export.py)
 
 # ── Optional feature extras (NOT installed by base; see pyproject extras) ──
 # Heavy/optional capabilities import-guard their deps so the base stays lean:
