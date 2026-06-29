@@ -1242,7 +1242,11 @@ def api_vision_test():
                 return _done(False, "401 Unauthorized - key invalid")
             if r.status_code != 200:
                 return _done(False, f"HTTP {r.status_code}: {r.text[:200]}")
-            return _done(True, "Groq key accepted")
+            # Groq's /openai/v1/models is OpenAI-shaped — return the catalogue so
+            # the Settings dropdown mirrors the other cloud providers.
+            models = [m.get("id", "") for m in (r.json().get("data") or [])
+                      if isinstance(m, dict) and m.get("id")]
+            return _done(True, f"connected, {len(models)} model(s) available", models=models)
 
         if provider == "ollama":
             url = (body_url or os.environ.get("OLLAMA_URL", "") or "http://127.0.0.1:11434").rstrip("/")
@@ -3746,6 +3750,38 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     x-text="(scraperTest['{{ scraper }}']?.ok ? '✓ ' : '✕ ') + (scraperTest['{{ scraper }}']?.message || '') + (scraperTest['{{ scraper }}']?.latency_ms != null ? ' (' + scraperTest['{{ scraper }}'].latency_ms + 'ms)' : '')"></span>
 </div>
 {%- endmacro -%}
+{# toggle(key, label, help) — a real switch bound to a settings value stored as
+   the string "true"/"false". A transparent native checkbox handles interaction +
+   keyboard focus and its @change bubbles so the Settings form dirty-tracking
+   fires (same contract as the legacy BLUR_NSFW_THUMBS checkbox); Alpine :class
+   drives the visual state. #}
+{% macro toggle(key, label, help='') -%}
+<label class="flex items-center justify-between gap-3 py-1.5 cursor-pointer select-none">
+  <span class="text-xs text-slate-300">{{ label }}{% if help %}{{ tip(help) }}{% endif %}</span>
+  <span class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+        :class="settings.{{ key }} === 'true' ? 'bg-indigo-500' : 'bg-slate-600'">
+    <input type="checkbox" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
+      :checked="settings.{{ key }} === 'true'"
+      @change="settings.{{ key }} = $event.target.checked ? 'true' : 'false'"/>
+    <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform pointer-events-none"
+      :class="settings.{{ key }} === 'true' ? 'translate-x-4' : 'translate-x-1'"></span>
+  </span>
+</label>
+{%- endmacro -%}
+{# slider(key, label, min, max, step, help, suffix) — a min..max range bound to a
+   numeric settings value, with a live value bubble. x-model fires input events
+   that bubble for dirty-tracking; accent colours the native track. #}
+{% macro slider(key, label, min=0, max=100, step=1, help='', suffix='') -%}
+<label class="block py-1.5">
+  <span class="flex items-center justify-between text-xs text-slate-300">
+    <span>{{ label }}{% if help %}{{ tip(help) }}{% endif %}</span>
+    <span class="font-mono text-indigo-300" x-text="(settings.{{ key }} || '{{ min }}') + '{{ suffix }}'"></span>
+  </span>
+  <input type="range" min="{{ min }}" max="{{ max }}" step="{{ step }}"
+    :value="settings.{{ key }} || '{{ min }}'" @input="settings.{{ key }} = $event.target.value"
+    class="w-full mt-2 accent-indigo-500 cursor-pointer"/>
+</label>
+{%- endmacro -%}
 <!doctype html>
 <html lang="en" class="dark">
 <head>
@@ -4142,8 +4178,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Cadence</span>
-            <input x-model="schedules.form.cadence" placeholder="@daily"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 mt-1 font-mono text-xs"/>
+            <select x-model="schedules.form.cadence"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 mt-1 text-sm">
+              <template x-for="opt in scheduleCadences" :key="opt.value">
+                <option :value="opt.value" :selected="schedules.form.cadence === opt.value" x-text="opt.label"></option>
+              </template>
+            </select>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Action</span>
@@ -5052,8 +5092,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('scoring.ovr_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.ovr_min')" @click="resetOverride('scoring.ovr_min')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input type="number" min="0" max="100" :value="effVal('scoring.ovr_min')" @input="setOverride('scoring.ovr_min', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scoring.ovr_min') ? 'text-slate-400' : ''"/>
+            <div class="flex items-center gap-3">
+              <input type="range" min="0" max="100" step="1" :value="effVal('scoring.ovr_min')" @input="setOverride('scoring.ovr_min', Number($event.target.value))"
+                     class="flex-1 accent-indigo-500 cursor-pointer"/>
+              <span class="text-sm font-mono w-9 text-right" :class="isOver('scoring.ovr_min') ? 'text-indigo-300' : 'text-slate-500'" x-text="(effVal('scoring.ovr_min') ?? 0)"></span>
+            </div>
           </div>
           <div>
             <div class="flex items-center justify-between mb-1">
@@ -5061,8 +5104,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('scoring.rel_min')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scoring.rel_min')" @click="resetOverride('scoring.rel_min')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input type="number" min="0" max="100" :value="effVal('scoring.rel_min')" @input="setOverride('scoring.rel_min', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scoring.rel_min') ? 'text-slate-400' : ''"/>
+            <div class="flex items-center gap-3">
+              <input type="range" min="0" max="100" step="1" :value="effVal('scoring.rel_min')" @input="setOverride('scoring.rel_min', Number($event.target.value))"
+                     class="flex-1 accent-indigo-500 cursor-pointer"/>
+              <span class="text-sm font-mono w-9 text-right" :class="isOver('scoring.rel_min') ? 'text-indigo-300' : 'text-slate-500'" x-text="(effVal('scoring.rel_min') ?? 0)"></span>
+            </div>
           </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
@@ -5569,7 +5615,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
             <div class="flex items-center justify-between mb-2">
               <div class="text-sm font-semibold">New preset</div>
-              <button @click="$refs.presetImport.click()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Import…</button>
+              <button @click="$refs.presetImport.click()" :disabled="configImporting" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="configImporting ? 'Importing…' : 'Import…'"></span></button>
               <input x-ref="presetImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
             </div>
             <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
@@ -5629,15 +5675,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="mt-1 flex flex-wrap gap-2">
                 <template x-for="nm in scraperNames" :key="'pe_'+nm">
                   <label class="flex items-center gap-1 text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1">
-                    <input type="checkbox" :checked="(presetEditor.cfg.scrapers.enabled||{})[nm] !== false"
+                    <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.enabled||{})[nm] !== false"
                            @change="(() => { const e = {...(presetEditor.cfg.scrapers.enabled||{})}; e[nm] = $event.target.checked; peSet('scrapers.enabled', e); })()"/>
                     <span x-text="nm"></span>
                   </label>
                 </template>
               </div>
             </label>
-            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
-            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
@@ -5685,10 +5731,16 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
           <div class="grid md:grid-cols-3 gap-3">
             <label class="block"><span class="text-xs text-slate-400">Min OVR{{ tip('Hard floor on the <b>overall</b> quality score (0-100); below this goes to DISCARD. 0 disables.', 'e.g. 60') }}</span>
-              <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.ovr_min" @input="peSet('scoring.ovr_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <div class="flex items-center gap-2 mt-1">
+                <input type="range" min="0" max="100" step="1" :value="presetEditor.cfg.scoring.ovr_min" @input="peSet('scoring.ovr_min', Number($event.target.value))" class="flex-1 accent-indigo-500 cursor-pointer"/>
+                <span class="text-xs font-mono text-indigo-300 w-8 text-right" x-text="(presetEditor.cfg.scoring.ovr_min ?? 0)"></span>
+              </div></label>
             <label class="block"><span class="text-xs text-slate-400">Min REL{{ tip('Hard floor on the <b>relevance</b> score to the subject (0-100). 0 disables.', 'e.g. 50') }}</span>
-              <input type="number" min="0" max="100" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
+              <div class="flex items-center gap-2 mt-1">
+                <input type="range" min="0" max="100" step="1" :value="presetEditor.cfg.scoring.rel_min" @input="peSet('scoring.rel_min', Number($event.target.value))" class="flex-1 accent-indigo-500 cursor-pointer"/>
+                <span class="text-xs font-mono text-indigo-300 w-8 text-right" x-text="(presetEditor.cfg.scoring.rel_min ?? 0)"></span>
+              </div></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.captioning.enabled" @change="peSet('captioning.enabled', $event.target.checked)"/><span class="text-sm">Auto-caption</span></label>
           </div>
 
           <!-- Vision workers: the global default fleet jobs inheriting this preset use. -->
@@ -5776,7 +5828,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <p class="text-xs text-slate-400 mb-3">Export every job + preset to one JSON file, or import a config / preset / job export. Import is additive — existing names are skipped unless you confirm an overwrite.</p>
         <div class="flex flex-wrap gap-2">
           <a href="/api/config/export" download class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Export all config</a>
-          <button @click="$refs.configImport.click()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Import config / preset / job…</button>
+          <button @click="$refs.configImport.click()" :disabled="configImporting" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50"><span x-text="configImporting ? 'Importing…' : 'Import config / preset / job…'"></span></button>
           <input x-ref="configImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
         </div>
       </div>
@@ -5817,8 +5869,14 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="gSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
-                  <input type="checkbox" :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
+                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer select-none">
+                  <span class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+                        :class="w.enabled ? 'bg-indigo-500' : 'bg-slate-600'">
+                    <input type="checkbox" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
+                      :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
+                    <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform pointer-events-none"
+                      :class="w.enabled ? 'translate-x-4' : 'translate-x-1'"></span>
+                  </span>
                   <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
@@ -5837,6 +5895,49 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <button @click="gAddFleet()" x-show="globalVision.loaded" class="mt-2 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
         <div x-show="!globalVision.loaded" class="text-xs text-slate-500 italic mt-2">Loading…</div>
+      </div>
+
+      <!-- LM Studio runtime — part of Local vision: VRAM unload policy + per-endpoint
+           timeouts for the local fleet above. Plain .env card (no @change.stop) so its
+           toggle/number inputs bubble up and mark the settings form dirty. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">LM Studio runtime <span class="text-xs font-normal text-slate-500">(local vision)</span></h3>
+        <p class="text-xs text-slate-400 mb-3">VRAM-unload policy and per-endpoint timeouts for the local fleet above. Test the primary LM Studio endpoint or free its VRAM on demand.</p>
+        <div class="flex items-center gap-3 flex-wrap mb-3">
+          <button @click="testProvider('lmstudio')" :disabled="!!providerTest.lmstudio?.testing"
+            class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
+            <span x-text="providerTest.lmstudio?.testing ? 'Testing…' : 'Test LM Studio'"></span>
+          </button>
+          <span class="text-xs" x-show="providerTest.lmstudio?.message"
+            :class="providerTest.lmstudio?.ok ? 'text-emerald-300' : 'text-rose-300'"
+            x-text="providerTest.lmstudio?.message"></span>
+          <button @click="unloadLmStudio()" :disabled="lmstudioUnload.busy"
+            class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50"
+            title="Free VRAM by unloading every model in LM Studio. Safe to call any time — JIT load fires on the next image.">
+            <span x-text="lmstudioUnload.busy ? 'Unloading…' : 'Unload LM Studio'"></span>
+          </button>
+          <span class="text-xs" x-show="lmstudioUnload.message"
+            :class="lmstudioUnload.ok ? 'text-emerald-300' : 'text-rose-300'"
+            x-text="lmstudioUnload.message"></span>
+        </div>
+        <div class="grid md:grid-cols-2 gap-x-8 gap-y-1">
+          {{ toggle('LMSTUDIO_UNLOAD_ON_STOP', 'Unload models when the pipeline stops', 'Free GPU VRAM by unloading every LM Studio model when you Stop the pipeline. JIT reload fires on the next image.') }}
+          <label class="block py-1.5">
+            <span class="text-xs text-slate-300">Idle auto-unload (minutes){{ tip('Auto-unload after this many idle minutes with an empty queue. 0 = never. Ignored while the lm-keepalive worker is active.') }}</span>
+            <input x-model="settings.LMSTUDIO_IDLE_UNLOAD_MINUTES" type="number" min="0" placeholder="10"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block py-1.5">
+            <span class="text-xs text-slate-300">Primary endpoint timeout (s){{ tip('Request timeout in seconds for the primary LM Studio endpoint.') }}</span>
+            <input x-model="settings.LMSTUDIO_PRIMARY_TIMEOUT" type="number" min="1" placeholder="120"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block py-1.5">
+            <span class="text-xs text-slate-300">Secondary endpoint timeout (s){{ tip('Request timeout in seconds for the secondary LM Studio endpoint (only if you run a second one).') }}</span>
+            <input x-model="settings.LMSTUDIO_SECONDARY_TIMEOUT" type="number" min="1" placeholder="120"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-1.5 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
       </div>
 
       <div class="card rounded-xl p-5">
@@ -5863,15 +5964,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1" :class="settingsErrors.PIPELINE_RECONCILE_SECONDS ? 'border-rose-600' : ''"/>
             <span class="text-[10px] text-slate-500">How quickly toggles take effect without a restart. Lower = snappier.</span>
           </label>
-          <label class="flex items-start gap-2 mt-5">
-            <input type="checkbox" :checked="settings.BLUR_NSFW_THUMBS === 'true'"
-                   @change="settings.BLUR_NSFW_THUMBS = $event.target.checked ? 'true' : 'false'"
-                   class="mt-1"/>
-            <div>
-              <div class="text-xs text-slate-300">Blur NSFW thumbnails by default</div>
-              <div class="text-[10px] text-slate-500">A small eye icon reveals a single image temporarily.</div>
-            </div>
-          </label>
+          <div class="mt-4 self-center">
+            {{ toggle('BLUR_NSFW_THUMBS', 'Blur NSFW thumbnails by default', 'A small eye icon reveals a single image temporarily.') }}
+          </div>
         </div>
       </div>
 
@@ -5907,153 +6002,67 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
+      <!-- Cloud vision providers — Groq joined with OpenAI / Anthropic / Gemini /
+           OpenRouter in one section. Each row: API key + Test (pulls the live model
+           list) + model dropdown + refresh. Enable a provider as a worker on the
+           Vision tab; its key + chosen model save to .env here. -->
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">Vision provider credentials</h3>
-        <p class="text-xs text-slate-400 mb-3">
-          You only need keys for the providers you select on the <strong>Vision</strong> tab.
-          Click <em>Test</em> after saving to confirm the credential works without starting the pipeline.
-        </p>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">GROQ_API_KEY (single key)</span>
-            <input x-model="settings.GROQ_API_KEY" type="password" placeholder="gsk_..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"
-              :class="settingsErrors.GROQ_API_KEY ? 'border-rose-600' : ''"/>
-            <span x-show="settingsErrors.GROQ_API_KEY" class="text-xs text-rose-300 mt-1 block" x-text="settingsErrors.GROQ_API_KEY"></span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">GROQ_API_KEYS{{ tip('One or more Groq API keys, comma-separated. cull rotates them round-robin to spread rate limits across keys.', 'gsk_one, gsk_two, gsk_three') }}</span>
-            <input x-model="settings.GROQ_API_KEYS" type="password" placeholder="gsk_one,gsk_two,gsk_three"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">GROQ_MODEL</span>
-            <input x-model="settings.GROQ_MODEL" placeholder="meta-llama/llama-4-scout-17b-16e-instruct"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <div class="flex items-end">
-            <button @click="testProvider('groq')" :disabled="!!providerTest.groq?.testing"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
-              <span x-text="providerTest.groq?.testing ? 'Testing...' : 'Test Groq'"></span>
-            </button>
-            <span class="ml-3 text-xs" x-show="providerTest.groq?.message"
-              :class="providerTest.groq?.ok ? 'text-emerald-300' : 'text-rose-300'"
-              x-text="providerTest.groq?.message"></span>
-          </div>
-
-          <div class="md:col-span-2 flex items-center gap-3">
-            <button @click="testProvider('lmstudio')" :disabled="!!providerTest.lmstudio?.testing"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">
-              <span x-text="providerTest.lmstudio?.testing ? 'Testing...' : 'Test LM Studio'"></span>
-            </button>
-            <span class="text-xs" x-show="providerTest.lmstudio?.message"
-              :class="providerTest.lmstudio?.ok ? 'text-emerald-300' : 'text-rose-300'"
-              x-text="providerTest.lmstudio?.message"></span>
-            <button @click="unloadLmStudio()" :disabled="lmstudioUnload.busy"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm"
-              title="Free VRAM by unloading every model in LM Studio. Safe to call any time — JIT load fires on the next image.">
-              <span x-text="lmstudioUnload.busy ? 'Unloading...' : 'Unload LM Studio'"></span>
-            </button>
-            <span class="text-xs" x-show="lmstudioUnload.message"
-              :class="lmstudioUnload.ok ? 'text-emerald-300' : 'text-rose-300'"
-              x-text="lmstudioUnload.message"></span>
-          </div>
-
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">LMSTUDIO_UNLOAD_ON_STOP — unload models when the pipeline stops (true/false)</span>
-            <input x-model="settings.LMSTUDIO_UNLOAD_ON_STOP" placeholder="true"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">LMSTUDIO_IDLE_UNLOAD_MINUTES — auto-unload after this many idle minutes (0 = off, ignored when lm-keepalive is active)</span>
-            <input x-model="settings.LMSTUDIO_IDLE_UNLOAD_MINUTES" type="number" min="0" placeholder="10"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-        </div>
-      </div>
-
-      <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">Cloud vision provider keys{{ tip('API keys + chosen model for the cloud vision workers (OpenAI / Anthropic / Gemini / OpenRouter). Enable the worker and pick a model on the Vision tab. Leave a model blank to auto-detect a vision-capable one.') }}</h3>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">OPENAI_API_KEY</span>
-            <input x-model="settings.OPENAI_API_KEY" type="password" placeholder="sk-..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">OPENAI_VISION_MODEL</span>
-            <input x-model="settings.OPENAI_VISION_MODEL" placeholder="(auto-detect)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">ANTHROPIC_API_KEY</span>
-            <input x-model="settings.ANTHROPIC_API_KEY" type="password" placeholder="sk-ant-..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">ANTHROPIC_VISION_MODEL</span>
-            <input x-model="settings.ANTHROPIC_VISION_MODEL" placeholder="(auto-detect)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">GEMINI_API_KEY / GOOGLE_API_KEY</span>
-            <input x-model="settings.GEMINI_API_KEY" type="password" placeholder="AIza..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">GEMINI_VISION_MODEL</span>
-            <input x-model="settings.GEMINI_VISION_MODEL" placeholder="(auto-detect)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">OPENROUTER_API_KEY</span>
-            <input x-model="settings.OPENROUTER_API_KEY" type="password" placeholder="sk-or-..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">OPENROUTER_VISION_MODEL</span>
-            <input x-model="settings.OPENROUTER_VISION_MODEL" placeholder="(auto-detect)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
+        <h3 class="font-semibold mb-1">Cloud vision providers{{ tip('Optional paid cloud workers that run alongside your local fleet. Paste a key, click Test to pull the live model list, then pick a model. Enable the worker itself on the Vision tab; keys + chosen models save to .env.') }}</h3>
+        <p class="text-xs text-slate-400 mb-3">Paste a key and <b>Test</b> to fetch that provider's live models, then choose one. Leave the model blank to auto-detect a vision-capable one on first use.</p>
+        <div class="space-y-2">
+          <template x-for="cp in settingsCloudProviders" :key="'setcloud_'+cp">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium" x-text="cloudProviderLabels[cp]"></span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-emerald-400" x-show="cloudEnabled(cp)" x-cloak>enabled worker</span>
+              </div>
+              <div class="grid md:grid-cols-12 gap-2 items-center">
+                <input type="password" :value="settings[cloudApiKey(cp)] || ''"
+                       @input="settings[cloudApiKey(cp)] = $event.target.value"
+                       :placeholder="cp === 'groq' ? 'gsk_...' : 'API key'" autocomplete="off"
+                       class="md:col-span-5 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"/>
+                <select :value="settings[cloudModelKey(cp)] || ''"
+                        @change="settings[cloudModelKey(cp)] = $event.target.value"
+                        title="Run Test to load the model list"
+                        class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
+                  <option value="">(auto-detect — Test to load)</option>
+                  <template x-for="m in cloudModelOptions(cp)" :key="cp+'_'+m">
+                    <option :value="m" :selected="m === settings[cloudModelKey(cp)]" x-text="m"></option>
+                  </template>
+                </select>
+                <button @click="testProvider(cp)" :disabled="!!(providerTest[cp] && providerTest[cp].testing)"
+                        class="md:col-span-2 px-2 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="(providerTest[cp] && providerTest[cp].testing) ? 'Testing…' : 'Test'"></span>
+                </button>
+                <button @click="testProvider(cp)" :disabled="!!(providerTest[cp] && providerTest[cp].testing)"
+                        title="Refresh model list" aria-label="Refresh model list"
+                        class="md:col-span-1 px-2 py-1.5 text-sm bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">↺</button>
+              </div>
+              <div class="mt-2" x-show="cp === 'groq'" x-cloak>
+                <input type="password" :value="settings.GROQ_API_KEYS || ''"
+                       @input="settings.GROQ_API_KEYS = $event.target.value"
+                       placeholder="GROQ_API_KEYS — optional, comma-separated keys for round-robin rotation" autocomplete="off"
+                       class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs font-mono"/>
+              </div>
+              <div class="text-xs mt-2 truncate" x-show="providerTest[cp] && !providerTest[cp].testing" x-cloak
+                   :class="providerTest[cp]?.ok ? 'text-emerald-300' : 'text-rose-300'" x-text="providerTest[cp]?.message"></div>
+            </div>
+          </template>
         </div>
       </div>
 
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Features &amp; automation{{ tip('Global feature toggles for the Wave-2 pipeline add-ons. These are read by the supervisor on (re)start — stop and start the pipeline to apply.') }}</h3>
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">PREFILTER_ENABLED — aesthetic pre-filter before classification (true/false)</span>
-            <input x-model="settings.PREFILTER_ENABLED" placeholder="false"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">PREFILTER_MIN_SCORE — drop below this aesthetic score (0-100)</span>
-            <input x-model="settings.PREFILTER_MIN_SCORE" type="number" min="0" max="100" placeholder="50"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">WEBHOOK_URL — POST a JSON event here when a job completes</span>
+        <div class="grid md:grid-cols-2 gap-x-8 gap-y-1">
+          {{ toggle('PREFILTER_ENABLED', 'Aesthetic pre-filter', 'Score images on aesthetic quality before the vision model runs and drop the worst — saves classification spend on junk. Uses the “Pre-filter min score” below.') }}
+          {{ slider('PREFILTER_MIN_SCORE', 'Pre-filter min score', 0, 100, 1, 'Drop images scoring below this aesthetic score (0–100). Only applies when the aesthetic pre-filter is on.') }}
+          {{ toggle('SCHEDULER_ENABLED', 'Scheduler', 'Run due per-job schedules on the supervisor reconcile loop. Configure cadences on a job’s Schedules tab.') }}
+          {{ toggle('DESKTOP_NOTIFICATIONS', 'Desktop notifications', 'Fire a desktop toast when a job completes (best-effort; needs a notification backend installed).') }}
+          {{ toggle('EMBEDDINGS_ENABLED', 'CLIP embeddings index', 'Build a CLIP embeddings index that powers near-duplicate detection and the “find similar” / balance tools.') }}
+          {{ toggle('VIDEO_CLASSIFY_ENABLED', 'Classify video clips', 'Classify video clips from a sampled frame, not just still images.') }}
+          <label class="block md:col-span-2 mt-2">
+            <span class="text-xs text-slate-400">WEBHOOK_URL{{ tip('POST a JSON event here when a job completes — fan out to Slack, Discord, or a home-automation hook. Leave blank to disable.') }}</span>
             <input x-model="settings.WEBHOOK_URL" placeholder="https://hooks.example.com/..."
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">DESKTOP_NOTIFICATIONS — fire a desktop toast on completion (true/false)</span>
-            <input x-model="settings.DESKTOP_NOTIFICATIONS" placeholder="false"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">SCHEDULER_ENABLED — run due schedules on the reconcile loop (true/false)</span>
-            <input x-model="settings.SCHEDULER_ENABLED" placeholder="false"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">EMBEDDINGS_ENABLED — build a CLIP embeddings index for dedup/search (true/false)</span>
-            <input x-model="settings.EMBEDDINGS_ENABLED" placeholder="false"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">VIDEO_CLASSIFY_ENABLED — classify video clips, not just stills (true/false)</span>
-            <input x-model="settings.VIDEO_CLASSIFY_ENABLED" placeholder="false"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
         </div>
@@ -6062,11 +6071,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">YT-DLP scraper{{ tip('Pull frames/clips from any site yt-dlp supports (YouTube, Vimeo, and 1000+ more). Enable, paste URLs (one per line or comma-separated), optionally cap per-URL items and point at a cookies.txt for gated content.') }}</h3>
         <div class="grid md:grid-cols-2 gap-4">
-          <label class="block">
-            <span class="text-xs text-slate-400">YT_DLP_ENABLED (true/false)</span>
-            <input x-model="settings.YT_DLP_ENABLED" placeholder="false"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
+          <div class="self-center">
+            {{ toggle('YT_DLP_ENABLED', 'yt-dlp scraper enabled', 'Enable the yt-dlp video lane for the URLs below.') }}
+          </div>
           <label class="block">
             <span class="text-xs text-slate-400">YT_DLP_LIMIT — max items per URL</span>
             <input x-model="settings.YT_DLP_LIMIT" type="number" min="1" placeholder="25"
@@ -6456,7 +6463,7 @@ function dashboard() {
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '', settingsBannerOk: true,
-    settingsDirty: false, settingsErrors: {},
+    settingsDirty: false, settingsErrors: {}, configImporting: false,
     providerTest: {},
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, local_sha: '', remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '', dirty: false, checking: false, checked: false },
@@ -6485,6 +6492,18 @@ function dashboard() {
                natural_language: 'Natural-language', motion: 'Motion / video' }[id] || id,
     })),
     hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '', status: '' },
+    // Cadence presets — every value here parses via scheduler.cadence_seconds().
+    scheduleCadences: [
+      { value: '@hourly', label: 'Hourly' },
+      { value: '@daily', label: 'Daily' },
+      { value: '@weekly', label: 'Weekly' },
+      { value: 'every 15m', label: 'Every 15 minutes' },
+      { value: 'every 30m', label: 'Every 30 minutes' },
+      { value: 'every 1h', label: 'Every hour' },
+      { value: 'every 2h', label: 'Every 2 hours' },
+      { value: 'every 6h', label: 'Every 6 hours' },
+      { value: 'every 12h', label: 'Every 12 hours' },
+    ],
     schedules: { loading: false, rows: [], actions: [], error: '',
                  form: { slug: '', cadence: '@daily', action: 'scrape', enabled: true } },
     visionHealth: { loading: false, probes: {}, fleet: [], error: '' },
@@ -6576,14 +6595,19 @@ function dashboard() {
       if (!file) return;
       let env;
       try { env = JSON.parse(await file.text()); } catch (e) { this.notify('Not valid JSON', 'error'); return; }
-      if (env.kind === 'cull.preset' || (env.name && env.cfg && !env.kind)) { return this._importPreset(env.name, env.cfg); }
-      if (env.kind !== 'cull.config' && env.kind !== 'cull.job') { this.notify('Unrecognised export file (no "kind")', 'error'); return; }
-      const r = await fetch('/api/config/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(env) });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) { this.notify('Import failed: ' + (j.error || r.status), 'error'); return; }
-      await this.loadPresets(); await this.loadJobs();
-      this.notify('Imported ' + (j.presets_added || 0) + ' preset(s), ' + (j.jobs_added || 0) + ' job(s)'
-        + (j.skipped && j.skipped.length ? ' · ' + j.skipped.length + ' skipped' : ''), 'success');
+      this.configImporting = true;
+      try {
+        if (env.kind === 'cull.preset' || (env.name && env.cfg && !env.kind)) { await this._importPreset(env.name, env.cfg); return; }
+        if (env.kind !== 'cull.config' && env.kind !== 'cull.job') { this.notify('Unrecognised export file (no "kind")', 'error'); return; }
+        const r = await fetch('/api/config/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(env) });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.notify('Import failed: ' + (j.error || r.status), 'error'); return; }
+        await this.loadPresets(); await this.loadJobs();
+        this.notify('Imported ' + (j.presets_added || 0) + ' preset(s), ' + (j.jobs_added || 0) + ' job(s)'
+          + (j.skipped && j.skipped.length ? ' · ' + j.skipped.length + ' skipped' : ''), 'success');
+      } finally {
+        this.configImporting = false;
+      }
     },
     async _importPreset(name, cfg) {
       name = (name || '').trim();
@@ -7207,16 +7231,18 @@ function dashboard() {
     // Cloud vision providers: provider id -> the settings key holding its model.
     // Test Connection fetches the live catalogue into the <select> below.
     cloudProviders: ['openai', 'anthropic', 'gemini', 'openrouter'],
-    cloudProviderLabels: { openai: 'OpenAI (GPT vision)', anthropic: 'Anthropic Claude',
+    // Settings tab unifies Groq with the four cloud providers in one section.
+    settingsCloudProviders: ['groq', 'openai', 'anthropic', 'gemini', 'openrouter'],
+    cloudProviderLabels: { groq: 'Groq (Llama-4 Scout)', openai: 'OpenAI (GPT vision)', anthropic: 'Anthropic Claude',
                            gemini: 'Google Gemini', openrouter: 'OpenRouter' },
     cloudWorkerName: { openai: 'openai', anthropic: 'anthropic', gemini: 'gemini', openrouter: 'openrouter' },
     cloudModelKey(provider) {
-      return { openai: 'OPENAI_VISION_MODEL', anthropic: 'ANTHROPIC_VISION_MODEL',
+      return { groq: 'GROQ_MODEL', openai: 'OPENAI_VISION_MODEL', anthropic: 'ANTHROPIC_VISION_MODEL',
                gemini: 'GEMINI_VISION_MODEL', openrouter: 'OPENROUTER_VISION_MODEL' }[provider];
     },
     cloudApiKey(provider) {
       // Settings key whose freshly-typed value is sent so an UNSAVED key tests.
-      return { openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY',
+      return { groq: 'GROQ_API_KEY', openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY',
                gemini: 'GEMINI_API_KEY', openrouter: 'OPENROUTER_API_KEY' }[provider];
     },
     cloudEnabled(provider) {
@@ -7237,7 +7263,7 @@ function dashboard() {
       // credential can be verified without saving first (masked secret => server
       // falls back to the stored env value).
       const body = { provider: name };
-      const isCloud = this.cloudProviders.includes(name);
+      const isCloud = this.cloudProviders.includes(name) || name === 'groq';
       if (isCloud) {
         const typedKey = (this.settings[this.cloudApiKey(name)] || '').trim();
         if (typedKey) body.api_key = typedKey;
