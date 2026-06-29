@@ -333,14 +333,71 @@ def _vision_fleet() -> list[dict]:
     return fleet
 
 
+def _failover_enabled() -> bool:
+    """Gate for health-probed failover (default OFF).
+
+    When unset/false the supervisor fans out EVERY enabled fleet instance exactly
+    as before — no probing, byte-identical behaviour. When truthy, the fleet is
+    health-probed and unreachable endpoints are skipped before fan-out.
+    """
+    return os.environ.get("VISION_FAILOVER_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _probe_timeout() -> float:
+    """Per-endpoint liveness-probe timeout in seconds (failover path only).
+
+    Reads ``VISION_PROBE_TIMEOUT`` (default 5). A malformed value falls back to
+    the default rather than crashing the reconcile loop.
+    """
+    try:
+        return float(os.environ.get("VISION_PROBE_TIMEOUT", "5"))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _healthy_fleet(fleet: list[dict]) -> list[dict]:
+    """Filter ``fleet`` to reachable endpoints when failover is enabled.
+
+    OFF (default): returns ``fleet`` unchanged — no import, no network, the
+    spawn set is identical to today. ON: lazily imports ``fleet_health``, probes
+    every endpoint, and drops the ones whose probe failed (logging each skip).
+    Best-effort — if the optional module is missing or probing blows up, we log
+    and fall back to the unfiltered fleet so a probe fault can never starve the
+    pipeline of workers.
+    """
+    if not fleet or not _failover_enabled():
+        return fleet
+    try:
+        import fleet_health
+        probes = fleet_health.probe_fleet(fleet, timeout=_probe_timeout())
+        healthy = fleet_health.pick_healthy(fleet, probes)
+    except Exception as exc:  # noqa: BLE001 - probing must never stop fan-out
+        logger.warning("vision failover probe failed; spawning full fleet: %s", exc)
+        return fleet
+    healthy_ids = {str(ep.get("id", "") or "") for ep in healthy}
+    for ep in fleet:
+        eid = str(ep.get("id", "") or "")
+        if eid not in healthy_ids:
+            name = str(ep.get("name", "") or eid or "?")
+            print(f"  [failover] skipping unhealthy endpoint {name}", flush=True)
+    return healthy
+
+
 def _vision_fleet_specs() -> list[AgentSpec]:
     """Fan VISION_WORKERS_JSON out into one Vision-<name> AgentSpec per instance,
     each carrying its own endpoint env so the (unchanged) worker script reads its
     URL/model/key from its own process env — mirrors the LOCAL_IMPORTS_JSON
-    fan-out for local folders."""
+    fan-out for local folders.
+
+    When ``VISION_FAILOVER_ENABLED`` is set, the fleet is first health-probed and
+    unreachable endpoints are dropped (see ``_healthy_fleet``); when unset the
+    fleet is fanned out unchanged.
+    """
     specs: list[AgentSpec] = []
     seen: set[str] = set()
-    for i, w in enumerate(_vision_fleet()):
+    for i, w in enumerate(_healthy_fleet(_vision_fleet())):
         provider = w["provider"]
         name = (str(w.get("name", "") or w.get("id", "") or f"w{i}")).strip() or f"w{i}"
         label = base = f"Vision-{name}"

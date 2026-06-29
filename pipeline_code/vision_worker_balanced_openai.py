@@ -23,6 +23,12 @@ Env vars:
     OPENAI_COMPAT_MODEL     Model identifier the server expects in the ``model`` field.
     OPENAI_COMPAT_API_KEY   Optional bearer token (LocalAI / hosted gateways).
     OPENAI_COMPAT_TIMEOUT   Per-request timeout in seconds. Default 600.
+    OPENAI_COMPAT_PROVIDER  Optional provider hint. When ``llamacpp`` (or when
+                            ``VISION_GRAMMAR_ENABLED`` is truthy) the request also
+                            carries a GBNF ``grammar`` derived from the response
+                            schema — llama.cpp's grammar-constrained decoding is
+                            stricter than its json-schema mode. Off by default;
+                            best-effort, falls back to ``response_format`` only.
 """
 from __future__ import annotations
 
@@ -68,6 +74,14 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         ).rstrip("/")
         self.model: str = os.environ.get("OPENAI_COMPAT_MODEL", "").strip()
         self.api_key: str = os.environ.get("OPENAI_COMPAT_API_KEY", "").strip()
+        # GBNF grammar gate (default OFF). Only llama.cpp's server understands the
+        # ``grammar`` field, so we opt in when the provider is explicitly llamacpp
+        # OR the operator flips VISION_GRAMMAR_ENABLED. Off → byte-identical request.
+        provider = os.environ.get("OPENAI_COMPAT_PROVIDER", "").strip().lower()
+        grammar_flag = os.environ.get("VISION_GRAMMAR_ENABLED", "false").strip().lower()
+        self.use_grammar: bool = (
+            provider == "llamacpp" or grammar_flag in ("1", "true", "yes", "on")
+        )
         try:
             self.request_timeout = int(
                 os.environ.get("OPENAI_COMPAT_TIMEOUT", str(self.request_timeout))
@@ -109,6 +123,25 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         logger.info("  Workers: %d", self.parallel_workers)
         logger.info("  Auth:    %s", "bearer token set" if self.api_key else "(none)")
 
+    def _grammar(self) -> str | None:
+        """Best-effort GBNF grammar for the response schema, or None.
+
+        Returns None when the gate is off OR the optional ``gbnf_grammar`` module
+        is unavailable OR conversion fails — so the request silently falls back to
+        the plain ``response_format`` path and never hard-fails on schema drift.
+        Lazily imported so the worker has no extra import cost when the gate is off.
+        """
+        if not self.use_grammar:
+            return None
+        try:
+            import gbnf_grammar
+            schema = build_response_format()["json_schema"]["schema"]
+            grammar = gbnf_grammar.json_schema_to_gbnf(schema)
+            return grammar or None
+        except Exception as exc:  # noqa: BLE001 - grammar is an optional optimisation
+            logger.warning("GBNF grammar build failed; using response_format: %s", exc)
+            return None
+
     def classify_image_bytes(
         self,
         b64_jpeg: str,
@@ -118,30 +151,38 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_instruction},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_jpeg}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2000,
+            "response_format": build_response_format(),
+        }
+        # llama.cpp only: attach the GBNF grammar (kept alongside response_format
+        # so non-grammar-aware servers still honour the schema envelope). No-op
+        # when the gate is off — the body is then byte-identical to before.
+        grammar = self._grammar()
+        if grammar is not None:
+            body["grammar"] = grammar
+
         try:
             response = requests.post(
                 f"{self.base_url}/v1/chat/completions",
                 headers=headers,
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_instruction},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{b64_jpeg}",
-                                    },
-                                },
-                            ],
-                        }
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 2000,
-                    "response_format": build_response_format(),
-                },
+                json=body,
                 timeout=self.request_timeout,
             )
         except requests.RequestException as exc:
