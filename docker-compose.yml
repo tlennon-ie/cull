@@ -1,0 +1,53 @@
+# cull — docker-compose for headless/server use.
+#
+#   docker compose up -d        # build + run in the background
+#   docker compose logs -f      # follow the dashboard/supervisor output
+#   docker compose down         # stop and remove the container
+#
+# The dashboard is then at http://localhost:5000 (it binds 0.0.0.0 inside the
+# container). Curated data persists in ./data on the host. Secrets come from
+# ./.env at run time (never baked into the image — see .dockerignore).
+
+services:
+  cull:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cull
+    container_name: cull
+    # Secrets + global config (GROQ_API_KEY(S), GROQ_MODEL, throttle, etc.).
+    # Copy .env.example -> .env and fill it in before `up`.
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      # Persist queue/, sorted/, logs/, jobs/ across container recreation.
+      # Must match PIPELINE_BASE_DIR=/data (set in the Dockerfile).
+      - ./data:/data
+    restart: unless-stopped
+
+  # ── Optional: local vision-fleet endpoint (Ollama) ──────────────────────────
+  # Uncomment to run an Ollama server alongside cull for a fully local vision
+  # fleet. Then, in the dashboard Vision tab (or a preset's `vision.workers`),
+  # add a worker with provider "ollama" and base URL http://ollama:11434
+  # (containers reach each other by service name on the default compose network).
+  # Pull a vision model first, e.g.:  docker compose exec ollama ollama pull llava
+  #
+  # ollama:
+  #   image: ollama/ollama
+  #   container_name: ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ./ollama:/root/.ollama
+  #   restart: unless-stopped
+  #   # GPU note: for NVIDIA acceleration, install the NVIDIA Container Toolkit
+  #   # on the host and uncomment the block below (Compose GPU device reservation).
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: all
+  #   #           capabilities: [gpu]

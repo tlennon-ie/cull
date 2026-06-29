@@ -149,8 +149,255 @@ _PORTRAIT_RULES = (
 )
 
 
-def _build_presets() -> dict[str, dict]:
+# ── shared judgement-rule preamble for VIDEO presets ─────────────────────────
+# Video-model trainers (LTX-Video, Wan, Hunyuan-Video, Mochi, CogVideoX) curate
+# CLIPS, judged on a sampled frame plus the prompt's motion description. This
+# reuses the SAME category vocabulary spine as the image presets (no new global
+# categories) but reframes the gates in temporal/motion terms. The cull worker
+# still classifies a representative frame, so the per-frame gates (medium,
+# composite, overlay, nsfw) carry over verbatim; the additions are motion-aware.
+_VIDEO_RULES = (
+    "STRICT JUDGEMENT RULES (no exceptions):\n"
+    "- This is a VIDEO-CLIP dataset judged from a representative frame plus the "
+    "prompt's motion description. Fill `description` and `primary_subject` FIRST "
+    "from the pixels, then make every label agree.\n"
+    "- art_medium = `photograph` ONLY for live-action (camera-captured or AI "
+    "photoreal) footage. Animation, 2D/cel motion, 3D render or motion graphics -> "
+    "the matching label, NEVER `photograph`.\n"
+    "- has_ai_flaws = TRUE for SEVERE per-frame artefacts (malformed face/hands, "
+    "wrong finger count, melted limbs, warped text, impossible geometry). Temporal "
+    "breakdown (flicker, morphing, identity drift) also counts as a severe flaw.\n"
+    "- A SCREEN-RECORDING is the WHOLE frame being a screen capture (UI chrome, "
+    "browser bars, cursor). A clip that merely shows a phone or monitor as a scene "
+    "object is NOT a screen-recording.\n"
+    "- A COMPOSITE/SPLIT-SCREEN is 2+ separate shots stitched into one frame -> "
+    "is_composite_grid=true and DISCARD.\n"
+    "- contains_text_overlay = TRUE for burned-in watermarks, captions, lower "
+    "thirds, subtitles, logos or end-card text.\n"
+    "- nsfw = TRUE only for explicit nudity or sexual content.\n"
+    "- The curation topic only informs REL_Quality_Score; do NOT invent motion or "
+    "details that aren't visible in the frame or stated in the prompt."
+)
+
+
+def _build_video_presets() -> dict[str, dict]:
+    """Video-dataset curation presets (a parallel set to the image presets).
+
+    Each mirrors an image preset's dict shape EXACTLY via the same `_preset`
+    factory, so `job_config` projection + the content-signature baseline
+    reconcile keep working unchanged. They reuse the shared `_SPAM_BANNED`
+    tuple and the SAME category vocabulary (Keep / Borderline / OffTopic plus a
+    per-theme off-theme bucket); the terminal DISCARD/CORRUPT stay system-owned.
+
+    `require_prompt=True` everywhere: a video prompt's MOTION description is the
+    load-bearing training signal, so a clip with no prompt is dropped. The
+    motion `generation_hints` then gate prompts to video-shaped descriptions.
+    """
     return {
+        # ── general motion-clip triage (parallel to image "default") ─────────
+        "video_default": _preset(
+            require_prompt=True,
+            ovr_min=45, rel_min=20,
+            min_prompt_length=20,
+            keywords_extra=("video", "clip", "motion", "footage", "b-roll",
+                            "camera pan", "tracking shot", "slow motion",
+                            "moving", "cinematic"),
+            banned_keywords=_SPAM_BANNED + ("still image", "photo only", "slideshow"),
+            generation_hints=("camera pan", "tracking shot", "slow motion",
+                              "b-roll", "establishing shot", "moving camera",
+                              "smooth motion"),
+            rules_preamble=_VIDEO_RULES,
+            categories=[
+                ("Keep", "Strong on-topic clip with clear, coherent motion, no "
+                 "severe per-frame or temporal flaws, no watermark/overlay, "
+                 "OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"),
+                ("Borderline", "On-topic and usable but average — minor motion "
+                 "blur, soft focus, light compression, brief flicker, or jerky "
+                 "motion. Bucket for human review"),
+                ("StaticShot", "A frozen/locked frame with no meaningful motion "
+                 "(a still exported as video, a held freeze) -> off-theme for a "
+                 "motion dataset"),
+                ("OffTopic", "Unrelated to the curation topic regardless of "
+                 "quality (REL_Quality_Score < 30)"),
+            ],
+            theme_rules=(
+                "GENERAL video-clip triage. Keep clips with clean, intentional "
+                "motion; send borderline motion/quality to review; route a "
+                "motionless held frame to StaticShot; drop the unrelated. Judge on "
+                "sharpness, exposure, composition, motion smoothness and absence "
+                "of temporal artefacts (flicker, warping, identity drift)."),
+            scoring_notes=(
+                "Reward sharp frames, stable exposure, smooth coherent motion and "
+                "temporal consistency across the clip. Penalise heavy compression, "
+                "rolling-shutter wobble, stutter, flicker and morphing."),
+            caption_style="natural_language",
+        ),
+
+        # ── cinematic / film-like camera work (parallel to "photoreal") ──────
+        "video_cinematic": _preset(
+            require_prompt=True,
+            ovr_min=55, rel_min=25,
+            min_prompt_length=24,
+            keywords_extra=("cinematic", "film", "dolly", "tracking shot",
+                            "establishing shot", "anamorphic", "depth of field",
+                            "color grade", "crane shot", "steadicam"),
+            banned_keywords=_SPAM_BANNED + ("webcam", "screen recording", "meme",
+                                            "selfie"),
+            generation_hints=("cinematic", "dolly shot", "tracking shot",
+                              "establishing shot", "crane shot", "anamorphic",
+                              "shallow depth of field", "film grain"),
+            rules_preamble=_VIDEO_RULES,
+            categories=[
+                ("Keep", "Film-like clip — deliberate camera move (dolly, crane, "
+                 "tracking), cinematic lighting/grade, shallow depth of field, "
+                 "stable and sharp, on-topic, no overlay"),
+                ("Borderline", "Cinematic intent but average execution — soft "
+                 "focus, uneven exposure, slightly unstable rig, or a minor "
+                 "lower-third/subtitle -> review"),
+                ("Amateur", "Casual handheld/webcam/phone-vertical look with no "
+                 "cinematic camera language -> off-theme for a film-look dataset"),
+                ("OffTopic", "Unrelated to the cinematic subject"),
+            ],
+            theme_rules=(
+                "Cinematic / film-look dataset. Reward deliberate camera language "
+                "(dolly, crane, tracking, push-in), motivated lighting, colour "
+                "grading and shallow depth of field with stable, sharp frames. A "
+                "casual webcam/selfie/screen-grab look is Amateur. Penalise shaky "
+                "handheld, flat phone-grade footage and burned-in lower thirds or "
+                "subtitles (contains_text_overlay=true -> Borderline at best; "
+                "DISCARD if the overlay dominates)."),
+            scoring_notes=(
+                "Reward cinematic composition, motivated lighting, smooth motivated "
+                "camera moves and grade. Penalise shaky handheld, flat exposure, "
+                "rolling shutter and overlay text."),
+            caption_style="natural_language",
+        ),
+
+        # ── animated / 2D motion (parallel to "anime_illustration") ──────────
+        "video_anime": _preset(
+            require_prompt=True,
+            ovr_min=45, rel_min=25,
+            min_prompt_length=20,
+            keywords_extra=("anime", "animation", "animated", "2d motion", "amv",
+                            "cel animation", "motion", "sakuga", "key animation"),
+            banned_keywords=_SPAM_BANNED + ("live action", "photoreal", "webcam"),
+            generation_hints=("anime", "animated", "smooth animation",
+                              "camera pan", "cel animation", "moving",
+                              "key animation", "dynamic motion"),
+            rules_preamble=_VIDEO_RULES,
+            categories=[
+                ("Keep", "Clean animated / 2D-motion clip, on-topic, smooth "
+                 "in-betweens, no severe per-frame or temporal flaws, no "
+                 "watermark/signature overlay"),
+                ("Borderline", "Usable but average — choppy in-betweens, jpeg/AI "
+                 "blocking, mild flicker, or a visible signature -> review"),
+                ("LiveAction", "Live-action or photoreal footage — NOT drawn/"
+                 "animated motion -> off-theme for an animation dataset"),
+                ("OffTopic", "Unrelated to the curation subject"),
+            ],
+            theme_rules=(
+                "Animation / 2D-motion dataset. art_medium MUST be a drawn or "
+                "rendered animated style (anime, cel, digital animation). "
+                "Live-action or photoreal footage is LiveAction (off-theme). Do "
+                "NOT apply real-human gates here. has_ai_flaws/temporal flaws = "
+                "TRUE only for severe issues (broken anatomy, melted detail, "
+                "warped text, heavy flicker or morphing between frames). Penalise "
+                "choppy motion, jpeg blocking and visible artist "
+                "signatures/watermarks (route Borderline)."),
+            scoring_notes=(
+                "Reward clean line work, smooth in-betweens, coherent anatomy and "
+                "temporal stability. Penalise choppy motion, jpeg blocking, severe "
+                "AI anatomy flaws, flicker and signature/watermark overlays."),
+            caption_style="booru_tags",
+        ),
+
+        # ── product / turntable / demo (parallel to "product_ecommerce") ─────
+        "video_product": _preset(
+            require_prompt=True,
+            ovr_min=50, rel_min=25,
+            min_prompt_length=18,
+            keywords_extra=("product video", "turntable", "360 spin", "demo",
+                            "unboxing", "rotating", "orbit", "studio",
+                            "product showcase", "motion"),
+            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme",
+                                            "screen recording"),
+            generation_hints=("product turntable", "360 rotation", "orbit shot",
+                              "slow rotation", "studio lighting", "smooth motion",
+                              "product demo", "tracking shot"),
+            rules_preamble=_VIDEO_RULES,
+            categories=[
+                ("Keep", "Single clearly-presented product with clean motion "
+                 "(turntable, slow orbit, controlled push-in), seamless/clean "
+                 "background, sharp, well-lit, accurate colour, no distracting "
+                 "watermark"),
+                ("Lifestyle", "Product shown in-use / lifestyle motion — useful "
+                 "but a different bucket from clean studio turntables"),
+                ("Borderline", "Product motion but cluttered background, soft "
+                 "focus, poor lighting, shaky orbit, or a minor watermark -> "
+                 "review"),
+                ("OffTopic", "No clear product, or unrelated to the catalogue "
+                 "subject"),
+            ],
+            theme_rules=(
+                "Product / e-commerce video dataset. Reward a single clearly-"
+                "presented product with smooth controlled motion (turntable, slow "
+                "360, motivated push-in), even studio lighting, a seamless/clean "
+                "background and accurate colour. A product shown in a real-world / "
+                "lifestyle scene goes to Lifestyle. Penalise busy backgrounds, "
+                "shaky or stuttering motion, distracting reflections and burned-in "
+                "promo text or watermarks (contains_text_overlay=true -> "
+                "Borderline at best; DISCARD if the overlay dominates)."),
+            scoring_notes=(
+                "Reward clean/seamless backgrounds, even lighting, sharpness, "
+                "accurate colour and smooth controlled motion. Penalise clutter, "
+                "shaky/stuttering motion, distracting reflections and burned-in "
+                "promo text/watermarks."),
+            caption_style="natural_language",
+        ),
+
+        # ── nature / wildlife / landscape motion (parallel to wildlife) ──────
+        "video_nature": _preset(
+            require_prompt=True,
+            ovr_min=50, rel_min=25,
+            min_prompt_length=18,
+            keywords_extra=("nature", "wildlife", "landscape", "drone", "aerial",
+                            "timelapse", "slow motion", "b-roll", "tracking shot",
+                            "moving"),
+            banned_keywords=_SPAM_BANNED + ("zoo", "captive", "aquarium",
+                                            "anime", "cartoon"),
+            generation_hints=("drone shot", "aerial footage", "tracking shot",
+                              "slow motion", "timelapse", "establishing shot",
+                              "b-roll", "smooth motion"),
+            rules_preamble=_VIDEO_RULES,
+            categories=[
+                ("Keep", "Sharp natural-world clip (wildlife, landscape, aerial) "
+                 "with clean, coherent motion, natural setting, on-topic, OVR>=60 "
+                 "and REL>=60"),
+                ("Borderline", "Nature motion but soft focus, distant/tiny "
+                 "subject, busy frame, heavy haze, or jerky motion -> review"),
+                ("CaptiveStaged", "Obvious zoo bars/enclosure, aquarium glass, or "
+                 "a captive/staged setting standing in for the wild -> off-theme"),
+                ("OffTopic", "Unrelated to the nature/wildlife subject"),
+            ],
+            theme_rules=(
+                "Nature / wildlife / landscape video dataset. Reward critical "
+                "sharpness on the subject (the animal's eye, the landscape's key "
+                "plane), a natural setting and smooth, coherent motion (drone, "
+                "tracking, gentle slow-motion or timelapse). A zoo enclosure, "
+                "aquarium glass or other captive/staged setting is CaptiveStaged. "
+                "Penalise visible cages/bars, heavy atmospheric haze, motion smear "
+                "and stutter on the subject."),
+            scoring_notes=(
+                "Reward subject sharpness, natural setting, clean separation and "
+                "smooth coherent motion. Penalise soft focus, tiny-in-frame "
+                "subjects, cage bars, haze and stutter/motion smear."),
+            caption_style="natural_language",
+        ),
+    }
+
+
+def _build_presets() -> dict[str, dict]:
+    presets: dict[str, dict] = {
         # ── general dataset-prep triage — the new shipped DEFAULT ───────────
         "default": _preset(
             require_prompt=True,
@@ -428,6 +675,10 @@ def _build_presets() -> dict[str, dict]:
             caption_style="sd_prompt",
         ),
     }
+    # Video presets are a parallel themed set built the same way; merge them in
+    # so PRESET_NAMES exposes both families from one source of truth.
+    presets.update(_build_video_presets())
+    return presets
 
 
 # Build the library ONCE at import; every public accessor deep-copies from this

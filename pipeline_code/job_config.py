@@ -738,6 +738,7 @@ def resolve_env(job: Job) -> dict[str, str]:
     t = _d(eff.get("topic"))
     s = _d(eff.get("scrapers"))
     gd = _d(s.get("gallery_dl"))
+    yt = _d(s.get("yt_dlp"))
     sc = _d(eff.get("scoring"))
     cap = _d(eff.get("captioning"))
     enabled = _d(s.get("enabled"))
@@ -769,6 +770,10 @@ def resolve_env(job: Job) -> dict[str, str]:
         "GALLERY_DL_LIMIT_PER_URL": str(int(gd.get("limit_per_url", 200) or 200)),
         "GALLERY_DL_COOKIES_FILE": str(gd.get("cookies_file", "") or ""),
         "GALLERY_DL_CONFIG_PATH": str(gd.get("config_path", "") or ""),
+        "YT_DLP_ENABLED": _b(yt.get("enabled", False)),
+        "YT_DLP_URLS": "\n".join(yt.get("urls", []) or []),
+        "YT_DLP_LIMIT": str(int(yt.get("limit", 200) or 200)),
+        "YT_DLP_COOKIES": str(yt.get("cookies", "") or ""),
         "LOCAL_IMPORTS_JSON": json.dumps(local),
         "VISION_OVR_MIN_SCORE": str(int(sc.get("ovr_min", 0) or 0)),
         "VISION_REL_MIN_SCORE": str(int(sc.get("rel_min", 0) or 0)),

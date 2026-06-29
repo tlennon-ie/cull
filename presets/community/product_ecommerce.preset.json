@@ -1,0 +1,57 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Product E-commerce",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "product", "packshot", "studio", "catalog", "e-commerce",
+        "white background", "product photography", "still life", "softbox"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "nsfw", "selfie", "meme", "screenshot"
+      ],
+      "generation_hints": [
+        "product photography", "studio lighting", "white background",
+        "commercial shot", "packshot", "catalog photo"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": ["productphotography", "commercialphotography"],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Single clearly-presented product, clean/seamless background, sharp, well-lit, accurate colour, no distracting watermark. OVR_Quality_Score >= 60"
+      },
+      {
+        "name": "Lifestyle",
+        "hint": "Product shown in-context / lifestyle scene — useful but a different bucket from clean packshots"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Product but cluttered background, soft focus, poor/uneven lighting, distracting reflections, or a minor watermark -> human review"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "No clear product, or unrelated to the catalogue subject"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image; a render/illustration is the matching label, never `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (melted product geometry, warped logos/text, impossible reflections).\n- A SCREENSHOT is the WHOLE frame being a screen capture (UI chrome). A photo that merely contains a screen as a scene object is NOT a screenshot.\n- A COMPOSITE/GRID is 2+ separate images stitched together -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in promo text, price tags, captions, logos or watermarks.\n- nsfw = TRUE only for explicit nudity or sexual content.\nProduct / e-commerce dataset. Reward a single clearly-presented product, even studio lighting, a seamless or clean background and accurate colour. A product shown within a real-world/lifestyle scene goes to Lifestyle. Penalise busy/cluttered backgrounds, distracting reflections, and burned-in promotional text or watermarks (contains_text_overlay=true -> Borderline at best; DISCARD if the overlay dominates). The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 50,
+      "rel_min": 25,
+      "notes": "Reward clean/seamless backgrounds, even lighting, sharpness and accurate colour. Penalise clutter, distracting reflections and burned-in promo text/watermarks."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    }
+  }
+}

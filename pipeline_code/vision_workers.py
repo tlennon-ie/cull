@@ -90,6 +90,41 @@ WORKERS: dict[str, WorkerSpec] = {
         script="vision_worker.py",
         description="Single-thread LM Studio fallback (debug only)",
     ),
+    # ── Cloud workers (registry pattern, like balanced-groq) ──────────────
+    "openai": WorkerSpec(
+        name="openai",
+        script="vision_worker_openai.py",
+        description=(
+            "OpenAI cloud (GPT vision) - structured output via "
+            "response_format json_schema. Reads OPENAI_API_KEY + "
+            "OPENAI_VISION_MODEL."
+        ),
+    ),
+    "anthropic": WorkerSpec(
+        name="anthropic",
+        script="vision_worker_anthropic.py",
+        description=(
+            "Anthropic Claude vision - structured output via forced tool-use. "
+            "Reads ANTHROPIC_API_KEY + ANTHROPIC_VISION_MODEL."
+        ),
+    ),
+    "gemini": WorkerSpec(
+        name="gemini",
+        script="vision_worker_gemini.py",
+        description=(
+            "Google Gemini vision (new google-genai SDK) - structured output "
+            "via response_schema. Reads GEMINI_API_KEY / GOOGLE_API_KEY + "
+            "GEMINI_VISION_MODEL."
+        ),
+    ),
+    "openrouter": WorkerSpec(
+        name="openrouter",
+        script="vision_worker_openrouter.py",
+        description=(
+            "OpenRouter (OpenAI-compatible gateway to many vision models). "
+            "Reads OPENROUTER_API_KEY + OPENROUTER_VISION_MODEL."
+        ),
+    ),
 }
 
 

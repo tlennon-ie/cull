@@ -98,6 +98,7 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "DISCORD_BOT_TOKEN", "DISCORD_AUTH_MODE",
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
+    "YT_DLP_URLS", "YT_DLP_COOKIES", "YT_DLP_LIMIT",
     "REQUIRE_PROMPT",
     "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
@@ -220,6 +221,60 @@ def active_job_env(slug: str | None = None) -> dict[str, str] | None:
     if job is None:
         return None
     return {**os.environ, **job_config.resolve_env(job)}
+
+
+# ── Optional scheduler tick (gated SCHEDULER_ENABLED, default OFF) ─────────────
+#
+# When enabled, the supervisor ticks the persisted schedules on its reconcile
+# loop. Each due schedule fans out to an existing supervisor primitive via
+# ``_schedule_runner``. Everything here is best-effort: a missing optional
+# ``scheduler`` module, or any runner error, is logged and swallowed so a
+# schedule failure can NEVER stop the supervisor. With SCHEDULER_ENABLED unset
+# the tick is a no-op and behaviour is byte-identical.
+
+def _scheduler_enabled() -> bool:
+    return os.environ.get("SCHEDULER_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _schedule_runner(slug: str, action: str) -> None:
+    """Map a due ``(slug, action)`` schedule onto existing supervisor primitives.
+
+    * ``scrape``  -> activate the job (projects its config + scraper toggles down
+      via ``job_config.activate``; the supervisor's index-watch then restarts
+      into it on the next reconcile).
+    * ``curate``  -> ensure the job's vision workers run, which (in the single
+      active-job model) means activating it so its fleet becomes desired.
+    * ``export``  -> best-effort dataset export via ``export_profiles``.
+
+    Kept tiny and side-effect-only so ``scheduler.run_due`` (which already
+    swallows runner exceptions) drives it; we still guard ``export`` locally.
+    """
+    if action in ("scrape", "curate"):
+        job_config.activate(slug)
+    elif action == "export":
+        try:
+            import export_profiles
+            out_dir = BASE_DIR / "exports" / slug
+            export_profiles.export_dataset(slug, "folders", out_dir)
+        except Exception as exc:  # noqa: BLE001 - export is best-effort
+            logger.warning("scheduled export for %r failed: %s", slug, exc)
+
+
+def _scheduler_tick() -> None:
+    """Run any due schedules. Gated + fully defensive (never raises).
+
+    Lazily imports ``scheduler`` so the supervisor still runs if the optional
+    module/deps are absent. A no-op unless ``SCHEDULER_ENABLED`` is truthy.
+    """
+    if not _scheduler_enabled():
+        return
+    try:
+        import scheduler
+        scheduler.run_due_now(_schedule_runner)
+    except Exception as exc:  # noqa: BLE001 - a schedule failure must not stop the supervisor
+        logger.warning("scheduler tick failed: %s", exc)
 
 
 # ── Desired-state computation ─────────────────────────────────────────────────
@@ -368,6 +423,16 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
         and (os.environ.get("GALLERY_DL_URLS", "") or "").strip()
     ):
         add(AgentSpec(label="Gallery-DL", script="scraper_gallery_dl.py", loop_sleep=1800))
+
+    # yt-dlp video scraper (YouTube, TikTok, X, Reddit, Vimeo, Twitch clips —
+    # anything yt-dlp knows). Gated identically to gallery-dl: desired only when
+    # the toggle is on AND at least one URL is configured, otherwise the
+    # supervisor would respawn an empty agent every loop_sleep.
+    if (
+        os.environ.get("YT_DLP_ENABLED", "false").lower() == "true"
+        and (os.environ.get("YT_DLP_URLS", "") or "").strip()
+    ):
+        add(AgentSpec(label="YT-DLP", script="scraper_yt_dlp.py", loop_sleep=1800))
 
     # Local vision-worker fleet (LM Studio / llama.cpp / Ollama) — one worker per
     # enabled instance in VISION_WORKERS_JSON, fanned out like local folders above.
@@ -669,6 +734,11 @@ class Supervisor:
                 if until and until <= now:
                     self._cooldown_until.pop(label, None)
                 self._spawn(spec)
+
+        # Optional per-job scheduler (gated SCHEDULER_ENABLED, default OFF). Runs
+        # outside the agent lock since it only touches job_config state; fully
+        # swallowed so a schedule failure can never stop the supervisor.
+        _scheduler_tick()
 
     def run(self) -> None:
         """Reconcile loop with fast-path env-change detection.

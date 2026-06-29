@@ -1,0 +1,60 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Film Photography LoRA",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "35mm", "120 film", "medium format", "kodak portra", "cinestill",
+        "fujifilm", "ektar", "tri-x", "grain", "analog", "film photography",
+        "film still", "halation"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "digital art", "3d render", "anime", "cartoon"
+      ],
+      "generation_hints": [
+        "shot on film", "35mm film", "kodak portra 400", "analog photograph",
+        "film grain", "cinestill 800t", "medium format film"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "analog", "filmphotography", "AnalogCommunity", "35mm", "mediumformat"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Authentic film look — visible (not faked-digital) grain, natural halation, period-correct colour science, sharp where intended, on-topic. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Reads as film but average — muddy scan, dust/scratches dominating, heavy colour cast, or only-okay quality. Bucket for human review"
+      },
+      {
+        "name": "DigitalLook",
+        "hint": "Clean clinical digital capture with no film characteristics (no grain, clipped highlights, sterile colour) -> off-theme for a film-emulation dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Unrelated to the film-photography subject regardless of quality (REL_Quality_Score < 30)"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image. A render, illustration or anime frame is NEVER `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face/hands, wrong finger count, melted limbs, warped text, impossible geometry).\n- A COMPOSITE/GRID is 2+ separate images stitched together -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in watermarks, captions, logos, or date stamps.\n- nsfw = TRUE only for explicit nudity or sexual content.\nThis dataset trains a FILM-EMULATION LoRA. Reward genuine analog character (organic grain, gentle halation/bloom, period colour palettes, soft highlight roll-off). A sterile, grainless, clipped digital photo is DigitalLook (off-theme). The curation topic only informs REL_Quality_Score; do NOT invent details that aren't in the pixels.",
+    "scoring": {
+      "ovr_min": 50,
+      "rel_min": 25,
+      "notes": "Reward organic film grain, smooth highlight roll-off, period-correct colour and a clear subject. Penalise faked/uniform digital noise, blown highlights, heavy dust/scratch damage and muddy low-res scans."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    }
+  }
+}

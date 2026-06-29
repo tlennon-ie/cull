@@ -60,7 +60,29 @@ SOURCES: dict[str, str] = {
 
 _SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
 _QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp")
+# Video containers the round-robin pop will surface ONLY when the video-
+# classification lane is enabled (VIDEO_CLASSIFY_ENABLED). Off by default so an
+# image-only pipeline never starts popping clips it can't classify — behaviour
+# stays byte-identical unless the flag is set. Mirrors video_frames.VIDEO_EXT /
+# export_profiles.VIDEO_EXT.
+_QUEUE_VIDEO_GLOBS = ("*.mp4", "*.mov", "*.webm", "*.mkv", "*.avi")
 _DEFAULT_CACHE_TTL = 5.0  # seconds; see FSQueue docstring
+
+
+def _video_classify_enabled() -> bool:
+    """Whether VIDEO_CLASSIFY_ENABLED is truthy (read live so a dashboard toggle
+    takes effect without restarting the worker)."""
+    return os.environ.get("VIDEO_CLASSIFY_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _queue_globs() -> tuple[str, ...]:
+    """The media globs the queue pops: images always, video clips only when the
+    video-classification lane is enabled."""
+    if _video_classify_enabled():
+        return _QUEUE_IMAGE_GLOBS + _QUEUE_VIDEO_GLOBS
+    return _QUEUE_IMAGE_GLOBS
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
@@ -232,7 +254,7 @@ class FSQueue:
     @staticmethod
     def _images_in(source_dir: Path) -> list[Path]:
         images: list[Path] = []
-        for pattern in _QUEUE_IMAGE_GLOBS:
+        for pattern in _queue_globs():
             images.extend(source_dir.glob(pattern))
         return sorted(images)
 

@@ -1,0 +1,34 @@
+# Dependabot — weekly dependency update PRs.
+#
+# Two ecosystems:
+#   * pip            — the runtime deps declared in requirements.txt.
+#   * github-actions — the action versions pinned in .github/workflows/*.
+#
+# Weekly cadence with a modest open-PR cap so the queue never floods. Note: the
+# gallery-dl git dependency (pinned to a Codeberg tag) is NOT auto-bumped by
+# Dependabot — bump it deliberately after a scraper smoke test (see requirements.txt).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci)"
