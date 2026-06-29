@@ -89,6 +89,11 @@ jobs:
   secrets:
     name: Secret scan (trufflehog)
     runs-on: ubuntu-latest
+    # PR-only: trufflehog diffs base..head, which is undefined on a push/merge to
+    # the same ref (BASE == HEAD → exit 183). Every change reaches main through a
+    # PR, so the diff scan still covers all new commits; pip-audit + CodeQL keep
+    # running on push + the weekly schedule.
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

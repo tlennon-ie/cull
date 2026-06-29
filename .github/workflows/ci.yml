@@ -53,6 +53,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # pytest lives in the [dev] extra, not requirements.txt — install it for
+          # the "Run tests" step (the suite mocks the heavy cloud/ml/video SDKs, so
+          # the base deps + pytest are all it needs).
+          pip install pytest
 
       - name: Lint (ruff)
         # Non-blocking: the repo ships no ruff config yet, so surface findings
