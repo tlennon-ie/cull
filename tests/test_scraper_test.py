@@ -12,6 +12,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -204,7 +205,8 @@ class TestCivitaiCom:
         calls = _patch_http(monkeypatch, st, 200)
         st.test_scraper("Civitai-Com", env={"CIVITAI_API_KEY": "mykey"})
         assert len(calls) == 1
-        assert "civitai.com" in calls[0]["url"]
+        host = (urlparse(calls[0]["url"]).hostname or "").lower()
+        assert host == "civitai.com" or host.endswith(".civitai.com")
 
     def test_timeout_returns_ok_false(self, st, monkeypatch):
         import requests

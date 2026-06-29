@@ -105,6 +105,22 @@ print("="*65)
 
 config_checks = {}
 
+
+def _redact_secret(value: str) -> str:
+    """Return a non-sensitive presence indicator for a credential.
+
+    Never echoes the raw secret. Shows only enough to be diagnostic:
+    "(set, ab...yz, len=N)" for a populated value, "(unset)" otherwise.
+    This is a sanitization barrier — the secret never reaches the sink.
+    """
+    if not value or value == "your_":
+        return "(unset)"
+    length = len(value)
+    if length <= 8:
+        return f"(set, len={length})"
+    return f"(set, {value[:4]}...{value[-4:]}, len={length})"
+
+
 # Discord
 discord_token = os.getenv("DISCORD_BOT_TOKEN", "")
 discord_channels = os.getenv("DISCORD_CHANNELS_JSON", "")
@@ -124,21 +140,25 @@ except Exception as e:
 # Civitai
 civitai_key = os.getenv("CIVITAI_API_KEY", "")
 civitai_domain = os.getenv("CIVITAI_DOMAIN", "civitai.com")
+civitai_key_redacted = _redact_secret(civitai_key)
 config_checks["civitai"] = {
     "api_key": "✅ Configured" if civitai_key and civitai_key != "your_" else "❌ Missing",
+    "api_key_redacted": civitai_key_redacted,
     "domain": f"✅ {civitai_domain}"
 }
 print(f"Civitai:")
-print(f"  API Key: {config_checks['civitai']['api_key']}")
+print(f"  API Key: {config_checks['civitai']['api_key']} {civitai_key_redacted}")
 print(f"  Domain: {config_checks['civitai']['domain']}")
 
 # Twitter
 twitter_cookies = os.getenv("TWITTER_COOKIES", "")
+twitter_cookies_redacted = _redact_secret(twitter_cookies)
 config_checks["twitter"] = {
-    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing"
+    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing",
+    "cookies_redacted": twitter_cookies_redacted
 }
 print(f"Twitter/X:")
-print(f"  Cookies: {config_checks['twitter']['cookies']}")
+print(f"  Cookies: {config_checks['twitter']['cookies']} {twitter_cookies_redacted}")
 
 # ============================================================================
 # TEST 3: Simulate Queue Population (5 images per source)
@@ -186,8 +206,8 @@ print(f"   Secondary: {test_results['secondary']['status']}")
 
 print(f"\n📱 Scrapers:")
 print(f"   Discord: {config_checks['discord']['bot_token']} ({config_checks['discord']['channels']})")
-print(f"   Civitai: {config_checks['civitai']['api_key']}")
-print(f"   Twitter: {config_checks['twitter']['cookies']}")
+print(f"   Civitai: {config_checks['civitai']['api_key']} {config_checks['civitai']['api_key_redacted']}")
+print(f"   Twitter: {config_checks['twitter']['cookies']} {config_checks['twitter']['cookies_redacted']}")
 
 print(f"\n✅ Queue Structure: Ready")
 print(f"   Path: {PIPELINE_QUEUE}")

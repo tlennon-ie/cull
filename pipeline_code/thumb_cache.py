@@ -31,6 +31,8 @@ from pathlib import Path
 
 from PIL import Image
 
+import paths
+
 logger = logging.getLogger(__name__)
 
 # Sizes the dashboard actually requests. Generating arbitrary sizes would
@@ -42,12 +44,25 @@ JPEG_QUALITY = 82
 _root: Path | None = None
 _root_lock = threading.Lock()
 
+# Optional explicit allow-list of roots a source image may live under. When
+# ``None`` the allowed roots default to the queue + sorted trees from ``paths``
+# (exactly the roots the dashboard already validates a thumbnail request against
+# with ``safe_inside``). The containment check below is the path-injection
+# barrier: a request can only ever read/thumbnail a file inside these roots.
+_allowed_source_roots: list[Path] | None = None
 
-def configure(root: Path) -> None:
-    """Set the on-disk cache root. Call once at process start."""
-    global _root
+
+def configure(root: Path, allowed_source_roots: list[Path] | None = None) -> None:
+    """Set the on-disk cache root. Call once at process start.
+
+    ``allowed_source_roots`` optionally pins the directories a source image may
+    live under; when omitted the queue + sorted roots from ``paths`` are used.
+    """
+    global _root, _allowed_source_roots
     _root = Path(root)
     _root.mkdir(parents=True, exist_ok=True)
+    if allowed_source_roots is not None:
+        _allowed_source_roots = [Path(p) for p in allowed_source_roots]
 
 
 def _ensure_configured() -> Path:
@@ -56,9 +71,46 @@ def _ensure_configured() -> Path:
     return _root
 
 
+def _source_roots() -> list[Path]:
+    """Resolve the directories a source image is allowed to live under."""
+    if _allowed_source_roots is not None:
+        roots = _allowed_source_roots
+    else:
+        roots = [paths.queue_root(), paths.sorted_root()]
+    resolved: list[Path] = []
+    for root in roots:
+        try:
+            resolved.append(Path(os.path.realpath(str(root))))
+        except OSError:
+            continue
+    return resolved
+
+
+def _validated_source(image_path: Path) -> Path:
+    """Return the realpath of ``image_path`` iff it sits inside an allowed root.
+
+    Resolves symlinks / ``..`` with ``os.path.realpath`` and confirms containment
+    via ``os.path.commonpath`` — a crafted traversal path (``../../etc/passwd``)
+    can never escape the queue / sorted roots. This is the path-injection barrier
+    every thumbnail source flows through before it is stat-ed or opened.
+    """
+    real = Path(os.path.realpath(str(image_path)))
+    for root in _source_roots():
+        try:
+            if os.path.commonpath([str(real), str(root)]) == str(root):
+                return real
+        except ValueError:
+            # Different drives / un-comparable paths → not contained.
+            continue
+    raise ValueError(f"image path outside allowed roots: {image_path!r}")
+
+
 def _hash_for(image_path: Path) -> str:
+    # Containment barrier: only a file inside the allowed roots may be hashed
+    # (and therefore stat-ed / opened). Rejects traversal before any disk touch.
+    safe_path = _validated_source(image_path)
     try:
-        stat = image_path.stat()
+        stat = safe_path.stat()
     except OSError as exc:
         raise FileNotFoundError(str(image_path)) from exc
     digest = hashlib.sha1()

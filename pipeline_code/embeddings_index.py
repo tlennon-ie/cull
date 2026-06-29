@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from paths import base_dir as _default_base_dir
+from paths import validate_slug as _validate_slug
 from pipeline_logging import get_logger
 
 import embeddings
@@ -63,7 +64,10 @@ class EmbeddingIndex:
         base_dir: Path | None = None,
         autoflush_every: int = 64,
     ) -> None:
-        self.slug = slug or os.environ.get("PIPELINE_SLUG", "default")
+        # Sanitise the slug before it becomes part of the on-disk path. The
+        # charset barrier rejects '/', '\\' and '.' so the per-slug filename can
+        # never escape the embeddings dir (path-injection barrier for CodeQL).
+        self.slug = _validate_slug(slug or os.environ.get("PIPELINE_SLUG", "default"))
         self.base_dir = base_dir or _default_base_dir()
         self.dir: Path = self.base_dir / EMBEDDINGS_DIRNAME
         self.path: Path = self.dir / f"{self.slug}.jsonl"

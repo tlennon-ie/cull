@@ -67,6 +67,7 @@ from PIL import Image
 
 from categories import SYSTEM_TERMINAL, get_categories
 from paths import sorted_dir
+from paths import validate_slug as _validate_slug
 from pipeline_logging import get_logger
 
 logger = get_logger(__name__)
@@ -300,7 +301,8 @@ def iter_samples(
     files (images :data:`IMAGE_EXT` + video clips :data:`VIDEO_EXT`) seed a
     sample.
     """
-    root = sorted_dir(slug)
+    # Sanitise the slug before it selects the sorted-tree root to walk.
+    root = sorted_dir(_validate_slug(slug))
     if not root.exists():
         return
 
@@ -788,7 +790,12 @@ def export_dataset(
         )
 
     options = _parse_options(opts)
-    out_path = Path(out_dir)
+    # Sanitise the slug (it selects the sorted source tree below) and resolve the
+    # caller-supplied destination to one canonical absolute root. Every profile
+    # writer joins this resolved ``out_path`` with computed segments, so all
+    # writes stay anchored under the normalised export directory.
+    slug = _validate_slug(slug)
+    out_path = Path(out_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
     samples = list(iter_samples(slug, categories=options.categories))

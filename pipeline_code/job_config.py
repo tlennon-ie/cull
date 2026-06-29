@@ -140,7 +140,9 @@ def jobs_dir() -> Path:
 
 
 def _job_path(slug: str) -> Path:
-    if not JOB_SLUG_RE.match(slug):
+    # ``fullmatch`` anchors both ends so the slug cannot contain a path separator
+    # or '..' traversal — this is the path-injection barrier for the per-job file.
+    if not JOB_SLUG_RE.fullmatch(slug or ""):
         raise ValueError(f"invalid slug: {slug!r}")
     return jobs_dir() / f"{slug}.json"
 
@@ -553,7 +555,7 @@ def _read_job_file(path: Path) -> Job | None:
 
 
 def get_job(slug: str) -> Job | None:
-    if not JOB_SLUG_RE.match(slug or ""):
+    if not JOB_SLUG_RE.fullmatch(slug or ""):
         return None
     path = _job_path(slug)
     return _read_job_file(path) if path.is_file() else None
@@ -604,6 +606,9 @@ def create_job(name: str, *, subject: str | None = None, preset: str | None = No
 
 
 def delete_job(slug: str) -> None:
+    # Sanitise before building any path: rejects '/', '\\' and '..' traversal.
+    if not JOB_SLUG_RE.fullmatch(slug or ""):
+        raise ValueError(f"invalid slug: {slug!r}")
     if slug == get_active_slug():
         raise ValueError(f"cannot delete the active job: {slug}")
     path = _job_path(slug)
