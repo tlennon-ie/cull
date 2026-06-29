@@ -9,6 +9,22 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from paths import base_dir
+from rate_limit import RateLimitConfig, RateLimiter
+
+# Per-source pacing + 429 backoff + optional proxy. Opt-in: unthrottled unless
+# RATE_LIMIT_CIVITAI_SEARCH_* env is set, so existing behaviour is unchanged.
+_LIMITER = RateLimiter(RateLimitConfig.from_mapping("civitai_search", os.environ))
+
+
+def _retry_after_seconds(resp) -> float | None:
+    """Parse a Retry-After header (delta-seconds form) into a float, or None."""
+    raw = resp.headers.get("Retry-After") if resp is not None else None
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
 
 BASE_DIR  = Path(os.environ.get("PIPELINE_BASE_DIR", str(base_dir())))
 TOPIC     = os.environ.get("PIPELINE_TOPIC", "Realistic Female Influencer")
@@ -143,8 +159,13 @@ def build_search_payload(query: str, offset: int = 0):
 
 def download_image(url: str, dest: Path) -> bool:
     try:
-        r = requests.get(url, timeout=30, stream=True)
+        _LIMITER.acquire()
+        r = requests.get(url, timeout=30, stream=True, **_LIMITER.requests_kwargs())
+        if r.status_code == 429:
+            _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+            return False
         if r.ok:
+            _LIMITER.note_success()
             data = r.content
             if len(data) > 5000:
                 dest.write_bytes(data)
@@ -177,15 +198,17 @@ def scrape_civitai_search(seen: set):
         payload = build_search_payload(query, offset)
         
         try:
-            r = requests.post(SEARCH_URL, headers=HEADERS, json=payload, timeout=20)
+            _LIMITER.acquire()
+            r = requests.post(SEARCH_URL, headers=HEADERS, json=payload, timeout=20, **_LIMITER.requests_kwargs())
             if r.status_code == 429:
-                print(f"  [429] Rate limited, sleeping 20s...")
-                time.sleep(20)
+                _LIMITER.note_429(retry_after=_retry_after_seconds(r))
+                print(f"  [429] Rate limited, backing off...")
                 continue
             if not r.ok:
                 print(f"  [Error] {r.status_code}: {r.text[:200]}")
                 break
-                
+
+            _LIMITER.note_success()
             data = r.json()
             # print(json.dumps(data, indent=2)[:500]) # Debug print
             

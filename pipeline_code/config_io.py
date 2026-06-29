@@ -234,6 +234,31 @@ def _validate_gallery_dl(gd: Any) -> dict:
     return out
 
 
+def _validate_yt_dlp(yt: Any) -> dict:
+    _require_object(yt, "scrapers.yt_dlp")
+    allowed = {"enabled", "urls", "limit", "cookies"}
+    out: dict[str, Any] = {}
+    for k, v in yt.items():
+        if k not in allowed:
+            raise ValidationError(f"unknown yt_dlp key: {k!r}")
+        if k == "enabled":
+            out[k] = bool(v)
+        elif k == "urls":
+            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+                raise ValidationError("yt_dlp.urls must be a list of strings")
+            if any("\x00" in x for x in v):
+                raise ValidationError("yt_dlp.urls contains a NUL byte")
+            out[k] = list(v)
+        elif k == "limit":
+            iv = _as_int(v, "yt_dlp.limit")
+            out[k] = max(1, min(_MAX_GALLERY_LIMIT, iv))
+        else:  # cookies (a path string)
+            if _bad_path_str(v):
+                raise ValidationError("yt_dlp.cookies is not a valid path string")
+            out[k] = v
+    return out
+
+
 def _validate_local_imports(li: Any) -> list[dict]:
     if not isinstance(li, list):
         raise ValidationError("scrapers.local_imports must be a list")
@@ -261,7 +286,7 @@ def _validate_local_imports(li: Any) -> list[dict]:
 def _validate_scrapers(s: Any) -> dict:
     _require_object(s, "scrapers")
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -281,6 +306,8 @@ def _validate_scrapers(s: Any) -> dict:
             out[k] = v
         elif k == "gallery_dl":
             out[k] = _validate_gallery_dl(v)
+        elif k == "yt_dlp":
+            out[k] = _validate_yt_dlp(v)
         else:  # local_imports
             out[k] = _validate_local_imports(v)
     return out
