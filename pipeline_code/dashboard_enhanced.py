@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -2279,6 +2280,56 @@ def api_queue_files():
     return jsonify(results)
 
 
+def _read_vision_prediction(image_path: Path) -> tuple[str, dict[str, Any]]:
+    """Best-effort ``(predicted_category, scores)`` for an image being re-labelled.
+
+    Reads the sibling ``<stem>.vision.json`` audit record (the full classifier
+    result, which carries both ``category`` and the score keys). Falls back to
+    the image's current parent-folder name for the predicted category when no
+    audit record exists or it is unparseable. Never raises — a missing/garbage
+    record just yields ``("", {})`` for the scores so the caller can still record
+    the corrected target.
+    """
+    predicted = image_path.parent.name
+    scores: dict[str, Any] = {}
+    meta_path = image_path.with_name(image_path.stem + ".vision.json")
+    try:
+        if meta_path.exists():
+            record = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(record, dict):
+                scores = record
+                cat = str(record.get("category") or "").strip()
+                if cat:
+                    predicted = cat
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return predicted, scores
+
+
+def _record_relabel_correction(
+    stem: str, predicted: str, target_category: str, scores: dict[str, Any],
+) -> None:
+    """Feed a manual queue re-label into the active-learning correction log.
+
+    ``predicted`` / ``scores`` are snapshotted from the image's ORIGINAL location
+    (before the move relocated it). Lazily imports ``active_learning`` and records
+    ``(predicted → target)`` keyed by the image stem so corrections accumulate for
+    the prompt's few-shot block. Wrapped so it can NEVER break the move that
+    already succeeded — and ``active_learning`` is best-effort, including against
+    a ``SystemExit``-subclass error (so we catch ``BaseException``).
+    """
+    if not predicted or predicted == target_category:
+        return  # not a correction — same bucket (or unknown source bucket)
+    try:
+        import active_learning
+        slug = _resolve_job_slug() or "default"
+        active_learning.record_correction(
+            slug, stem, predicted, target_category, scores,
+        )
+    except BaseException as exc:  # noqa: BLE001 - learning is best-effort, never fatal
+        logger.debug("record_correction skipped for %s: %s", stem, exc)
+
+
 @app.route("/api/queue/action", methods=["POST"])
 def api_queue_action():
     data = request.get_json() or {}
@@ -2297,8 +2348,15 @@ def api_queue_action():
             return jsonify({"error": "target required"}), 400
         dest = PIPELINE_QUEUE / target
         dest.mkdir(parents=True, exist_ok=True)
+        # Snapshot the original prediction + scores BEFORE the move relocates the
+        # sidecar (the predicted bucket is the source folder / the .vision.json's
+        # category — both gone once the image lands under <target>).
+        predicted, scores = _read_vision_prediction(path)
         for sibling in path.parent.glob(f"{path.stem}.*"):
             shutil.move(str(sibling), str(dest / sibling.name))
+        # After a SUCCESSFUL move, log the re-label for active learning.
+        # Best-effort — never breaks the move.
+        _record_relabel_correction(path.stem, predicted, target, scores)
         return jsonify({"success": True, "action": "move", "target": str(dest)})
     return jsonify({"error": "unknown action"}), 400
 
@@ -3117,15 +3175,83 @@ def api_export_dataset():
 
 _HF_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+# Background HF-export jobs, keyed by a generated id. Each value is
+# ``{state: running|done|error, message, data, repo_id, slug}``. The upload runs
+# off the request thread so a large dataset push doesn't block the dashboard; the
+# UI polls the status endpoint below. Guarded by a lock for cross-thread access.
+_HF_JOBS: dict[str, dict[str, Any]] = {}
+_HF_JOBS_LOCK = threading.Lock()
+# How long the POST waits for the worker before handing back a 202 + id. A
+# mocked/instant push (tests) finishes inside this window and returns its terminal
+# result synchronously; a real upload exceeds it and switches to async polling.
+_HF_SYNC_WAIT_SECONDS = 0.5
+# Cap on retained finished jobs so the dict can't grow without bound.
+_HF_JOBS_MAX = 64
+
+
+def _hf_error_status(exc: Exception) -> tuple[str, int]:
+    """Map a ``push_to_hf`` exception to ``(message, http_status)``.
+
+    Mirrors the original synchronous mapping so the terminal envelope (and the
+    status endpoint) report the same actionable messages.
+    """
+    if isinstance(exc, credentials.MissingCredentialError):
+        return "set HF_TOKEN in the environment to push to HuggingFace", 400
+    if isinstance(exc, ValueError):            # nothing to export
+        return str(exc), 400
+    if isinstance(exc, RuntimeError):          # huggingface_hub not installed
+        return str(exc), 400
+    logger.warning("HF push failed: %s", exc)  # upload / network failure
+    return str(exc), 500
+
+
+def _hf_set(job_id: str, **fields: Any) -> None:
+    with _HF_JOBS_LOCK:
+        entry = _HF_JOBS.setdefault(job_id, {})
+        entry.update(fields)
+        # Evict the oldest finished jobs if we're over the cap (insertion order).
+        if len(_HF_JOBS) > _HF_JOBS_MAX:
+            for stale in [k for k, v in _HF_JOBS.items()
+                          if v.get("state") in ("done", "error")][: len(_HF_JOBS) - _HF_JOBS_MAX]:
+                _HF_JOBS.pop(stale, None)
+
+
+def _hf_get(job_id: str) -> dict[str, Any] | None:
+    with _HF_JOBS_LOCK:
+        entry = _HF_JOBS.get(job_id)
+        return dict(entry) if entry is not None else None
+
+
+def _run_hf_push(job_id: str, *, slug: str, repo_id: str, private: bool,
+                 include_video: bool, categories_arg: list | None) -> None:
+    """Thread body: run the push, recording terminal state into ``_HF_JOBS``.
+
+    Catches ``BaseException`` because ``credentials.MissingCredentialError`` is a
+    ``SystemExit`` subclass (so it would otherwise escape a plain ``except
+    Exception`` and kill the worker thread silently).
+    """
+    try:
+        result = hf_export.push_to_hf(
+            slug=slug, repo_id=repo_id, private=private,
+            include_video=include_video, categories=categories_arg)
+    except BaseException as exc:  # noqa: BLE001 - mapped to a friendly status below
+        message, status = _hf_error_status(exc)
+        _hf_set(job_id, state="error", message=message, status=status, data=None)
+        return
+    _hf_set(job_id, state="done", message="upload complete", status=200, data=result)
+
 
 @app.route("/api/jobs/<slug>/export/huggingface", methods=["POST"])
 def api_export_huggingface(slug: str):
-    """Push ``data/sorted/<slug>`` to a (private by default) HF dataset repo.
+    """Kick off a push of ``data/sorted/<slug>`` to a (private by default) HF repo.
 
     Body: ``{repo_id, private?, include_video?, categories?}``. ``repo_id`` must
-    match ``namespace/name``. Upload is BLOCKING (a background-thread improvement
-    is a follow-up). Returns ``{success, data: <result>, error}``; maps the
-    module's typed failures to actionable messages.
+    match ``namespace/name`` (validated synchronously). The upload then runs on a
+    background thread keyed by a generated id; poll
+    ``GET /api/jobs/<slug>/export/huggingface/status?id=`` for progress. If the
+    work finishes within ``_HF_SYNC_WAIT_SECONDS`` (e.g. a fast failure) the
+    terminal ``{success, data, error}`` envelope is returned immediately with the
+    mapped status; otherwise a ``202`` with ``{data: {id, state: "running"}}``.
     """
     if not job_config.JOB_SLUG_RE.match(slug) or job_config.get_job(slug) is None:
         return jsonify({"success": False, "data": None, "error": "unknown job"}), 404
@@ -3137,21 +3263,162 @@ def api_export_huggingface(slug: str):
     private = bool(data.get("private", True))
     include_video = bool(data.get("include_video", False))
     categories_arg = data.get("categories") if isinstance(data.get("categories"), list) else None
-    try:
-        result = hf_export.push_to_hf(
-            slug=slug, repo_id=repo_id, private=private,
-            include_video=include_video, categories=categories_arg)
-    except credentials.MissingCredentialError:
+
+    job_id = uuid.uuid4().hex
+    _hf_set(job_id, state="running", message="upload in progress", status=202,
+            data=None, slug=slug, repo_id=repo_id)
+    thread = threading.Thread(
+        target=_run_hf_push, name=f"hf-push-{job_id[:8]}", daemon=True,
+        kwargs={"job_id": job_id, "slug": slug, "repo_id": repo_id,
+                "private": private, "include_video": include_video,
+                "categories_arg": categories_arg})
+    thread.start()
+    # Give a fast/mocked push a chance to finish so its terminal result (and the
+    # original status-code mapping) is returned inline; real uploads time out
+    # here and hand back a 202 for polling.
+    thread.join(_HF_SYNC_WAIT_SECONDS)
+    entry = _hf_get(job_id) or {}
+    state = entry.get("state")
+    if state == "done":
+        return jsonify({"success": True, "data": entry.get("data"), "error": None})
+    if state == "error":
         return jsonify({"success": False, "data": None,
-                        "error": "set HF_TOKEN in the environment to push to HuggingFace"}), 400
-    except ValueError as exc:  # nothing to export
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
-    except RuntimeError as exc:  # huggingface_hub not installed
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
-    except Exception as exc:  # noqa: BLE001 - upload/network failure
-        logger.warning("HF push failed: %s", exc)
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
-    return jsonify({"success": True, "data": result, "error": None})
+                        "error": entry.get("message")}), int(entry.get("status", 500))
+    # Still running: hand back the id for status polling.
+    return jsonify({"success": True, "error": None,
+                    "data": {"id": job_id, "state": "running", "repo_id": repo_id}}), 202
+
+
+@app.route("/api/jobs/<slug>/export/huggingface/status", methods=["GET"])
+def api_export_huggingface_status(slug: str):
+    """Report the state of a background HF-export job started for ``slug``.
+
+    Query: ``?id=<job id>``. Returns ``{success, data: {id, state, repo_id,
+    result?}, error}`` where ``state`` is ``running|done|error``; ``error`` carries
+    the friendly message when the job failed. Unknown ids are a clean 404.
+    """
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"success": False, "data": None, "error": "invalid job slug"}), 400
+    job_id = (request.args.get("id") or "").strip()
+    entry = _hf_get(job_id) if job_id else None
+    if entry is None:
+        return jsonify({"success": False, "data": None, "error": "unknown export job"}), 404
+    state = entry.get("state")
+    payload = {"id": job_id, "state": state, "repo_id": entry.get("repo_id")}
+    if state == "done":
+        payload["result"] = entry.get("data")
+    return jsonify({
+        "success": state != "error",
+        "data": payload,
+        "error": entry.get("message") if state == "error" else None,
+    })
+
+
+# ── API: CLIP embeddings (status + find-similar) ──────────────────────────────
+#
+# Embeddings are an OPTIONAL feature gated on the ML extra (open_clip + torch).
+# Both endpoints degrade gracefully: when the extra is absent OR the per-slug
+# index is empty they return a friendly, actionable envelope rather than a 500.
+# `embeddings` / `embeddings_index` import cleanly without the ML stack (the
+# heavy deps are lazy inside embed_image), so a plain `import` is safe here, but
+# we keep it lazy to mirror the active_learning pattern and avoid loading them
+# until an embeddings feature is actually used.
+
+_EMBED_HINT = ("Embeddings need the ML extra. Install it with `pip install .[ml]`, "
+               "then build the index with `python tools/embed_sorted.py`.")
+_EMBED_EMPTY_HINT = ("No embeddings indexed for this job yet. Build the index with "
+                     "`python tools/embed_sorted.py`.")
+
+
+@app.route("/api/embeddings/status", methods=["GET"])
+def api_embeddings_status():
+    """Report whether semantic features are usable for ``?job=<slug>``.
+
+    Returns ``{success, data: {available, indexed, slug}, error}`` where
+    ``available`` is ``embeddings.open_clip_available()`` and ``indexed`` is the
+    number of vectors stored for the slug. Never 500s — a missing ML extra just
+    reports ``available: false`` with a hint.
+    """
+    slug = _resolve_job_slug() or "default"
+    try:
+        import embeddings
+        import embeddings_index
+        available = bool(embeddings.open_clip_available())
+        indexed = len(embeddings_index.EmbeddingIndex(slug=slug))
+    except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
+        logger.debug("embeddings status unavailable: %s", exc)
+        return jsonify({"success": True, "error": None,
+                        "data": {"available": False, "indexed": 0, "slug": slug,
+                                 "hint": _EMBED_HINT}})
+    data: dict[str, Any] = {"available": available, "indexed": indexed, "slug": slug}
+    if not available:
+        data["hint"] = _EMBED_HINT
+    elif indexed == 0:
+        data["hint"] = _EMBED_EMPTY_HINT
+    return jsonify({"success": True, "data": data, "error": None})
+
+
+@app.route("/api/embeddings/similar", methods=["GET"])
+def api_embeddings_similar():
+    """Nearest neighbours of an indexed image for ``?job=<slug>``.
+
+    Query: ``?key=<image key>&top_k=&job=``. Looks up the key's stored vector in
+    ``EmbeddingIndex(slug)`` and ranks the rest by cosine similarity. Returns
+    ``{success, data: {results: [{path, thumb_url, score}], ...}, error}`` —
+    paths are ``safe_inside``-guarded against the queue/sorted roots. Degrades
+    gracefully (never 500) when the ML extra is missing, the index is empty, or
+    the key isn't indexed.
+    """
+    slug = _resolve_job_slug() or "default"
+    key = (request.args.get("key") or "").strip()
+    try:
+        top_k = max(1, min(60, int(request.args.get("top_k", 12))))
+    except (TypeError, ValueError):
+        top_k = 12
+    if not key:
+        return jsonify({"success": False, "data": None, "error": "key is required"}), 400
+
+    try:
+        import embeddings
+        import embeddings_index
+        available = bool(embeddings.open_clip_available())
+        index = embeddings_index.EmbeddingIndex(slug=slug)
+    except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
+        logger.debug("embeddings similar unavailable: %s", exc)
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": False, "indexed": 0,
+                                 "message": _EMBED_HINT}})
+
+    indexed = len(index)
+    if not available or indexed == 0:
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": available, "indexed": indexed,
+                                 "message": _EMBED_HINT if not available else _EMBED_EMPTY_HINT}})
+
+    query_vec = index.get(key)
+    if query_vec is None:
+        return jsonify({"success": True, "error": None,
+                        "data": {"results": [], "available": True, "indexed": indexed,
+                                 "message": "That image isn't in the embeddings index yet."}})
+
+    # Ask for one extra so we can drop the query image itself from the results.
+    neighbours = index.search(query_vec, top_k=top_k + 1)
+    results: list[dict[str, Any]] = []
+    for neighbour_key, score in neighbours:
+        if neighbour_key == key:
+            continue
+        safe = safe_inside(neighbour_key, [PIPELINE_QUEUE, PIPELINE_SORTED])
+        if safe is None:
+            continue  # traversal-guarded out (stale index row pointing elsewhere)
+        results.append({
+            "path": neighbour_key,
+            "thumb_url": f"/api/thumbnail?path={_urlquote(neighbour_key)}",
+            "score": round(float(score), 4),
+        })
+        if len(results) >= top_k:
+            break
+    return jsonify({"success": True, "error": None,
+                    "data": {"results": results, "available": True, "indexed": indexed}})
 
 
 # ── API: per-job schedules ────────────────────────────────────────────────────
@@ -4075,7 +4342,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <span class="bg-slate-800/60 rounded px-1" :title="(c.width||'?') + 'x' + (c.height||'?')" x-text="c.resolution_bucket"></span>
               </div>
               <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
-              <span class="link-btn mt-1" @click="openModalFromCard(c)">Open</span>
+              <div class="mt-1 flex items-center gap-3">
+                <span class="link-btn" @click="openModalFromCard(c)">Open</span>
+                <span class="link-btn" @click="findSimilar(c)" title="Find visually similar kept images (CLIP embeddings)">Find similar</span>
+              </div>
             </div>
           </template>
           <template x-if="!galleryLoading && (gallery.items?.length ?? 0) === 0">
@@ -4088,6 +4358,25 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">python tools/seed_demo_data.py</code>
                 from the repo root to populate a synthetic preview.
               </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Find-similar results strip (CLIP embeddings; on-demand). -->
+      <div x-show="sim.open" x-cloak class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">Similar to <span class="font-mono text-xs" x-text="sim.sourceName"></span></h3>
+          <button @click="sim.open = false" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Close</button>
+        </div>
+        <div x-show="sim.loading" class="text-xs text-slate-400">Searching…</div>
+        <div x-show="!sim.loading && sim.message" x-cloak class="text-xs text-amber-300" x-text="sim.message"></div>
+        <div x-show="!sim.loading && !sim.message && sim.results.length === 0" x-cloak class="text-xs text-slate-500">No similar images found.</div>
+        <div class="flex flex-wrap gap-3 mt-2">
+          <template x-for="m in sim.results" :key="m.path">
+            <div class="relative w-32">
+              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700"/>
+              <div class="text-[11px] text-slate-400 mt-1">score <span x-text="m.score"></span></div>
             </div>
           </template>
         </div>
@@ -4228,7 +4517,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-1">Push to HuggingFace</h3>
-        <p class="text-xs text-slate-400 mb-3">Upload the kept set as a HuggingFace dataset repo. Requires <code>HF_TOKEN</code> in the environment and <code>pip install huggingface_hub</code>. Upload is blocking — the page waits until it finishes.</p>
+        <p class="text-xs text-slate-400 mb-3">Upload the kept set as a HuggingFace dataset repo. Requires <code>HF_TOKEN</code> in the environment and <code>pip install huggingface_hub</code>. The upload runs in the background — you can keep working while it finishes.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Repo ID (namespace/name)</span>
@@ -4249,6 +4538,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
             <span x-text="hf.pushing ? 'Uploading…' : 'Push to HuggingFace'"></span>
           </button>
+          <span x-show="hf.status && hf.pushing" x-cloak class="text-xs text-amber-300" x-text="hf.status"></span>
           <span x-show="hf.error" class="text-xs text-rose-300" x-text="hf.error"></span>
         </div>
         <div x-show="hf.result" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="hf.result ? JSON.stringify(hf.result, null, 2) : ''"></div>
@@ -4894,6 +5184,42 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
+      <!-- yt-dlp (overridden wholesale as scrapers.yt_dlp). Mirrors gallery-dl. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">yt-dlp</h3>
+          <div>
+            <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
+                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+            <span class="text-sm">Enable yt-dlp for this job</span>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+            <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+            <textarea :value="ytUrls()" @input="setYtUrls($event.target.value)" rows="4"
+                      placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
+            <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+        </template>
+      </div>
+
       <!-- Local folders (multi): scrapers.local_imports list. Each row is its
            own concurrent source. -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
@@ -5070,9 +5396,20 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </label>
             <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
+            <label class="flex items-center gap-2 mt-5"><input type="checkbox" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
             <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+          <div class="grid md:grid-cols-2 gap-3">
+            <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+              <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+            <div class="grid grid-cols-1 gap-3">
+              <label class="block"><span class="text-xs text-slate-400">yt-dlp frames per URL</span>
+                <input type="number" min="1" max="5000" :value="(presetEditor.cfg.scrapers.yt_dlp||{}).limit" @input="peSet('scrapers.yt_dlp.limit', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <label class="block"><span class="text-xs text-slate-400">yt-dlp cookies file</span>
+                <input :value="(presetEditor.cfg.scrapers.yt_dlp||{}).cookies" @input="peSet('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
+            </div>
+          </div>
 
           <div>
             <div class="text-xs text-slate-400 mb-1">Local folders</div>
@@ -5865,6 +6202,7 @@ function dashboard() {
     scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
     // Wave-2 surfaces (all on-demand — never on the status poll).
     dup: { loading: false, threshold: 10, groups: [], scanned: false, error: '' },
+    sim: { open: false, loading: false, results: [], message: '', sourceName: '' },
     exportForm: { profile: 'kohya', trigger_word: '', train_val_split: '',
                   resolution_bucketing: false, repeats: '', video_bucketing: '',
                   running: false, summary: null, error: '' },
@@ -5877,7 +6215,7 @@ function dashboard() {
       label: { sd_prompt: 'SD / Flux prompt', booru_tags: 'Booru tags',
                natural_language: 'Natural-language', motion: 'Motion / video' }[id] || id,
     })),
-    hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '' },
+    hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '', status: '' },
     schedules: { loading: false, rows: [], actions: [], error: '',
                  form: { slug: '', cadence: '@daily', action: 'scrape', enabled: true } },
     visionHealth: { loading: false, probes: {}, fleet: [], error: '' },
@@ -6272,6 +6610,7 @@ function dashboard() {
     // List/url convenience views.
     effList(path) { const v = this.effVal(path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
     effUrls() { const v = this.effVal('scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    ytUrls() { const v = this.effVal('scrapers.yt_dlp.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     // Set an override (and optimistically update the effective view), debounce PUT.
     setOverride(path, value) {
       this._deepSet(this.je.overrides, path, value);
@@ -6280,6 +6619,7 @@ function dashboard() {
     },
     setOverrideList(path, text) { this.setOverride(path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); },
     setOverrideUrls(text) { this.setOverride('scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
+    setYtUrls(text) { this.setOverride('scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
     // Reset a field back to the preset (remove the override). Re-fetch to get the
     // recomputed effective value from the preset.
     async resetOverride(path) {
@@ -6426,6 +6766,7 @@ function dashboard() {
         cfg.topic_filters = cfg.topic_filters || {};
         cfg.scrapers = cfg.scrapers || {};
         cfg.scrapers.gallery_dl = cfg.scrapers.gallery_dl || {};
+        cfg.scrapers.yt_dlp = cfg.scrapers.yt_dlp || {};
         if (!Array.isArray(cfg.scrapers.local_imports)) cfg.scrapers.local_imports = [];
         cfg.scoring = cfg.scoring || {};
         cfg.captioning = cfg.captioning || {};
@@ -6444,6 +6785,8 @@ function dashboard() {
     peSetList(path, text) { this._deepSet(this.presetEditor.cfg, path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); this.schedulePresetSave(); },
     peUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     peSetUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
+    peYtUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
+    peSetYtUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
     peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
     // Preset-editor vision fleet (global default fleet jobs inherit).
     peFleet() { const v = this._deepGet(this.presetEditor.cfg, 'vision.workers'); return Array.isArray(v) ? v : []; },
@@ -7074,6 +7417,26 @@ function dashboard() {
       for (const p of victims) { await this.deleteDuplicate(p); }
     },
 
+    // ── Find similar (CLIP embeddings) ───────────────────────────────────────
+    async findSimilar(card) {
+      // Open the results strip and fetch nearest neighbours for this image. The
+      // backend degrades gracefully (no ML extra / empty index / un-indexed key)
+      // by returning a friendly message instead of an error.
+      this.sim = { open: true, loading: true, results: [], message: '', sourceName: card.name || '' };
+      const q = this.jobQuery();
+      const sep = q ? '&' : '?';
+      const url = '/api/embeddings/similar' + q + sep
+                + 'key=' + encodeURIComponent(card.path) + '&top_k=12';
+      try {
+        const j = await (await fetch(url)).json();
+        const data = j.data || {};
+        if (!j.success) { this.sim.message = j.error || 'similar search failed'; }
+        else if (data.message && (data.results || []).length === 0) { this.sim.message = data.message; }
+        else { this.sim.results = data.results || []; }
+      } catch (e) { this.sim.message = 'network error'; }
+      this.sim.loading = false;
+    },
+
     // ── Dataset export ───────────────────────────────────────────────────────
     async runDatasetExport() {
       this.exportForm.running = true; this.exportForm.error = ''; this.exportForm.summary = null;
@@ -7098,17 +7461,51 @@ function dashboard() {
     async pushToHuggingFace() {
       const repo = (this.hf.repo_id || '').trim();
       if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { this.hf.error = 'repo_id must look like namespace/name'; return; }
-      this.hf.pushing = true; this.hf.error = ''; this.hf.result = null;
+      this.hf.pushing = true; this.hf.error = ''; this.hf.result = null; this.hf.status = '';
       try {
         const r = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/export/huggingface', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ repo_id: repo, private: !!this.hf.private, include_video: !!this.hf.include_video }),
         });
         const j = await r.json();
-        if (j.success) { this.hf.result = j.data; this.notify('Pushed to HuggingFace', 'info'); }
-        else { this.hf.error = j.error || 'push failed'; }
-      } catch (e) { this.hf.error = 'network error'; }
+        // 202 + an id means the upload is running on a background thread — poll
+        // the status endpoint until it finishes. A terminal result (fast failure
+        // or an already-finished push) comes back inline and skips polling.
+        if (r.status === 202 && j.data && j.data.id) {
+          this.hf.status = 'Uploading…';
+          await this._pollHfStatus(j.data.id);
+        } else if (j.success) {
+          this.hf.result = j.data; this.hf.status = 'done';
+          this.notify('Pushed to HuggingFace', 'info');
+        } else {
+          this.hf.error = j.error || 'push failed'; this.hf.status = '';
+        }
+      } catch (e) { this.hf.error = 'network error'; this.hf.status = ''; }
       this.hf.pushing = false;
+    },
+    async _pollHfStatus(id) {
+      // Poll the HF-export status endpoint every 2s until done/error. Best-effort
+      // polling: a transient network blip just retries on the next tick.
+      const url = '/api/jobs/' + encodeURIComponent(this.currentJob)
+                + '/export/huggingface/status?id=' + encodeURIComponent(id);
+      for (let i = 0; i < 1800; i++) {            // ~1h ceiling at 2s intervals
+        await new Promise(res => setTimeout(res, 2000));
+        let j;
+        try { j = await (await fetch(url)).json(); } catch (e) { continue; }
+        const state = j.data && j.data.state;
+        if (state === 'done') {
+          this.hf.result = (j.data && j.data.result) || null; this.hf.status = 'done';
+          this.notify('Pushed to HuggingFace', 'info');
+          return;
+        }
+        if (state === 'error' || j.success === false) {
+          this.hf.error = j.error || 'push failed'; this.hf.status = '';
+          return;
+        }
+        this.hf.status = 'Uploading…';
+      }
+      this.hf.status = '';
+      this.hf.error = 'upload is taking longer than expected — check HuggingFace directly';
     },
 
     // ── Schedules ────────────────────────────────────────────────────────────
