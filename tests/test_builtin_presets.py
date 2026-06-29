@@ -210,6 +210,16 @@ def test_themed_presets_seed_subreddits_and_keywords():
         assert presets[name]["topic_filters"]["keywords_extra"], name
 
 
+def test_video_presets_seed_scraper_targets():
+    # Every video_* preset must ship with starter Reddit targets (mirrors the
+    # image themes above) so a fresh video job isn't left with no scraper feeds.
+    presets = bp.builtin_library()["presets"]
+    video = [n for n in presets if n.startswith("video_")]
+    assert video, "no video_* presets found"
+    for name in video:
+        assert presets[name]["scrapers"]["reddit_subreddits"], name
+
+
 def test_all_presets_have_a_nonzero_ovr_floor():
     # The user asked for Min OVR/REL configured to suitable (non-zero) values.
     for name, cfg in bp.builtin_library()["presets"].items():
