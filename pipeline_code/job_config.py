@@ -192,6 +192,7 @@ def _default_preset_cfg() -> dict:
             "civitai_domains": [],
             "gallery_dl": {"enabled": False, "urls": [], "limit_per_url": 200,
                             "cookies_file": "", "config_path": ""},
+            "yt_dlp": {"enabled": False, "urls": [], "limit": 200, "cookies": ""},
             "local_imports": [],
         },
         "categories": cats,
@@ -727,6 +728,43 @@ def clean_vision_fleet(workers: Any) -> list[dict]:
     return out
 
 
+def _project_active_learning_exemplars(slug: str, eff: dict) -> str:
+    """Best-effort: project the job's accumulated active-learning exemplars into
+    a JSON map ``{category: [exemplar, ...]}`` for the classification prompt's
+    few-shot block. Positives are the EFFECTIVE keep buckets; negatives are the
+    terminal categories. Returns ``"{}"`` when there is no signal or on ANY error
+    — this is an opportunistic enrichment that must never break projection.
+
+    The env var ``ACTIVE_LEARNING_EXEMPLARS_JSON`` it feeds is an internal
+    projection (never user-set); ``vision_prompt`` reads it and injects the block
+    only when it is non-empty, so an absent/empty value leaves the prompt
+    byte-identical to today."""
+    try:
+        import active_learning
+    except Exception:  # pragma: no cover - active_learning always importable here
+        return "{}"
+    try:
+        cats = eff.get("categories")
+        keep = [c.get("name", "") for c in cats if isinstance(c, dict)] \
+            if isinstance(cats, list) else []
+        terminal = sorted(active_learning.TERMINAL)
+        out: dict[str, list] = {}
+        # Keep buckets first (positives), then terminal (negatives); dedupe names.
+        for cat in [*keep, *terminal]:
+            name = (cat or "").strip()
+            if not name or name in out:
+                continue
+            try:
+                ex = active_learning.exemplars(slug, name)
+            except Exception:
+                ex = []
+            if ex:
+                out[name] = ex
+        return json.dumps(out)
+    except Exception:  # pragma: no cover - never block projection
+        return "{}"
+
+
 def resolve_env(job: Job) -> dict[str, str]:
     """Flatten the EFFECTIVE config into the existing env-var names. Every key is
     always emitted so a job fully overrides any stale value in the global .env."""
@@ -782,6 +820,7 @@ def resolve_env(job: Job) -> dict[str, str]:
         "AUTO_CAPTION_ENABLED": _b(cap.get("enabled", False)),
         "AUTO_CAPTION_STYLE": str(cap.get("style", "sd_prompt") or "sd_prompt"),
         "AUTO_CAPTION_OVERWRITE": _b(cap.get("overwrite", False)),
+        "ACTIVE_LEARNING_EXEMPLARS_JSON": _project_active_learning_exemplars(job.slug, eff),
     }
 
 
