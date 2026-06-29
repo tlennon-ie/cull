@@ -266,9 +266,12 @@ class ScoreConfig:
 # When AUTO_CAPTION_ENABLED=true the vision call is asked to ALSO emit a
 # `caption` string suitable for downstream LoRA / fine-tune training. Style
 # choice is user-configurable so the same pipeline can produce SD prompts
-# for Flux LoRAs, Booru tags for anime LoRAs, or natural-language captions
-# for general image-text models.
-CAPTION_STYLES: tuple[str, ...] = ("sd_prompt", "booru_tags", "natural_language")
+# for Flux LoRAs, Booru tags for anime LoRAs, natural-language captions for
+# general image-text models, or motion-oriented captions for video-model
+# trainers (LTX-Video, Wan, Hunyuan-Video, Mochi, CogVideoX).
+CAPTION_STYLES: tuple[str, ...] = (
+    "sd_prompt", "booru_tags", "natural_language", "motion",
+)
 
 _CAPTION_STYLE_INSTRUCTIONS: dict[str, str] = {
     "sd_prompt": (
@@ -291,6 +294,22 @@ _CAPTION_STYLE_INSTRUCTIONS: dict[str, str] = {
         "'A young woman with brown hair smiles softly at the camera in a "
         "warmly-lit indoor space. The shot is a tight headshot with shallow "
         "depth of field, suggesting a 35mm portrait lens.'"
+    ),
+    "motion": (
+        "Motion / video-trainer caption (LTX-Video, Wan, Hunyuan-Video, "
+        "Mochi, CogVideoX). One flowing sentence that reads as a directable "
+        "shot description. Cover, in this order: (1) CAMERA MOVEMENT - the "
+        "camera move (static, slow pan left/right, tilt up/down, dolly in/out, "
+        "tracking, crane, handheld, orbit, zoom); (2) SUBJECT ACTION - what "
+        "the subject is doing and how it moves through the frame; (3) SHOT "
+        "TYPE - the framing / angle (wide establishing shot, medium shot, "
+        "close-up, low-angle, aerial); (4) TEMPORAL description - how the "
+        "scene evolves over time / throughout the clip (what changes from "
+        "start to end), plus pacing, lighting and mood. Even for a still "
+        "frame, infer the most plausible motion. Example: 'A slow dolly-in on "
+        "a lone runner as she sprints toward camera across a misty bridge at "
+        "dawn; the wide establishing shot tightens to a medium shot while the "
+        "sun rises over the duration, warm light building throughout.'"
     ),
 }
 

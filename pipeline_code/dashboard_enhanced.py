@@ -40,6 +40,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote as _urlquote
 
 from dotenv import load_dotenv
 
@@ -115,6 +116,14 @@ import thumb_cache
 import job_config
 import scraper_test
 import paths as _paths
+import vision_model_catalog
+import phash_dedup
+import export_profiles
+import hf_export
+import scheduler
+import fleet_health
+import vision_prompt
+import credentials
 
 # Now that job_config is importable, derive the canonical scraper toggle list
 # from its SCRAPER_NAMES (single source of truth) annotated with UI descriptions.
@@ -924,6 +933,10 @@ def api_update_run():
 
 ALLOWED_VISION_WORKERS = [
     "balanced-groq",
+    "openai",                 # OpenAI cloud (GPT vision)
+    "anthropic",              # Anthropic Claude vision
+    "gemini",                 # Google Gemini vision (google-genai SDK)
+    "openrouter",             # OpenRouter OpenAI-compatible gateway
     "balanced-lm",            # targets LMSTUDIO_PRIMARY_*
     "balanced-lm-secondary",  # same worker script, forced to LMSTUDIO_SECONDARY_* via env override
     "lm-autodetect",
@@ -933,6 +946,10 @@ ALLOWED_VISION_WORKERS = [
 
 _VISION_WORKER_DESCRIPTIONS = {
     "balanced-groq":           "Groq cloud, llama-4-scout - fast, paid",
+    "openai":                  "OpenAI cloud (GPT vision) - structured JSON schema. Reads OPENAI_API_KEY + OPENAI_VISION_MODEL",
+    "anthropic":               "Anthropic Claude vision - structured output via forced tool-use. Reads ANTHROPIC_API_KEY + ANTHROPIC_VISION_MODEL",
+    "gemini":                  "Google Gemini vision (new google-genai SDK) - response_schema output. Reads GEMINI_API_KEY/GOOGLE_API_KEY + GEMINI_VISION_MODEL",
+    "openrouter":              "OpenRouter - OpenAI-compatible gateway to many vision models. Reads OPENROUTER_API_KEY + OPENROUTER_VISION_MODEL",
     "balanced-lm":             "LM Studio PRIMARY endpoint",
     "balanced-lm-secondary":   "LM Studio SECONDARY endpoint (runs in parallel to primary)",
     "lm-autodetect":           "LM Studio, auto-picks vision-capable model",
@@ -984,6 +1001,19 @@ SETTINGS_KEYS: list[str] = [
     # Global UX / runtime
     "BLUR_NSFW_THUMBS",
     "PIPELINE_RECONCILE_SECONDS",
+    # Wave-2 global feature toggles (scheduler/notifications/embeddings/prefilter/video)
+    "PREFILTER_ENABLED",
+    "PREFILTER_MIN_SCORE",
+    "WEBHOOK_URL",
+    "DESKTOP_NOTIFICATIONS",
+    "EMBEDDINGS_ENABLED",
+    "SCHEDULER_ENABLED",
+    "VIDEO_CLASSIFY_ENABLED",
+    # yt-dlp scraper (global toggle + targets; credentials/cookies are global)
+    "YT_DLP_ENABLED",
+    "YT_DLP_URLS",
+    "YT_DLP_LIMIT",
+    "YT_DLP_COOKIES",
     # Storage paths (global roots; per-slug subdirs derive from the job slug)
     "PIPELINE_BASE_DIR",
     "PIPELINE_QUEUE",
@@ -1006,6 +1036,17 @@ SETTINGS_KEYS: list[str] = [
     "OLLAMA_URL",
     "OLLAMA_MODEL",
     "OLLAMA_TIMEOUT",
+    # Cloud vision providers (key + model). Test Connection fetches the live
+    # model catalogue into the dropdown; the worker reads <PROVIDER>_VISION_MODEL.
+    "OPENAI_API_KEY",
+    "OPENAI_VISION_MODEL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_VISION_MODEL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_VISION_MODEL",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_VISION_MODEL",
     # Scraper credentials (the keys are global; per-job targets live in the job)
     "CIVITAI_API_KEY",
     "CIVITAI_API_RED_KEY",
@@ -1022,6 +1063,8 @@ SECRET_KEYS: set[str] = {
     "TWITTER_COOKIES", "DISCORD_BOT_TOKEN",
     "REDDIT_CLIENT_SECRET",
     "OPENAI_COMPAT_API_KEY",
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
 }
 # Placeholder shown in the UI for a credential that IS set. The real value never
 # leaves the server: GET returns this for any non-empty secret, and POST treats
@@ -1096,14 +1139,37 @@ def api_settings_post():
     return jsonify({"success": True, "applied": changes, "restart_required": True})
 
 
+# Cloud vision providers whose model catalogue /api/vision/test fetches via
+# vision_model_catalog. Value = the env var names a key is resolved from, in
+# order (first non-empty wins). Mirrors the cloud workers' own env lookup.
+_CLOUD_VISION_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+}
+
+
+def _cloud_provider_key(provider: str) -> str:
+    """Resolve a cloud provider's API key from its env var(s), '' when unset."""
+    for env_name in _CLOUD_VISION_PROVIDERS.get(provider, ()):  # first set wins
+        val = (os.environ.get(env_name) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 @app.route("/api/vision/test", methods=["POST"])
 def api_vision_test():
     """Probe one vision endpoint and (for local providers) return its model list.
 
     Body: ``{provider, url?, api_key?}``. ``provider`` is one of groq, lmstudio,
-    llamacpp, ollama, openai-compat. For local providers the caller-supplied
-    ``url``/``api_key`` are probed directly so a worker can be verified BEFORE it
-    is saved, and the discovered models are returned so the UI can fill the model
+    llamacpp, ollama, openai-compat, OR a cloud provider (openai / anthropic /
+    gemini / openrouter). For local providers the caller-supplied ``url``/
+    ``api_key`` are probed directly so a worker can be verified BEFORE it is
+    saved; for cloud providers the key resolves from the body or the provider's
+    env var and the live model catalogue is fetched via vision_model_catalog.
+    Either way the discovered models are returned so the UI can fill the model
     dropdown. Returns ``{ok, message, models, latency_ms, provider}``.
 
     Security: this is a localhost single-user admin tool whose job is to test
@@ -1116,6 +1182,12 @@ def api_vision_test():
     provider = (data.get("provider") or "").strip().lower()
     body_url = (data.get("url") or "").strip()
     body_key = (data.get("api_key") or "").strip()
+    # A masked sentinel means "the field still shows the stored secret, I didn't
+    # type a new key" — treat it as empty so the key falls back to the env var
+    # rather than literally sending "********" to the provider (mirrors the
+    # scraper-test guard against SECRET_MASK).
+    if body_key == SECRET_MASK:
+        body_key = ""
     started = _t.time()
 
     def _done(ok: bool, message: str, status: int = 200, models: list | None = None) -> Any:
@@ -1135,7 +1207,8 @@ def api_vision_test():
             if not key:
                 return _done(False, "no GROQ_API_KEY configured", 400)
             r = requests.get("https://api.groq.com/openai/v1/models",
-                             headers={"Authorization": f"Bearer {key}"}, timeout=10)
+                             headers={"Authorization": f"Bearer {key}"}, timeout=10,
+                             allow_redirects=False)  # no 302-bounce to metadata
             if r.status_code == 401:
                 return _done(False, "401 Unauthorized - key invalid")
             if r.status_code != 200:
@@ -1177,6 +1250,23 @@ def api_vision_test():
             models = [m.get("id", "") for m in (r.json().get("data") or [])
                       if isinstance(m, dict) and m.get("id")]
             return _done(True, f"connected, {len(models)} model(s) loaded", models=models)
+
+        if provider in _CLOUD_VISION_PROVIDERS:
+            # Cloud providers (openai/anthropic/gemini/openrouter): fetch the live
+            # model catalogue so the UI dropdown mirrors the local-fleet picker.
+            # The key comes from the request body first (lets you test an unsaved
+            # key) then the provider's env var(s). list_models is best-effort and
+            # never raises; an empty list with a key set means auth/endpoint fail.
+            key = body_key or _cloud_provider_key(provider)
+            if not key:
+                env_hint = " / ".join(_CLOUD_VISION_PROVIDERS[provider])
+                return _done(False, f"no API key — set {env_hint} in Settings or type one above", 400)
+            models = vision_model_catalog.list_models(
+                provider, base_url=body_url or None, api_key=key)
+            if models:
+                return _done(True, f"connected, {len(models)} model(s) available", models=models)
+            return _done(False, "no models returned — check the API key"
+                                + (" / base URL" if body_url else ""))
 
         return _done(False, f"unknown provider: {provider!r}", 400)
     except (requests.RequestException, ValueError) as exc:
@@ -1324,7 +1414,10 @@ _INHERITABLE_KEYS = frozenset({
     "topic_filters", "scrapers", "categories", "category_rules", "scoring",
     "captioning", "vision",
 })
-_CAPTION_STYLES = frozenset({"sd_prompt", "booru_tags", "natural_language"})
+# Sourced from vision_prompt.CAPTION_STYLES (single source of truth) so a new
+# style like "motion" stays in sync across the prompt builder, the override
+# validator, and the UI dropdown rather than being hardcoded in three places.
+_CAPTION_STYLES = frozenset(vision_prompt.CAPTION_STYLES)
 _VISION_PROVIDERS = frozenset(job_config.VISION_PROVIDERS)
 _MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
@@ -2854,6 +2947,278 @@ def api_gallery_download():
     )
 
 
+# ── API: near-duplicate detection (perceptual hash) ───────────────────────────
+
+@app.route("/api/duplicates")
+def api_duplicates():
+    """Group near-duplicate sorted images by perceptual hash, scoped to ?job=.
+
+    Query: ``threshold`` (Hamming distance, default 10) and ``job``. Returns the
+    envelope ``{success, data: {groups, threshold}, error}`` where each group is
+    a list of ``{path, thumb_url, category}`` for images that are within
+    ``threshold`` bits of one another. On-demand only — never run on the status
+    poll. Every path is re-validated with ``safe_inside`` so a stale index row
+    pointing outside the pipeline roots can never leak a thumbnail URL.
+    """
+    slug = _resolve_job_slug()
+    threshold = _parse_int(request.args.get("threshold"), default=phash_dedup.DEFAULT_THRESHOLD)
+    threshold = max(0, min(64, threshold))
+    try:
+        raw_groups = phash_dedup.find_near_duplicates(threshold=threshold, slug=slug)
+    except Exception as exc:  # noqa: BLE001 - a scan failure must not 500 the UI
+        logger.warning("duplicate scan failed: %s", exc)
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+
+    # Map index keys (image paths) to display cards via the cached sorted items,
+    # so we reuse the category/thumb info without a second filesystem walk.
+    by_path = {str(it.image_path): it for it in _get_sorted_items_scoped(slug)}
+    groups: list[list[dict[str, Any]]] = []
+    for keys in raw_groups:
+        members: list[dict[str, Any]] = []
+        for key in keys:
+            safe = safe_inside(key, [PIPELINE_QUEUE, PIPELINE_SORTED])
+            if safe is None:
+                continue
+            item = by_path.get(key)
+            members.append({
+                "path": key,
+                # URL-encode so a path with spaces / ? / # / + can't break the
+                # query string (api_thumbnail re-validates with safe_inside).
+                "thumb_url": f"/api/thumbnail?path={_urlquote(key, safe='')}",
+                "category": item.category if item is not None else "",
+            })
+        if len(members) > 1:
+            groups.append(members)
+    return jsonify({"success": True,
+                    "data": {"groups": groups, "threshold": threshold},
+                    "error": None})
+
+
+@app.route("/api/duplicates/delete", methods=["POST"])
+def api_duplicates_delete():
+    """Delete one image (and its sidecars) from the duplicates view.
+
+    Body: ``{path}``. The path MUST resolve inside the queue/sorted roots via
+    ``safe_inside`` — the queue-only delete endpoint can't touch sorted images,
+    so this mirrors its sibling-sweep for the sorted tree behind the same guard.
+    Returns ``{success, error}``.
+    """
+    data = request.get_json() or {}
+    path = safe_inside(data.get("path", ""), [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if path is None or not path.exists():
+        return jsonify({"success": False, "error": "path outside pipeline roots or missing"}), 400
+    try:
+        for sibling in path.parent.glob(f"{path.stem}.*"):
+            sibling.unlink(missing_ok=True)
+    except OSError as exc:
+        return jsonify({"success": False, "error": f"delete failed: {exc}"}), 500
+    # Invalidate the sorted cache so the next scan/gallery doesn't show the dupe.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True, "error": None})
+
+
+# ── API: dataset export (training-ready layouts) ──────────────────────────────
+
+@app.route("/api/export/dataset", methods=["POST"])
+def api_export_dataset():
+    """Export the active (or ?job=) sorted library into a training-ready layout.
+
+    Body: ``{profile, trigger_word?, train_val_split?, resolution_bucketing?,
+    repeats?, video_bucketing?, categories?}``. Validates ``profile`` against
+    ``export_profiles.PROFILES``, writes under
+    ``<base_dir>/exports/<slug>/<profile>_<stamp>`` (never touching the source),
+    and returns ``{success, data: <summary>, error}``.
+    """
+    slug = _resolve_job_slug(default=None) or job_config.get_active_slug()
+    if not slug:
+        return jsonify({"success": False, "data": None,
+                        "error": "no active job — activate one first"}), 409
+    data = request.get_json() or {}
+    profile = (data.get("profile") or "").strip()
+    if profile not in export_profiles.PROFILES:
+        return jsonify({"success": False, "data": None,
+                        "error": f"profile must be one of {list(export_profiles.PROFILES)}"}), 400
+
+    # Collect the allowed options, validating the scalar shapes here so a
+    # malformed value (e.g. a dict where an int is expected) returns a clean 400
+    # rather than a TypeError that would fall through to the 500 branch.
+    opts: dict[str, Any] = {}
+    for key in ("trigger_word", "train_val_split", "resolution_bucketing",
+                "repeats", "video_bucketing", "categories"):
+        if key not in data or data[key] in (None, ""):
+            continue
+        val = data[key]
+        if key in ("train_val_split", "repeats") and not isinstance(val, (int, float)):
+            return jsonify({"success": False, "data": None,
+                            "error": f"{key} must be a number"}), 400
+        if key in ("trigger_word", "video_bucketing") and not isinstance(val, str):
+            return jsonify({"success": False, "data": None,
+                            "error": f"{key} must be a string"}), 400
+        # bool is a subclass of int, so check it explicitly (and before any int
+        # coercion) so a stray dict/str for the bucketing flag is a clean 400.
+        if key == "resolution_bucketing" and not isinstance(val, bool):
+            return jsonify({"success": False, "data": None,
+                            "error": "resolution_bucketing must be a boolean"}), 400
+        if key == "categories" and not isinstance(val, list):
+            return jsonify({"success": False, "data": None,
+                            "error": "categories must be a list"}), 400
+        opts[key] = val
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = _paths.base_dir() / "exports" / slug / f"{profile}_{stamp}"
+    try:
+        summary = export_profiles.export_dataset(slug, profile, out_dir, **opts)
+    except ValueError as exc:  # bad option / unknown profile
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001 - export I/O failure shouldn't 500-crash
+        logger.warning("dataset export failed: %s", exc)
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+    return jsonify({"success": True, "data": summary, "error": None})
+
+
+# ── API: push a curated dataset to HuggingFace ────────────────────────────────
+
+_HF_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+@app.route("/api/jobs/<slug>/export/huggingface", methods=["POST"])
+def api_export_huggingface(slug: str):
+    """Push ``data/sorted/<slug>`` to a (private by default) HF dataset repo.
+
+    Body: ``{repo_id, private?, include_video?, categories?}``. ``repo_id`` must
+    match ``namespace/name``. Upload is BLOCKING (a background-thread improvement
+    is a follow-up). Returns ``{success, data: <result>, error}``; maps the
+    module's typed failures to actionable messages.
+    """
+    if not job_config.JOB_SLUG_RE.match(slug) or job_config.get_job(slug) is None:
+        return jsonify({"success": False, "data": None, "error": "unknown job"}), 404
+    data = request.get_json() or {}
+    repo_id = (data.get("repo_id") or "").strip()
+    if not _HF_REPO_RE.match(repo_id):
+        return jsonify({"success": False, "data": None,
+                        "error": "repo_id must look like 'namespace/name'"}), 400
+    private = bool(data.get("private", True))
+    include_video = bool(data.get("include_video", False))
+    categories_arg = data.get("categories") if isinstance(data.get("categories"), list) else None
+    try:
+        result = hf_export.push_to_hf(
+            slug=slug, repo_id=repo_id, private=private,
+            include_video=include_video, categories=categories_arg)
+    except credentials.MissingCredentialError:
+        return jsonify({"success": False, "data": None,
+                        "error": "set HF_TOKEN in the environment to push to HuggingFace"}), 400
+    except ValueError as exc:  # nothing to export
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+    except RuntimeError as exc:  # huggingface_hub not installed
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001 - upload/network failure
+        logger.warning("HF push failed: %s", exc)
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+    return jsonify({"success": True, "data": result, "error": None})
+
+
+# ── API: per-job schedules ────────────────────────────────────────────────────
+
+@app.route("/api/schedules", methods=["GET"])
+def api_schedules_list():
+    """All persisted schedules as ``{success, data: {schedules, actions}, error}``."""
+    rows = [s.to_dict() for s in scheduler.list_schedules()]
+    return jsonify({"success": True,
+                    "data": {"schedules": rows, "actions": list(scheduler.ACTIONS)},
+                    "error": None})
+
+
+@app.route("/api/schedules", methods=["POST"])
+def api_schedules_add():
+    """Upsert a schedule. Body: ``{slug, cadence, action, enabled?}``."""
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip()
+    if not job_config.JOB_SLUG_RE.match(slug) or job_config.get_job(slug) is None:
+        return jsonify({"success": False, "data": None, "error": "unknown job slug"}), 400
+    try:
+        sched = scheduler.Schedule(
+            slug=slug,
+            cadence=str(data.get("cadence", "@daily")),
+            action=str(data.get("action", "scrape")),
+            enabled=bool(data.get("enabled", True)),
+        )
+    except ValueError as exc:  # bad cadence / action
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+    try:
+        scheduler.add_schedule(sched)
+    except OSError as exc:  # disk full / perms — clean error, not a 500 traceback
+        return jsonify({"success": False, "data": None, "error": f"could not persist: {exc}"}), 500
+    return jsonify({"success": True, "data": sched.to_dict(), "error": None})
+
+
+@app.route("/api/schedules", methods=["DELETE"])
+def api_schedules_delete():
+    """Delete the schedule identified by ``?slug=&action=``."""
+    slug = (request.args.get("slug") or "").strip()
+    action = (request.args.get("action") or "").strip()
+    if not slug or not action:
+        return jsonify({"success": False, "data": None,
+                        "error": "slug and action are required"}), 400
+    # Validate the slug shape (mirrors the POST handler) so a malformed slug can
+    # never reach the persistence layer. We deliberately don't require the job to
+    # still exist, so an orphaned schedule remains deletable.
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"success": False, "data": None,
+                        "error": "invalid job slug"}), 400
+    try:
+        removed = scheduler.remove_schedule(slug, action)
+    except OSError as exc:  # disk write failure on the rewrite
+        return jsonify({"success": False, "data": None, "error": f"could not persist: {exc}"}), 500
+    return jsonify({"success": True, "data": {"removed": removed}, "error": None})
+
+
+# ── API: vision fleet health telemetry ────────────────────────────────────────
+
+def _scrub_fleet(fleet: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the raw ``api_key`` from each fleet worker before it leaves the box.
+
+    The health panel echoes the fleet so the UI can label probes, but the worker
+    dicts carry the per-instance API key. Replace it with a ``has_key`` bool so
+    the browser learns whether a key is set without ever receiving the secret.
+    """
+    scrubbed: list[dict[str, Any]] = []
+    for worker in fleet:
+        if not isinstance(worker, dict):
+            continue
+        safe = {k: v for k, v in worker.items() if k != "api_key"}
+        safe["has_key"] = bool(str(worker.get("api_key", "") or "").strip())
+        scrubbed.append(safe)
+    return scrubbed
+
+
+@app.route("/api/vision/health")
+def api_vision_health():
+    """Probe the active (or ?job=) job's vision fleet — a live telemetry panel.
+
+    Returns ``{success, data: {probes, fleet}, error}`` where ``probes`` is
+    ``{id: {ok, latency_ms, error}}`` from ``fleet_health.probe_fleet`` over the
+    cleaned worker list. On-demand only.
+    """
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    fleet: list[dict[str, Any]] = []
+    if job is not None:
+        eff = job_config.effective_config(job)
+        vision = eff.get("vision") if isinstance(eff.get("vision"), dict) else {}
+        fleet = job_config.clean_vision_fleet(vision.get("workers"))
+    try:
+        probes = fleet_health.probe_fleet(fleet)
+    except Exception as exc:  # noqa: BLE001 - probe must never 500 the panel
+        logger.warning("fleet health probe failed: %s", exc)
+        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+    # Never ship raw per-worker api_keys to the browser — replace with has_key.
+    return jsonify({"success": True,
+                    "data": {"probes": probes, "fleet": _scrub_fleet(fleet)},
+                    "error": None})
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
@@ -3242,6 +3607,65 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <template x-if="!jobsLoading && jobsList.length === 0">
         <div class="text-xs text-slate-500">No jobs yet — create one above to begin curating.</div>
       </template>
+    </section>
+
+    <!-- SCHEDULES (per-job cadence → scrape/curate/export) -->
+    <section x-show="view === 'jobs' && active === 'schedules'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Schedules</h3>
+        <p class="text-xs text-slate-400 mb-3">Run a job action on a cadence (<code>@hourly</code>, <code>@daily</code>, <code>@weekly</code>, or <code>every 30m</code> / <code>every 2h</code>). The supervisor fires due schedules on its reconcile loop when <code>SCHEDULER_ENABLED=true</code>.</p>
+        <div class="grid md:grid-cols-4 gap-3 items-end">
+          <label class="block">
+            <span class="text-xs text-slate-400">Job</span>
+            <select x-model="schedules.form.slug" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 mt-1">
+              <option value="" :selected="!schedules.form.slug">(pick a job)</option>
+              <template x-for="jb in jobsList" :key="jb.slug">
+                <option :value="jb.slug" :selected="schedules.form.slug === jb.slug" x-text="jb.name + ' (' + jb.slug + ')'"></option>
+              </template>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Cadence</span>
+            <input x-model="schedules.form.cadence" placeholder="@daily"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Action</span>
+            <select x-model="schedules.form.action" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 mt-1">
+              <template x-for="a in (schedules.actions.length ? schedules.actions : ['scrape','curate','export'])" :key="a">
+                <option :value="a" :selected="schedules.form.action === a" x-text="a"></option>
+              </template>
+            </select>
+          </label>
+          <button @click="addSchedule()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Add / update</button>
+        </div>
+        <div x-show="schedules.error" x-cloak class="text-xs text-rose-300 mt-2" x-text="schedules.error"></div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h4 class="font-semibold text-sm">Active schedules</h4>
+          <button @click="loadSchedules()" class="text-xs link-btn">refresh</button>
+        </div>
+        <div x-show="!schedules.rows.length" class="text-sm text-slate-500">No schedules yet.</div>
+        <table x-show="schedules.rows.length" class="w-full text-sm">
+          <thead><tr class="text-left text-xs text-slate-400 border-b border-slate-700">
+            <th class="py-1">Job</th><th>Cadence</th><th>Action</th><th>Enabled</th><th>Last run</th><th></th>
+          </tr></thead>
+          <tbody>
+            <template x-for="s in schedules.rows" :key="s.slug + '_' + s.action">
+              <tr class="border-b border-slate-800">
+                <td class="py-1.5 font-mono text-xs" x-text="s.slug"></td>
+                <td class="font-mono text-xs" x-text="s.cadence"></td>
+                <td x-text="s.action"></td>
+                <td x-text="s.enabled ? 'yes' : 'no'"></td>
+                <td class="text-xs text-slate-400" x-text="s.last_run || '—'"></td>
+                <td class="text-right"><button @click="removeSchedule(s.slug, s.action)" class="text-xs text-rose-300 hover:text-rose-200">delete</button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <!-- GLOBAL STATS ──────────────────────────────────────────────────────
@@ -3670,6 +4094,132 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
     </section>
 
+    <!-- DUPLICATES (perceptual-hash near-dupes; on-demand scan) -->
+    <section x-show="view === 'job' && active === 'duplicates'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 class="font-semibold">Near-duplicate finder</h3>
+            <p class="text-xs text-slate-400 mt-1">Groups visually-similar sorted images by perceptual hash (dHash). Lower threshold = stricter (only very close matches). On-demand — it never runs on the auto-refresh.</p>
+          </div>
+          <div class="flex items-end gap-3">
+            <label class="text-xs text-slate-400">Threshold (0-64)
+              <input type="number" min="0" max="64" x-model.number="dup.threshold"
+                     class="w-20 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 mt-1 block"/>
+            </label>
+            <button @click="loadDuplicates()" :disabled="dup.loading"
+                    class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+              <span x-text="dup.loading ? 'Scanning…' : 'Scan for duplicates'"></span>
+            </button>
+          </div>
+        </div>
+        <div x-show="dup.error" x-cloak class="text-xs text-rose-300 mt-3" x-text="dup.error"></div>
+        <div x-show="dup.scanned && !dup.loading && !dup.groups.length" class="text-sm text-slate-500 mt-4">No near-duplicates found at this threshold.</div>
+      </div>
+
+      <template x-for="(group, gi) in dup.groups" :key="'dg' + gi">
+        <div class="card rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs text-slate-400" x-text="group.length + ' similar images'"></span>
+          </div>
+          <div class="flex flex-wrap gap-3">
+            <template x-for="m in group" :key="m.path">
+              <div class="relative w-32">
+                <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700"/>
+                <div class="text-[11px] text-slate-400 mt-1 truncate" x-text="m.category || '—'"></div>
+                <div class="flex gap-1 mt-1">
+                  <button @click="keepOnly(group, m.path)" class="flex-1 px-1 py-0.5 text-[11px] bg-emerald-700 hover:bg-emerald-600 rounded" title="Keep this one, delete the rest of the group">Keep</button>
+                  <button @click="deleteDuplicate(m.path)" class="flex-1 px-1 py-0.5 text-[11px] bg-rose-700 hover:bg-rose-600 rounded" title="Delete this image">Delete</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- EXPORT (training-ready dataset profiles + HuggingFace push) -->
+    <section x-show="view === 'job' && active === 'export'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Export dataset</h3>
+        <p class="text-xs text-slate-400 mb-3">Pack <code x-text="currentJob"></code>'s kept images into a training-ready layout under <code>data/exports/</code>. Copy-only — your sorted library is never modified.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">Profile</span>
+            <select x-model="exportForm.profile" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <template x-for="p in exportProfiles" :key="p">
+                <option :value="p" :selected="exportForm.profile === p" x-text="p"></option>
+              </template>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Trigger word (prepended to every caption)</span>
+            <input x-model="exportForm.trigger_word" placeholder="optional"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Train/val split (0.0–0.99)</span>
+            <input x-model="exportForm.train_val_split" type="number" min="0" max="0.99" step="0.05" placeholder="0 = none"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Repeats (kohya concept folder)</span>
+            <input x-model="exportForm.repeats" type="number" min="0" placeholder="0 = flat"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Video bucketing (clip_caption)</span>
+            <select x-model="exportForm.video_bucketing" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="" :selected="!exportForm.video_bucketing">(none)</option>
+              <template x-for="m in videoBucketModes" :key="m">
+                <option :value="m" :selected="exportForm.video_bucketing === m" x-text="m"></option>
+              </template>
+            </select>
+          </label>
+          <label class="flex items-center gap-2 mt-6">
+            <input type="checkbox" x-model="exportForm.resolution_bucketing" class="accent-indigo-500"/>
+            <span class="text-sm">Bucket by resolution</span>
+          </label>
+        </div>
+        <div class="mt-4 flex items-center gap-3">
+          <button @click="runDatasetExport()" :disabled="exportForm.running"
+                  class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+            <span x-text="exportForm.running ? 'Exporting…' : 'Run export'"></span>
+          </button>
+          <span x-show="exportForm.error" class="text-xs text-rose-300" x-text="exportForm.error"></span>
+        </div>
+        <div x-show="exportForm.summary" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="exportForm.summary ? JSON.stringify(exportForm.summary, null, 2) : ''"></div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Push to HuggingFace</h3>
+        <p class="text-xs text-slate-400 mb-3">Upload the kept set as a HuggingFace dataset repo. Requires <code>HF_TOKEN</code> in the environment and <code>pip install huggingface_hub</code>. Upload is blocking — the page waits until it finishes.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Repo ID (namespace/name)</span>
+            <input x-model="hf.repo_id" placeholder="your-name/my-dataset"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="flex items-center gap-2">
+            <input type="checkbox" x-model="hf.private" class="accent-indigo-500"/>
+            <span class="text-sm">Private repo</span>
+          </label>
+          <label class="flex items-center gap-2">
+            <input type="checkbox" x-model="hf.include_video" class="accent-indigo-500"/>
+            <span class="text-sm">Include video clips</span>
+          </label>
+        </div>
+        <div class="mt-4 flex items-center gap-3">
+          <button @click="pushToHuggingFace()" :disabled="hf.pushing"
+                  class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
+            <span x-text="hf.pushing ? 'Uploading…' : 'Push to HuggingFace'"></span>
+          </button>
+          <span x-show="hf.error" class="text-xs text-rose-300" x-text="hf.error"></span>
+        </div>
+        <div x-show="hf.result" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="hf.result ? JSON.stringify(hf.result, null, 2) : ''"></div>
+      </div>
+    </section>
+
     <!-- SCRAPERS (per-job toggles via overrides; Local-<name> rows read-only) -->
     <section x-show="view === 'job' && active === 'scrapers'" class="card rounded-xl p-5">
       <div class="flex items-start justify-between gap-4 mb-3">
@@ -3778,6 +4328,29 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="text-xs text-slate-500 mt-3" x-text="'Running: ' + ((status.pipeline?.vision_workers || []).join(', ') || '(none)')"></div>
       </div>
 
+      <!-- Fleet health telemetry — live probe of each worker endpoint. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">Fleet health{{ tip('Live latency/reachability probe of every enabled worker endpoint in this job\'s fleet. On-demand — click Probe.') }}</h3>
+          <button @click="loadVisionHealth()" :disabled="visionHealth.loading"
+                  class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+            <span x-text="visionHealth.loading ? 'Probing…' : 'Probe'"></span>
+          </button>
+        </div>
+        <div x-show="visionHealth.error" x-cloak class="text-xs text-rose-300" x-text="visionHealth.error"></div>
+        <div x-show="!visionHealth.fleet.length && !visionHealth.loading" class="text-xs text-slate-500">No fleet workers to probe.</div>
+        <div class="space-y-1">
+          <template x-for="w in visionHealth.fleet" :key="w.id">
+            <div class="flex items-center justify-between text-xs border-b border-slate-800 py-1">
+              <span class="font-mono" x-text="(w.name || w.id) + ' · ' + (w.base_url || '')"></span>
+              <span x-show="visionHealth.probes[w.id]"
+                    :class="(visionHealth.probes[w.id] && visionHealth.probes[w.id].ok) ? 'text-emerald-400' : 'text-rose-400'"
+                    x-text="visionHealth.probes[w.id] ? ((visionHealth.probes[w.id].ok ? '✓ ' + (visionHealth.probes[w.id].latency_ms ?? '?') + 'ms' : '✗ ' + (visionHealth.probes[w.id].error || 'down'))) : ''"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <!-- Cloud worker (Groq) — global toggle, runs alongside the local fleet. -->
         <div class="card rounded-xl p-5">
@@ -3798,6 +4371,44 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="card rounded-xl p-5">
           <h3 class="font-semibold mb-3">Throttle (<span x-text="throttle + '%'"></span>)</h3>
           <input type="range" min="0" max="100" step="5" x-model="throttle" @change="setThrottle()" class="w-full accent-indigo-500"/>
+        </div>
+      </div>
+
+      <!-- Cloud vision workers — global toggles. Test Connection fetches the
+           provider's live model catalogue into the dropdown (mirrors the local
+           fleet picker). Keys + the chosen model are saved via Global Settings. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Cloud vision workers{{ tip('Optional paid cloud workers that run alongside your local fleet. Enable, click Test Connection to pull the live model list, pick a model, then Save in Global Settings (the API key + chosen model live there). Global, not per-job.') }}</h3>
+        <p class="text-xs text-slate-400 mb-3">Enter the API key in <button class="link-btn" @click="view='jobs'; active='settings'">Global Settings</button>, then Test here to load models. Save in Settings to persist the model.</p>
+        <div class="grid md:grid-cols-2 gap-4">
+          <template x-for="cp in cloudProviders" :key="cp">
+            <div class="border border-slate-700 rounded-lg p-3 space-y-2">
+              <div class="flex items-center justify-between">
+                <label class="inline-flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" :checked="cloudEnabled(cp)" @change="toggleVisionWorker(cloudWorkerName[cp], $event.target.checked)" class="accent-indigo-500"/>
+                  <span class="text-sm font-medium" x-text="cloudProviderLabels[cp]"></span>
+                </label>
+                <button @click="testProvider(cp)" :disabled="!!(providerTest[cp] && providerTest[cp].testing)"
+                        class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="(providerTest[cp] && providerTest[cp].testing) ? 'Testing…' : 'Test Connection'"></span>
+                </button>
+              </div>
+              <div class="text-xs" x-show="providerTest[cp] && providerTest[cp].message"
+                   :class="(providerTest[cp] && providerTest[cp].ok) ? 'text-emerald-400' : 'text-rose-400'"
+                   x-text="providerTest[cp] && providerTest[cp].message"></div>
+              <div>
+                <label class="text-xs text-slate-400 block mb-1" x-text="(cp.toUpperCase()) + ' model'"></label>
+                <select @change="settings[cloudModelKey(cp)] = $event.target.value; markSettingsDirty()"
+                        class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
+                  <option value="" :selected="!(settings[cloudModelKey(cp)] || '').trim()">(auto-detect)</option>
+                  <template x-for="m in cloudModelOptions(cp)" :key="m">
+                    <option :value="m" :selected="settings[cloudModelKey(cp)] === m" x-text="m"></option>
+                  </template>
+                </select>
+                <p class="text-[11px] text-slate-500 mt-1" x-show="!cloudModelOptions(cp).length">Click Test Connection to load models.</p>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
 
@@ -3851,13 +4462,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('captioning.style')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('captioning.style')" @click="resetOverride('captioning.style')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <select :value="effVal('captioning.style')" @change="setOverride('captioning.style', $event.target.value)"
+            <select @change="setOverride('captioning.style', $event.target.value)"
                     :disabled="!effVal('captioning.enabled')"
                     class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 disabled:opacity-50"
                     :class="!isOver('captioning.style') ? 'text-slate-400' : ''">
-              <option value="sd_prompt">SD / Flux prompt</option>
-              <option value="booru_tags">Booru tags</option>
-              <option value="natural_language">Natural-language</option>
+              <template x-for="cs in captionStyles" :key="cs.id">
+                <option :value="cs.id" :selected="effVal('captioning.style') === cs.id" x-text="cs.label"></option>
+              </template>
             </select>
           </div>
         </div>
@@ -4749,6 +5360,120 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Cloud vision provider keys{{ tip('API keys + chosen model for the cloud vision workers (OpenAI / Anthropic / Gemini / OpenRouter). Enable the worker and pick a model on the Vision tab. Leave a model blank to auto-detect a vision-capable one.') }}</h3>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">OPENAI_API_KEY</span>
+            <input x-model="settings.OPENAI_API_KEY" type="password" placeholder="sk-..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">OPENAI_VISION_MODEL</span>
+            <input x-model="settings.OPENAI_VISION_MODEL" placeholder="(auto-detect)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">ANTHROPIC_API_KEY</span>
+            <input x-model="settings.ANTHROPIC_API_KEY" type="password" placeholder="sk-ant-..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">ANTHROPIC_VISION_MODEL</span>
+            <input x-model="settings.ANTHROPIC_VISION_MODEL" placeholder="(auto-detect)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GEMINI_API_KEY / GOOGLE_API_KEY</span>
+            <input x-model="settings.GEMINI_API_KEY" type="password" placeholder="AIza..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GEMINI_VISION_MODEL</span>
+            <input x-model="settings.GEMINI_VISION_MODEL" placeholder="(auto-detect)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">OPENROUTER_API_KEY</span>
+            <input x-model="settings.OPENROUTER_API_KEY" type="password" placeholder="sk-or-..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">OPENROUTER_VISION_MODEL</span>
+            <input x-model="settings.OPENROUTER_VISION_MODEL" placeholder="(auto-detect)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">Features &amp; automation{{ tip('Global feature toggles for the Wave-2 pipeline add-ons. These are read by the supervisor on (re)start — stop and start the pipeline to apply.') }}</h3>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">PREFILTER_ENABLED — aesthetic pre-filter before classification (true/false)</span>
+            <input x-model="settings.PREFILTER_ENABLED" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">PREFILTER_MIN_SCORE — drop below this aesthetic score (0-100)</span>
+            <input x-model="settings.PREFILTER_MIN_SCORE" type="number" min="0" max="100" placeholder="50"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">WEBHOOK_URL — POST a JSON event here when a job completes</span>
+            <input x-model="settings.WEBHOOK_URL" placeholder="https://hooks.example.com/..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">DESKTOP_NOTIFICATIONS — fire a desktop toast on completion (true/false)</span>
+            <input x-model="settings.DESKTOP_NOTIFICATIONS" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">SCHEDULER_ENABLED — run due schedules on the reconcile loop (true/false)</span>
+            <input x-model="settings.SCHEDULER_ENABLED" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">EMBEDDINGS_ENABLED — build a CLIP embeddings index for dedup/search (true/false)</span>
+            <input x-model="settings.EMBEDDINGS_ENABLED" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">VIDEO_CLASSIFY_ENABLED — classify video clips, not just stills (true/false)</span>
+            <input x-model="settings.VIDEO_CLASSIFY_ENABLED" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-3">YT-DLP scraper{{ tip('Pull frames/clips from any site yt-dlp supports (YouTube, Vimeo, and 1000+ more). Enable, paste URLs (one per line or comma-separated), optionally cap per-URL items and point at a cookies.txt for gated content.') }}</h3>
+        <div class="grid md:grid-cols-2 gap-4">
+          <label class="block">
+            <span class="text-xs text-slate-400">YT_DLP_ENABLED (true/false)</span>
+            <input x-model="settings.YT_DLP_ENABLED" placeholder="false"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">YT_DLP_LIMIT — max items per URL</span>
+            <input x-model="settings.YT_DLP_LIMIT" type="number" min="1" placeholder="25"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">YT_DLP_URLS — one per line or comma-separated</span>
+            <textarea x-model="settings.YT_DLP_URLS" rows="2"
+              placeholder="https://www.youtube.com/@channel&#10;https://vimeo.com/..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">YT_DLP_COOKIES — optional path to a Netscape cookies.txt</span>
+            <input x-model="settings.YT_DLP_COOKIES" placeholder="/path/to/cookies.txt"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Scraper credentials</h3>
         <p class="text-xs text-slate-400 mb-3">Required only for the scrapers you've enabled on the <strong>Scrapers</strong> tab.</p>
         <div class="grid md:grid-cols-2 gap-4">
@@ -5033,6 +5758,8 @@ function dashboard() {
       {id:'logs',         label:'Historical'},
       {id:'queue',        label:'Queue'},
       {id:'gallery',      label:'Gallery'},
+      {id:'duplicates',   label:'Duplicates'},
+      {id:'export',       label:'Export'},
       {id:'stats',        label:'Stats'},
       {id:'overview',     label:'Overview'},
       {id:'scrapers',     label:'Scrapers'},
@@ -5042,12 +5769,13 @@ function dashboard() {
     ],
     // Global sections (shown when view==='jobs').
     globalTabs: [
-      {id:'jobs',     label:'Jobs'},
-      {id:'presets',  label:'Presets'},
-      {id:'gstats',   label:'Global Stats'},
-      {id:'settings', label:'Global Settings'},
-      {id:'faq',      label:'FAQ'},
-      {id:'about',    label:'About'},
+      {id:'jobs',      label:'Jobs'},
+      {id:'presets',   label:'Presets'},
+      {id:'schedules', label:'Schedules'},
+      {id:'gstats',    label:'Global Stats'},
+      {id:'settings',  label:'Global Settings'},
+      {id:'faq',       label:'FAQ'},
+      {id:'about',     label:'About'},
     ],
     // Jobs landing state.
     jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
@@ -5100,6 +5828,24 @@ function dashboard() {
                      confirmLabel: 'Confirm', cancelLabel: 'Cancel', danger: false,
                      input: false, inputValue: '', inputPlaceholder: '', _resolve: null },
     scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
+    // Wave-2 surfaces (all on-demand — never on the status poll).
+    dup: { loading: false, threshold: 10, groups: [], scanned: false, error: '' },
+    exportForm: { profile: 'kohya', trigger_word: '', train_val_split: '',
+                  resolution_bucketing: false, repeats: '', video_bucketing: '',
+                  running: false, summary: null, error: '' },
+    exportProfiles: {{ export_profiles_json|safe }},
+    videoBucketModes: {{ video_bucket_modes_json|safe }},
+    // Caption styles sourced from vision_prompt.CAPTION_STYLES (server-injected)
+    // so the dropdown stays in lockstep with the prompt builder + validator.
+    captionStyles: ({{ caption_styles_json|safe }}).map(id => ({
+      id,
+      label: { sd_prompt: 'SD / Flux prompt', booru_tags: 'Booru tags',
+               natural_language: 'Natural-language', motion: 'Motion / video' }[id] || id,
+    })),
+    hf: { repo_id: '', private: true, include_video: false, pushing: false, result: null, error: '' },
+    schedules: { loading: false, rows: [], actions: [], error: '',
+                 form: { slug: '', cadence: '@daily', action: 'scrape', enabled: true } },
+    visionHealth: { loading: false, probes: {}, fleet: [], error: '' },
     notify(message, type = 'info', timeout) {
       const id = ++this._toastSeq;
       if (timeout === undefined) timeout = (type === 'error') ? 6500 : 3800;
@@ -5792,22 +6538,63 @@ function dashboard() {
       if (n.includes('lm')) return 'lmstudio';
       return null;
     },
+    // Cloud vision providers: provider id -> the settings key holding its model.
+    // Test Connection fetches the live catalogue into the <select> below.
+    cloudProviders: ['openai', 'anthropic', 'gemini', 'openrouter'],
+    cloudProviderLabels: { openai: 'OpenAI (GPT vision)', anthropic: 'Anthropic Claude',
+                           gemini: 'Google Gemini', openrouter: 'OpenRouter' },
+    cloudWorkerName: { openai: 'openai', anthropic: 'anthropic', gemini: 'gemini', openrouter: 'openrouter' },
+    cloudModelKey(provider) {
+      return { openai: 'OPENAI_VISION_MODEL', anthropic: 'ANTHROPIC_VISION_MODEL',
+               gemini: 'GEMINI_VISION_MODEL', openrouter: 'OPENROUTER_VISION_MODEL' }[provider];
+    },
+    cloudApiKey(provider) {
+      // Settings key whose freshly-typed value is sent so an UNSAVED key tests.
+      return { openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY',
+               gemini: 'GEMINI_API_KEY', openrouter: 'OPENROUTER_API_KEY' }[provider];
+    },
+    cloudEnabled(provider) {
+      return !!(this.visionWorkers.find(w => w.name === provider) || {}).enabled;
+    },
+    // Options for a cloud provider's model <select>: the saved model first (if it
+    // isn't already in the fetched list) then everything Test discovered.
+    cloudModelOptions(provider) {
+      const fetched = (this.providerTest[provider] && this.providerTest[provider].models) || [];
+      const cur = (this.settings[this.cloudModelKey(provider)] || '').trim();
+      const head = (cur && !fetched.includes(cur)) ? [cur] : [];
+      return head.concat(fetched);
+    },
     async testProvider(name) {
       if (!name) return;
-      this.providerTest[name] = { testing: true, message: 'Connecting...', ok: null };
+      this.providerTest[name] = { testing: true, message: 'Connecting...', ok: null, models: [] };
+      // For a cloud provider, pass the freshly typed key + model so an unsaved
+      // credential can be verified without saving first (masked secret => server
+      // falls back to the stored env value).
+      const body = { provider: name };
+      const isCloud = this.cloudProviders.includes(name);
+      if (isCloud) {
+        const typedKey = (this.settings[this.cloudApiKey(name)] || '').trim();
+        if (typedKey) body.api_key = typedKey;
+      }
       try {
         const r = await fetch('/api/vision/test', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({provider: name}),
+          body: JSON.stringify(body),
         });
         const j = await r.json();
         this.providerTest[name] = {
           testing: false,
           ok: j.ok,
+          models: j.models || [],
           message: (j.ok ? '✓ ' : '✗ ') + (j.message || 'unknown') + ` (${j.latency_ms}ms)`,
         };
+        // Auto-fill a blank cloud model so the user isn't stuck on "" after Test.
+        if (isCloud && j.ok && (j.models || []).length) {
+          const k = this.cloudModelKey(name);
+          if (!(this.settings[k] || '').trim()) { this.settings[k] = j.models[0]; this.markSettingsDirty(); }
+        }
       } catch (e) {
-        this.providerTest[name] = { testing: false, ok: false, message: '✗ network error' };
+        this.providerTest[name] = { testing: false, ok: false, message: '✗ network error', models: [] };
       }
     },
     // ── Vision-worker fleet (Job tab: per-job inherit/override of vision.workers) ─
@@ -6212,6 +6999,126 @@ function dashboard() {
       const qs = this.galleryQueryString();
       window.open('/api/gallery/download.zip?' + qs, '_blank');
     },
+
+    // Scope query string for job-aware endpoints: ?job=<slug> when viewing a
+    // job, else '' (server falls back to the active job).
+    jobQuery() { return this.currentJob ? ('?job=' + encodeURIComponent(this.currentJob)) : ''; },
+    // ── Duplicates (perceptual-hash near-dupes) ──────────────────────────────
+    async loadDuplicates() {
+      this.dup.loading = true; this.dup.error = '';
+      try {
+        const q = this.jobQuery();
+        const sep = q ? '&' : '?';
+        const r = await fetch('/api/duplicates' + q + sep + 'threshold=' + (this.dup.threshold|0));
+        const j = await r.json();
+        if (j.success) { this.dup.groups = j.data.groups || []; this.dup.scanned = true; }
+        else { this.dup.error = j.error || 'scan failed'; }
+      } catch (e) { this.dup.error = 'network error'; }
+      this.dup.loading = false;
+    },
+    async deleteDuplicate(path) {
+      // Delete a sorted dupe + its sidecars (safe_inside-guarded server-side).
+      try {
+        const r = await fetch('/api/duplicates/delete', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ path }),
+        });
+        const j = await r.json();
+        if (j.success) {
+          // Drop the deleted path from every group; prune singletons.
+          this.dup.groups = this.dup.groups
+            .map(g => g.filter(m => m.path !== path))
+            .filter(g => g.length > 1);
+          this.notify('Deleted 1 image', 'info');
+        } else { this.notify(j.error || 'delete failed', 'error'); }
+      } catch (e) { this.notify('network error', 'error'); }
+    },
+    async keepOnly(group, keepPath) {
+      // Delete every member of the group except keepPath.
+      const victims = group.filter(m => m.path !== keepPath).map(m => m.path);
+      for (const p of victims) { await this.deleteDuplicate(p); }
+    },
+
+    // ── Dataset export ───────────────────────────────────────────────────────
+    async runDatasetExport() {
+      this.exportForm.running = true; this.exportForm.error = ''; this.exportForm.summary = null;
+      const f = this.exportForm;
+      const body = { profile: f.profile, resolution_bucketing: !!f.resolution_bucketing };
+      if (f.trigger_word.trim()) body.trigger_word = f.trigger_word.trim();
+      if (String(f.train_val_split).trim()) body.train_val_split = parseFloat(f.train_val_split);
+      if (String(f.repeats).trim()) body.repeats = parseInt(f.repeats, 10);
+      if (f.video_bucketing) body.video_bucketing = f.video_bucketing;
+      try {
+        const r = await fetch('/api/export/dataset', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+        });
+        const j = await r.json();
+        if (j.success) { this.exportForm.summary = j.data; this.notify('Export complete', 'info'); }
+        else { this.exportForm.error = j.error || 'export failed'; }
+      } catch (e) { this.exportForm.error = 'network error'; }
+      this.exportForm.running = false;
+    },
+
+    // ── Push to HuggingFace ──────────────────────────────────────────────────
+    async pushToHuggingFace() {
+      const repo = (this.hf.repo_id || '').trim();
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { this.hf.error = 'repo_id must look like namespace/name'; return; }
+      this.hf.pushing = true; this.hf.error = ''; this.hf.result = null;
+      try {
+        const r = await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/export/huggingface', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ repo_id: repo, private: !!this.hf.private, include_video: !!this.hf.include_video }),
+        });
+        const j = await r.json();
+        if (j.success) { this.hf.result = j.data; this.notify('Pushed to HuggingFace', 'info'); }
+        else { this.hf.error = j.error || 'push failed'; }
+      } catch (e) { this.hf.error = 'network error'; }
+      this.hf.pushing = false;
+    },
+
+    // ── Schedules ────────────────────────────────────────────────────────────
+    async loadSchedules() {
+      this.schedules.loading = true; this.schedules.error = '';
+      try {
+        const r = await fetch('/api/schedules');
+        const j = await r.json();
+        if (j.success) { this.schedules.rows = j.data.schedules || []; this.schedules.actions = j.data.actions || []; }
+        else { this.schedules.error = j.error || 'load failed'; }
+      } catch (e) { this.schedules.error = 'network error'; }
+      this.schedules.loading = false;
+    },
+    async addSchedule() {
+      const f = this.schedules.form;
+      if (!f.slug) { this.notify('pick a job', 'error'); return; }
+      try {
+        const r = await fetch('/api/schedules', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ slug: f.slug, cadence: f.cadence, action: f.action, enabled: !!f.enabled }),
+        });
+        const j = await r.json();
+        if (j.success) { this.notify('Schedule saved', 'info'); this.loadSchedules(); }
+        else { this.notify(j.error || 'save failed', 'error'); }
+      } catch (e) { this.notify('network error', 'error'); }
+    },
+    async removeSchedule(slug, action) {
+      try {
+        const r = await fetch('/api/schedules?slug=' + encodeURIComponent(slug) + '&action=' + encodeURIComponent(action), { method: 'DELETE' });
+        const j = await r.json();
+        if (j.success) { this.loadSchedules(); } else { this.notify(j.error || 'delete failed', 'error'); }
+      } catch (e) { this.notify('network error', 'error'); }
+    },
+
+    // ── Vision fleet health telemetry ────────────────────────────────────────
+    async loadVisionHealth() {
+      this.visionHealth.loading = true; this.visionHealth.error = '';
+      try {
+        const r = await fetch('/api/vision/health' + this.jobQuery());
+        const j = await r.json();
+        if (j.success) { this.visionHealth.probes = j.data.probes || {}; this.visionHealth.fleet = j.data.fleet || []; }
+        else { this.visionHealth.error = j.error || 'probe failed'; }
+      } catch (e) { this.visionHealth.error = 'network error'; }
+      this.visionHealth.loading = false;
+    },
     galleryPrev() { if (this.gallery.page > 1) this.loadGallery(this.gallery.page - 1); },
     galleryNext() {
       const totalPages = Math.max(1, Math.ceil(this.gallery.total / this.gallery.pageSize));
@@ -6253,6 +7160,9 @@ function dashboard() {
         if (tab === 'gstats') this.loadGlobalStats();
         if (tab === 'presets') this.loadPresets();
         if (tab === 'settings') this.loadGlobalVision();
+        if (tab === 'schedules') { this.loadSchedules(); if (!this.jobsList.length) this.loadJobs(); }
+        // Duplicates is on-demand: the "Scan for duplicates" button is the only
+        // trigger (a perceptual-hash sweep is too expensive to auto-fire).
         if (tab === 'gallery' && this.gallery.items.length === 0 && !this.galleryLoading) {
           this.loadGallery();
           this.loadGalleryInsights();
@@ -6260,6 +7170,7 @@ function dashboard() {
         // Job Settings + Vision both edit this job's inheritable config (v2),
         // so they need the effective cfg + overrides loaded.
         if ((tab === 'jobSettings' || tab === 'vision') && !this.je.loaded) this.loadJobEditor();
+        if (tab === 'vision') this.loadVisionHealth();
       });
       setInterval(() => { if (this.active === 'stats') this.loadStats(); }, 30000);
       // Self-update: check on load, then every 30 minutes. The endpoint is
@@ -6284,6 +7195,9 @@ def dashboard():
     return render_template_string(
         HTML_TEMPLATE,
         scraper_names_json=json.dumps(list(job_config.SCRAPER_NAMES)),
+        export_profiles_json=json.dumps(list(export_profiles.PROFILES)),
+        video_bucket_modes_json=json.dumps(list(export_profiles.VIDEO_BUCKET_MODES)),
+        caption_styles_json=json.dumps(list(vision_prompt.CAPTION_STYLES)),
     )
 
 

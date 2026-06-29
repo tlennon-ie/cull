@@ -1,0 +1,50 @@
+# Keep the build context small and secrets/data OUT of the image.
+# Secrets arrive at run time via env_file/--env-file, never baked in.
+
+# Secrets — never copy .env into an image layer.
+.env
+.env.*
+!.env.example
+
+# Curated data + runtime artifacts (bind-mounted at /data instead).
+data/
+
+# Virtualenvs / local interpreter state.
+.venv
+.venv_state
+venv
+env
+
+# Python caches and bytecode.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local SQLite stores (dedup archives, etc.).
+*.sqlite3
+*.sqlite
+
+# Scratch / temp working files.
+scratch/
+tmp/
+*.tmp
+*.log
+
+# VCS + tooling metadata.
+.git
+.gitignore
+.github/
+.idea/
+.vscode/
+
+# Docs / project meta not needed at runtime.
+*.md
+docs/
+
+# The Docker artifacts themselves.
+Dockerfile
+docker-compose.yml
+.dockerignore

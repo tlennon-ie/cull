@@ -10,6 +10,10 @@
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-1f1f1f.svg"></a>
   <a href="#quick-start"><img alt="Cross-platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-1f1f1f.svg"></a>
   <a href="#the-dashboard"><img alt="Dashboard included" src="https://img.shields.io/badge/dashboard-flask%20%2B%20alpine-1f1f1f.svg"></a>
+  <!-- CI badge placeholder — wire to your CI provider once the workflow lands -->
+  <a href="#"><img alt="CI" src="https://img.shields.io/badge/CI-pending-1f1f1f.svg"></a>
+  <!-- Security badge placeholder — point at your pip-audit / dependency-scan job -->
+  <a href="#"><img alt="Security: pip-audit" src="https://img.shields.io/badge/security-pip--audit-1f1f1f.svg"></a>
 </p>
 
 ![cull — job-based curation](assets/cull-jobs-demo.svg)
@@ -19,7 +23,7 @@
 
 ## What it is
 
-cull is a single-machine curation engine for AI-generated images. It pulls from a handful of dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. No Docker required.
+cull is a single-machine curation engine for AI-generated images. It pulls from a handful of dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. Docker optional — run it from the bootstrap scripts, `pip install -e .`, or a container, whichever you prefer.
 
 - Pulls from dedicated sources (Civitai, X/Twitter, Reddit, Discord, local folders) plus any URL gallery-dl knows (Pixiv, DeviantArt, the booru family, ArtStation, Tumblr, Newgrounds, FurAffinity / e621, Imgur, Flickr, …). Dedupes, queues, and runs vision in one process tree.
 - Forces every backend (LM Studio, Groq, anything OpenAI-compatible) into the same JSON schema so output never drifts.
@@ -73,6 +77,56 @@ PIPELINE_TOPIC="Artistic Showcase" PIPELINE_SLUG=artistic_showcase \
   python pipeline_code/dashboard_enhanced.py
 # open http://localhost:5050
 ```
+
+## Run with Docker
+
+Docker is optional — the bootstrap scripts above need nothing else — but a container is the cleanest way to pin the runtime on a server or GPU box. The image installs the declared dependencies plus `ffmpeg` (the video lane needs it), copies the source, exposes the dashboard on `5000`, and launches the real entrypoint (`pipeline_code/integrated_launcher.py`).
+
+```bash
+docker compose up --build      # build the image and boot the dashboard
+# open http://localhost:5000
+```
+
+`docker-compose.yml` bind-mounts `./data` so your queue, sorted output, prompts, and job JSON live on the host (nothing is trapped in the container), publishes `5000:5000`, and reads secrets from `.env` at run time via `env_file` — so your `GROQ_API_KEY`, cookies, and tokens never get baked into an image layer. `.dockerignore` keeps `data/`, the virtualenv, and `.env` out of the build context.
+
+> Docker assets (`Dockerfile`, `docker-compose.yml`, `.dockerignore`) ship alongside this README; build them with the command above.
+
+## Headless / CLI
+
+No dashboard, no browser — drive cull from the command line on a remote GPU box. The headless CLI is a thin wrapper over the same `job_config` / supervisor APIs the dashboard uses, so it never reimplements job state. Once installed (`pip install -e .`, see below) the `cull` command is on your `PATH`:
+
+```bash
+cull job create lora_faces --subject "studio portrait photography"   # create a job from the default preset
+cull jobs activate lora_faces                                        # project its env + categories
+cull jobs list                                                       # list jobs (active one is starred)
+cull presets list                                                    # list the starter preset library
+cull status                                                          # active job + queue/sorted counts
+cull run                                                             # start the supervisor (runs the active job)
+```
+
+Prefer not to install? Every subcommand also runs straight from the source tree inside the venv:
+
+```bash
+python pipeline_code/cull_cli.py jobs list
+python pipeline_code/cull_cli.py job create lora_faces --subject "studio portrait photography"
+python pipeline_code/cull_cli.py run
+```
+
+## Optional extras
+
+The base install stays lean — heavy or provider-specific dependencies are split into [PEP 621](https://peps.python.org/pep-0621/) extras in [`pyproject.toml`](pyproject.toml). Install only what a given job needs:
+
+```bash
+pip install -e .             # base runtime (dashboard, scrapers, local + Groq vision)
+pip install -e ".[cloud]"    # OpenAI / Anthropic / Gemini cloud vision SDKs
+pip install -e ".[video]"    # scenedetect + ffmpeg-python (video frame extraction)
+pip install -e ".[ml]"       # torch + open_clip_torch (embeddings, aesthetic prefilter)
+pip install -e ".[dev]"      # pytest + ruff + pip-audit (tests, lint, security audit)
+```
+
+Combine them in one shot, e.g. `pip install -e ".[cloud,dev]"`. The `launch.*` / `install.*` bootstrap scripts remain the zero-config path and install `requirements.txt`; `pip install -e .` is the standards-based alternative that also exposes the extras and the `cull` console command.
+
+> **Known limitation.** `gallery-dl` is pinned to a Codeberg git tag in `requirements.txt`; a direct VCS URL can't live in a publishable `[project.dependencies]` entry, so it is installed via `requirements.txt` (or the bootstrap scripts) rather than duplicated in `pyproject.toml`. Run `pip install -r requirements.txt` once for the URL-based scraper if you installed only with `pip install -e .`.
 
 ## How it works
 

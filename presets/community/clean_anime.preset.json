@@ -1,0 +1,60 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Clean Anime",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "anime", "illustration", "manga", "digital art", "character",
+        "key visual", "cel shaded", "official art", "line art"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "photograph", "photorealistic", "3d render"
+      ],
+      "generation_hints": [
+        "anime", "illustration", "masterpiece", "best quality", "detailed",
+        "official art", "key visual"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": true
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "anime", "awwnime", "Animewallpaper", "ImaginaryCharacters",
+        "DigitalArt", "Illustration", "characterdrawing"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Clean anime/illustration artwork, on-topic, coherent anatomy, no severe AI flaws, no watermark/signature overlay. OVR_Quality_Score >= 60"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Usable but average — minor anatomy slips, jpeg/AI blocking, soft line work, or a visible artist signature -> human review"
+      },
+      {
+        "name": "Photoreal",
+        "hint": "An actual photograph or photoreal render — NOT drawn/painted illustration -> off-theme for an illustration dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Unrelated to the curation subject regardless of quality"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium MUST be a drawn or painted style (anime, manga, cel-shaded, digital_painting, illustration, line art). A camera photograph or photoreal-AI image is Photoreal (off-theme).\n- Do NOT apply real-human gates here — drawn characters are not real people.\n- has_ai_flaws = TRUE only for SEVERE artefacts (broken anatomy, extra fingers, melted detail, warped text, impossible geometry).\n- A COMPOSITE/GRID is 2+ separate images stitched together -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in watermarks, captions, logos, or large signature blocks.\n- nsfw = TRUE only for explicit nudity or sexual content.\nPenalise heavy jpeg blocking and visible artist signatures/watermarks (route Borderline). The curation topic only informs REL_Quality_Score; do NOT invent details that aren't in the pixels.",
+    "scoring": {
+      "ovr_min": 45,
+      "rel_min": 25,
+      "notes": "Reward clean line work / rendering, coherent anatomy and absence of compression artefacts. Penalise jpeg blocking, severe AI anatomy flaws and watermark/signature overlays."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "booru_tags",
+      "overwrite": false
+    }
+  }
+}

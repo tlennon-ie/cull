@@ -1,0 +1,181 @@
+# pyproject.toml — PEP 621 packaging for cull.
+#
+# cull is a flat-module project: every module lives directly in pipeline_code/
+# and imports its siblings by bare name (``import job_config``), relying on
+# pipeline_code/ being on sys.path. To preserve that at install time we map the
+# package root to pipeline_code/ (``package-dir = {"" = "pipeline_code"}``) and
+# install each module as a top-level module (``py-modules``). This keeps the
+# bare imports working AND lets the console script resolve ``cull_cli:main``.
+#
+# Install paths:
+#   pip install -e .            # editable dev install (modern path)
+#   pip install -e ".[dev]"     # + pytest / ruff / pip-audit
+#   pip install -e ".[cloud]"   # + openai / anthropic / google-genai SDKs
+#   pip install -e ".[video]"   # + scenedetect / ffmpeg-python (video lane)
+#   pip install -e ".[ml]"      # + torch / open_clip_torch (embeddings, aesthetic)
+#
+# The launch.sh / launch.bat bootstrap scripts remain the zero-config path; this
+# file is the standards-based alternative (and the source of the extras the
+# launchers and requirements.txt reference).
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cull"
+version = "0.1.0"
+description = "The curation engine for AI image datasets — scrape, dedupe, vision-classify, and sort AI-generated images on a single machine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Thomas Lennon" }]
+keywords = [
+    "image-curation",
+    "dataset",
+    "vision-language-model",
+    "lora",
+    "machine-learning",
+    "scraper",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Base runtime dependencies — kept in sync with requirements.txt (the base
+# block). The heavy/optional capabilities live in optional-dependencies below.
+# NOTE: gallery-dl is pinned to a Codeberg git tag in requirements.txt; a direct
+# git URL is not allowed in a [project.dependencies] entry that gets published
+# to PyPI, so it is intentionally installed via requirements.txt rather than
+# duplicated here (see the "Known limitation" note in README → Optional extras).
+dependencies = [
+    "Flask>=3.1",
+    "Flask-Cors>=6.0",
+    "Pillow>=11.0",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32",
+    "groq>=0.20",
+    "playwright>=1.49",
+    "schedule>=1.2",
+    "yt-dlp>=2026.6.9",
+    "huggingface_hub>=0.34",
+]
+
+[project.optional-dependencies]
+# Cloud vision-provider SDKs (only needed for the cloud workers).
+cloud = [
+    "openai>=1.40",
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+]
+# Video lane — frame extraction / scene detection.
+video = [
+    "scenedetect>=0.6",
+    "ffmpeg-python>=0.2",
+]
+# Embeddings / aesthetic prefilter / ML.
+ml = [
+    "torch>=2.2",
+    "open_clip_torch>=2.24",
+]
+# Dev / CI tooling.
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+    "pip-audit>=2.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/tlennon-ie/cull"
+Repository = "https://github.com/tlennon-ie/cull"
+Issues = "https://github.com/tlennon-ie/cull/issues"
+
+[project.scripts]
+# Installed `cull` command → headless CLI entry point (pipeline_code/cull_cli.py).
+cull = "cull_cli:main"
+
+# ── setuptools: flat-module layout ───────────────────────────────────────────
+# Map the (implicit, root) package to pipeline_code/ and install each loose
+# module as a top-level module so bare sibling imports keep working.
+[tool.setuptools]
+package-dir = { "" = "pipeline_code" }
+py-modules = [
+    "active_learning",
+    "builtin_presets",
+    "categories",
+    "config_io",
+    "credentials",
+    "cull_cli",
+    "dashboard_enhanced",
+    "embeddings",
+    "embeddings_index",
+    "export_profiles",
+    "feed_local_folder",
+    "fleet_health",
+    "gbnf_grammar",
+    "hf_export",
+    "index_store",
+    "integrated_launcher",
+    "job_config",
+    "lmstudio_admin",
+    "lmstudio_models",
+    "paths",
+    "phash_dedup",
+    "pipeline_logging",
+    "prefilter_aesthetic",
+    "queue_manager",
+    "rate_limit",
+    "requeue_sorted",
+    "run_pipeline",
+    "scheduler",
+    "scraper_civitai",
+    "scraper_civitai_search",
+    "scraper_discord",
+    "scraper_gallery_dl",
+    "scraper_test",
+    "scraper_web",
+    "scraper_x",
+    "scraper_yt_dlp",
+    "seen_store",
+    "thumb_cache",
+    "topic_filter",
+    "vision_model_catalog",
+    "vision_prompt",
+    "vision_worker",
+    "vision_worker_anthropic",
+    "vision_worker_balanced_groq",
+    "vision_worker_balanced_lm",
+    "vision_worker_balanced_ollama",
+    "vision_worker_balanced_openai",
+    "vision_worker_base",
+    "vision_worker_gemini",
+    "vision_worker_lm_autodetect",
+    "vision_worker_lm_keepalive",
+    "vision_worker_openai",
+    "vision_worker_openrouter",
+    "vision_workers",
+]
+
+# ── ruff: minimal lint config ────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# ── pytest: only collect the tests/ tree ─────────────────────────────────────
+# pipeline_code/test_harness.py is a live end-to-end runner (loads .env at
+# import), NOT a unit test — scoping collection to tests/ keeps bare `pytest`
+# (and CI) from trying to import it.
+[tool.pytest.ini_options]
+testpaths = ["tests"]

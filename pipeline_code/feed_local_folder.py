@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,6 +55,12 @@ _MIGRATIONS: list[MigrationSpec] = MigrationSpec.parse_env(
 MIN_PROMPT_LENGTH: int = int(get_optional("MIN_PROMPT_LENGTH", "40"))
 MIN_IMAGE_BYTES: int = 5000
 IMAGE_SUFFIXES: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
+# Video containers a local folder may hold. Local folders can now be "video
+# folders" too, so the feeder picks these up alongside images.
+VIDEO_SUFFIXES: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi")
+# The full accepted set. Existing image behaviour is unchanged; this just
+# widens what counts as an ingestible media file.
+MEDIA_SUFFIXES: tuple[str, ...] = IMAGE_SUFFIXES + VIDEO_SUFFIXES
 ENABLED: bool = get_optional("LOCAL_IMPORT_ENABLED", "false").lower() == "true"
 
 
@@ -66,7 +72,7 @@ def _match_in(source_dir: Path, filename_prefix: str, stem: str) -> bool:
     # moving to sorted, so we match by prefix instead of exact filename.
     target_prefix = f"{filename_prefix}_{stem}"
     return any(f.name.startswith(target_prefix) for f in source_dir.iterdir()
-               if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES)
+               if f.is_file() and f.suffix.lower() in MEDIA_SUFFIXES)
 
 
 def already_sorted(stem: str) -> bool:
@@ -103,14 +109,14 @@ def already_queued(stem: str) -> bool:
     target = QUEUE_DIR / SOURCE_NAME
     if not target.exists():
         return False
-    return any((target / f"{qname}{suffix}").exists() for suffix in IMAGE_SUFFIXES)
+    return any((target / f"{qname}{suffix}").exists() for suffix in MEDIA_SUFFIXES)
 
 
 def iter_sources() -> list[Path]:
     if SRC_DIR is None or not SRC_DIR.exists():
         return []
     images: list[Path] = []
-    for suffix in IMAGE_SUFFIXES:
+    for suffix in MEDIA_SUFFIXES:
         images.extend(SRC_DIR.glob(f"*{suffix}"))
     return sorted(images)
 
@@ -152,7 +158,7 @@ def process_one(img_path: Path, seen: SeenStore) -> bool:
             "source_guild": f"local:{SRC_DIR}",
             "author": "local",
             "timestamp": "",
-            "queued_at": datetime.utcnow().isoformat(),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
             "pipeline_topic": get_optional("PIPELINE_TOPIC"),
         }
         saved = save_to_queue(SOURCE_NAME, tmp_path, prompt, metadata)
