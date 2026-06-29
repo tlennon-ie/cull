@@ -59,12 +59,14 @@ CDN_BASE   = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nk
 
 # Civitai.red runs on a separate auth backend, so the admin can supply a dedicated
 # key via CIVITAI_API_RED_KEY. Fall back to the .com key if only one is set.
+# Read OPTIONALLY at import so the module stays import-safe with no .env (e.g. on
+# CI / the import-smoke check); the hard requirement is enforced at runtime in the
+# __main__ entrypoint, where MissingCredentialError still triggers the supervisor's
+# cooldown.
 if CIVITAI_DOMAIN == "civitai.red":
-    TOKEN = get_optional("CIVITAI_API_RED_KEY") or get_optional("CIVITAI_API_KEY")
-    if not TOKEN:
-        raise MissingCredentialError("CIVITAI_API_KEY", scraper="civitai-red")
+    TOKEN = get_optional("CIVITAI_API_RED_KEY") or get_optional("CIVITAI_API_KEY") or ""
 else:
-    TOKEN = get_required("CIVITAI_API_KEY", scraper="civitai-search")
+    TOKEN = get_optional("CIVITAI_API_KEY") or ""
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -301,5 +303,10 @@ def scrape_civitai_search(seen: set):
     print(f"=== Done. Saved {saved_count} images. ===")
 
 if __name__ == "__main__":
+    # Enforce the credential at RUNTIME (not import) so MissingCredentialError
+    # raises the supervisor's cooldown while the import smoke stays clean.
+    if not TOKEN:
+        _key = "CIVITAI_API_RED_KEY" if CIVITAI_DOMAIN == "civitai.red" else "CIVITAI_API_KEY"
+        raise MissingCredentialError(_key, scraper="civitai-search")
     seen = _make_seen_store()
     scrape_civitai_search(seen)
