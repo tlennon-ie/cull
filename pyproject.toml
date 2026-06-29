@@ -77,7 +77,7 @@ dependencies = [
 # Cloud vision-provider SDKs (only needed for the cloud workers).
 cloud = [
     "openai>=1.40",
-    "anthropic>=0.40",
+    "anthropic>=0.112.0",
     "google-genai>=1.0",
 ]
 # Video lane — frame extraction / scene detection.
