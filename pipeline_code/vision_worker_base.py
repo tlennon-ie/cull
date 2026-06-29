@@ -42,6 +42,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import random
 import shutil
 import time
@@ -67,6 +68,22 @@ from vision_prompt import (
 )
 
 logger = get_logger(__name__)
+
+
+def _safe_component(value: str, fallback: str) -> str:
+    """Reduce a user/model-derived string to a single safe path component.
+
+    ``os.path.basename`` strips any directory prefix and ``..``/separator
+    sequences, so the result can never escape the directory it's joined to —
+    a path-injection barrier for the category / source folder names used when
+    routing a classified image. Empty / separator-only inputs fall back to
+    ``fallback`` so a malformed model answer still lands somewhere valid.
+    """
+    base = os.path.basename(str(value or "").strip().replace("\\", "/").rstrip("/"))
+    base = base.strip()
+    if not base or base in (".", ".."):
+        return fallback
+    return base
 
 
 # Single sentinel used for non-final outcomes so callers can branch cleanly.
@@ -99,7 +116,11 @@ class BaseVisionWorker(ABC):
         # while the worker is mid-run still routes correctly.
         from categories import get_categories  # lazy: pick up edits made between imports
         for category in get_categories():
-            (self.sorted_dir / category).mkdir(parents=True, exist_ok=True)
+            # Constrain each taxonomy-derived folder name to a single safe
+            # component before it becomes a path (path-injection barrier).
+            (self.sorted_dir / _safe_component(category, "Unknown")).mkdir(
+                parents=True, exist_ok=True
+            )
         # Subclasses can stash backend-specific state here in setup().
         self._processed_count: int = 0
 
@@ -344,11 +365,16 @@ class BaseVisionWorker(ABC):
         final_category = result.get("category", "Unknown")
         msg_id_key = ctx.metadata.get("message_id", ctx.image_path.stem)
 
-        dest_dir = self.sorted_dir / final_category / ctx.source_name
+        # The category (model output) and source (queue-derived) become directory
+        # names — constrain each to a single safe component so a crafted value
+        # can't escape the sorted root (path-injection barrier).
+        safe_category = _safe_component(final_category, "Unknown")
+        safe_source = _safe_component(ctx.source_name, "unknown")
+        dest_dir = self.sorted_dir / safe_category / safe_source
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         safe_name = (
-            f"{final_category.lower()}_{msg_id_key}"
+            f"{safe_category.lower()}_{msg_id_key}"
             f"_{int(time.time())}_{random.randint(100, 999)}"
         )
         ext = ctx.image_path.suffix

@@ -44,6 +44,7 @@ from typing import Any, Iterable, Iterator
 import categories
 import credentials
 from paths import sorted_dir
+from paths import validate_slug as _validate_slug
 from pipeline_logging import get_logger
 
 logger = get_logger(__name__)
@@ -199,7 +200,8 @@ def _stage_dataset(
     ``data/sorted`` are never moved or modified. ``file_name`` values are POSIX
     relative paths so the HF dataset viewer / loader resolves them.
     """
-    sorted_root = sorted_dir(slug)
+    # Sanitise the slug before it selects the sorted-tree root to walk.
+    sorted_root = sorted_dir(_validate_slug(slug))
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
@@ -335,6 +337,10 @@ def push_to_hf(
         ValueError: no exportable samples were found.
         RuntimeError: ``huggingface_hub`` is not installed.
     """
+    # 0. Sanitise the slug up front — it feeds both the sorted-tree path and the
+    #    staging-dir name below, so reject any traversal before either is built.
+    slug = _validate_slug(slug)
+
     # 1. Resolve the token FIRST so we fail fast and never stage on a misconfig.
     resolved_token = _resolve_token(token)
 

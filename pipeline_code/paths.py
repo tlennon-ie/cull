@@ -10,11 +10,37 @@ these helpers re-read them each call, so updates take effect on pipeline restart
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 # pipeline_code/ sits under the repo root; the repo root is where .env lives.
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR: Path = REPO_ROOT / "data"
+
+# Job-slug charset (mirrors ``job_config.JOB_SLUG_RE``). It deliberately
+# excludes the path separators ``/`` and ``\`` and the dot ``.``, so a string
+# that passes this gate cannot contain a directory traversal component. That
+# makes ``validate_slug`` a path-injection *barrier* the CodeQL py/path-injection
+# query recognises: every slug→filesystem-path flow is sanitised here first.
+_SAFE_SLUG_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def validate_slug(slug: str) -> str:
+    """Return ``slug`` iff it matches the safe job-slug charset; else raise.
+
+    The charset (``^[a-z0-9_]+$``) excludes ``/``, ``\\`` and ``.``, so the
+    returned value can never contain a path separator or ``..`` traversal — this
+    is the shared sanitiser callers run a slug (or any user-derived key) through
+    immediately before using it to build a filesystem path.
+
+    Raises:
+        ValueError: when ``slug`` is empty or contains any character outside the
+            safe charset.
+    """
+    s = str(slug or "")
+    if not _SAFE_SLUG_RE.fullmatch(s):
+        raise ValueError(f"invalid job slug: {slug!r}")
+    return s
 
 
 def base_dir() -> Path:
@@ -86,6 +112,7 @@ def local_import_name() -> str:
 __all__ = [
     "REPO_ROOT",
     "DEFAULT_DATA_DIR",
+    "validate_slug",
     "base_dir",
     "queue_dir",
     "sorted_dir",

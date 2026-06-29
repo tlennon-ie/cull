@@ -267,18 +267,45 @@ def pipeline_running() -> bool:
     return proc is not None and proc.poll() is None
 
 
+# ── error responses ─────────────────────────────────────────────────────────────
+
+def _err(message: str, exc: BaseException | None = None, code: int = 500):
+    """Build a generic error JSON response without leaking exception detail.
+
+    The client only ever sees ``message`` (a fixed, non-sensitive string); the
+    underlying exception text is logged server-side so operators keep the detail
+    for debugging while a stack trace / internal path never reaches the browser.
+    Returns the standard ``{success, data, error}`` envelope with ``code``.
+    """
+    if exc is not None:
+        logger.warning("%s: %s", message, exc)
+    return jsonify({"success": False, "data": None, "error": message}), code
+
+
 # ── path guards ────────────────────────────────────────────────────────────────
 
 def safe_inside(raw: str, roots: list[Path]) -> Path | None:
+    """Return the resolved ``raw`` path iff it is contained in one of ``roots``.
+
+    Uses ``os.path.realpath`` to fully normalise the candidate (collapsing
+    ``..`` / symlinks) and ``os.path.commonpath`` for the containment check — a
+    normalize-then-contain pattern static analysers recognise as a path-traversal
+    sanitiser. Returns the resolved :class:`~pathlib.Path` when it lives under a
+    root, else ``None``. Behaviour is identical to the previous
+    ``Path.relative_to`` loop (in-roots → resolved Path, out-of-roots / traversal
+    → None); ``commonpath`` raising :class:`ValueError` on a different Windows
+    drive is treated as "not contained".
+    """
     try:
-        path = Path(raw).resolve()
-    except OSError:
+        real = os.path.realpath(str(raw))
+    except (OSError, ValueError):
         return None
     for root in roots:
         try:
-            path.relative_to(root.resolve())
-            return path
-        except (ValueError, OSError):
+            root_real = os.path.realpath(str(root))
+            if os.path.commonpath([real, root_real]) == root_real:
+                return Path(real)
+        except (OSError, ValueError):
             continue
     return None
 
@@ -598,7 +625,7 @@ def api_pipeline_start():
             return jsonify({"success": True, "pid": _pipeline_proc.pid})
         except Exception as exc:
             logger.exception("failed to start pipeline")
-            return jsonify({"error": str(exc)}), 500
+            return jsonify({"error": "failed to start pipeline"}), 500
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -888,7 +915,8 @@ def api_update_run():
         if dirty_out:
             return jsonify({"ok": False, "error": "uncommitted changes present"}), 409
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return jsonify({"ok": False, "error": f"git unavailable: {exc}"}), 500
+        logger.warning("git unavailable during update: %s", exc)
+        return jsonify({"ok": False, "error": "git unavailable"}), 500
 
     if sys.platform == "win32":
         script = REPO_ROOT / "update.bat"
@@ -1272,7 +1300,8 @@ def api_vision_test():
         return _done(False, f"unknown provider: {provider!r}", 400)
     except (requests.RequestException, ValueError) as exc:
         # ValueError covers JSONDecodeError on a 200-but-non-JSON response.
-        return _done(False, f"connection error: {exc}")
+        logger.warning("vision provider test connection error (%s): %s", provider, exc)
+        return _done(False, "connection error — check the base URL and that the endpoint is reachable")
 
 
 @app.route("/api/scrapers/test", methods=["POST"])
@@ -1747,7 +1776,8 @@ def api_jobs_create():
         )
     except ValueError as exc:
         # Duplicate slug / empty slug / unknown base_on all surface here.
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("create_job rejected: %s", exc)
+        return jsonify({"error": "could not create job (duplicate name or invalid base_on)"}), 400
     return jsonify({"success": True, "job": _job_detail(job)}), 201
 
 
@@ -1814,7 +1844,8 @@ def api_jobs_update(slug: str):
     try:
         saved = job_config.save_job(job_config.Job.from_dict(merged))
     except (ValueError, TypeError) as exc:
-        return jsonify({"error": f"invalid job config: {exc}"}), 400
+        logger.warning("save_job rejected invalid config for %s: %s", slug, exc)
+        return jsonify({"error": "invalid job config"}), 400
 
     return jsonify({"success": True, "job": _job_detail(saved)})
 
@@ -1860,7 +1891,8 @@ def api_jobs_clone(slug: str):
     try:
         job = job_config.create_job(name, base_on=slug)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("clone job rejected (base_on=%s): %s", slug, exc)
+        return jsonify({"error": "could not clone job (duplicate name)"}), 400
     return jsonify({"success": True, "job": job.to_dict()}), 201
 
 
@@ -1885,7 +1917,8 @@ def api_jobs_set_queue():
     try:
         job_config.set_queue(order)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("set_queue rejected: %s", exc)
+        return jsonify({"error": "invalid queue order"}), 400
     return jsonify({"success": True, "queue": job_config.get_index().get("queue", [])})
 
 
@@ -1898,7 +1931,8 @@ def api_jobs_enqueue(slug: str):
     try:
         job_config.enqueue(slug)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("enqueue rejected (%s): %s", slug, exc)
+        return jsonify({"error": "could not enqueue job"}), 400
     return jsonify({"success": True, "queue": job_config.get_index().get("queue", [])})
 
 
@@ -1958,7 +1992,8 @@ def api_presets_create():
     try:
         job_config.save_preset(name, seed)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("create preset rejected (%s): %s", name, exc)
+        return jsonify({"error": "could not save preset"}), 400
     return jsonify({"success": True, "name": name, "cfg": job_config.get_preset(name)}), 201
 
 
@@ -1995,7 +2030,8 @@ def api_presets_update(name: str):
     try:
         job_config.save_preset(name, merged)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("update preset rejected (%s): %s", name, exc)
+        return jsonify({"error": "could not save preset"}), 400
     return jsonify({"success": True, "name": name, "cfg": job_config.get_preset(name)})
 
 
@@ -2009,7 +2045,8 @@ def api_presets_delete(name: str):
         job_config.delete_preset(name)
     except ValueError as exc:
         # default / referenced-by-a-job → 409 conflict.
-        return jsonify({"error": str(exc)}), 409
+        logger.warning("delete preset rejected (%s): %s", name, exc)
+        return jsonify({"error": "cannot delete this preset (it is the default or in use by a job)"}), 409
     return jsonify({"success": True, "name": name})
 
 
@@ -2028,7 +2065,8 @@ def api_presets_clone(name: str):
     try:
         job_config.save_preset(new_name, job_config.get_preset(name))
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("clone preset rejected (%s -> %s): %s", name, new_name, exc)
+        return jsonify({"error": "could not clone preset"}), 400
     return jsonify({"success": True, "name": new_name, "cfg": job_config.get_preset(new_name)}), 201
 
 
@@ -2041,7 +2079,8 @@ def api_presets_set_default():
     try:
         job_config.set_default_preset(name)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("set_default_preset rejected (%s): %s", name, exc)
+        return jsonify({"error": "could not set default preset"}), 400
     return jsonify({"success": True, "default": name})
 
 
@@ -2053,7 +2092,8 @@ def api_presets_reset(name: str):
     try:
         cfg = job_config.reset_preset_to_builtin(name)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning("reset_preset_to_builtin rejected (%s): %s", name, exc)
+        return jsonify({"error": "could not reset preset (not a shipped preset)"}), 400
     return jsonify({"success": True, "name": name, "cfg": cfg})
 
 
@@ -2346,7 +2386,13 @@ def api_queue_action():
     if action == "move":
         if not target:
             return jsonify({"error": "target required"}), 400
-        dest = PIPELINE_QUEUE / target
+        # Re-validate the destination through safe_inside so a traversal target
+        # (e.g. "../../etc") can never resolve outside the queue root. We resolve
+        # BEFORE any mkdir/move so a bad target never creates dirs or relocates a
+        # file outside the queue; all subsequent file ops use the returned Path.
+        dest = safe_inside(str(PIPELINE_QUEUE / target), [PIPELINE_QUEUE])
+        if dest is None:
+            return jsonify({"error": "target outside queue"}), 400
         dest.mkdir(parents=True, exist_ok=True)
         # Snapshot the original prediction + scores BEFORE the move relocates the
         # sidecar (the predicted bucket is the source folder / the .vision.json's
@@ -2423,8 +2469,12 @@ def api_gallery_recategorize():
             "moved": False,
         }, "error": None})
 
-    dest_dir = _recategorise_dest_dir(path, target)
-    if dest_dir is None or safe_inside(str(dest_dir), [PIPELINE_SORTED]) is None:
+    raw_dest_dir = _recategorise_dest_dir(path, target)
+    # safe_inside both validates AND returns the resolved destination; every file
+    # op below uses that returned Path (never the raw recomputed one) so a
+    # destination escaping the sorted root can never be created or written to.
+    dest_dir = safe_inside(str(raw_dest_dir), [PIPELINE_SORTED]) if raw_dest_dir is not None else None
+    if dest_dir is None:
         return jsonify({"success": False, "error": "could not resolve a destination inside sorted"}), 400
 
     predicted, scores = _read_vision_prediction(path)
@@ -2434,7 +2484,8 @@ def api_gallery_recategorize():
         for sibling in path.parent.glob(f"{path.stem}.*"):
             shutil.move(str(sibling), str(dest_dir / sibling.name))
     except OSError as exc:
-        return jsonify({"success": False, "error": f"move failed: {exc}"}), 500
+        logger.warning("recategorize move failed: %s", exc)
+        return jsonify({"success": False, "error": "move failed"}), 500
 
     # Best-effort active-learning correction (same contract as the queue mover).
     _record_relabel_correction(path.stem, predicted, target, scores)
@@ -3065,7 +3116,8 @@ def api_prompt_save():
     try:
         txt_path.write_text(text, encoding="utf-8")
     except OSError as exc:
-        return jsonify({"error": f"write failed: {exc}"}), 500
+        logger.warning("prompt write failed: %s", exc)
+        return jsonify({"error": "write failed"}), 500
     # Invalidate the scan cache so the next /api/stats sees the new prompt.
     with _sorted_cache_lock:
         _sorted_cache["ts"] = 0.0
@@ -3105,8 +3157,7 @@ def api_caption_get():
         try:
             text = txt_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            return jsonify({"success": False, "data": None,
-                            "error": f"read failed: {exc}"}), 500
+            return _err("read failed", exc, 500)
     return jsonify({"success": True,
                     "data": {"path": str(txt_path), "text": text}, "error": None})
 
@@ -3137,8 +3188,7 @@ def api_caption_save():
     try:
         txt_path.write_text(text, encoding="utf-8")
     except OSError as exc:
-        return jsonify({"success": False, "data": None,
-                        "error": f"write failed: {exc}"}), 500
+        return _err("write failed", exc, 500)
     # Invalidate the scan cache so the next /api/stats sees the new caption.
     with _sorted_cache_lock:
         _sorted_cache["ts"] = 0.0
@@ -3220,8 +3270,7 @@ def api_duplicates():
     try:
         raw_groups = phash_dedup.find_near_duplicates(threshold=threshold, slug=slug)
     except Exception as exc:  # noqa: BLE001 - a scan failure must not 500 the UI
-        logger.warning("duplicate scan failed: %s", exc)
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+        return _err("duplicate scan failed", exc, 500)
 
     # Map index keys (image paths) to display cards via the cached sorted items,
     # so we reuse the category/thumb info without a second filesystem walk.
@@ -3265,7 +3314,8 @@ def api_duplicates_delete():
         for sibling in path.parent.glob(f"{path.stem}.*"):
             sibling.unlink(missing_ok=True)
     except OSError as exc:
-        return jsonify({"success": False, "error": f"delete failed: {exc}"}), 500
+        logger.warning("duplicate delete failed: %s", exc)
+        return jsonify({"success": False, "error": "delete failed"}), 500
     # Invalidate the sorted cache so the next scan/gallery doesn't show the dupe.
     with _sorted_cache_lock:
         _sorted_cache["ts"] = 0.0
@@ -3325,10 +3375,9 @@ def api_export_dataset():
     try:
         summary = export_profiles.export_dataset(slug, profile, out_dir, **opts)
     except ValueError as exc:  # bad option / unknown profile
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+        return _err("invalid export option", exc, 400)
     except Exception as exc:  # noqa: BLE001 - export I/O failure shouldn't 500-crash
-        logger.warning("dataset export failed: %s", exc)
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+        return _err("dataset export failed", exc, 500)
     return jsonify({"success": True, "data": summary, "error": None})
 
 
@@ -3608,11 +3657,11 @@ def api_schedules_add():
             enabled=bool(data.get("enabled", True)),
         )
     except ValueError as exc:  # bad cadence / action
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 400
+        return _err("invalid cadence or action", exc, 400)
     try:
         scheduler.add_schedule(sched)
     except OSError as exc:  # disk full / perms — clean error, not a 500 traceback
-        return jsonify({"success": False, "data": None, "error": f"could not persist: {exc}"}), 500
+        return _err("could not persist", exc, 500)
     return jsonify({"success": True, "data": sched.to_dict(), "error": None})
 
 
@@ -3633,7 +3682,7 @@ def api_schedules_delete():
     try:
         removed = scheduler.remove_schedule(slug, action)
     except OSError as exc:  # disk write failure on the rewrite
-        return jsonify({"success": False, "data": None, "error": f"could not persist: {exc}"}), 500
+        return _err("could not persist", exc, 500)
     return jsonify({"success": True, "data": {"removed": removed}, "error": None})
 
 
@@ -3674,8 +3723,7 @@ def api_vision_health():
     try:
         probes = fleet_health.probe_fleet(fleet)
     except Exception as exc:  # noqa: BLE001 - probe must never 500 the panel
-        logger.warning("fleet health probe failed: %s", exc)
-        return jsonify({"success": False, "data": None, "error": str(exc)}), 500
+        return _err("fleet health probe failed", exc, 500)
     # Never ship raw per-worker api_keys to the browser — replace with has_key.
     return jsonify({"success": True,
                     "data": {"probes": probes, "fleet": _scrub_fleet(fleet)},
