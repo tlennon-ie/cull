@@ -19,7 +19,7 @@
 # launchers and requirements.txt reference).
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=82.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -70,19 +70,19 @@ dependencies = [
     "playwright>=1.49",
     "schedule>=1.2",
     "yt-dlp>=2026.6.9",
-    "huggingface_hub>=0.34",
+    "huggingface_hub>=1.21.0",
 ]
 
 [project.optional-dependencies]
 # Cloud vision-provider SDKs (only needed for the cloud workers).
 cloud = [
     "openai>=1.40",
-    "anthropic>=0.40",
+    "anthropic>=0.112.0",
     "google-genai>=1.0",
 ]
 # Video lane — frame extraction / scene detection.
 video = [
-    "scenedetect>=0.6",
+    "scenedetect>=0.7",
     "ffmpeg-python>=0.2",
 ]
 # Embeddings / aesthetic prefilter / ML.
@@ -92,7 +92,7 @@ ml = [
 ]
 # Dev / CI tooling.
 dev = [
-    "pytest>=8",
+    "pytest>=9.1.1",
     "ruff>=0.5",
     "pip-audit>=2.7",
 ]
