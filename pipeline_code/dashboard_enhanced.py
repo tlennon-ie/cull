@@ -2361,6 +2361,93 @@ def api_queue_action():
     return jsonify({"error": "unknown action"}), 400
 
 
+# ── API: gallery culling (recategorise a SORTED image) ────────────────────────
+#
+# The gallery shows images that have already been *sorted* into category folders
+# under PIPELINE_SORTED (layout: <sorted>/[<slug>/]<category>/<source>/<file>).
+# api_queue_action only moves within the *queue*, so the keyboard-driven cull
+# needs its own move path for the sorted tree. It mirrors the queue mover's
+# sibling-sweep but recomputes the destination by swapping the category folder,
+# and returns the resolved {from_category, to_category, path} so the client can
+# build a reversible undo entry. safe_inside guards both the source and the
+# (recomputed) destination — neither may escape PIPELINE_SORTED.
+
+def _recategorise_dest_dir(image_path: Path, target_category: str) -> Path | None:
+    """Destination ``<category>/<source>`` folder for recategorising a sorted image.
+
+    The category folder is the image's grandparent (``…/<category>/<source>/<file>``)
+    and the source folder is its parent. We swap only the category segment, keeping
+    the same source sub-folder, so a Civitai image stays under ``civitai/``. Returns
+    None when the image isn't nested under a ``<category>/<source>`` pair (so we never
+    fabricate a bogus destination from a too-shallow path).
+    """
+    source_folder = image_path.parent
+    category_folder = source_folder.parent
+    # category_folder must be a real directory below the sorted root, not the
+    # root itself or a drive anchor — otherwise the layout is unexpected.
+    if category_folder == source_folder or category_folder.parent == category_folder:
+        return None
+    return category_folder.parent / target_category / source_folder.name
+
+
+@app.route("/api/gallery/recategorize", methods=["POST"])
+def api_gallery_recategorize():
+    """Move one sorted image (and its sidecars) into a different category folder.
+
+    Body: ``{path, target, job?}``. ``path`` must resolve inside PIPELINE_SORTED
+    via ``safe_inside``; ``target`` must be a known category (keep bucket or a
+    system-terminal bucket such as DISCARD) so a typo can't spray arbitrary
+    folders across the sorted tree. The recomputed destination is re-checked with
+    ``safe_inside`` before any file is touched. Returns the envelope plus
+    ``{from_category, to_category, path}`` for the client's undo stack.
+    """
+    data = request.get_json() or {}
+    path = safe_inside(data.get("path", ""), [PIPELINE_SORTED])
+    target = (data.get("target") or "").strip()
+    if path is None or not path.exists():
+        return jsonify({"success": False, "error": "path outside sorted roots or missing"}), 400
+    if not target:
+        return jsonify({"success": False, "error": "target category required"}), 400
+    # Validate against the active taxonomy (keep buckets + DISCARD/CORRUPT). This
+    # is the single source of truth — never inline a category list here.
+    allowed = set(_categories_mod.get_all_categories())
+    if target not in allowed:
+        return jsonify({"success": False, "error": f"unknown target category '{target}'"}), 400
+
+    from_category = path.parent.parent.name
+    if from_category == target:
+        # No-op move — report success without churning the filesystem so the
+        # client can skip pushing an undo entry that reverses nothing.
+        return jsonify({"success": True, "data": {
+            "path": str(path), "from_category": from_category, "to_category": target,
+            "moved": False,
+        }, "error": None})
+
+    dest_dir = _recategorise_dest_dir(path, target)
+    if dest_dir is None or safe_inside(str(dest_dir), [PIPELINE_SORTED]) is None:
+        return jsonify({"success": False, "error": "could not resolve a destination inside sorted"}), 400
+
+    predicted, scores = _read_vision_prediction(path)
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        new_image_path = dest_dir / path.name
+        for sibling in path.parent.glob(f"{path.stem}.*"):
+            shutil.move(str(sibling), str(dest_dir / sibling.name))
+    except OSError as exc:
+        return jsonify({"success": False, "error": f"move failed: {exc}"}), 500
+
+    # Best-effort active-learning correction (same contract as the queue mover).
+    _record_relabel_correction(path.stem, predicted, target, scores)
+    # Invalidate the sorted cache so the next gallery/stats read reflects the move.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True, "data": {
+        "path": str(new_image_path), "from_category": from_category,
+        "to_category": target, "moved": True,
+    }, "error": None})
+
+
 # ── Brand assets ──────────────────────────────────────────────────────────────
 
 # Whitelist - only these filenames are served from /brand/<name>. Keeps the
@@ -2986,6 +3073,80 @@ def api_prompt_save():
     return jsonify({"success": True, "path": str(txt_path), "bytes": len(text)})
 
 
+# ── API: inline caption editor (training .txt next to an image) ───────────────
+#
+# A focused, envelope-returning surface for the gallery's inline caption editor.
+# It is intentionally separate from /api/prompt (which is the modal's free-form
+# prompt editor and predates the envelope convention): the caption editor wants a
+# small, predictable {success,data,error} shape, a hard length cap, and a GET that
+# returns the current sibling .txt. Both verbs are safe_inside-guarded against the
+# queue + sorted roots — the .txt is always written next to the image stem, never
+# at an attacker-chosen location.
+
+_MAX_CAPTION_CHARS: int = 20_000
+
+
+@app.route("/api/caption", methods=["GET"])
+def api_caption_get():
+    """Return the current ``<stem>.txt`` caption for an image (or empty).
+
+    Query: ``?path=<image>``. The path must resolve inside the queue/sorted
+    roots; a traversal or out-of-roots path is a clean 400 (never a file read
+    outside the pipeline). Envelope: ``{success, data:{path,text}, error}``.
+    """
+    raw = request.args.get("path", "")
+    image_path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if image_path is None:
+        return jsonify({"success": False, "data": None,
+                        "error": "path outside pipeline roots"}), 400
+    txt_path = image_path.with_suffix(".txt")
+    text = ""
+    if txt_path.exists():
+        try:
+            text = txt_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return jsonify({"success": False, "data": None,
+                            "error": f"read failed: {exc}"}), 500
+    return jsonify({"success": True,
+                    "data": {"path": str(txt_path), "text": text}, "error": None})
+
+
+@app.route("/api/caption", methods=["POST"])
+def api_caption_save():
+    """Write ``<stem>.txt`` next to an image.
+
+    Body: ``{path, text, job?}``. ``path`` must resolve inside the queue/sorted
+    roots via ``safe_inside`` (traversal / out-of-roots → 400). ``text`` is
+    required and length-capped at ``_MAX_CAPTION_CHARS`` so a runaway client can't
+    write an unbounded file. Envelope: ``{success, data:{path,bytes}, error}``.
+    """
+    data = request.get_json() or {}
+    raw = data.get("path") or ""
+    text = data.get("text")
+    if not isinstance(text, str):
+        return jsonify({"success": False, "data": None,
+                        "error": "missing or non-string 'text' field"}), 400
+    if len(text) > _MAX_CAPTION_CHARS:
+        return jsonify({"success": False, "data": None,
+                        "error": f"caption exceeds {_MAX_CAPTION_CHARS} chars"}), 400
+    image_path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if image_path is None:
+        return jsonify({"success": False, "data": None,
+                        "error": "path outside pipeline roots"}), 400
+    txt_path = image_path.with_suffix(".txt")
+    try:
+        txt_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"success": False, "data": None,
+                        "error": f"write failed: {exc}"}), 500
+    # Invalidate the scan cache so the next /api/stats sees the new caption.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"success": True,
+                    "data": {"path": str(txt_path), "bytes": len(text)}, "error": None})
+
+
 # ── API: zip download of filtered gallery ─────────────────────────────────────
 
 @app.route("/api/gallery/download.zip")
@@ -3577,6 +3738,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .prompt-snippet { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .link-btn { color:#818cf8; cursor:pointer; font-size:.75rem; }
   .link-btn:hover { color:#a5b4fc; text-decoration:underline; }
+  /* Keyboard-cull legend key caps. */
+  .kbd { display:inline-block; padding:0 .35em; min-width:1.2em; text-align:center;
+         font-family:ui-monospace,monospace; font-size:.7rem; line-height:1.4;
+         color:#e2e8f0; background:#1e293b; border:1px solid #334155;
+         border-bottom-width:2px; border-radius:.25rem; }
   /* NSFW blur container - the eye button overlays so the user can reveal a single thumb. */
   .nsfw-wrap { position:relative; display:inline-block; line-height:0; }
   .nsfw-blur { filter: blur(18px) saturate(0.7); transition: filter .2s; }
@@ -4317,10 +4483,37 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               :disabled="gallery.page >= Math.max(1, Math.ceil(gallery.total / gallery.pageSize))">Next</button>
           </div>
         </div>
+
+        <!-- Keyboard culling legend (§3a). Click a card to focus it, then drive
+             the keep/reject/recategorize hotkeys without leaving the keyboard. -->
+        <div class="mb-3 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-[11px] text-slate-300">
+          <div class="flex items-center justify-between">
+            <span class="font-semibold text-slate-200">Keyboard culling</span>
+            <button class="link-btn" @click="cullLegendOpen = !cullLegendOpen"
+              x-text="cullLegendOpen ? 'hide' : 'show'"></button>
+          </div>
+          <div x-show="cullLegendOpen" class="mt-2 flex flex-wrap gap-x-3 gap-y-1">
+            <span><kbd class="kbd">←↑↓→</kbd>/<kbd class="kbd">h j k l</kbd> move focus</span>
+            <span><kbd class="kbd">k</kbd> keep <span class="text-slate-500" x-text="'(' + (cullPrimaryKeep() || '—') + ')'"></span></span>
+            <span><kbd class="kbd">x</kbd> reject → DISCARD</span>
+            <span><kbd class="kbd">1</kbd>–<kbd class="kbd">9</kbd> Nth category</span>
+            <span><kbd class="kbd">u</kbd> undo <span class="text-slate-500" x-text="'(' + cullUndo.length + ')'"></span></span>
+            <span><kbd class="kbd">Esc</kbd> clear focus</span>
+          </div>
+          <div x-show="cullLegendOpen && cullCategories.length" class="mt-1 text-slate-500">
+            <template x-for="(cat, i) in cullCategories" :key="cat.name">
+              <span class="mr-2"><span class="text-slate-400" x-text="(i+1)"></span>=<span x-text="cat.name"></span></span>
+            </template>
+          </div>
+        </div>
+
         <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          <template x-for="c in gallery.items" :key="c.path">
-            <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col">
+          <template x-for="(c, idx) in gallery.items" :key="c.path">
+            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow"
+                 :data-cull-idx="idx"
+                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : 'border-slate-800'"
+                 @click="cullFocus = idx">
               <span class="nsfw-wrap block">
                 <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
@@ -4343,8 +4536,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
               <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
               <div class="mt-1 flex items-center gap-3">
-                <span class="link-btn" @click="openModalFromCard(c)">Open</span>
-                <span class="link-btn" @click="findSimilar(c)" title="Find visually similar kept images (CLIP embeddings)">Find similar</span>
+                <span class="link-btn" @click.stop="openModalFromCard(c)">Open</span>
+                <span class="link-btn" @click.stop="findSimilar(c)" title="Find visually similar kept images (CLIP embeddings)">Find similar</span>
               </div>
             </div>
           </template>
@@ -6091,6 +6284,34 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <textarea x-model="modal.prompt" rows="14"
               class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-slate-200"></textarea>
           </template>
+
+          <!-- Inline caption editor (§3d): edits the training <stem>.txt that
+               lives next to the image. Independent of the prompt block above. -->
+          <template x-if="modal.path">
+            <div class="mt-5 border-t border-slate-800 pt-4">
+              <div class="flex items-center justify-between mb-2">
+                <h4 class="text-xs uppercase tracking-wider text-slate-400">Caption (.txt)</h4>
+                <span class="text-[11px] text-slate-500" x-text="'~' + captionTokenCount(modal.caption) + ' tokens'"></span>
+              </div>
+              <div class="flex flex-wrap items-center gap-2 mb-2">
+                <input x-model="triggerWord" placeholder="trigger word"
+                  class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs w-40"
+                  @keydown.enter.prevent="prependTriggerWord()"/>
+                <button @click="prependTriggerWord()"
+                  class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded"
+                  title="Prepend the trigger word to the caption">+ trigger word</button>
+                <button @click="saveCaption()" :disabled="!!modal.captionSaving"
+                  class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded disabled:opacity-50">
+                  <span x-text="modal.captionSaving ? 'Saving…' : 'Save caption'"></span>
+                </button>
+                <span class="text-[11px] text-emerald-300" x-show="modal.captionFlash" x-text="modal.captionFlash"></span>
+              </div>
+              <textarea x-model="modal.caption" rows="5"
+                class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-slate-200"
+                placeholder="No caption yet — type one and Save."></textarea>
+            </div>
+          </template>
+
           <template x-if="modal.summary">
             <div class="mt-4">
               <h4 class="text-xs uppercase tracking-wider text-slate-400 mb-1">Vision summary</h4>
@@ -6340,7 +6561,11 @@ function dashboard() {
     lastRefresh: '...',
     modal: { open:false, imageUrl:'', prompt:'', promptOriginal:'', editing:false,
              saving:false, savedFlash:'', name:'', source:'', category:'', summary:'',
-             path:'', meta:null },
+             path:'', meta:null,
+             // Inline caption editor (§3d) — independent of the prompt editor above.
+             caption:'', captionOriginal:'', captionSaving:false, captionFlash:'' },
+    // Trigger word the "+ trigger word" button prepends to a caption.
+    triggerWord: '',
     // Stats tab state
     stats: { totals:{}, keywords:[], top_overall:[], top_quality:[], top_relative:[], sources:[] },
     statsLoading: false,
@@ -6357,6 +6582,21 @@ function dashboard() {
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
     modalReturnFocus: null,
+
+    // ── Keyboard-driven culling (§3a) ────────────────────────────────────
+    // cullFocus is an index into gallery.items (-1 = nothing focused). The
+    // focused card gets a visible ring and is the implicit target of the cull
+    // hotkeys. cullCategories is the ordered keep-bucket taxonomy (loaded from
+    // /api/categories) that powers k=keep-primary and 1..9=Nth-category.
+    // cullUndo is a stack of reversible moves: each entry is
+    // {path, fromCategory, toCategory}. Hard deletes are never pushed (not
+    // reversible). cullBusy debounces a hotkey while a move is in flight.
+    cullFocus: -1,
+    cullCategories: [],   // [{name, ...}] keep buckets, in taxonomy order
+    cullTerminal: [],     // ['DISCARD','CORRUPT'] — system terminal buckets
+    cullUndo: [],
+    cullBusy: false,
+    cullLegendOpen: true,
 
     // Label for the active section, resolved across whichever tab set is live.
     currentTabLabel() {
@@ -7199,6 +7439,7 @@ function dashboard() {
         editing: false, saving: false, savedFlash: '',
         name: name || '', source: source || '', category: category || '',
         summary: summary || '', path: path || '', meta: meta || null,
+        caption: '', captionOriginal: '', captionSaving: false, captionFlash: '',
       };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
@@ -7206,6 +7447,9 @@ function dashboard() {
         this.modal.prompt = value || '(empty)';
         this.modal.promptOriginal = value;
       } catch (e) { this.modal.prompt = '(failed to load prompt)'; }
+      // Load the training caption (.txt) into the inline caption editor. Separate
+      // fetch from the prompt above so the two editors stay independent.
+      this.loadCaption();
     },
     upsize(url) { if (!url) return url; return url + (url.includes('?') ? '&' : '?') + 'size=1600'; },
     openModalFromFile(f) {
@@ -7376,6 +7620,226 @@ function dashboard() {
     galleryDownload() {
       const qs = this.galleryQueryString();
       window.open('/api/gallery/download.zip?' + qs, '_blank');
+    },
+
+    // ── Keyboard-driven culling (§3a) ────────────────────────────────────
+    // The primary keep bucket is the first non-terminal category in taxonomy
+    // order. Falls back to 'Keepers' only if the taxonomy somehow has none.
+    cullPrimaryKeep() {
+      const first = (this.cullCategories || [])[0];
+      return first ? first.name : null;
+    },
+    // Load the ordered taxonomy so 1..9 and k map to real category names. Cheap;
+    // fired once when the gallery tab opens (and refreshed on demand).
+    async loadCullCategories() {
+      try {
+        const j = await fetch('/api/categories' + this.jobParam('?')).then(r => r.json());
+        this.cullCategories = (j.active && j.active.categories) || [];
+        this.cullTerminal = j.system_terminal || [];
+      } catch (e) { /* leave whatever we had; hotkeys degrade gracefully */ }
+    },
+    // True when keyboard culling should respond: gallery tab open, no modal,
+    // and the user isn't typing into a field. Keeps hotkeys from firing while
+    // someone edits a filter or caption.
+    cullHotkeysActive() {
+      if (this.view !== 'job' || this.active !== 'gallery') return false;
+      if (this.modal.open) return false;
+      const el = document.activeElement;
+      if (el) {
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) return false;
+      }
+      return true;
+    },
+    cullFocusCard(idx) {
+      const n = (this.gallery.items || []).length;
+      if (n === 0) { this.cullFocus = -1; return; }
+      // Clamp into range and wrap is not needed; arrow handlers clamp.
+      this.cullFocus = Math.max(0, Math.min(n - 1, idx));
+    },
+    cullClearFocus() { this.cullFocus = -1; },
+    // Move focus by a delta within the flat item list (used by h/j/k/l + arrows).
+    cullMoveFocus(delta) {
+      const n = (this.gallery.items || []).length;
+      if (n === 0) { this.cullFocus = -1; return; }
+      const next = this.cullFocus < 0 ? 0 : this.cullFocus + delta;
+      this.cullFocus = Math.max(0, Math.min(n - 1, next));
+      this.$nextTick(() => {
+        const node = document.querySelector('[data-cull-idx="' + this.cullFocus + '"]');
+        if (node && node.scrollIntoView) node.scrollIntoView({ block: 'nearest' });
+      });
+    },
+    // The currently focused card object, or null.
+    cullFocused() {
+      if (this.cullFocus < 0) return null;
+      return (this.gallery.items || [])[this.cullFocus] || null;
+    },
+    // Recategorise the focused card to `target` via the sorted-move endpoint and
+    // push a reversible entry onto the undo stack. Optimistically drops the card
+    // from the current view so culling feels instant; a failed move re-fetches.
+    async cullRecategorize(target) {
+      const card = this.cullFocused();
+      if (!card || !target || this.cullBusy) return;
+      this.cullBusy = true;
+      const focusedIdx = this.cullFocus;
+      try {
+        const r = await fetch('/api/gallery/recategorize', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: card.path, target, job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.notify((j && j.error) || ('move failed: ' + r.status), 'error');
+          return;
+        }
+        if (j.data && j.data.moved) {
+          // Push undo BEFORE mutating the list. The new path (under the target
+          // folder) is what we'd reverse.
+          this.cullUndo.push({
+            path: j.data.path, fromCategory: j.data.from_category, toCategory: j.data.to_category,
+          });
+          if (this.cullUndo.length > 100) this.cullUndo.shift();
+          // Optimistically remove the card from the view and keep focus sane.
+          this.gallery.items = (this.gallery.items || []).filter(it => it.path !== card.path);
+          this.gallery.total = Math.max(0, (this.gallery.total || 1) - 1);
+          const n = this.gallery.items.length;
+          this.cullFocus = n === 0 ? -1 : Math.min(focusedIdx, n - 1);
+          this.notify(card.name + ' → ' + target, 'success', 1500);
+        } else {
+          this.notify('Already in ' + target, 'info', 1200);
+        }
+      } catch (e) {
+        this.notify('Network error during move', 'error');
+      } finally {
+        this.cullBusy = false;
+      }
+    },
+    cullKeep() {
+      const keep = this.cullPrimaryKeep();
+      if (!keep) { this.notify('No keep bucket in this taxonomy', 'warn'); return; }
+      this.cullRecategorize(keep);
+    },
+    cullReject() { this.cullRecategorize('DISCARD'); },
+    // 1..9 → Nth keep bucket (1-indexed) in taxonomy order.
+    cullRecategorizeNth(n) {
+      const cat = (this.cullCategories || [])[n - 1];
+      if (!cat) { this.notify('No category #' + n, 'warn'); return; }
+      this.cullRecategorize(cat.name);
+    },
+    // Undo the last move by moving the image back (same endpoint, from/to swapped).
+    async cullUndoLast() {
+      if (this.cullBusy) return;
+      const last = this.cullUndo.pop();
+      if (!last) { this.notify('Nothing to undo', 'info', 1200); return; }
+      this.cullBusy = true;
+      try {
+        const r = await fetch('/api/gallery/recategorize', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: last.path, target: last.fromCategory, job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.notify((j && j.error) || 'undo failed', 'error');
+          this.cullUndo.push(last);   // restore so the user can retry
+          return;
+        }
+        this.notify('Undid → ' + last.fromCategory, 'success', 1500);
+        // The card now belongs in the current view again only if the filter
+        // matches; cheapest correct option is a reload.
+        this.loadGallery();
+      } catch (e) {
+        this.notify('Network error during undo', 'error');
+        this.cullUndo.push(last);
+      } finally {
+        this.cullBusy = false;
+      }
+    },
+    // Single keydown entry-point bound to window. Guards against typing in
+    // fields, then dispatches the cull hotkeys. Returns early (no preventDefault)
+    // for unhandled keys so normal browser shortcuts still work.
+    onCullKeydown(ev) {
+      if (!this.cullHotkeysActive()) return;
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;   // don't hijack browser combos
+      const k = ev.key;
+      // Digits 1..9 → Nth category.
+      if (k >= '1' && k <= '9') { ev.preventDefault(); this.cullRecategorizeNth(Number(k)); return; }
+      switch (k) {
+        case 'ArrowRight': case 'l': ev.preventDefault(); this.cullMoveFocus(1); return;
+        case 'ArrowLeft':  case 'h': ev.preventDefault(); this.cullMoveFocus(-1); return;
+        case 'ArrowDown':  case 'j': ev.preventDefault(); this.cullMoveFocus(this.cullRowStride()); return;
+        case 'ArrowUp':              ev.preventDefault(); this.cullMoveFocus(-this.cullRowStride()); return;
+        case 'k': ev.preventDefault(); this.cullKeep(); return;
+        case 'x': ev.preventDefault(); this.cullReject(); return;
+        case 'u': ev.preventDefault(); this.cullUndoLast(); return;
+        case 'Escape': this.cullClearFocus(); return;
+        default: return;
+      }
+    },
+    // 'k' is BOTH "move focus down a row" (vim) AND "keep". We resolve the
+    // ambiguity in favour of keep (the headline action); use ArrowDown/j to move
+    // down a row. cullRowStride approximates the column count of the responsive
+    // grid so j/ArrowDown jump a visual row rather than one card.
+    cullRowStride() {
+      const w = window.innerWidth || 1280;
+      if (w >= 1024) return 6;   // lg:grid-cols-6
+      if (w >= 768) return 4;    // md:grid-cols-4
+      if (w >= 640) return 3;    // sm:grid-cols-3
+      return 2;                  // grid-cols-2
+    },
+
+    // ── Inline caption editor (§3d) ──────────────────────────────────────
+    // Approximate token count: whitespace + comma split (good enough for the UI
+    // hint; not a real tokenizer). Empty/whitespace → 0.
+    captionTokenCount(text) {
+      const t = (text || '').trim();
+      if (!t) return 0;
+      return t.split(/[\s,]+/).filter(Boolean).length;
+    },
+    async loadCaption() {
+      // Pull the current .txt for the modal's image into the caption editor.
+      if (!this.modal.path) { this.modal.caption = ''; this.modal.captionOriginal = ''; return; }
+      try {
+        const enc = encodeURIComponent(this.modal.path);
+        const j = await fetch('/api/caption?path=' + enc).then(r => r.json());
+        const text = (j && j.success && j.data) ? (j.data.text || '') : '';
+        this.modal.caption = text;
+        this.modal.captionOriginal = text;
+      } catch (e) {
+        this.modal.caption = ''; this.modal.captionOriginal = '';
+      }
+    },
+    // Prepend the trigger word to the caption (idempotent-ish: skips if the
+    // caption already starts with it). Comma-separated, the LoRA-tag convention.
+    prependTriggerWord() {
+      const tw = (this.triggerWord || '').trim();
+      if (!tw) { this.notify('Enter a trigger word first', 'warn', 1500); return; }
+      const cur = this.modal.caption || '';
+      if (cur.toLowerCase().startsWith(tw.toLowerCase())) { this.notify('Already prefixed', 'info', 1200); return; }
+      this.modal.caption = cur ? (tw + ', ' + cur) : tw;
+    },
+    async saveCaption() {
+      if (!this.modal.path || this.modal.captionSaving) return;
+      this.modal.captionSaving = true;
+      try {
+        const r = await fetch('/api/caption', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: this.modal.path, text: this.modal.caption || '', job: this.currentJob || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.success) {
+          this.modal.captionFlash = 'Error: ' + ((j && j.error) || r.status);
+          return;
+        }
+        this.modal.captionOriginal = this.modal.caption;
+        this.modal.captionFlash = 'Caption saved.';
+        this.notify('Caption saved', 'success', 1500);
+        setTimeout(() => this.modal.captionFlash = '', 2500);
+      } catch (e) {
+        this.modal.captionFlash = 'Network error — check console';
+        console.error('saveCaption failed', e);
+      } finally {
+        this.modal.captionSaving = false;
+      }
     },
 
     // Scope query string for job-aware endpoints: ?job=<slug> when viewing a
@@ -7583,6 +8047,9 @@ function dashboard() {
       this.loadJobs();
       this.loadPresets();
       this.refresh();
+      // Global keyboard-cull listener. Gated entirely by cullHotkeysActive()
+      // (gallery tab open, no modal, not typing) so it's inert everywhere else.
+      window.addEventListener('keydown', (ev) => this.onCullKeydown(ev));
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
       // auto-refreshes alongside the rest of the dashboard. Gallery stays
@@ -7599,6 +8066,10 @@ function dashboard() {
           this.loadGallery();
           this.loadGalleryInsights();
         }
+        // Keyboard culling needs the ordered taxonomy; load it whenever the
+        // gallery opens and reset focus so a stale index from a prior view
+        // doesn't ring a card the user can't see.
+        if (tab === 'gallery') { this.loadCullCategories(); this.cullFocus = -1; }
         // Job Settings + Vision both edit this job's inheritable config (v2),
         // so they need the effective cfg + overrides loaded.
         if ((tab === 'jobSettings' || tab === 'vision') && !this.je.loaded) this.loadJobEditor();
