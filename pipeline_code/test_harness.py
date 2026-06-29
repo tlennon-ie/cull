@@ -106,18 +106,9 @@ print("="*65)
 config_checks = {}
 
 
-def _redact_secret(value: str) -> str:
-    """Return a non-sensitive presence indicator for a credential.
-
-    Never echoes the raw secret OR any slice of it — only whether it is set and
-    its length, neither of which is recoverable secret material: "(set, len=N)"
-    for a populated value, "(unset)" otherwise. This is a sanitization barrier —
-    no character of the secret ever reaches the logging sink.
-    """
-    if not value or value == "your_":
-        return "(unset)"
-    return f"(set, len={len(value)})"
-
+# Credential checks log only a present/missing STATUS (a literal chosen by a
+# condition), never the secret value or anything derived from it (not even its
+# length) — so no sensitive data reaches a logging sink.
 
 # Discord
 discord_token = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -138,25 +129,21 @@ except Exception as e:
 # Civitai
 civitai_key = os.getenv("CIVITAI_API_KEY", "")
 civitai_domain = os.getenv("CIVITAI_DOMAIN", "civitai.com")
-civitai_key_redacted = _redact_secret(civitai_key)
 config_checks["civitai"] = {
     "api_key": "✅ Configured" if civitai_key and civitai_key != "your_" else "❌ Missing",
-    "api_key_redacted": civitai_key_redacted,
     "domain": f"✅ {civitai_domain}"
 }
 print(f"Civitai:")
-print(f"  API Key: {config_checks['civitai']['api_key']} {civitai_key_redacted}")
+print(f"  API Key: {config_checks['civitai']['api_key']}")
 print(f"  Domain: {config_checks['civitai']['domain']}")
 
 # Twitter
 twitter_cookies = os.getenv("TWITTER_COOKIES", "")
-twitter_cookies_redacted = _redact_secret(twitter_cookies)
 config_checks["twitter"] = {
-    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing",
-    "cookies_redacted": twitter_cookies_redacted
+    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing"
 }
 print(f"Twitter/X:")
-print(f"  Cookies: {config_checks['twitter']['cookies']} {twitter_cookies_redacted}")
+print(f"  Cookies: {config_checks['twitter']['cookies']}")
 
 # ============================================================================
 # TEST 3: Simulate Queue Population (5 images per source)
@@ -204,8 +191,8 @@ print(f"   Secondary: {test_results['secondary']['status']}")
 
 print(f"\n📱 Scrapers:")
 print(f"   Discord: {config_checks['discord']['bot_token']} ({config_checks['discord']['channels']})")
-print(f"   Civitai: {config_checks['civitai']['api_key']} {config_checks['civitai']['api_key_redacted']}")
-print(f"   Twitter: {config_checks['twitter']['cookies']} {config_checks['twitter']['cookies_redacted']}")
+print(f"   Civitai: {config_checks['civitai']['api_key']}")
+print(f"   Twitter: {config_checks['twitter']['cookies']}")
 
 print(f"\n✅ Queue Structure: Ready")
 print(f"   Path: {PIPELINE_QUEUE}")
