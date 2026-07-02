@@ -61,6 +61,13 @@ logger = get_logger(__name__)
 _VISION_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "pixtral",
                  "gemma-3", "qwen-vl", "internvl", "smolvlm", "phi-3.5-vision")
 
+# Substrings that mark a model as a reasoning/"thinking" variant. These emit
+# chain-of-thought prose and, in LM Studio's reasoning split-mode, routinely burn
+# the whole token budget thinking before they ever emit the JSON object — so the
+# strict response_format yields "empty/invalid JSON". Auto-detect deprioritises
+# them: a non-thinking vision model is always preferred when one is listed.
+_THINKING_HINTS = ("thinking", "reasoning", "-r1", "qwq", "deepseek-r")
+
 
 class BalancedOpenAICompatWorker(BaseVisionWorker):
     name = "balanced-openai-compat"
@@ -112,7 +119,27 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         ids = [m.get("id", "") for m in data if isinstance(m, dict) and m.get("id")]
         if not ids:
             return ""
-        chosen = next((i for i in ids if any(h in i.lower() for h in _VISION_HINTS)), ids[0])
+
+        def _is_vision(i: str) -> bool:
+            return any(h in i.lower() for h in _VISION_HINTS)
+
+        def _is_thinking(i: str) -> bool:
+            return any(h in i.lower() for h in _THINKING_HINTS)
+
+        # Prefer a non-thinking vision model; fall back to any vision model (even a
+        # thinking one) and finally the first listed id. Thinking models break
+        # strict structured output, so they're the last vision resort, not the first.
+        chosen = (
+            next((i for i in ids if _is_vision(i) and not _is_thinking(i)), "")
+            or next((i for i in ids if _is_vision(i)), "")
+            or ids[0]
+        )
+        if _is_thinking(chosen):
+            logger.warning(
+                "auto-detected model %r looks like a reasoning/thinking model — it may "
+                "emit chain-of-thought instead of JSON. Set an explicit non-thinking "
+                "vision model in the fleet if classification returns empty JSON.", chosen,
+            )
         logger.info("auto-detected model %r from %s/v1/models", chosen, self.base_url)
         return chosen
 

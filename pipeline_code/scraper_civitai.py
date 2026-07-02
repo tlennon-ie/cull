@@ -44,7 +44,19 @@ QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 from seen_store import MigrationSpec, SeenStore  # noqa: E402
 from topic_filter import prompt_optional  # noqa: E402
+import media_policy  # noqa: E402
 _SEEN_NAME = f"civitai_{_DOMAIN.replace('.', '_')}"
+
+
+def _civitai_types() -> list[str]:
+    """Civitai post types to request, from the active media policy. Civitai's
+    tRPC image feed supports both "image" and "video" post types."""
+    types = []
+    if media_policy.wants_image():
+        types.append("image")
+    if media_policy.wants_video():
+        types.append("video")
+    return types or ["image"]
 
 CDN_BASE  = os.environ.get("CIVITAI_CDN_BASE", "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA")
 TRPC_BASE = os.environ.get("CIVITAI_TRPC_BASE", f"https://{_DOMAIN}/api/trpc")
@@ -59,10 +71,13 @@ BROWSE_PARAMS = {
     "period":         "Month",
     "periodMode":     "published",
     "sort":           "Most Collected",
-    "types":          ["image"],
+    "types":          _civitai_types(),
     "withMeta":       True,
     "fromPlatform":   False,
-    "baseModels":     ["ZImageBase", "ZImageTurbo", "Flux.2 Klein 9B", "Flux.2 D", "Flux.2 Klein 9B-base", "Qwen"],
+    # AI-model restriction only when a prompt is REQUIRED. With prompts optional
+    # the user wants media from ANY model (no flux/qwen/zimage narrowing), so we
+    # send an empty list = all base models.
+    "baseModels":     [] if prompt_optional() else ["ZImageBase", "ZImageTurbo", "Flux.2 Klein 9B", "Flux.2 D", "Flux.2 Klein 9B-base", "Qwen"],
     "useIndex":       True,
     "browsingLevel":  31,
     "include":        ["cosmetics"],
@@ -246,10 +261,21 @@ def scrape_pages(seen: set) -> int:
 
             seen.add(str(image_id))
 
-            # Determine extension
-            ext = ".jpg"
-            if mime == "image/png" or "png" in uuid.lower(): ext = ".png"
-            elif mime == "image/webp": ext = ".webp"
+            # Determine extension from the mime. Video posts (mimeType video/*)
+            # get their container extension; the CDN's original=true returns the
+            # real clip. Skip anything the job's media policy doesn't accept.
+            is_video = str(mime).lower().startswith("video/")
+            if is_video:
+                sub = str(mime).split("/", 1)[1].split(";")[0].strip() or "mp4"
+                ext = ".mov" if sub == "quicktime" else f".{sub}"
+            elif mime == "image/png" or "png" in uuid.lower():
+                ext = ".png"
+            elif mime == "image/webp":
+                ext = ".webp"
+            else:
+                ext = ".jpg"
+            if not media_policy.accepts(ext):
+                continue
 
             img_url   = build_image_url(uuid, mime)
             stem      = f"civitai_{image_id}"
@@ -258,9 +284,9 @@ def scrape_pages(seen: set) -> int:
             meta_path = QUEUE_DIR / f"{stem}.meta.json"
 
             if not download_image(img_url, img_path):
-                # Try width fallback
+                # Width fallback only makes sense for images (not video clips).
                 img_url2 = f"{CDN_BASE}/{uuid}/width=1024"
-                if not download_image(img_url2, img_path):
+                if is_video or not download_image(img_url2, img_path):
                     seen.discard(str(image_id))
                     print(f"    [{image_id}] download failed — skip")
                     continue

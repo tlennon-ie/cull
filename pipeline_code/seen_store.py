@@ -111,6 +111,16 @@ class SeenStore:
     def __len__(self) -> int:
         return len(self._set)
 
+    def __iter__(self):
+        """Iterate the keys. Yields from a snapshot copy so a concurrent add()
+        (e.g. autoflush threads, or a scraper adding while prefix-scanning) can't
+        raise "set changed size during iteration". Completes the set-like API
+        alongside __contains__/__len__ — scrapers do ``for k in seen`` to do
+        prefix matches (skip a tweet if any of its media IDs are already seen)."""
+        with self._lock:
+            snapshot = tuple(self._set)
+        return iter(snapshot)
+
     def add(self, key: str) -> bool:
         """Insert a key. Returns True if the key was new (not previously present)."""
         with self._lock:

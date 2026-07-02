@@ -201,6 +201,15 @@ def _default_preset_cfg() -> dict:
         "category_rules": rules,
         "scoring": {"ovr_min": 0, "rel_min": 0, "notes": ""},
         "captioning": {"enabled": False, "style": "sd_prompt", "overwrite": False},
+        # Which media the scrapers fetch + the queue pops. ``types`` is a subset of
+        # {image, video}; the ext lists are editable so you aren't limited to one
+        # format each. Projected to MEDIA_* env by resolve_env; media_policy.py is
+        # the runtime source of truth every scraper consults.
+        "media": {
+            "types": ["image"],
+            "image_exts": [".jpg", ".jpeg", ".png", ".webp", ".gif"],
+            "video_exts": [".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"],
+        },
         "vision": {"workers": _default_vision_workers()},
     }
 
@@ -522,6 +531,7 @@ def effective_config(job: Job) -> dict:
         "category_rules": cfg.get("category_rules", ""),
         "scoring": cfg.get("scoring", {}),
         "captioning": cfg.get("captioning", {}),
+        "media": cfg.get("media", {}),
         "vision": cfg.get("vision", {}),
     }
 
@@ -784,6 +794,9 @@ def resolve_env(job: Job) -> dict[str, str]:
     yt = _d(s.get("yt_dlp"))
     sc = _d(eff.get("scoring"))
     cap = _d(eff.get("captioning"))
+    md = _d(eff.get("media"))
+    media_types_list = [x for x in (md.get("types") or ["image"])
+                        if x in ("image", "video")] or ["image"]
     enabled = _d(s.get("enabled"))
     vision = _d(eff.get("vision"))
     fleet = clean_vision_fleet(vision.get("workers"))
@@ -826,6 +839,12 @@ def resolve_env(job: Job) -> dict[str, str]:
         "AUTO_CAPTION_STYLE": str(cap.get("style", "sd_prompt") or "sd_prompt"),
         "AUTO_CAPTION_OVERWRITE": _b(cap.get("overwrite", False)),
         "ACTIVE_LEARNING_EXEMPLARS_JSON": _project_active_learning_exemplars(job.slug, eff),
+        "MEDIA_TYPES": ",".join(media_types_list),
+        "MEDIA_IMAGE_EXTS": _csv(md.get("image_exts")),
+        "MEDIA_VIDEO_EXTS": _csv(md.get("video_exts")),
+        # Selecting video turns the classify lane on so the queue actually pops
+        # clips; image-only jobs inherit the global .env toggle (key omitted).
+        **({"VIDEO_CLASSIFY_ENABLED": "true"} if "video" in media_types_list else {}),
     }
 
 

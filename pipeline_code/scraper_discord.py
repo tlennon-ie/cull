@@ -54,7 +54,12 @@ QUEUE_DIR  = _RAW_QUEUE if _RAW_QUEUE.name == SLUG else _RAW_QUEUE / SLUG
 from queue_manager import save_to_queue  # noqa: E402
 from seen_store import SeenStore  # noqa: E402
 
-from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+from topic_filter import (
+    load_config as _load_topic_config,
+    passes as _topic_passes,
+    prompt_optional as _prompt_optional,
+)
+import media_policy
 from rate_limit import RateLimitConfig, RateLimiter  # noqa: E402
 
 # Per-source pacing + 429 backoff + optional proxy. Opt-in: unthrottled unless
@@ -255,8 +260,17 @@ def process_channel(ch):
 
     for msg in messages:
         atts = msg.get("attachments", [])
-        images = [a for a in atts if "image" in a.get("content_type","") or
-                  a["url"].split("?")[0].lower().endswith((".png",".jpg",".jpeg",".webp"))]
+
+        def _att_ok(a) -> bool:
+            ct = a.get("content_type", "") or ""
+            url = a["url"].split("?")[0].lower()
+            if media_policy.wants_image() and ("image" in ct or url.endswith(media_policy.image_exts())):
+                return True
+            if media_policy.wants_video() and ("video" in ct or url.endswith(media_policy.video_exts())):
+                return True
+            return False
+
+        images = [a for a in atts if _att_ok(a)]
         yamls  = [a for a in atts if a.get("filename","").endswith((".yaml",".yml"))]
 
         embed_imgs = []
@@ -332,12 +346,16 @@ def process_channel(ch):
                     if emb.get("footer",{}).get("text"): parts.append(emb["footer"]["text"])
                 pt = " | ".join(p for p in parts if p).strip() or None
 
-            if not is_valid_prompt(pt):
+            # Topic-text filter only when a prompt is REQUIRED. When prompts are
+            # optional the user wants every image from the configured channels
+            # pulled regardless of caption; the vision worker culls afterwards.
+            if not _prompt_optional() and not is_valid_prompt(pt):
                 continue
 
-            # Save to queue
+            # Save to queue. Keep the real extension when the policy accepts it
+            # (so a .mp4 clip stays a clip); otherwise fall back to jpg.
             ext = img_url.split("?")[0].split(".")[-1].lower()
-            if ext not in ("jpg","jpeg","png","webp"): ext = "jpg"
+            if not media_policy.accepts("." + ext): ext = "jpg"
             qid = f"{msg['id']}_{queued}"
             
             # Create temp file for queue_manager

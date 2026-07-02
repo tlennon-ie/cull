@@ -65,6 +65,7 @@ from pipeline_logging import get_logger  # noqa: E402
 from queue_manager import save_to_queue  # noqa: E402
 from seen_store import SeenStore  # noqa: E402
 from topic_filter import prompt_optional  # noqa: E402
+import media_policy  # noqa: E402
 
 logger = get_logger(__name__)
 
@@ -77,9 +78,9 @@ SLUG: str = (os.environ.get("PIPELINE_SLUG") or "default").strip() or "default"
 _CAPTION_FIELDS: tuple[str, ...] = (
     "description", "caption", "selftext", "content", "title",
 )
-_IMAGE_SUFFIXES: tuple[str, ...] = (
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff",
-)
+# Media suffixes are governed by the active media policy (MEDIA_TYPES + ext
+# lists) — gallery-dl already downloads whatever the extractor yields (images
+# AND video), so we simply stop discarding the kinds the job accepts.
 
 
 def _split_urls(raw: str) -> list[str]:
@@ -132,9 +133,19 @@ def _configure_gallery_dl(tmp_dir: Path, archive_path: Path, limit: int) -> None
     # Flat output directory: empty list = no per-site subfolders.
     config.set(("extractor",), "base-directory", str(tmp_dir))
     config.set(("extractor",), "directory", [])
-    config.set(("extractor",), "filename", "{category}_{id}_{num}.{extension}")
+    # IMPORTANT: do NOT override `filename` either. Each extractor's native
+    # filename_fmt is designed to be unique per file; our `{category}_{num}`
+    # template collapsed every post in a listing to the same name (`reddit_0.jpg`,
+    # `redgifs_0.m4v`) because `{num}` is only the per-POST file index — so all but
+    # the first "already exist" and the run churns the same handful of files.
+    # Native names are flat (no path separators) so they stay in one directory.
     config.set(("extractor",), "archive", str(archive_path))
-    config.set(("extractor",), "archive-format", "{category}_{id}_{num}")
+    # IMPORTANT: do NOT override `archive-format`. Each extractor ships a native
+    # `archive_fmt` purpose-built to uniquely identify a file for that site. The
+    # previous `{category}_{id}_{num}` override broke dedup on every site without
+    # a numeric `id`: pornpics emits id=None, so all galleries collapsed to the
+    # same keys (`pornpics_None_1..N`) and gallery-dl skipped every gallery after
+    # the first one — i.e. the scraper silently downloaded nothing.
     range_value = f"1-{max(1, limit)}"
     config.set(("extractor",), "image-range", range_value)
     config.set(("extractor",), "file-range", range_value)
@@ -180,7 +191,7 @@ def _ingest_tmp_dir(tmp_dir: Path, seen: SeenStore, source_url: str) -> int:
         if not img_path.is_file():
             continue
         suffix = img_path.suffix.lower()
-        if suffix not in _IMAGE_SUFFIXES:
+        if not media_policy.accepts(suffix):
             continue
 
         # gallery-dl writes `<image>.<ext>.json` (extension `json`, suffix
@@ -205,10 +216,15 @@ def _ingest_tmp_dir(tmp_dir: Path, seen: SeenStore, source_url: str) -> int:
             img_path.unlink(missing_ok=True)
             continue
 
-        # Build a stable id we can store in the SeenStore for analytics.
-        category_id = (
+        # Build a stable, GLOBALLY-unique id for the SeenStore. Prefer the source
+        # image URL (unique per image across every gallery). Fall back to
+        # category+id+num — but use ``or`` (not dict.get's default) because many
+        # extractors emit ``id`` as an explicit null: ``meta.get('id', stem)``
+        # returns None there, which collapsed every gallery to ``<cat>_None_<n>``
+        # and made the cull-layer dedup skip images across unrelated galleries.
+        category_id = meta.get("url") or (
             f"{meta.get('category', 'unknown')}_"
-            f"{meta.get('id', img_path.stem)}_"
+            f"{meta.get('id') or img_path.stem}_"
             f"{meta.get('num', 0)}"
         )
         if category_id in seen:

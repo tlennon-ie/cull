@@ -59,13 +59,13 @@ SOURCES: dict[str, str] = {
 }
 
 _SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
-_QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp")
+_QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif")
 # Video containers the round-robin pop will surface ONLY when the video-
 # classification lane is enabled (VIDEO_CLASSIFY_ENABLED). Off by default so an
 # image-only pipeline never starts popping clips it can't classify — behaviour
 # stays byte-identical unless the flag is set. Mirrors video_frames.VIDEO_EXT /
 # export_profiles.VIDEO_EXT.
-_QUEUE_VIDEO_GLOBS = ("*.mp4", "*.mov", "*.webm", "*.mkv", "*.avi")
+_QUEUE_VIDEO_GLOBS = ("*.mp4", "*.mov", "*.webm", "*.mkv", "*.avi", "*.m4v")
 _DEFAULT_CACHE_TTL = 5.0  # seconds; see FSQueue docstring
 
 
@@ -78,8 +78,22 @@ def _video_classify_enabled() -> bool:
 
 
 def _queue_globs() -> tuple[str, ...]:
-    """The media globs the queue pops: images always, video clips only when the
-    video-classification lane is enabled."""
+    """The media globs the queue pops, derived from the active media policy:
+    image extensions when the job accepts images, plus video extensions when it
+    accepts video AND the video-classification lane is enabled. Defaults mirror
+    the historical image/video globs, so an unconfigured pipeline is unchanged."""
+    try:
+        import media_policy
+        globs: tuple[str, ...] = ()
+        if media_policy.wants_image():
+            globs += tuple(f"*{e}" for e in media_policy.image_exts())
+        if media_policy.wants_video() and _video_classify_enabled():
+            globs += tuple(f"*{e}" for e in media_policy.video_exts())
+        if globs:
+            return globs
+    except Exception:  # noqa: BLE001 - never let policy parsing break the queue
+        pass
+    # Fallback to the historical fixed set.
     if _video_classify_enabled():
         return _QUEUE_IMAGE_GLOBS + _QUEUE_VIDEO_GLOBS
     return _QUEUE_IMAGE_GLOBS
