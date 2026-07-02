@@ -92,6 +92,7 @@ def _preset(
     reddit_subreddits: tuple[str, ...] = (),
     civitai_domains: tuple[str, ...] = _CIVITAI_BOTH,
     rules_preamble: str = _COMMON_RULES,
+    media_types: tuple[str, ...] = ("image",),
 ) -> dict:
     """Build one sparse preset bundle. `categories` is [(name, hint), ...].
 
@@ -122,6 +123,9 @@ def _preset(
         "scoring": {"ovr_min": int(ovr_min), "rel_min": int(rel_min),
                     "notes": scoring_notes},
         "captioning": {"enabled": False, "style": caption_style, "overwrite": False},
+        # Which media the scrapers fetch. Video presets pass ("video",); the ext
+        # lists inherit the default shape via get_preset's deep-merge.
+        "media": {"types": list(media_types)},
     }
 
 
@@ -209,6 +213,7 @@ def _build_video_presets() -> dict[str, dict]:
                               "b-roll", "establishing shot", "moving camera",
                               "smooth motion"),
             rules_preamble=_VIDEO_RULES,
+            media_types=("video",),
             categories=[
                 ("Keep", "Strong on-topic clip with clear, coherent motion, no "
                  "severe per-frame or temporal flaws, no watermark/overlay, "
@@ -250,6 +255,7 @@ def _build_video_presets() -> dict[str, dict]:
                               "establishing shot", "crane shot", "anamorphic",
                               "shallow depth of field", "film grain"),
             rules_preamble=_VIDEO_RULES,
+            media_types=("video",),
             categories=[
                 ("Keep", "Film-like clip — deliberate camera move (dolly, crane, "
                  "tracking), cinematic lighting/grade, shallow depth of field, "
@@ -289,6 +295,7 @@ def _build_video_presets() -> dict[str, dict]:
                               "camera pan", "cel animation", "moving",
                               "key animation", "dynamic motion"),
             rules_preamble=_VIDEO_RULES,
+            media_types=("video",),
             categories=[
                 ("Keep", "Clean animated / 2D-motion clip, on-topic, smooth "
                  "in-betweens, no severe per-frame or temporal flaws, no "
@@ -330,6 +337,7 @@ def _build_video_presets() -> dict[str, dict]:
                               "slow rotation", "studio lighting", "smooth motion",
                               "product demo", "tracking shot"),
             rules_preamble=_VIDEO_RULES,
+            media_types=("video",),
             categories=[
                 ("Keep", "Single clearly-presented product with clean motion "
                  "(turntable, slow orbit, controlled push-in), seamless/clean "
@@ -376,6 +384,7 @@ def _build_video_presets() -> dict[str, dict]:
                               "slow motion", "timelapse", "establishing shot",
                               "b-roll", "smooth motion"),
             rules_preamble=_VIDEO_RULES,
+            media_types=("video",),
             categories=[
                 ("Keep", "Sharp natural-world clip (wildlife, landscape, aerial) "
                  "with clean, coherent motion, natural setting, on-topic, OVR>=60 "

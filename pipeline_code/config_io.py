@@ -70,8 +70,10 @@ _KIND_JOB = "cull.job"
 # flow through the SAME validators so a bad value can never reach projection.
 _INHERITABLE_KEYS: frozenset[str] = frozenset({
     "topic_filters", "scrapers", "categories", "category_rules", "scoring",
-    "captioning", "vision",
+    "captioning", "media", "vision",
 })
+_MEDIA_TYPES: frozenset[str] = frozenset({"image", "video"})
+_MAX_MEDIA_EXTS: int = 40
 _CAPTION_STYLES: frozenset[str] = frozenset(
     {"sd_prompt", "booru_tags", "natural_language"})
 _VISION_PROVIDERS: frozenset[str] = frozenset(job_config.VISION_PROVIDERS)
@@ -87,8 +89,12 @@ _MAX_DISCORD_JSON = 20000
 _MAX_PROMPT_LEN = 10000
 _MAX_GALLERY_LIMIT = 5000
 
-# A category name drives the strict JSON-schema enum; keep it a safe identifier.
-_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+# A category name drives the strict JSON-schema enum AND becomes a sorted/ folder
+# name. Allow spaces and hyphens for human-readable labels ("Irish cars") while
+# staying filesystem-safe: must start with a letter, then letters/digits/space/
+# underscore/hyphen, max 40 chars. _safe_component() is still the path-injection
+# barrier downstream, so this only governs what the dashboard accepts.
+_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
 _RESERVED_CATEGORIES: frozenset[str] = frozenset({"DISCARD", "CORRUPT"})
 # A local-import folder ``name`` becomes a filesystem path component downstream.
 _LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -137,8 +143,8 @@ def _validate_categories(cats: Any, *, required: bool) -> list[dict]:
         hint = (entry.get("hint") or "").strip()
         if not _CAT_NAME_RE.match(name):
             raise ValidationError(
-                f"invalid category name {name!r} (letters/digits/_ only, "
-                "must start with a letter, max 32 chars)")
+                f"invalid category name {name!r} (letters, digits, spaces, _ or - "
+                "only, must start with a letter, max 40 chars)")
         if name in _RESERVED_CATEGORIES:
             raise ValidationError(f"{name!r} is reserved for the system")
         if len(hint) > _MAX_HINT:
@@ -359,6 +365,48 @@ def _as_int(v: Any, what: str) -> int:
         raise ValidationError(f"{what} must be an integer") from None
 
 
+def _validate_exts(val: Any, what: str) -> list[str]:
+    if not isinstance(val, list):
+        raise ValidationError(f"{what} must be a list")
+    if len(val) > _MAX_MEDIA_EXTS:
+        raise ValidationError(f"{what}: too many extensions (max {_MAX_MEDIA_EXTS})")
+    out: list[str] = []
+    for raw in val:
+        e = str(raw or "").strip().lower()
+        if not e:
+            continue
+        if not e.startswith("."):
+            e = "." + e
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", e):
+            raise ValidationError(f"{what}: invalid extension {e!r}")
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def _validate_media(val: Any) -> dict:
+    """Media block: ``types`` subset of {image, video}, plus editable ext lists."""
+    _require_object(val, "media")
+    out: dict[str, Any] = {}
+    order = {"image": 0, "video": 1}
+    for k, v in val.items():
+        if k == "types":
+            if not isinstance(v, list):
+                raise ValidationError("media.types must be a list")
+            types = [str(x).strip().lower() for x in v]
+            if any(t not in _MEDIA_TYPES for t in types):
+                raise ValidationError(
+                    f"media.types must be a subset of {sorted(_MEDIA_TYPES)}")
+            out["types"] = sorted(dict.fromkeys(types), key=lambda t: order[t]) or ["image"]
+        elif k == "image_exts":
+            out["image_exts"] = _validate_exts(v, "media.image_exts")
+        elif k == "video_exts":
+            out["video_exts"] = _validate_exts(v, "media.video_exts")
+        else:
+            raise ValidationError(f"unknown media key: {k!r}")
+    return out
+
+
 def validate_inheritable_cfg(cfg: Any, *, partial: bool) -> dict:
     """Validate a preset body (``partial=False``) or a job override map
     (``partial=True``); return a cleaned copy. Unknown top-level keys and bad
@@ -385,6 +433,8 @@ def validate_inheritable_cfg(cfg: Any, *, partial: bool) -> dict:
             out["scoring"] = _validate_scoring(value)
         elif key == "captioning":
             out["captioning"] = _validate_captioning(value)
+        elif key == "media":
+            out["media"] = _validate_media(value)
         else:  # vision
             out["vision"] = _validate_vision(value)
     if not partial and "categories" not in out:

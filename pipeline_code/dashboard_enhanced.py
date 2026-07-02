@@ -86,7 +86,7 @@ _SCRAPER_DESCRIPTIONS: dict[str, str] = {
     "Discord-1":   "Discord UD channels",
     "Civitai-Com": "Civitai (civitai.com)",
     "Civitai-Red": "Civitai (civitai.red)",
-    "Web":         "Reddit / promptsref",
+    "Web":         "Reddit",
     "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
 }
 
@@ -674,7 +674,10 @@ def api_pipeline_stop():
 
 import categories as _categories_mod
 
-_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+# Mirror of config_io._CAT_NAME_RE — allow spaces/hyphens for readable labels
+# ("Irish cars"); start with a letter, max 40 chars. _safe_component() guards the
+# filesystem downstream. Keep this in lockstep with config_io.py.
+_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
 _MAX_CATEGORIES = 12
 
 
@@ -695,7 +698,7 @@ def _validate_categories_payload(payload: Any) -> tuple[dict[str, Any] | None, s
         name = (entry.get("name") or "").strip()
         hint = (entry.get("hint") or "").strip()
         if not _CAT_NAME_RE.match(name):
-            return None, f"invalid category name {name!r} (letters/digits/_ only, must start with letter, max 32 chars)"
+            return None, f"invalid category name {name!r} (letters, digits, spaces, _ or - only, must start with a letter, max 40 chars)"
         if name in {"DISCARD", "CORRUPT"}:
             return None, f"{name!r} is reserved for the system"
         if len(hint) > 2000:
@@ -1016,8 +1019,10 @@ def api_vision_workers_toggle():
     elif not enabled and name in current:
         current = [w for w in current if w != name]
     update_env("PIPELINE_VISION_WORKERS", ",".join(current))
-    if current:
-        update_env("PIPELINE_VISION_WORKER", current[0])
+    # Keep the legacy singular in lockstep — including CLEARING it when the list
+    # empties. Otherwise _active_vision_workers() falls back to a stale
+    # PIPELINE_VISION_WORKER and the just-disabled worker snaps back to enabled.
+    update_env("PIPELINE_VISION_WORKER", current[0] if current else "")
     return jsonify({"success": True, "active": current})
 
 
@@ -1085,12 +1090,13 @@ SETTINGS_KEYS: list[str] = [
     "REDDIT_CLIENT_ID",
     "REDDIT_CLIENT_SECRET",
     "REDDIT_USER_AGENT",
+    "REDDIT_COOKIES",
 ]
 SECRET_KEYS: set[str] = {
     "GROQ_API_KEY", "GROQ_API_KEYS",
     "CIVITAI_API_KEY", "CIVITAI_API_RED_KEY",
     "TWITTER_COOKIES", "DISCORD_BOT_TOKEN",
-    "REDDIT_CLIENT_SECRET",
+    "REDDIT_CLIENT_SECRET", "REDDIT_COOKIES",
     "OPENAI_COMPAT_API_KEY",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
@@ -5322,6 +5328,42 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
+      <!-- Media types (inheritable): what scrapers fetch + the queue classifies. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Media types</h3>
+          <template x-if="isOver('media.types') || isOver('media.image_exts') || isOver('media.video_exts')">
+            <button @click="resetOverride('media.types'); resetOverride('media.image_exts'); resetOverride('media.video_exts')" class="text-xs link-btn">reset ↺</button>
+          </template>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">What every scraper fetches and the queue classifies. Enabling <b>Video</b> turns on the video-classify lane (needs the <code>.[video]</code> extra) and runs image + video in parallel when both are on. Scrapers that only produce one kind sit out when it isn't selected.</p>
+        <template x-if="je.eff">
+          <div>
+            <div class="flex gap-5 mb-3">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" :checked="(effVal('media.types')||[]).includes('image')" @change="toggleMediaType('image', $event.target.checked)" class="accent-indigo-500"/>
+                <span class="text-sm">Images</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" :checked="(effVal('media.types')||[]).includes('video')" @change="toggleMediaType('video', $event.target.checked)" class="accent-indigo-500"/>
+                <span class="text-sm">Video</span>
+              </label>
+              <span x-show="!isOver('media.types')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 self-center text-xs">global</span>
+            </div>
+            <div class="grid md:grid-cols-2 gap-4">
+              <label class="block">
+                <span class="text-xs text-slate-400">Image extensions{{ tip('Comma-separated. Pillow must be able to open them.', '.jpg, .jpeg, .png, .webp') }}</span>
+                <input :value="effList('media.image_exts')" @change="setOverrideList('media.image_exts', $event.target.value)" placeholder=".jpg, .jpeg, .png, .webp" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+              </label>
+              <label class="block">
+                <span class="text-xs text-slate-400">Video extensions{{ tip('Comma-separated. The .[video] ffmpeg backend must decode them.', '.mp4, .webm, .mov, .mkv, .avi') }}</span>
+                <input :value="effList('media.video_exts')" @change="setOverrideList('media.video_exts', $event.target.value)" placeholder=".mp4, .webm, .mov, .mkv, .avi" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+              </label>
+            </div>
+          </div>
+        </template>
+      </div>
+
       <!-- Topic filters (inheritable). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <h3 class="font-semibold mb-3">Topic filters</h3>
@@ -5333,7 +5375,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('topic_filters.keywords_extra')" @input="setOverrideList('topic_filters.keywords_extra', $event.target.value)"
+            <input :value="effList('topic_filters.keywords_extra')" @change="setOverrideList('topic_filters.keywords_extra', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.keywords_extra') ? 'text-slate-400' : ''"/>
           </div>
           <div class="md:col-span-2">
@@ -5342,7 +5384,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('topic_filters.banned_keywords')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.banned_keywords')" @click="resetOverride('topic_filters.banned_keywords')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('topic_filters.banned_keywords')" @input="setOverrideList('topic_filters.banned_keywords', $event.target.value)"
+            <input :value="effList('topic_filters.banned_keywords')" @change="setOverrideList('topic_filters.banned_keywords', $event.target.value)"
                    placeholder="link in bio, dm me, patreon, onlyfans..."
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.banned_keywords') ? 'text-slate-400' : ''"/>
           </div>
@@ -5352,7 +5394,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('topic_filters.generation_hints')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.generation_hints')" @click="resetOverride('topic_filters.generation_hints')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('topic_filters.generation_hints')" @input="setOverrideList('topic_filters.generation_hints', $event.target.value)"
+            <input :value="effList('topic_filters.generation_hints')" @change="setOverrideList('topic_filters.generation_hints', $event.target.value)"
                    placeholder="photorealistic, cinematic, cfg, lora..."
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('topic_filters.generation_hints') ? 'text-slate-400' : ''"/>
           </div>
@@ -5389,7 +5431,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('scrapers.x_accounts')" @input="setOverrideList('scrapers.x_accounts', $event.target.value)"
+            <input :value="effList('scrapers.x_accounts')" @change="setOverrideList('scrapers.x_accounts', $event.target.value)"
                    placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
           </div>
           <div>
@@ -5398,7 +5440,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
             </div>
-            <input :value="effList('scrapers.reddit_subreddits')" @input="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
+            <input :value="effList('scrapers.reddit_subreddits')" @change="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
           </div>
           <div>
@@ -5453,7 +5495,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
-            <textarea :value="effUrls()" @input="setOverrideUrls($event.target.value)" rows="4"
+            <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
                       placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
@@ -5494,7 +5536,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
-            <textarea :value="ytUrls()" @input="setYtUrls($event.target.value)" rows="4"
+            <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
                       placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
@@ -5647,19 +5689,33 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="space-y-4">
           <div class="grid md:grid-cols-2 gap-3">
             <label class="block"><span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. A source prompt/caption must contain at least one of these or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
-              <input :value="peList('topic_filters.keywords_extra')" @input="peSetList('topic_filters.keywords_extra', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <input :value="peList('topic_filters.keywords_extra')" @change="peSetList('topic_filters.keywords_extra', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block"><span class="text-xs text-slate-400">Banned keywords{{ tip('Comma-separated. Any match in the prompt/caption rejects the image.', 'e.g. nsfw, watermark, meme') }}</span>
-              <input :value="peList('topic_filters.banned_keywords')" @input="peSetList('topic_filters.banned_keywords', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <input :value="peList('topic_filters.banned_keywords')" @change="peSetList('topic_filters.banned_keywords', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block"><span class="text-xs text-slate-400">Generation hints{{ tip('Comma-separated. Like required keywords, but matched against the generation prompt specifically.', 'e.g. 35mm, f/1.8, golden hour') }}</span>
-              <input :value="peList('topic_filters.generation_hints')" @input="peSetList('topic_filters.generation_hints', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <input :value="peList('topic_filters.generation_hints')" @change="peSetList('topic_filters.generation_hints', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block"><span class="text-xs text-slate-400">Minimum prompt length</span>
               <input type="number" min="0" :value="presetEditor.cfg.topic_filters.min_prompt_length" @input="peSet('topic_filters.min_prompt_length', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
           </div>
+          <div class="border-t border-slate-800 pt-3 mt-1">
+            <div class="text-xs font-semibold text-slate-300 mb-1">Media types</div>
+            <p class="text-[11px] text-slate-500 mb-2">What scrapers fetch and the queue classifies. Enabling Video turns on the video-classify lane; both run in parallel when selected. Extension lists are editable.</p>
+            <div class="flex gap-5 mb-2">
+              <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" :checked="((presetEditor.cfg.media||{}).types||['image']).includes('image')" @change="peToggleMedia('image', $event.target.checked)" class="accent-indigo-500"/><span class="text-sm">Images</span></label>
+              <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" :checked="((presetEditor.cfg.media||{}).types||['image']).includes('video')" @change="peToggleMedia('video', $event.target.checked)" class="accent-indigo-500"/><span class="text-sm">Video</span></label>
+            </div>
+            <div class="grid md:grid-cols-2 gap-3">
+              <label class="block"><span class="text-xs text-slate-400">Image extensions</span>
+                <input :value="peList('media.image_exts')" @change="peSetList('media.image_exts', $event.target.value)" placeholder=".jpg, .jpeg, .png, .webp" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
+              <label class="block"><span class="text-xs text-slate-400">Video extensions</span>
+                <input :value="peList('media.video_exts')" @change="peSetList('media.video_exts', $event.target.value)" placeholder=".mp4, .webm, .mov, .mkv, .avi" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
+            </div>
+          </div>
           <div class="grid md:grid-cols-2 gap-3">
             <label class="block md:col-span-2"><span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles, <b>without</b> the @. Empty scrapes search results only.', 'e.g. dronefeed, natureshots') }}</span>
-              <input :value="peList('scrapers.x_accounts')" @input="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <input :value="peList('scrapers.x_accounts')" @change="peSetList('scrapers.x_accounts', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <label class="block md:col-span-2"><span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
-              <input :value="peList('scrapers.reddit_subreddits')" @input="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
+              <input :value="peList('scrapers.reddit_subreddits')" @change="peSetList('scrapers.reddit_subreddits', $event.target.value)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
             <div class="block md:col-span-2"><span class="text-xs text-slate-400">Civitai domains{{ tip('Tick which Civitai hosts to scrape (civitai.com and/or the civitai.red mirror).') }}</span>
               <div class="flex items-center gap-5 py-1.5 mt-1">
                 <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
@@ -5686,7 +5742,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
-            <textarea :value="peUrls()" @input="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+            <textarea :value="peUrls()" @change="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <div class="grid md:grid-cols-2 gap-3">
             <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
               <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
@@ -5786,6 +5842,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          Writes to .env via /api/settings. -->
     <section x-show="view === 'jobs' && active === 'settings'" class="space-y-4"
       @input="markSettingsDirty()" @change="markSettingsDirty()">
+
+      <!-- Sticky action bar: Save/Reload for the .env form, always reachable at
+           the top of the page (and pinned while scrolling). -->
+      <div class="sticky top-0 z-20 py-3 bg-slate-950/90 backdrop-blur border-b border-slate-800
+                  flex items-start justify-between gap-4">
+        <div>
+          <h3 class="font-semibold">Global settings</h3>
+          <p class="text-xs text-slate-400">Credentials, endpoints, paths, and global UX. Changes write to <code>.env</code>. Stop + Start the pipeline to apply.</p>
+        </div>
+        <div class="flex gap-2 shrink-0">
+          <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
+          <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+        </div>
+      </div>
+      <template x-if="settingsBanner">
+        <div class="border text-xs px-3 py-2 rounded"
+          :class="settingsBannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
+                                   : 'bg-rose-950/60 border-rose-700 text-rose-200'"
+          x-text="settingsBanner"></div>
+      </template>
 
       <!-- Software updates — pull origin/main + restart. Mirrors the update toast. -->
       <div class="card rounded-xl p-5">
@@ -5941,22 +6017,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="card rounded-xl p-5">
-        <div class="flex items-start justify-between gap-4 mb-3">
-          <div>
-            <h3 class="font-semibold">Global settings</h3>
-            <p class="text-xs text-slate-400">Credentials, endpoints, paths, and global UX. Changes write to <code>.env</code>. Stop + Start the pipeline to apply.</p>
-          </div>
-          <div class="flex gap-2">
-            <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-            <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
-          </div>
-        </div>
-        <template x-if="settingsBanner">
-          <div class="border text-xs px-3 py-2 rounded mb-3"
-            :class="settingsBannerOk ? 'bg-indigo-950/60 border-indigo-700 text-indigo-200'
-                                     : 'bg-rose-950/60 border-rose-700 text-rose-200'"
-            x-text="settingsBanner"></div>
-        </template>
+        <h3 class="font-semibold mb-1">Credentials &amp; endpoints</h3>
+        <p class="text-xs text-slate-400 mb-3">Use the <b>Save</b> button pinned at the top of this page to persist changes to <code>.env</code>.</p>
         <div class="grid md:grid-cols-2 gap-4">
           <label class="block">
             <span class="text-xs text-slate-400">Supervisor reconcile interval (seconds)</span>
@@ -6131,6 +6193,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <input x-model="settings.REDDIT_USER_AGENT" placeholder="cull/0.1"
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
             {{ testbtn('Reddit') }}
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}</span>
+            <textarea x-model="settings.REDDIT_COOKIES" rows="2"
+              placeholder="reddit_session=...; token_v2=..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
         </div>
       </div>
@@ -6930,6 +6998,16 @@ function dashboard() {
       this.scheduleJobSave();
     },
     setOverrideList(path, text) { this.setOverride(path, (text || '').split(',').map(s => s.trim()).filter(Boolean)); },
+    // Media types are a fixed set {image, video}; toggling keeps at least one and
+    // preserves image-before-video order.
+    toggleMediaType(kind, on) {
+      let cur = (this.effVal('media.types') || []).filter(x => x !== kind);
+      if (on) cur.push(kind);
+      if (!cur.length) cur = [kind];
+      const order = ['image', 'video'];
+      cur.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+      this.setOverride('media.types', cur);
+    },
     setOverrideUrls(text) { this.setOverride('scrapers.gallery_dl.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
     setYtUrls(text) { this.setOverride('scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); },
     // Reset a field back to the preset (remove the override). Re-fetch to get the
@@ -7100,6 +7178,14 @@ function dashboard() {
     peYtUrls() { const v = this._deepGet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls'); return Array.isArray(v) ? v.join('\n') : (v || ''); },
     peSetYtUrls(text) { this._deepSet(this.presetEditor.cfg, 'scrapers.yt_dlp.urls', (text || '').split(/[\n,]/).map(s => s.trim()).filter(s => s && !s.startsWith('#'))); this.schedulePresetSave(); },
     peSet(path, value) { this._deepSet(this.presetEditor.cfg, path, value); this.schedulePresetSave(); },
+    peToggleMedia(kind, on) {
+      let cur = (((this.presetEditor.cfg || {}).media || {}).types || ['image']).filter(x => x !== kind);
+      if (on) cur.push(kind);
+      if (!cur.length) cur = [kind];
+      const order = ['image', 'video'];
+      cur.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+      this.peSet('media.types', cur);
+    },
     // Preset-editor vision fleet (global default fleet jobs inherit).
     peFleet() { const v = this._deepGet(this.presetEditor.cfg, 'vision.workers'); return Array.isArray(v) ? v : []; },
     peFleetModelOptions(idx) {

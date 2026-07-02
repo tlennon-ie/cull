@@ -1,10 +1,9 @@
 """
-scraper_x.py - Scrape X.com for AI image prompts + promptsref.com
+scraper_x.py - Scrape X.com for image/media posts
 - Searches X with multiple queries
-- Scrapes specific accounts known for good prompts
+- Scrapes specific accounts known for good content
 - Opens each tweet page to extract full prompt (body + first comments)
 - Handles JSON prompts, XML/role prompts, plain text prompts
-- Also scrapes promptsref.com/library/grok and /nano-banana-pro
 - Saves to source-based queue using queue_manager for balanced processing
 """
 import asyncio, json, re, hashlib, os, requests, tempfile
@@ -14,7 +13,12 @@ from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 load_dotenv()
 
-from topic_filter import load_config as _load_topic_config, passes as _topic_passes
+from topic_filter import (
+    load_config as _load_topic_config,
+    passes as _topic_passes,
+    prompt_optional as _prompt_optional,
+)
+import media_policy
 _TOPIC_CFG = _load_topic_config()
 from paths import base_dir
 from rate_limit import RateLimitConfig, RateLimiter
@@ -67,15 +71,32 @@ if not X_COOKIES:
 def build_searches(topic: str) -> list:
     """
     Auto-generate X.com search queries from a topic string.
-    Always includes AI-tool queries + topic-specific keywords.
+
+    Two modes, gated on whether a prompt is required (``REQUIRE_PROMPT``):
+
+    * **Prompt required (default):** hunt AI-art posts — wrap the topic in the
+      AI-tool / "prompt" framing so results are likely to carry a usable
+      generation prompt.
+    * **Prompt NOT required:** search plainly by the topic terms and pull any
+      matching media (``filter:media`` so video tweets match too). No AI-tool or
+      "prompt" keywords are added — the user asked for raw topic media, and the
+      vision worker does the relevance culling downstream.
     """
     t = topic.lower()
-    ai_tools = "(zimage OR qwen OR flux OR midjourney OR grok OR nanobanana OR sdxl)"
 
     # Extract key noun from topic (last meaningful word usually)
     words = [w for w in t.split() if w not in ("realistic","real","ultra","ai","generated","style","the","a","an")]
     subject = " OR ".join(words[:3]) if words else topic
 
+    if _prompt_optional():
+        # Plain topic media search — no AI-tool / "prompt" framing.
+        queries = [
+            f"{topic} filter:media",
+            f"({subject}) filter:media",
+        ]
+        return list(dict.fromkeys(queries))  # de-dup when subject == topic
+
+    ai_tools = "(zimage OR qwen OR flux OR midjourney OR grok OR nanobanana OR sdxl)"
     queries = [
         f"{ai_tools} {topic} prompt filter:images min_faves:5",
         f"{ai_tools} ({subject}) prompt filter:images min_faves:5",
@@ -185,12 +206,17 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
         return False
     seen.add(dedup_key)
 
-    # Topic filter: reject off-topic / spammy tweets before downloading.
-    context = f"{author} {source}"
-    ok, reason = _topic_passes(context, prompt, cfg=_TOPIC_CFG)
-    if not ok:
-        print(f"    SKIP {dedup_key} ({reason})", flush=True)
-        return False
+    # Topic filter: reject off-topic / spammy tweets before downloading. Only
+    # applied when a prompt is REQUIRED — the filter judges the tweet's *text*,
+    # which an image/video-only tweet (already matched by X's own search) won't
+    # have. When prompts are optional the user wants the raw media pulled and the
+    # vision worker does the relevance culling, so we skip the text gate.
+    if not _prompt_optional():
+        context = f"{author} {source}"
+        ok, reason = _topic_passes(context, prompt, cfg=_TOPIC_CFG)
+        if not ok:
+            print(f"    SKIP {dedup_key} ({reason})", flush=True)
+            return False
 
     stem = dedup_key
     
@@ -413,108 +439,6 @@ async def scrape_account(ctx, handle: str, seen: set, saved_count: list):
     seen.flush()
 
 
-# ── Scrape promptsref.com ───────────────────────────────────────────────────
-async def scrape_promptsref(ctx, seen: set, saved_count: list):
-    """Scrape promptsref.com Grok and NanoBanana libraries — prompts + share images."""
-    for lib_path, label in [("/library/grok", "grok"), ("/library/nano-banana-pro", "nanobanana")]:
-        url = f"https://promptsref.com{lib_path}"
-        print(f"\n  promptsref.com {label}...")
-        page = await ctx.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
-
-            # Scroll to load all items
-            for _ in range(8):
-                await page.keyboard.press("End")
-                await asyncio.sleep(1.5)
-
-            # Extract prompt cards: each has a prompt text block + image
-            cards = await page.evaluate("""
-                () => {
-                    const out = [];
-                    // Look for elements containing long JSON-like text
-                    const candidates = Array.from(document.querySelectorAll('div, pre, code, p'));
-                    for (const el of candidates) {
-                        const txt = el.innerText ? el.innerText.trim() : '';
-                        if (txt.length > 100 && (txt.includes('"subject"') || txt.includes('"prompt"') || txt.includes('"description"'))) {
-                            // Find nearest image
-                            let imgSrc = '';
-                            let parent = el;
-                            for (let i = 0; i < 10; i++) {
-                                parent = parent.parentElement;
-                                if (!parent) break;
-                                const img = parent.querySelector('img[src]');
-                                if (img && img.src && !img.src.includes('logo') && !img.src.includes('icon')) {
-                                    imgSrc = img.src;
-                                    break;
-                                }
-                            }
-                            out.push({ prompt: txt.slice(0, 3000), imgSrc });
-                        }
-                    }
-                    // Deduplicate by first 50 chars of prompt
-                    const seen = new Set();
-                    return out.filter(c => {
-                        const k = c.prompt.slice(0, 50);
-                        if (seen.has(k)) return false;
-                        seen.add(k);
-                        return true;
-                    });
-                }
-            """)
-
-            print(f"  Found {len(cards)} prompt cards")
-            for i, card in enumerate(cards):
-                prompt  = extract_prompt_from_text(card.get("prompt", ""))
-                img_src = card.get("imgSrc", "")
-                if not prompt or not img_src:
-                    continue
-
-                dedup_key = f"promptsref_{label}_{hashlib.md5(prompt[:80].encode()).hexdigest()[:10]}"
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-
-                stem = dedup_key
-                
-                # Download to temp file
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                    tmp_path = Path(tmp.name)
-
-                if not download_image(img_src, tmp_path):
-                    seen.discard(dedup_key)
-                    tmp_path.unlink(missing_ok=True)
-                    continue
-
-                # Prepare metadata
-                meta_data = {
-                    "message_id":     dedup_key,
-                    "image_url":      img_src,
-                    "source_channel": f"promptsref_{label}",
-                    "source_guild":   "promptsref.com",
-                    "author":         "",
-                    "timestamp":      "",
-                }
-                
-                # Save to source-based queue
-                result = queue_save("nanobanana", tmp_path, prompt, meta_data)
-                
-                if result:
-                    size_kb = result.stat().st_size // 1024
-                    print(f"    SAVED {result.name} ({size_kb}KB) | {prompt[:70]}")
-                    saved_count[0] += 1
-                else:
-                    seen.discard(dedup_key)
-
-        except Exception as e:
-            print(f"  promptsref error: {e}")
-        finally:
-            await page.close()
-
-    seen.flush()
-
-
 # ── Seen helpers ─────────────────────────────────────────────────────────────
 
 # Pull dedup keys back out of sorted filenames. Vision worker writes:
@@ -580,8 +504,15 @@ def _make_seen_store() -> SeenStore:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
+    # This scraper harvests still images (pbs.twimg.com/media). For a video-only
+    # job it has nothing to contribute — and its stills would sit unpoppable in a
+    # video queue — so skip. Use gallery-dl or yt-dlp for X video.
+    if not media_policy.wants_image():
+        print("[scraper_x] media policy excludes images — skipping (use gallery-dl "
+              "or yt-dlp for X video)", flush=True)
+        return
     seen = _make_seen_store()
-    print(f"=== X.com + promptsref Scraper ===")
+    print(f"=== X.com Scraper ===")
     print(f"Loaded {len(seen)} already-seen IDs")
     saved_count = [0]
 
@@ -600,9 +531,6 @@ async def main():
         # 2. Search queries
         for query in SEARCHES:
             await scrape_search(ctx, query, seen, saved_count)
-
-        # 3. promptsref.com (no auth needed)
-        await scrape_promptsref(ctx, seen, saved_count)
 
         await browser.close()
 

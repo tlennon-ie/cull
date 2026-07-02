@@ -44,6 +44,20 @@ SOURCE_KEY = "civitai_red" if CIVITAI_DOMAIN == "civitai.red" else "civitai"
 from credentials import get_optional, get_required, MissingCredentialError  # noqa: E402
 from seen_store import MigrationSpec, SeenStore  # noqa: E402
 from topic_filter import prompt_optional  # noqa: E402
+import media_policy  # noqa: E402
+
+
+def _type_filter():
+    """meilisearch ``type`` filter from the media policy: a single expression, or
+    an OR-group list when the job accepts both images and video."""
+    types = []
+    if media_policy.wants_image():
+        types.append('type = "image"')
+    if media_policy.wants_video():
+        types.append('type = "video"')
+    if not types:
+        types = ['type = "image"']
+    return types[0] if len(types) == 1 else types
 
 _SEEN_NAME = f"civitai_search_{CIVITAI_DOMAIN.replace('.', '_')}"
 
@@ -91,10 +105,13 @@ BASE_MODELS = [
 
 # Filters
 # Only images, only Portrait, created in last ~14 days (1759273200000 approx), NSFW allowed
+# The baseModel OR-group restricts results to specific AI models (Flux/Qwen/…).
+# Included only when a prompt is REQUIRED; with prompts optional the user wants
+# topic matches from ANY model, so the group is dropped (no model narrowing).
 FILTER_EXPRESSION = [
     'aspectRatio = "Portrait"',
-    [f'baseModel = "{m}"' for m in BASE_MODELS],
-    'type = "image"',
+    *([] if prompt_optional() else [[f'baseModel = "{m}"' for m in BASE_MODELS]]),
+    _type_filter(),
     # "createdAtUnix >= 1759273200000", # Can adjust or remove for broader history
     # "createdAtUnix <= 1772236800000",
     "(poi != true OR user.username = TL_) AND (minor != true) AND (nsfwLevel IN [1, 2, 4, 8, 16])"
@@ -259,9 +276,21 @@ def scrape_civitai_search(seen: set):
                 seen.add(iid)
                 
                 stem = f"civitai_{iid}"
-                
+
+                # Extension from the hit's filename / type; skip kinds this job's
+                # media policy doesn't accept (e.g. a video hit in an image job).
+                name_ext = os.path.splitext(str(name_part))[1].lower()
+                if name_ext and media_policy.accepts(name_ext):
+                    ext = name_ext
+                elif str(hit.get("type", "")).lower() == "video":
+                    ext = ".mp4"
+                else:
+                    ext = ".jpg"
+                if not media_policy.accepts(ext):
+                    continue
+
                 # Download to temp file first
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                     tmp_path = Path(tmp.name)
                 
                 if download_image(img_url, tmp_path):

@@ -33,6 +33,7 @@ from pipeline_logging import get_logger
 from queue_manager import save_to_queue
 from seen_store import MigrationSpec, SeenStore
 from topic_filter import prompt_optional
+import media_policy
 
 logger = get_logger(__name__)
 
@@ -116,7 +117,9 @@ def iter_sources() -> list[Path]:
     if SRC_DIR is None or not SRC_DIR.exists():
         return []
     images: list[Path] = []
-    for suffix in MEDIA_SUFFIXES:
+    # Only pick up the media types this job accepts (media_policy) — so a video
+    # job ignores stray images in the folder and vice versa.
+    for suffix in media_policy.accepted_exts():
         images.extend(SRC_DIR.glob(f"*{suffix}"))
     return sorted(images)
 

@@ -70,6 +70,7 @@ from pipeline_logging import get_logger  # noqa: E402
 from queue_manager import save_to_queue  # noqa: E402
 from seen_store import SeenStore  # noqa: E402
 from topic_filter import prompt_optional  # noqa: E402
+import media_policy  # noqa: E402
 
 logger = get_logger(__name__)
 
@@ -268,7 +269,7 @@ def _iter_downloaded(work_dir: Path) -> list[Path]:
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
-        if suffix in _VIDEO_SUFFIXES:
+        if suffix in _VIDEO_SUFFIXES or media_policy.is_video_ext(suffix):
             videos.append(path)
         elif suffix not in _SIDECAR_SUFFIXES:
             # Unknown extension that isn't a known sidecar — treat as media so
@@ -327,6 +328,12 @@ def run_one(url: str, work_dir: Path, seen: SeenStore) -> int:
 def main() -> int:
     if get_optional("YT_DLP_ENABLED", "false").lower() != "true":
         logger.info("YT_DLP_ENABLED is not 'true' - skipping run")
+        return 0
+
+    # yt-dlp only produces video. If the job's media policy excludes video the
+    # queue won't pop the clips anyway, so don't fetch them.
+    if not media_policy.wants_video():
+        logger.info("media policy excludes video - skipping yt-dlp run")
         return 0
 
     urls = _split_urls(get_optional("YT_DLP_URLS"))

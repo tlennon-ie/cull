@@ -17,7 +17,15 @@ SECONDARY_URL = os.getenv("LMSTUDIO_SECONDARY_URL", "")
 TIMEOUT = 5
 
 def fetch_models(url):
-    """Fetch available models from LMStudio instance."""
+    """Fetch available models from LMStudio instance.
+
+    A blank/unconfigured URL is treated as disconnected (returns None) rather
+    than probed — otherwise ``requests.get("/v1/models")`` raises MissingSchema
+    and spams the log. Local LM Studio endpoints now live in the Vision fleet;
+    these legacy primary/secondary vars are often blank.
+    """
+    if not (url or "").strip():
+        return None
     try:
         # LMStudio /v1/models endpoint
         response = requests.get(

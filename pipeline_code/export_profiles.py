@@ -73,12 +73,12 @@ from pipeline_logging import get_logger
 logger = get_logger(__name__)
 
 # Image extensions the sorter is known to produce (mirrors requeue_sorted).
-IMAGE_EXT: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
+IMAGE_EXT: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 # Video containers the sorter / scrapers (gallery-dl, yt-dlp) can land. Clips
 # are exported as first-class samples alongside images; the prober reads their
 # resolution / fps / duration for bucketing.
-VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi")
+VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 # Everything iter_samples treats as an exportable sample.
 MEDIA_EXT: tuple[str, ...] = IMAGE_EXT + VIDEO_EXT

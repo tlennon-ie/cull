@@ -37,7 +37,7 @@ logger = get_logger(__name__)
 
 # Containers we attempt to extract from. Mirrors export_profiles.VIDEO_EXT and
 # the queue-manager video globs so the three stay in lockstep.
-VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi")
+VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 # Where extracted frames go. A dedicated subdir of the system tempdir keeps them
 # off the queue/sorted trees and easy to sweep.
