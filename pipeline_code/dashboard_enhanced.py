@@ -1452,8 +1452,9 @@ def _validate_job_scoring(raw: Any) -> tuple[dict | None, str]:
 # validators so a bad value can't reach the projection layer from either path.
 _INHERITABLE_KEYS = frozenset({
     "topic_filters", "scrapers", "categories", "category_rules", "scoring",
-    "captioning", "vision",
+    "captioning", "media", "vision",
 })
+_MEDIA_TYPE_VALUES = frozenset({"image", "video"})
 # Sourced from vision_prompt.CAPTION_STYLES (single source of truth) so a new
 # style like "motion" stays in sync across the prompt builder, the override
 # validator, and the UI dropdown rather than being hardcoded in three places.
@@ -1688,6 +1689,43 @@ def _validate_vision(v: Any) -> tuple[dict | None, str]:
     return out, ""
 
 
+def _validate_media_cfg(value: Any) -> tuple[dict | None, str]:
+    """Validate the ``media`` block: ``types`` subset of {image, video} plus
+    editable image/video extension lists. Mirrors config_io._validate_media."""
+    if not isinstance(value, dict):
+        return None, "media must be an object"
+    out: dict[str, Any] = {}
+    order = {"image": 0, "video": 1}
+    for k, v in value.items():
+        if k == "types":
+            if not isinstance(v, list):
+                return None, "media.types must be a list"
+            types = [str(x).strip().lower() for x in v]
+            if any(t not in _MEDIA_TYPE_VALUES for t in types):
+                return None, "media.types must be a subset of ['image', 'video']"
+            out["types"] = sorted(dict.fromkeys(types), key=lambda t: order[t]) or ["image"]
+        elif k in ("image_exts", "video_exts"):
+            if not isinstance(v, list):
+                return None, f"media.{k} must be a list"
+            if len(v) > 40:
+                return None, f"media.{k}: too many extensions (max 40)"
+            exts: list[str] = []
+            for raw in v:
+                e = str(raw or "").strip().lower()
+                if not e:
+                    continue
+                if not e.startswith("."):
+                    e = "." + e
+                if not re.fullmatch(r"\.[a-z0-9]{1,8}", e):
+                    return None, f"media.{k}: invalid extension {e!r}"
+                if e not in exts:
+                    exts.append(e)
+            out[k] = exts
+        else:
+            return None, f"unknown media key: {k!r}"
+    return out, ""
+
+
 def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, str]:
     """Validate a preset cfg (``partial=False``) or a job override map
     (``partial=True``). Returns (clean_cfg, error).
@@ -1734,6 +1772,11 @@ def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, 
             if err:
                 return None, err
             out["captioning"] = clean_cap
+        elif key == "media":
+            clean_media, err = _validate_media_cfg(value)
+            if err:
+                return None, err
+            out["media"] = clean_media
         else:  # vision
             clean_vis, err = _validate_vision(value)
             if err:
