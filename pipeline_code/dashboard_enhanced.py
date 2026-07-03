@@ -1092,6 +1092,9 @@ SETTINGS_KEYS: list[str] = [
     "REDDIT_CLIENT_SECRET",
     "REDDIT_USER_AGENT",
     "REDDIT_COOKIES",
+    # gallery-dl global defaults (a job's per-job cookies/args override these).
+    "GALLERY_DL_COOKIES_FILE",
+    "GALLERY_DL_CONFIG_JSON",
 ]
 SECRET_KEYS: set[str] = {
     "GROQ_API_KEY", "GROQ_API_KEYS",
@@ -5166,7 +5169,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <!-- gallery-dl (overridden wholesale as scrapers.gallery_dl). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">gallery-dl</h3>
+          <h3 class="font-semibold">gallery-dl
+            <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="text-xs font-normal link-btn ml-1">supported sites ↗</a>
+          </h3>
           <div>
             <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
             <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
@@ -5196,9 +5201,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
+            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config file to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
             <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">Custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults AND the global gallery-dl config. Any option from the gallery-dl docs. Leave blank for none.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
+            <textarea :value="effVal('scrapers.gallery_dl.config_json')" @change="setOverride('scrapers.gallery_dl.config_json', $event.target.value)" rows="3"
+                      placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}'
+                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
         </div>
         </template>
@@ -5432,8 +5443,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
           </div>
-          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
+          <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }} <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="link-btn">supported sites ↗</a></span>
             <textarea :value="peUrls()" @change="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
+          <label class="block"><span class="text-xs text-slate-400">gallery-dl custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults + the global gallery-dl config. Any option from the gallery-dl docs.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
+            <textarea :value="(presetEditor.cfg.scrapers.gallery_dl||{}).config_json||''" @change="peSet('scrapers.gallery_dl.config_json', $event.target.value)" rows="2" placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}' class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <div class="grid md:grid-cols-2 gap-3">
             <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
               <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
@@ -5889,6 +5902,17 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}</span>
             <textarea x-model="settings.REDDIT_COOKIES" rows="2"
               placeholder="reddit_session=...; token_v2=..."
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">GALLERY_DL_COOKIES_FILE{{ tip('Global default cookies.txt for gallery-dl (Netscape format). A job&#39;s own cookies file overrides this. Used for sites that need a login.', 'C:\\Users\\you\\gallery-dl-cookies.txt') }}</span>
+            <input x-model="settings.GALLERY_DL_COOKIES_FILE" placeholder="C:\\Users\\you\\cookies.txt"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-xs text-slate-400">GALLERY_DL_CONFIG_JSON{{ tip('Global gallery-dl custom arguments (a JSON object). Applied to every job; a job can add/override with its own custom arguments. Any option from the gallery-dl docs.', '{&quot;extractor&quot;: {&quot;base-directory&quot;: null, &quot;sleep&quot;: 1}}') }} <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="link-btn">supported sites ↗</a></span>
+            <textarea x-model="settings.GALLERY_DL_CONFIG_JSON" rows="2"
+              placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}'
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
         </div>

@@ -88,6 +88,7 @@ _MAX_NOTES = 2000
 _MAX_DISCORD_JSON = 20000
 _MAX_PROMPT_LEN = 10000
 _MAX_GALLERY_LIMIT = 5000
+_MAX_GALLERY_CONFIG_JSON = 20000
 
 # A category name drives the strict JSON-schema enum AND becomes a sorted/ folder
 # name. Allow spaces and hyphens for human-readable labels ("Irish cars") while
@@ -217,7 +218,8 @@ def _validate_captioning(cap: Any) -> dict:
 
 def _validate_gallery_dl(gd: Any) -> dict:
     _require_object(gd, "scrapers.gallery_dl")
-    allowed = {"enabled", "urls", "limit_per_url", "cookies_file", "config_path"}
+    allowed = {"enabled", "urls", "limit_per_url", "cookies_file", "config_path",
+               "config_json"}
     out: dict[str, Any] = {}
     for k, v in gd.items():
         if k not in allowed:
@@ -233,6 +235,22 @@ def _validate_gallery_dl(gd: Any) -> dict:
         elif k == "limit_per_url":
             iv = _as_int(v, "gallery_dl.limit_per_url")
             out[k] = max(1, min(_MAX_GALLERY_LIMIT, iv))
+        elif k == "config_json":
+            # Inline gallery-dl config (custom arguments). Must be a JSON object
+            # so the scraper can merge it into gallery-dl's config.
+            if not isinstance(v, str):
+                raise ValidationError("gallery_dl.config_json must be a string")
+            if len(v) > _MAX_GALLERY_CONFIG_JSON:
+                raise ValidationError(
+                    f"gallery_dl.config_json too long (max {_MAX_GALLERY_CONFIG_JSON} chars)")
+            if v.strip():
+                try:
+                    parsed = json.loads(v)
+                except (ValueError, TypeError):
+                    raise ValidationError("gallery_dl.config_json must be valid JSON") from None
+                if not isinstance(parsed, dict):
+                    raise ValidationError("gallery_dl.config_json must be a JSON object")
+            out[k] = v
         else:  # cookies_file / config_path
             if _bad_path_str(v):
                 raise ValidationError(f"gallery_dl.{k} is not a valid path string")

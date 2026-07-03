@@ -193,7 +193,7 @@ def _default_preset_cfg() -> dict:
             "x_accounts": [], "reddit_subreddits": [], "discord_channels_json": "",
             "civitai_domains": [],
             "gallery_dl": {"enabled": False, "urls": [], "limit_per_url": 200,
-                            "cookies_file": "", "config_path": ""},
+                            "cookies_file": "", "config_path": "", "config_json": ""},
             "yt_dlp": {"enabled": False, "urls": [], "limit": 200, "cookies": ""},
             "local_imports": [],
         },
@@ -824,8 +824,10 @@ def resolve_env(job: Job) -> dict[str, str]:
         "GALLERY_DL_ENABLED": _b(gd.get("enabled", False)),
         "GALLERY_DL_URLS": "\n".join(gd.get("urls", []) or []),
         "GALLERY_DL_LIMIT_PER_URL": str(int(gd.get("limit_per_url", 200) or 200)),
-        "GALLERY_DL_COOKIES_FILE": str(gd.get("cookies_file", "") or ""),
         "GALLERY_DL_CONFIG_PATH": str(gd.get("config_path", "") or ""),
+        # Per-job custom gallery-dl config (inline JSON), applied ON TOP of the
+        # global GALLERY_DL_CONFIG_JSON. Distinct env name so both coexist/merge.
+        "GALLERY_DL_CONFIG_JSON_JOB": str(gd.get("config_json", "") or ""),
         "YT_DLP_ENABLED": _b(yt.get("enabled", False)),
         "YT_DLP_URLS": "\n".join(yt.get("urls", []) or []),
         "YT_DLP_LIMIT": str(int(yt.get("limit", 200) or 200)),
@@ -845,6 +847,11 @@ def resolve_env(job: Job) -> dict[str, str]:
         # Selecting video turns the classify lane on so the queue actually pops
         # clips; image-only jobs inherit the global .env toggle (key omitted).
         **({"VIDEO_CLASSIFY_ENABLED": "true"} if "video" in media_types_list else {}),
+        # Per-job gallery-dl cookies file OVERRIDES the global .env default when
+        # set; emitted only when non-empty so an unset job falls through to the
+        # global GALLERY_DL_COOKIES_FILE from Settings.
+        **({"GALLERY_DL_COOKIES_FILE": str(gd.get("cookies_file", "") or "").strip()}
+           if str(gd.get("cookies_file", "") or "").strip() else {}),
     }
 
 
