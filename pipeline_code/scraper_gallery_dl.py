@@ -124,6 +124,39 @@ def _caption_from_meta(meta: dict[str, Any]) -> str:
     return ""
 
 
+def _apply_inline_config(config, raw_json: str, label: str) -> None:
+    """Merge an inline gallery-dl config (JSON object string) into the module
+    config by writing it to a temp file and using gallery-dl's own loader (which
+    deep-merges). No-op on empty / invalid JSON — a bad custom arg can never
+    break the run, it's just logged and skipped."""
+    raw = (raw_json or "").strip()
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        logger.warning("ignoring %s (not valid JSON): %s", label, exc)
+        return
+    if not isinstance(data, dict):
+        logger.warning("ignoring %s: expected a JSON object", label)
+        return
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            json.dump(data, fh)
+            tmp_path = fh.name
+        config.load([tmp_path])          # gallery-dl reads immediately + merges
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not apply %s: %s", label, exc)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def _configure_gallery_dl(tmp_dir: Path, archive_path: Path, limit: int) -> None:
     """Push our defaults into gallery-dl's module-level config."""
     from gallery_dl import config
@@ -170,6 +203,14 @@ def _configure_gallery_dl(tmp_dir: Path, archive_path: Path, limit: int) -> None
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not load extra gallery-dl config %s: %s",
                            extra_config, exc)
+
+    # Custom gallery-dl arguments (inline JSON) — any option from the gallery-dl
+    # docs. Global first, then the per-job block on top, so a job can extend or
+    # override the global. Both merge into gallery-dl's config.
+    _apply_inline_config(config, get_optional("GALLERY_DL_CONFIG_JSON"),
+                         "global GALLERY_DL_CONFIG_JSON")
+    _apply_inline_config(config, get_optional("GALLERY_DL_CONFIG_JSON_JOB"),
+                         "per-job gallery-dl config")
 
 
 def _safe_int(raw: str, default: int) -> int:
