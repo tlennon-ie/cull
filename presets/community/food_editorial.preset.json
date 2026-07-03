@@ -1,0 +1,79 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Food Editorial",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "food photography", "food styling", "plated dish", "chef",
+        "cookbook", "editorial food", "restaurant menu", "gastronomy",
+        "hero shot", "still life food", "top-down food", "45 degree food"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "meal prep haul", "grocery haul", "unboxing", "anime", "cartoon"
+      ],
+      "generation_hints": [
+        "food photography", "food styling", "plated dish", "editorial food",
+        "cookbook photo", "natural window light", "shallow depth of field",
+        "top-down shot"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "FoodPorn", "foodphotography", "foodstyling", "cookbooks",
+        "FineDining", "eatsandwiches", "PlatingPorn"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Deliberately styled plated dish — clean plate rim, considered props, motivated (usually window) light, sharp on the hero element, on-topic. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "Documentary",
+        "hint": "Real-world / documentary food shot (a chef at work, market produce, a family meal in-situ) — useful but a different bucket from styled editorial"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Recognisable food photo but harsh direct flash, greasy smears on the plate rim, cluttered composition, unappetising colour cast, or only-average quality -> human review"
+      },
+      {
+        "name": "Casual",
+        "hint": "Snapshot / phone-camera restaurant photo with no styling, harsh overhead ambient light -> off-theme for an editorial dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Not a food image at all (people, packaging shots, drinks-only, kitchen tools)"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image; a food illustration or 3D render is the matching label, never `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (melted/impossible food geometry, warped cutlery, floating garnish, malformed hands touching the food, warped text on labels).\n- A COMPOSITE/GRID is 2+ separate images stitched together (recipe step grid, side-by-side plating) -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in recipe titles, price stamps, menu prices, restaurant logos, or macro-nutrient annotations.\n- nsfw = TRUE only for explicit nudity or sexual content.\nFood editorial dataset. Reward deliberate plating (clean plate rim, considered negative space, thoughtful props), motivated soft light, appetising colour, and sharpness on the hero element (the pour, the garnish, the crumb). A candid chef / market / family-meal shot goes to Documentary. A phone-camera restaurant snapshot with no styling is Casual (off-theme). Penalise greasy plate rims, harsh direct flash, blown highlights on shiny surfaces and burned-in recipe / menu text. The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 55,
+      "rel_min": 25,
+      "notes": "Reward deliberate styling, clean plate rims, motivated soft light and appetising colour balance. Penalise harsh direct flash, greasy smears, dull/grey colour casts and blown specular highlights."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

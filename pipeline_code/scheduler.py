@@ -41,17 +41,21 @@ Public API:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 import threading
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlparse
 
 import requests
 
+import digest as _digest
 from paths import base_dir as _default_base_dir
 from pipeline_logging import get_logger
 
@@ -61,7 +65,14 @@ logger = get_logger(__name__)
 
 #: The job actions a schedule may trigger. Kept here (not inlined) so callers /
 #: the dashboard editor can offer exactly these and nothing else.
-ACTIONS: tuple[str, ...] = ("scrape", "curate", "export")
+ACTIONS: tuple[str, ...] = ("scrape", "curate", "export", "digest")
+
+#: Timeout used when POSTing a digest webhook. Kept small so a slow hook can
+#: never stall a scheduler tick.
+_DIGEST_TIMEOUT = 15.0
+
+#: Accepted digest webhook payload styles.
+_DIGEST_STYLES: frozenset[str] = frozenset({"discord", "slack"})
 
 #: Named cron-ish aliases → period in seconds.
 _ALIASES: dict[str, int] = {
@@ -135,6 +146,12 @@ class Schedule:
     action: str = "scrape"
     enabled: bool = True
     last_run: datetime | None = field(default=None)
+    # Free-form action config. Kept out of ``__post_init__`` validation because
+    # each action gets to interpret its own keys; today only the ``digest``
+    # action consumes it (``webhook_url`` / ``webhook_style`` / ``since_hours``
+    # / ``top_n``). Frozen dataclass → we hold a tuple of items for hashability
+    # and expose a dict via :attr:`config`.
+    config: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.action not in ACTIONS:
@@ -148,23 +165,32 @@ class Schedule:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly representation (datetime → ISO-8601 string)."""
-        return {
+        out: dict[str, Any] = {
             "slug": self.slug,
             "cadence": self.cadence,
             "action": self.action,
             "enabled": bool(self.enabled),
             "last_run": self.last_run.isoformat() if self.last_run else None,
         }
+        # Only serialise config when non-empty so existing schedule files stay
+        # byte-identical after a load / save round trip.
+        if self.config:
+            out["config"] = dict(self.config)
+        return out
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Schedule":
         """Rebuild a Schedule from persisted JSON, tolerating loose types."""
+        cfg = raw.get("config")
+        if not isinstance(cfg, dict):
+            cfg = {}
         return cls(
             slug=str(raw.get("slug", "")),
             cadence=str(raw.get("cadence", "@daily")),
             action=str(raw.get("action", "scrape")),
             enabled=bool(raw.get("enabled", True)),
             last_run=_parse_dt(raw.get("last_run")),
+            config=dict(cfg),
         )
 
 
@@ -315,6 +341,26 @@ def remove_schedule(slug: str, action: str) -> bool:
 Runner = Callable[[str, str], Any]
 
 
+def _dispatch(sched: Schedule, runner: Runner) -> None:
+    """Run one schedule's action.
+
+    Scheduler-owned actions (``digest``) are handled here directly — they are
+    pure reads over :mod:`index_store` and do not touch the supervisor's
+    process fleet. Everything else is delegated to the injected ``runner``.
+    """
+    if sched.action == "digest":
+        cfg = sched.config or {}
+        run_digest(
+            sched.slug,
+            since_hours=int(cfg.get("since_hours", 24) or 24),
+            top_n=int(cfg.get("top_n", 20) or 20),
+            webhook_url=cfg.get("webhook_url") or None,
+            webhook_style=str(cfg.get("webhook_style", "discord") or "discord"),
+        )
+        return
+    runner(sched.slug, sched.action)
+
+
 def run_due(now: datetime, runner: Runner) -> list[Schedule]:
     """Run every persisted schedule that is due at ``now`` via ``runner``.
 
@@ -337,7 +383,7 @@ def run_due(now: datetime, runner: Runner) -> list[Schedule]:
         succeeded: list[Schedule] = []
         for sched in to_run:
             try:
-                runner(sched.slug, sched.action)
+                _dispatch(sched, runner)
             except Exception as exc:  # noqa: BLE001 - best-effort, never abort the tick
                 logger.warning(
                     "scheduled %s for %r failed: %s", sched.action, sched.slug, exc
@@ -361,6 +407,134 @@ def run_due_now(runner: Runner) -> list[Schedule]:
     core. The supervisor can call this directly from its reconcile loop.
     """
     return run_due(datetime.now(timezone.utc), runner)
+
+
+# ── SSRF guard ────────────────────────────────────────────────────────────────
+
+def _is_public_http_url(url: str) -> bool:
+    """Return True iff ``url`` is a well-formed http(s) URL whose host resolves
+    exclusively to public unicast addresses.
+
+    Rejects: non-http(s) schemes, missing hostnames, hosts in the private /
+    loopback / link-local / multicast / reserved ranges, and hosts whose DNS
+    resolution touches any of those. The DNS check catches naive attempts to
+    dodge the string check with a domain that points at ``127.0.0.1``.
+
+    Best-effort: a DNS failure returns False (fail-closed) — the digest hook
+    is a webhook, not a critical path, so we prefer "silently skip" over
+    "silently deliver to localhost".
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    # Explicit belt-and-braces string check for the most common gotchas.
+    if host in ("localhost", "0.0.0.0", "broadcasthost", "ip6-localhost", "ip6-loopback"):
+        return False
+
+    # Every resolved address must be a public unicast address. socket.getaddrinfo
+    # covers both IPv4 and IPv6.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            return False
+        addr = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+# ── Digest action ─────────────────────────────────────────────────────────────
+
+def _digest_webhook_body(markdown: str, style: str) -> dict[str, Any]:
+    """Format ``markdown`` for the target webhook style.
+
+    Discord expects ``{"content": ...}``; Slack expects ``{"text": ...}``.
+    Anything else falls back to Discord's shape (matches the parameter default).
+    """
+    key = "text" if style == "slack" else "content"
+    return {key: markdown}
+
+
+def run_digest(
+    slug: str,
+    *,
+    since_hours: int = 24,
+    top_n: int = 20,
+    webhook_url: str | None = None,
+    webhook_style: str = "discord",
+) -> dict[str, Any]:
+    """Build a digest payload for ``slug`` and optionally POST it to a webhook.
+
+    Always logs a one-line summary regardless of webhook configuration so the
+    supervisor's tick log records that the digest fired. When ``webhook_url``
+    is set, the URL is validated by :func:`_is_public_http_url` (SSRF guard)
+    and the Markdown body is POSTed with a 15s cap. A rejected URL is logged
+    as a warning and the payload is still returned to the caller.
+    """
+    hours = max(1, int(since_hours or 24))
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    payload = _digest.build_digest(slug, since=since, top_n=int(top_n or 20))
+
+    totals = payload.get("totals", {})
+    logger.info(
+        "digest: slug=%s window=%dh sample=%d kept=%d borderline=%d off_topic=%d discarded=%d",
+        slug,
+        payload.get("window_hours", hours),
+        payload.get("sample_count", 0),
+        totals.get("kept", 0),
+        totals.get("borderline", 0),
+        totals.get("off_topic", 0),
+        totals.get("discarded", 0),
+    )
+
+    if webhook_url:
+        style = (webhook_style or "discord").strip().lower()
+        if style not in _DIGEST_STYLES:
+            logger.warning(
+                "digest: unknown webhook_style %r for slug=%s, falling back to discord",
+                webhook_style, slug,
+            )
+            style = "discord"
+        if not _is_public_http_url(webhook_url):
+            logger.warning(
+                "digest: refusing to POST to non-public webhook URL for slug=%s", slug,
+            )
+        else:
+            body = _digest_webhook_body(_digest.render_markdown(payload), style)
+            try:
+                resp = requests.post(webhook_url, json=body, timeout=_DIGEST_TIMEOUT)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.warning("digest: webhook POST failed for slug=%s: %s", slug, exc)
+            except Exception as exc:  # noqa: BLE001 - best-effort, never crash a tick
+                logger.warning("digest: webhook POST errored for slug=%s: %s", slug, exc)
+
+    return payload
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -465,5 +639,6 @@ __all__ = [
     "remove_schedule",
     "run_due",
     "run_due_now",
+    "run_digest",
     "notify",
 ]

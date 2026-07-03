@@ -1,0 +1,81 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Interior Design",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "interior", "interior design", "architecture", "living room",
+        "bedroom", "kitchen", "bathroom", "dining room", "home decor",
+        "furniture", "mid-century", "scandinavian", "japandi", "loft",
+        "open plan", "hardwood floor", "vaulted ceiling"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "selfie", "meme", "anime", "cartoon"
+      ],
+      "generation_hints": [
+        "interior photograph", "architectural photography",
+        "wide angle interior", "natural window light", "real estate photo",
+        "editorial interior"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "InteriorDesign", "malelivingspace", "femalelivingspace",
+        "AmateurRoomPorn", "RoomPorn", "DesignPorn", "CozyPlaces",
+        "ArchitecturePorn", "MidCenturyModern"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Clean, styled interior room shot — deliberate composition (parallel verticals, corrected perspective), balanced natural or motivated lighting, uncluttered surfaces, sharp on the primary architectural feature. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "RealEstate",
+        "hint": "Correctly-shot but plain listing / real-estate photo (fisheye look, flash bounce, no styling). Useful for a real-estate-style dataset but a different bucket from editorial interiors"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Interior scene but skewed verticals, blown windows, cluttered surfaces, mixed colour temperature, or only-average quality -> human review"
+      },
+      {
+        "name": "Exterior",
+        "hint": "Building exterior, streetscape or garden shot — NOT an interior room -> off-theme for an interiors dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Unrelated to interior design regardless of quality (REL_Quality_Score < 30)"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image; an architectural rendering / 3D vis is `3d_render`, never `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (melted furniture geometry, warped window frames, impossible reflections, floating objects, wrong perspective on a straight edge).\n- A COMPOSITE/GRID is 2+ separate images stitched together (before/after grid, room-by-room panel) -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in room labels, MLS logos, dimensions or price stamps.\n- nsfw = TRUE only for explicit nudity or sexual content.\nInteriors dataset. Reward corrected verticals, coherent perspective, motivated lighting, uncluttered styling and a clear architectural focal point (a fireplace, a window bay, a run of cabinetry). A plain real-estate flash-bounce shot goes to RealEstate. A building exterior or streetscape is Exterior (off-theme). Penalise heavy converging verticals, blown windows, distracting clutter, and any burned-in listing text (contains_text_overlay=true -> Borderline at best; DISCARD if the overlay dominates). The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 50,
+      "rel_min": 25,
+      "notes": "Reward corrected verticals, balanced window/interior exposure, styled but uncluttered surfaces and coherent colour temperature. Penalise skewed perspective, blown highlights on windows, mixed colour casts and heavy clutter."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

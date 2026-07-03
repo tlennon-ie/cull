@@ -100,6 +100,11 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
     "YT_DLP_URLS", "YT_DLP_COOKIES", "YT_DLP_LIMIT",
+    # Kohya training-set feeder — a change to root/name/toggles/mode must restart
+    # the feeder so the new dataset path takes effect. KOHYA_POLL_INTERVAL is
+    # read live inside the feeder loop, so it's not structural.
+    "KOHYA_IMPORT_ENABLED", "KOHYA_IMPORT_DIR", "KOHYA_IMPORT_NAME",
+    "KOHYA_MOVE", "KOHYA_ALLOW_FLAT",
     "REQUIRE_PROMPT",
     "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
@@ -470,6 +475,22 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
                 "LOCAL_IMPORT_ENABLED": "true",
                 "LOCAL_IMPORT_MIGRATE_FROM": str(folder.get("migrate_from", "") or ""),
             },
+        ))
+
+    # Kohya-style training-set feeder. Gated identically to gallery-dl: only
+    # desired when both the toggle is on AND a dataset root is configured, so an
+    # empty config never respawns a broken agent every loop_sleep. The feeder
+    # walks ``<repeats>_<concept>`` subdirs and (optionally) flat Danbooru-style
+    # folders — see feed_kohya_folder.py.
+    if (
+        os.environ.get("KOHYA_IMPORT_ENABLED", "false").lower() == "true"
+        and (os.environ.get("KOHYA_IMPORT_DIR", "") or "").strip()
+    ):
+        _kohya_name = (os.environ.get("KOHYA_IMPORT_NAME", "") or "kohya").strip() or "kohya"
+        add(AgentSpec(
+            label=f"Kohya-{_kohya_name}",
+            script="feed_kohya_folder.py",
+            loop_sleep=3600,
         ))
 
     # gallery-dl URL-based scraper (Pixiv, DeviantArt, booru sites, ArtStation,

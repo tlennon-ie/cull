@@ -1,0 +1,80 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Retro Pixel Art",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "pixel art", "pixelart", "16bit", "16-bit", "8bit", "8-bit",
+        "snes", "genesis", "gameboy", "sprite art", "tileset",
+        "aseprite", "dithering", "restricted palette", "chiptune art"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "photograph", "photorealistic", "3d render", "smooth shading",
+        "airbrush", "anti-aliased painting"
+      ],
+      "generation_hints": [
+        "pixel art", "16-bit style", "restricted palette", "sprite",
+        "sprite sheet", "dithered shading", "clean pixel cluster",
+        "chunky pixels"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": true
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "PixelArt", "pixelart", "PixelArtTutorials", "PixelDailies",
+        "IndieDev", "gamedev", "aseprite"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Clean pixel-art image with a coherent restricted palette, deliberate pixel clusters (no smudged / anti-aliased pixels), no visible upscaling artefacts, on-topic. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "SpriteSheet",
+        "hint": "A pixel-art SPRITE SHEET / tileset / animation strip laid out on a grid — useful but a different bucket from finished single-scene pixel art"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Reads as pixel art but muddy palette, inconsistent pixel size within the frame, mild anti-aliasing bleed, or minor upscaling smudging -> human review"
+      },
+      {
+        "name": "FakePixel",
+        "hint": "A high-resolution painting or 3D render passed off as pixel art — smooth gradients, anti-aliased edges, or clearly non-integer pixel sizes. Off-theme for a real pixel-art dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Not pixel art at all (photograph, smooth digital painting, vector illustration)"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium MUST be `pixel_art` (or the closest `digital_painting` cousin) for Keep. A photograph, a photoreal render or a smoothly-painted digital illustration is NOT pixel art.\n- has_ai_flaws = TRUE for SEVERE pixel-art-specific artefacts: non-integer pixel scaling (a stray 1.5x pixel next to a 1x pixel), anti-aliased grey bleed on what should be a hard-edge cluster, melted anatomy, or a palette that visibly drifts across the frame.\n- A SPRITE SHEET / tileset / animation strip laid out on a grid is NOT a `is_composite_grid` DISCARD — route SpriteSheet. A COMPOSITE is 2+ unrelated finished images stitched together -> DISCARD.\n- contains_text_overlay = TRUE for burned-in artist signatures/watermarks in the pixel grid, or captions layered on top in a non-pixel font.\n- nsfw = TRUE only for explicit nudity or sexual content.\nPixel-art dataset. Reward a coherent restricted palette, deliberate pixel clustering, consistent 1x pixel size across the frame, and readable shape silhouettes. Route sprite sheets and tilesets to SpriteSheet. Route smoothly-painted or 3D-rendered fakes to FakePixel. Penalise smudged edges, mixed pixel sizes, unresolved palette drift and non-pixel-font signature overlays. The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 45,
+      "rel_min": 25,
+      "notes": "Reward clean pixel clusters, a coherent restricted palette, consistent pixel size and readable silhouettes. Penalise anti-aliasing bleed, mixed pixel sizes, palette drift and upscaling smudge."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "booru_tags",
+      "overwrite": false
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

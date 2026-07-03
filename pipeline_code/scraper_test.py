@@ -25,8 +25,11 @@ Timeout is 8 seconds; responses are mapped to clear user-facing messages.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import ipaddress
+import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -484,6 +487,264 @@ def _check_gallery_dl(config: dict, env: dict | None) -> dict:
     return _ok("gallery-dl installed and config paths verified")
 
 
+_GALLERY_DL_URL_TIMEOUT = 10.0
+
+
+def _iter_gallery_dl_extractor(extr: Any, max_items: int) -> list[str]:
+    """Iterate a gallery-dl extractor, returning up to `max_items` file URLs.
+
+    Filters for ``Message.Url`` entries (skips Directory / Queue messages).
+    """
+    from gallery_dl.extractor.message import Message  # local import
+
+    urls: list[str] = []
+    for msg in extr:
+        if not isinstance(msg, tuple) or len(msg) < 2:
+            continue
+        kind = msg[0]
+        if kind == Message.Url:
+            url_val = msg[1]
+            if isinstance(url_val, str):
+                urls.append(url_val)
+                if len(urls) >= max_items:
+                    break
+        elif kind == Message.Queue:
+            # Sub-gallery link — count the queued URL as a sample too so users
+            # can see a listing page yields links, without descending into it.
+            queued = msg[1]
+            if isinstance(queued, str):
+                urls.append(queued)
+                if len(urls) >= max_items:
+                    break
+    return urls
+
+
+def _check_gallery_dl_url(
+    url: str,
+    cookies_txt: str | None = None,
+    config_json: str | None = None,
+    max_items_estimate: int = 5,
+) -> dict:
+    """Verify a URL via gallery-dl in dry-run mode.
+
+    Runs the URL through gallery-dl's extractor machinery WITHOUT downloading
+    any files. Returns a dict describing which extractor matched, its category,
+    and a small sample of file URLs the extractor would have downloaded.
+
+    Parameters
+    ----------
+    url : str
+        The URL to probe. Must be http(s).
+    cookies_txt : str | None
+        Optional Netscape cookies.txt contents. Written to a temp file for the
+        duration of the probe; the file is deleted in a ``finally`` block so
+        cookie material never leaks past this call.
+    config_json : str | None
+        Optional inline gallery-dl config (JSON object string). Merged over
+        the module defaults for the duration of the probe.
+    max_items_estimate : int
+        Cap the sample of URLs returned. Iteration stops as soon as we have
+        this many.
+
+    Returns
+    -------
+    dict with keys: ok, extractor, category, sample_urls, message, error.
+    """
+    empty: dict = {
+        "ok": False,
+        "extractor": None,
+        "category": None,
+        "sample_urls": [],
+        "message": "",
+        "error": None,
+    }
+
+    # ---- Basic validation --------------------------------------------------
+    if not isinstance(url, str) or not url.strip():
+        return {**empty, "error": "url is required", "message": "url is required"}
+    url = url.strip()
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except Exception:  # noqa: BLE001
+        return {**empty, "error": "invalid url", "message": "invalid url"}
+    if scheme not in ("http", "https"):
+        return {
+            **empty,
+            "error": "only http(s) URLs are allowed",
+            "message": "only http(s) URLs are allowed",
+        }
+
+    # ---- Import gallery-dl -------------------------------------------------
+    try:
+        from gallery_dl import extractor as gdl_extractor
+        from gallery_dl import config as gdl_config
+    except Exception as exc:  # noqa: BLE001 - not installed / corrupt install
+        return {
+            **empty,
+            "error": "gallery-dl not installed",
+            "message": f"gallery-dl not importable ({type(exc).__name__})",
+        }
+
+    # ---- Wire optional cookies + config inside a scoped try/finally --------
+    cookies_path: str | None = None
+    config_path: str | None = None
+    # Snapshot the module config so we can restore it on exit — gallery-dl's
+    # config is process-global, so leaking probe settings into a concurrent
+    # scraper run would misroute downloads.
+    original_config = None
+    try:
+        try:
+            original_config = json.loads(json.dumps(gdl_config._config))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - private attr fallback
+            original_config = None
+
+        if cookies_txt and isinstance(cookies_txt, str) and cookies_txt.strip():
+            fd, cookies_path = tempfile.mkstemp(
+                prefix="cull_gdl_cookies_", suffix=".txt"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(cookies_txt)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            gdl_config.set(("extractor",), "cookies", cookies_path)
+
+        if config_json and isinstance(config_json, str) and config_json.strip():
+            try:
+                cfg_data = json.loads(config_json)
+            except (ValueError, TypeError) as exc:
+                return {
+                    **empty,
+                    "error": f"config_json is not valid JSON: {exc}",
+                    "message": "config_json is not valid JSON",
+                }
+            if not isinstance(cfg_data, dict):
+                return {
+                    **empty,
+                    "error": "config_json must be a JSON object",
+                    "message": "config_json must be a JSON object",
+                }
+            fd, config_path = tempfile.mkstemp(
+                prefix="cull_gdl_config_", suffix=".json"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(cfg_data, fh)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            try:
+                gdl_config.load([config_path])
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    **empty,
+                    "error": f"could not load config_json: {exc}",
+                    "message": "could not apply config_json",
+                }
+
+        # ---- Identify the extractor ---------------------------------------
+        try:
+            extr = gdl_extractor.find(url)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                **empty,
+                "error": f"extractor.find failed: {type(exc).__name__}",
+                "message": "gallery-dl could not process this URL",
+            }
+        if extr is None:
+            return {
+                **empty,
+                "error": "URL not recognised",
+                "message": "no gallery-dl extractor matches this URL",
+            }
+
+        extractor_name = type(extr).__name__.lower()
+        category = getattr(extr, "category", None) or None
+
+        # ---- Iterate under a hard timeout ---------------------------------
+        try:
+            max_items = max(1, int(max_items_estimate))
+        except (TypeError, ValueError):
+            max_items = 5
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_iter_gallery_dl_extractor, extr, max_items)
+                sample_urls = future.result(timeout=_GALLERY_DL_URL_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            return {
+                "ok": False,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched, but the site did "
+                    f"not respond within {int(_GALLERY_DL_URL_TIMEOUT)}s"
+                ),
+                "error": "timed out",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gallery-dl iteration error for %s: %s", url, exc)
+            return {
+                "ok": False,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched but iteration failed"
+                ),
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+
+        if not sample_urls:
+            return {
+                "ok": True,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched — no items to preview "
+                    "(gallery may be empty, private, or paginated)"
+                ),
+                "error": None,
+            }
+
+        return {
+            "ok": True,
+            "extractor": extractor_name,
+            "category": category,
+            "sample_urls": sample_urls,
+            "message": (
+                f"extractor '{extractor_name}' matched — "
+                f"{len(sample_urls)} sample item(s) previewed"
+            ),
+            "error": None,
+        }
+    finally:
+        # Restore config so a probe never leaks cookies/config into a live run.
+        try:
+            if original_config is not None:
+                gdl_config._config.clear()  # type: ignore[attr-defined]
+                gdl_config._config.update(original_config)  # type: ignore[attr-defined]
+            else:
+                gdl_config.clear()
+        except Exception:  # noqa: BLE001 - restoration is best-effort
+            pass
+        for path in (cookies_path, config_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
 def _check_local(config: dict, env: dict | None) -> dict:
     """Local folder import — checks dir exists and is readable.
 
@@ -531,6 +792,24 @@ _CHECKERS = {
 
 
 # ---------------------------------------------------------------------------
+# Per-URL test registry (parallel to _CHECKERS / SUPPORTED)
+# ---------------------------------------------------------------------------
+# Some sources aren't scrapers per se — they're generic URL probes. gallery-dl
+# is the first: any URL a user pastes into the dashboard can be pre-flighted
+# to confirm gallery-dl recognises it and to preview a few items. The registry
+# below carries `kind="per_url"` so dashboards can route these to the right
+# UI (an input field for a URL, not a per-scraper Test button).
+SUPPORTED_URL_TESTS: dict[str, dict[str, Any]] = {
+    "gallery_dl_url": {
+        "label": "gallery-dl URL",
+        "check": _check_gallery_dl_url,
+        "requires": [],
+        "kind": "per_url",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -565,4 +844,10 @@ def test_scraper(
         )
 
 
-__all__ = ["test_scraper", "SUPPORTED", "_http_request"]
+__all__ = [
+    "test_scraper",
+    "SUPPORTED",
+    "SUPPORTED_URL_TESTS",
+    "_check_gallery_dl_url",
+    "_http_request",
+]
