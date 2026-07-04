@@ -4378,11 +4378,58 @@ def api_gallery_requeue():
 
 @app.route("/api/scrapers/gallery-dl/test-url", methods=["POST"])
 def api_scrapers_gallery_dl_test_url():
-    """Preflight one URL through gallery-dl's extractor (no downloads)."""
+    """Preflight one URL through gallery-dl's extractor (no downloads).
+
+    Accepts either ``cookies_txt`` (raw Netscape-format cookie content) OR
+    ``cookies_file`` (a filesystem PATH to a cookies file). When both are
+    present the PATH wins — the field is unambiguous, and this matches how
+    the scraper config already stores it. When ``cookies_file`` is supplied
+    we read the file server-side (bound to 127.0.0.1) and pass the content
+    down as ``cookies_txt`` so the underlying probe sees exactly one shape.
+    """
     data = request.get_json() or {}
     url = (data.get("url") or "").strip()
     cookies_txt = data.get("cookies_txt")
+    cookies_file = data.get("cookies_file")
     config_json = data.get("config_json")
+
+    # cookies_file (path) beats inline cookies_txt — surfaces a clearer error
+    # than gallery-dl's cryptic "not enough values to unpack" when the caller
+    # accidentally sent a PATH string as CONTENT.
+    if isinstance(cookies_file, str) and cookies_file.strip():
+        raw_path = cookies_file.strip()
+        # Reject Windows special-device paths outright — Path.resolve() can
+        # silently accept them, which is not what a "pick your local cookies
+        # file" flow should ever hit.
+        if raw_path.startswith(("\\\\?\\", "\\\\.\\", "//?/", "//./")):
+            return jsonify({"ok": False, "error": f"cookies file path not allowed: {raw_path}"})
+        try:
+            cp = Path(raw_path).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            return jsonify({"ok": False, "error": f"invalid cookies file path: {exc}"})
+        if not cp.exists() or not cp.is_file():
+            return jsonify({"ok": False, "error": f"cookies file not found: {cp}"})
+        try:
+            size = cp.stat().st_size
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot stat cookies file: {exc}"})
+        if size > 1_048_576:  # 1 MB defensive cap
+            return jsonify({"ok": False, "error": "cookies file too large (>1 MB)"})
+        try:
+            content = cp.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot read cookies file: {exc}"})
+        # Netscape-format sanity check — saves users a bewildering downstream
+        # ValueError from gallery-dl's cookiejar parser.
+        first_line = content.lstrip().splitlines()[0] if content.strip() else ""
+        if not first_line.lower().startswith("# netscape http cookie file"):
+            return jsonify({
+                "ok": False,
+                "error": ("cookies file is not in Netscape format "
+                          "(expected first line '# Netscape HTTP Cookie File')"),
+            })
+        cookies_txt = content
+
     try:
         result = scraper_test._check_gallery_dl_url(
             url,
@@ -4422,13 +4469,29 @@ def api_scrapers_yt_dlp_test_url():
 
     import concurrent.futures as _cf_ytdlp
 
+    # Heuristic: for a single video, extract_flat='in_playlist' makes yt-dlp
+    # skip metadata extraction on some paths and report "not available". Only
+    # keep flat mode for URLs that look like a playlist / channel / list.
+    _u_lower = url.lower()
+    _is_playlist = ("/playlist" in _u_lower
+                    or "/channel" in _u_lower
+                    or "list=" in _u_lower)
+
     def _probe() -> dict:
         opts = {
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
-            "extract_flat": "in_playlist",
+            # Playlists → flat; single videos → full metadata pass.
+            "extract_flat": "in_playlist" if _is_playlist else False,
             "socket_timeout": 10,
+            # A realistic UA + Accept-Language shuts down the vast majority
+            # of YouTube's "Sign in to confirm you're not a bot" refusals
+            # on server-hosted IPs.
+            "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
         }
         with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[attr-defined]
             info = ydl.extract_info(url, download=False)
@@ -4471,9 +4534,15 @@ def api_scrapers_yt_dlp_test_url():
         })
     except Exception as exc:  # noqa: BLE001
         logger.debug("yt-dlp test-url error for %s: %s", url, exc)
+        msg = str(exc)[:200]
+        # Bot-check / geo / age-gate / private → point the user at cookies.
+        if "not available" in msg.lower() or "sign in" in msg.lower():
+            msg = (f"{msg} — May be geo-blocked, age-restricted, private, or "
+                   "requiring a signed-in browser cookie file — try adding "
+                   "cookies in the scraper config.")
         return jsonify({
             "ok": False,
-            "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            "error": f"{type(exc).__name__}: {msg}",
         })
 
 
@@ -5760,12 +5829,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <span class="font-brand text-2xl font-medium tracking-tight">cull</span>
       </a>
       <p class="text-xs text-slate-400 mt-1" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
-      <div class="mt-2">
-        <span class="pill px-2 py-0.5 rounded"
+      <div class="mt-2 min-w-0 flex flex-wrap items-center gap-1">
+        <span class="pill px-2 py-0.5 rounded shrink-0"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
           x-text="status.pipeline?.running ? 'running' : 'stopped'"></span>
-        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 ml-1"
-          x-show="jobsActive" x-text="'active: ' + (jobsActive || '')"></span>
+        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 truncate max-w-full inline-block"
+          x-show="jobsActive" :title="jobsActive"
+          x-text="'active: ' + (jobsActive || '')"></span>
       </div>
     </div>
 
@@ -9542,6 +9612,33 @@ function dashboard() {
         const typedKey = (this.settings[this.cloudApiKey(name)] || '').trim();
         if (typedKey) body.api_key = typedKey;
       }
+      // Legacy runtime tests (lmstudio/llamacpp/openai-compat) used to read
+      // LMSTUDIO_PRIMARY_URL from .env, which is empty in fleet-based
+      // deployments. Feed the endpoint URL from the actual fleet instead so
+      // the button works against the same worker that will run classification.
+      if (!isCloud && (name === 'lmstudio' || name === 'llamacpp' || name === 'openai-compat' || name === 'openai_compat')) {
+        // Prefer legacy .env URL if the user still has one; otherwise use the
+        // first enabled fleet entry matching the provider.
+        const legacyKey = name === 'lmstudio' ? 'LMSTUDIO_PRIMARY_URL' : 'OPENAI_COMPAT_URL';
+        const legacyUrl = (this.settings && this.settings[legacyKey] || '').trim();
+        if (legacyUrl) {
+          body.url = legacyUrl;
+        } else {
+          const fleet = (typeof this.gFleet === 'function' ? this.gFleet() : []) || [];
+          const target = (name === 'lmstudio')
+            ? fleet.find(w => w && w.enabled !== false && w.provider === 'lmstudio')
+            : fleet.find(w => w && w.enabled !== false && (w.provider === 'llamacpp' || w.provider === 'lmstudio'));
+          if (target) {
+            if (target.base_url) body.url = String(target.base_url).trim();
+            if (target.api_key) body.api_key = String(target.api_key).trim();
+          } else if (name === 'lmstudio') {
+            this.providerTest[name] = { testing: false, ok: false,
+              message: '✗ No LM Studio worker configured in the fleet — add one above first.',
+              models: [] };
+            return;
+          }
+        }
+      }
       try {
         const r = await fetch('/api/vision/test', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -10856,9 +10953,12 @@ function dashboard() {
     async testGalleryDlUrl(url, idx) {
       this.gdlTest = { ...this.gdlTest, [idx]: { busy: true, result: null } };
       try {
-        const cookies = this.je.eff?.scrapers?.gallery_dl?.cookies_file || undefined;
+        // cookies_file is a filesystem PATH — the backend reads it and
+        // resolves to Netscape-format content. Sending it as cookies_txt
+        // (raw content) mis-decodes and confuses gallery-dl's cookiejar.
+        const cookiesFile = this.je.eff?.scrapers?.gallery_dl?.cookies_file || undefined;
         const configJson = this.je.eff?.scrapers?.gallery_dl?.config_json || undefined;
-        const body = { url, cookies_txt: cookies, config_json: configJson };
+        const body = { url, cookies_file: cookiesFile, config_json: configJson };
         const r = await fetch('/api/scrapers/gallery-dl/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
         // Normalise: scraper_test returns {ok, extractor, category, sample_urls,
