@@ -307,10 +307,35 @@ def _validate_local_imports(li: Any) -> list[dict]:
     return out
 
 
+def _validate_kohya_import(ki: Any) -> dict:
+    """Validate scrapers.kohya_import — a single per-job Kohya dataset root.
+
+    Shape mirrors the default preset in job_config._default_preset_cfg
+    (fields: enabled, dir, name, move, allow_flat). Same defensive path check
+    as local_imports; ``name`` reuses _LOCAL_NAME_RE so it can safely become a
+    filesystem component downstream.
+    """
+    _require_object(ki, "scrapers.kohya_import")
+    if _bad_path_str(ki.get("dir", "")):
+        raise ValidationError("scrapers.kohya_import.dir is not a valid path string")
+    name = ki.get("name", "kohya") or "kohya"
+    if not isinstance(name, str) or not _LOCAL_NAME_RE.match(name):
+        raise ValidationError(
+            "scrapers.kohya_import.name must match [A-Za-z0-9_-] (1-40 chars)")
+    return {
+        "enabled": bool(ki.get("enabled", False)),
+        "dir": str(ki.get("dir", "") or ""),
+        "name": name,
+        "move": bool(ki.get("move", False)),
+        "allow_flat": bool(ki.get("allow_flat", False)),
+    }
+
+
 def _validate_scrapers(s: Any) -> dict:
     _require_object(s, "scrapers")
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports",
+               "kohya_import"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -332,6 +357,8 @@ def _validate_scrapers(s: Any) -> dict:
             out[k] = _validate_gallery_dl(v)
         elif k == "yt_dlp":
             out[k] = _validate_yt_dlp(v)
+        elif k == "kohya_import":
+            out[k] = _validate_kohya_import(v)
         else:  # local_imports
             out[k] = _validate_local_imports(v)
     return out
