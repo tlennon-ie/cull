@@ -3917,8 +3917,11 @@ def api_vision_dry_run():
         headers["Authorization"] = f"Bearer {api_key}"
     raw_response: dict[str, Any] = {}
     parsed: dict[str, Any] = {}
+    # Preserve the upstream URL for diagnostics — showing the endpoint we
+    # actually hit is half the battle when a user misconfigures base_url.
     try:
         if provider == "ollama":
+            call_url = f"{base_url}/api/chat"
             payload = {
                 "model": model or "llama3.2-vision",
                 "messages": [{
@@ -3931,13 +3934,16 @@ def api_vision_dry_run():
                 "options": {"temperature": 0},
             }
             resp = _requests.post(
-                f"{base_url}/api/chat", headers=headers, json=payload,
+                call_url, headers=headers, json=payload,
                 timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
             raw_response = resp.json() if resp.content else {}
             content = ((raw_response.get("message") or {}).get("content") or "")
         else:
             # Default OpenAI-compat path: lmstudio / llamacpp / openai / openrouter.
+            call_url = f"{base_url}/v1/chat/completions"
             payload = {
                 "model": model or "gpt-4o-mini",
                 "messages": [{
@@ -3952,13 +3958,16 @@ def api_vision_dry_run():
                 "temperature": 0,
             }
             resp = _requests.post(
-                f"{base_url}/v1/chat/completions", headers=headers, json=payload,
+                call_url, headers=headers, json=payload,
                 timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
             raw_response = resp.json() if resp.content else {}
             choices = raw_response.get("choices") or []
             content = (choices[0].get("message", {}).get("content") or "") if choices else ""
     except Exception as exc:  # noqa: BLE001 - never 500 the dry-run
+        # Network-level failures (ConnectionError, Timeout, DNS, etc.).
         return jsonify({"ok": False, "error": f"worker call failed: {exc}"}), 502
 
     # Parse + score-apply the model's JSON exactly like the worker would.
@@ -3987,6 +3996,31 @@ def _b64encode_bytes(data: bytes) -> str:
     """Base64-encode bytes to a UTF-8 string (helper for dry-run)."""
     import base64 as _b64
     return _b64.b64encode(data).decode("ascii")
+
+
+def _format_upstream_error(resp: Any, url: str) -> str:
+    """Format a rich diagnostic string from a non-2xx upstream response.
+
+    LM Studio / llama.cpp / Ollama frequently return 400 with a JSON body that
+    explains WHY (bad model name, unsupported field, schema issue). Surfacing
+    that body — status + url + up to ~800 chars, pretty-printed if JSON — turns
+    "worker call failed: 400 Client Error" into an actually actionable error.
+    """
+    body_text = ""
+    try:
+        # Prefer the parsed JSON body when the upstream sent one, so the
+        # keys the model rejected show up cleanly instead of as escaped text.
+        payload = resp.json()
+        body_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - fall through to raw text
+        try:
+            body_text = resp.text or ""
+        except Exception:  # noqa: BLE001
+            body_text = ""
+    if len(body_text) > 800:
+        body_text = body_text[:800] + "…"
+    status = getattr(resp, "status_code", "?")
+    return f"upstream {status} from {url}: {body_text}".strip()
 
 
 # ── T2 #10 — Endpoint discovery ───────────────────────────────────────────────
@@ -4358,6 +4392,89 @@ def api_scrapers_gallery_dl_test_url():
     except Exception as exc:  # noqa: BLE001
         return _err("gallery-dl url test failed", exc, 500)
     return jsonify(result)
+
+
+# yt-dlp URL preflight — parallels gallery-dl's endpoint. Uses the yt_dlp
+# Python package in extract_info(download=False) mode inside a 15s watchdog
+# so a slow / hostile remote can't stall the request thread.
+_YT_DLP_URL_TIMEOUT_SECONDS = 15.0
+
+
+@app.route("/api/scrapers/yt-dlp/test-url", methods=["POST"])
+def api_scrapers_yt_dlp_test_url():
+    """Preflight one URL through yt-dlp's extract_info (no downloads)."""
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"})
+    try:
+        scheme = _wave_urlparse(url).scheme.lower()
+    except Exception:  # noqa: BLE001
+        return jsonify({"ok": False, "error": "invalid url"})
+    if scheme not in ("http", "https"):
+        return jsonify({"ok": False, "error": "only http(s) URLs are allowed"})
+
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp not importable: %s", exc)
+        return jsonify({"ok": False, "error": "yt-dlp not installed"})
+
+    import concurrent.futures as _cf_ytdlp
+
+    def _probe() -> dict:
+        opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "socket_timeout": 10,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[attr-defined]
+            info = ydl.extract_info(url, download=False)
+        info = info or {}
+        # Playlists / channels expose `entries` (may be a generator).
+        entries = info.get("entries")
+        count_estimate: int | None = None
+        if isinstance(entries, list):
+            count_estimate = len(entries)
+        elif entries is not None:
+            try:
+                # Best-effort: bounded iteration so a huge playlist doesn't
+                # eat memory.
+                count_estimate = 0
+                for _ in entries:
+                    count_estimate += 1
+                    if count_estimate >= 200:
+                        break
+            except Exception:  # noqa: BLE001
+                count_estimate = None
+        duration = info.get("duration")
+        return {
+            "ok": True,
+            "extractor": info.get("extractor") or info.get("extractor_key"),
+            "title": info.get("title"),
+            "duration_sec": int(duration) if isinstance(duration, (int, float)) else None,
+            "count_estimate": count_estimate,
+            "error": None,
+        }
+
+    try:
+        with _cf_ytdlp.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_probe)
+            result = fut.result(timeout=_YT_DLP_URL_TIMEOUT_SECONDS)
+        return jsonify(result)
+    except _cf_ytdlp.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": f"timed out after {int(_YT_DLP_URL_TIMEOUT_SECONDS)}s",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp test-url error for %s: %s", url, exc)
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+        })
 
 
 # ── T3 #18 — Cookies converter ────────────────────────────────────────────────
@@ -4864,30 +4981,248 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
 
   /* ── Theme system (T3 #22) — three color modes stored on <html>. Dark
-     stays the default; light + high-contrast override a small set of tokens.
-     Named CSS variables so future components can consume them instead of
-     hard-coding slate-* palette values. */
+     stays the default; light + high-contrast override the full token set so
+     hard-coded Tailwind-esque utility classes across the tree flip
+     automatically via blanket selector overrides below. */
   :root {
     --color-bg: #020617;
+    --color-bg-elev: #0f172a;
     --color-fg: #f1f5f9;
+    --color-fg-muted: #94a3b8;
     --color-surface: rgba(15,23,42,0.78);
+    --color-surface-alt: #1e293b;
     --color-border: rgba(51,65,85,0.5);
+    --color-border-strong: #334155;
     --color-accent: #6366f1;
+    --color-accent-hover: #4f46e5;
+    --color-accent-fg: #ffffff;
+    --color-success: #10b981;
+    --color-success-fg: #ffffff;
+    --color-warn: #f59e0b;
+    --color-warn-fg: #0f172a;
     --color-danger: #e11d48;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #0f172a;
+    --color-input-fg: #f1f5f9;
+    --color-input-placeholder: #64748b;
+    --color-pill-bg: rgba(30,41,59,0.6);
+    --color-pill-fg: #cbd5e1;
   }
-  html.theme-light body { background:#f5f2ec !important; color:#0f1115 !important; }
-  html.theme-light .card { background: rgba(255,255,255,0.85) !important; border-color: rgba(0,0,0,0.1) !important; color:#0f1115; }
-  html.theme-light .text-slate-100, html.theme-light .text-slate-200, html.theme-light .text-slate-300 { color:#0f1115 !important; }
-  html.theme-light .text-slate-400, html.theme-light .text-slate-500 { color:#4b5563 !important; }
-  html.theme-light aside { background: rgba(255,255,255,0.9) !important; border-color: rgba(0,0,0,0.08) !important; }
-  html.theme-light input, html.theme-light select, html.theme-light textarea { background:#ffffff !important; color:#0f1115 !important; border-color:#cbd5e1 !important; }
-  html.theme-light .bg-slate-900\/60, html.theme-light .bg-slate-900\/40, html.theme-light .bg-slate-800 { background:#f8fafc !important; }
-  html.theme-hc body { background:#000 !important; color:#fff !important; }
-  html.theme-hc .card { background:#000 !important; border:2px solid #fff !important; color:#fff; }
-  html.theme-hc aside { background:#000 !important; border-color:#fff !important; }
-  html.theme-hc .link-btn { color:#ffe600 !important; text-decoration:underline !important; }
-  html.theme-hc input, html.theme-hc select, html.theme-hc textarea { background:#000 !important; color:#fff !important; border-color:#fff !important; }
-  html.theme-hc .pill { color:#ffe600 !important; }
+
+  /* Base defaults for elements. Dark uses the :root values; light overrides
+     everything below. This block is theme-agnostic — it reads variables. */
+  input, select, textarea {
+    color: var(--color-input-fg);
+    background: var(--color-input-bg);
+    border-color: var(--color-border);
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--color-input-placeholder);
+    opacity: 1;
+    font-style: italic;
+  }
+  input:not(:placeholder-shown):not([type=checkbox]):not([type=radio]),
+  textarea:not(:placeholder-shown) {
+    color: var(--color-input-fg);
+    font-weight: 500;
+  }
+
+  /* ── LIGHT THEME ── comprehensive coverage. Overrides tokens + then blanket
+     selectors so existing utility classes flip without editing markup. */
+  html.theme-light {
+    --color-bg: #f5f2ec;
+    --color-bg-elev: #ffffff;
+    --color-fg: #0f172a;
+    --color-fg-muted: #475569;
+    --color-surface: #ffffff;
+    --color-surface-alt: #f1f5f9;
+    --color-border: #e2e8f0;
+    --color-border-strong: #cbd5e1;
+    --color-accent: #4f46e5;
+    --color-accent-hover: #4338ca;
+    --color-accent-fg: #ffffff;
+    --color-success: #059669;
+    --color-success-fg: #ffffff;
+    --color-warn: #d97706;
+    --color-warn-fg: #ffffff;
+    --color-danger: #dc2626;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #ffffff;
+    --color-input-fg: #0f172a;
+    --color-input-placeholder: #94a3b8;
+    --color-pill-bg: #eef2ff;
+    --color-pill-fg: #3730a3;
+  }
+  html.theme-light body { background: var(--color-bg) !important; color: var(--color-fg) !important; }
+  html.theme-light aside,
+  html.theme-light aside.bg-slate-900\/70,
+  html.theme-light .bg-slate-900\/70 {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html.theme-light .card {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Surface / panel backgrounds. */
+  html.theme-light .bg-slate-800,
+  html.theme-light .bg-slate-800\/60,
+  html.theme-light .bg-slate-800\/50,
+  html.theme-light .bg-slate-800\/40,
+  html.theme-light .bg-slate-900,
+  html.theme-light .bg-slate-900\/60,
+  html.theme-light .bg-slate-900\/50,
+  html.theme-light .bg-slate-900\/40,
+  html.theme-light .bg-slate-900\/30,
+  html.theme-light .bg-slate-950,
+  html.theme-light .bg-slate-950\/60,
+  html.theme-light .bg-slate-700,
+  html.theme-light .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Text tokens. */
+  html.theme-light .text-slate-100,
+  html.theme-light .text-slate-200,
+  html.theme-light .text-slate-300,
+  html.theme-light .text-white { color: var(--color-fg) !important; }
+  html.theme-light .text-slate-400,
+  html.theme-light .text-slate-500,
+  html.theme-light .text-slate-600 { color: var(--color-fg-muted) !important; }
+  /* Borders. */
+  html.theme-light .border-slate-600,
+  html.theme-light .border-slate-700,
+  html.theme-light .border-slate-800,
+  html.theme-light .border-slate-900 { border-color: var(--color-border) !important; }
+  /* Accent buttons. */
+  html.theme-light .bg-indigo-500,
+  html.theme-light .bg-indigo-600,
+  html.theme-light .hover\:bg-indigo-500:hover,
+  html.theme-light .hover\:bg-indigo-600:hover,
+  html.theme-light .hover\:bg-indigo-700:hover {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-fg) !important;
+  }
+  html.theme-light .text-indigo-300,
+  html.theme-light .text-indigo-400,
+  html.theme-light .text-indigo-500 { color: var(--color-accent) !important; }
+  /* Success (emerald). */
+  html.theme-light .bg-emerald-500,
+  html.theme-light .bg-emerald-600,
+  html.theme-light .hover\:bg-emerald-500:hover,
+  html.theme-light .hover\:bg-emerald-600:hover,
+  html.theme-light .bg-emerald-800,
+  html.theme-light .bg-emerald-800\/60 {
+    background: var(--color-success) !important;
+    color: var(--color-success-fg) !important;
+  }
+  html.theme-light .text-emerald-100,
+  html.theme-light .text-emerald-200,
+  html.theme-light .text-emerald-300,
+  html.theme-light .text-emerald-400 { color: var(--color-success) !important; }
+  /* Warn (amber). */
+  html.theme-light .bg-amber-500,
+  html.theme-light .bg-amber-600,
+  html.theme-light .hover\:bg-amber-400:hover,
+  html.theme-light .hover\:bg-amber-500:hover {
+    background: var(--color-warn) !important;
+    color: var(--color-warn-fg) !important;
+  }
+  html.theme-light .text-amber-300,
+  html.theme-light .text-amber-400 { color: var(--color-warn) !important; }
+  /* Danger (rose / red). */
+  html.theme-light .bg-rose-500,
+  html.theme-light .bg-rose-600,
+  html.theme-light .bg-red-500,
+  html.theme-light .bg-red-600,
+  html.theme-light .bg-rose-900\/60,
+  html.theme-light .bg-rose-950\/60,
+  html.theme-light .hover\:bg-rose-500:hover,
+  html.theme-light .hover\:bg-rose-800:hover {
+    background: var(--color-danger) !important;
+    color: var(--color-danger-fg) !important;
+  }
+  html.theme-light .text-rose-100,
+  html.theme-light .text-rose-200,
+  html.theme-light .text-rose-300,
+  html.theme-light .text-rose-400,
+  html.theme-light .text-red-400 { color: var(--color-danger) !important; }
+  /* Inputs / selects / textareas — already set via :root; enforce for
+     Tailwind-classed inputs that hard-code dark bgs. */
+  html.theme-light input,
+  html.theme-light select,
+  html.theme-light textarea {
+    background: var(--color-input-bg) !important;
+    color: var(--color-input-fg) !important;
+    border-color: var(--color-border-strong) !important;
+  }
+  html.theme-light input::placeholder,
+  html.theme-light textarea::placeholder { color: var(--color-input-placeholder) !important; }
+  /* Pills. */
+  html.theme-light .pill { background: var(--color-pill-bg) !important; color: var(--color-pill-fg) !important; }
+  /* Table headers with hardcoded dark bg (Global Stats etc.). */
+  html.theme-light thead,
+  html.theme-light thead tr,
+  html.theme-light th { background: var(--color-surface-alt) !important; color: var(--color-fg) !important; }
+  /* Code + <code> spans. */
+  html.theme-light code {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-accent) !important;
+    border-color: var(--color-border) !important;
+  }
+  /* Links. */
+  html.theme-light a, html.theme-light .link-btn { color: var(--color-accent) !important; }
+
+  /* ── HIGH-CONTRAST THEME ── pure black/white/yellow, comprehensive. */
+  html.theme-hc {
+    --color-bg: #000000;
+    --color-bg-elev: #000000;
+    --color-fg: #ffffff;
+    --color-fg-muted: #ffffff;
+    --color-surface: #000000;
+    --color-surface-alt: #000000;
+    --color-border: #ffffff;
+    --color-border-strong: #ffffff;
+    --color-accent: #ffe600;
+    --color-accent-hover: #ffd400;
+    --color-accent-fg: #000000;
+    --color-success: #00ff88;
+    --color-success-fg: #000000;
+    --color-warn: #ffe600;
+    --color-warn-fg: #000000;
+    --color-danger: #ff5c5c;
+    --color-danger-fg: #000000;
+    --color-input-bg: #000000;
+    --color-input-fg: #ffffff;
+    --color-input-placeholder: #cccccc;
+    --color-pill-bg: #000000;
+    --color-pill-fg: #ffe600;
+  }
+  html.theme-hc body { background: #000 !important; color: #fff !important; }
+  html.theme-hc .card { background: #000 !important; border: 2px solid #fff !important; color: #fff !important; }
+  html.theme-hc aside { background: #000 !important; border-color: #fff !important; color: #fff !important; }
+  html.theme-hc .link-btn, html.theme-hc a { color: #ffe600 !important; text-decoration: underline !important; }
+  html.theme-hc input, html.theme-hc select, html.theme-hc textarea {
+    background: #000 !important; color: #fff !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc input::placeholder, html.theme-hc textarea::placeholder { color: #cccccc !important; font-style: italic; }
+  html.theme-hc .pill { background: #000 !important; color: #ffe600 !important; border: 1px solid #ffe600 !important; }
+  html.theme-hc .bg-slate-800, html.theme-hc .bg-slate-900, html.theme-hc .bg-slate-900\/60,
+  html.theme-hc .bg-slate-900\/40, html.theme-hc .bg-slate-950, html.theme-hc .bg-slate-700 {
+    background: #000 !important; color: #fff !important;
+  }
+  html.theme-hc .text-slate-100, html.theme-hc .text-slate-200, html.theme-hc .text-slate-300,
+  html.theme-hc .text-slate-400, html.theme-hc .text-slate-500 { color: #fff !important; }
+  html.theme-hc .border-slate-600, html.theme-hc .border-slate-700,
+  html.theme-hc .border-slate-800 { border-color: #fff !important; }
+  html.theme-hc .bg-indigo-500, html.theme-hc .bg-indigo-600, html.theme-hc .bg-emerald-500,
+  html.theme-hc .bg-emerald-600, html.theme-hc .bg-amber-500, html.theme-hc .bg-amber-600,
+  html.theme-hc .bg-rose-500, html.theme-hc .bg-rose-600 {
+    background: #ffe600 !important; color: #000 !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc thead, html.theme-hc th { background: #000 !important; color: #ffe600 !important; border-color: #fff !important; }
 
   /* Preset marketplace + wizard shared card styling. */
   .preset-card { transition: transform .12s, border-color .12s; }
@@ -5029,7 +5364,14 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 x-text="'Step ' + s"></span>
         </template>
       </div>
-      <div x-show="wizard.error" x-cloak class="text-xs text-rose-300 mb-2" x-text="wizard.error"></div>
+      <div x-show="wizard.error" x-cloak class="text-xs text-rose-300 mb-2 flex items-center gap-2">
+        <span x-text="wizard.error"></span>
+        <button x-show="wizard.canRetryUnique" @click="wizardRetryWithNewName()"
+                :disabled="wizard.submitting"
+                class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] disabled:opacity-50">
+          Retry with new name
+        </button>
+      </div>
 
       <div x-show="wizard.step === 1">
         <label class="block">
@@ -5139,6 +5481,30 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <button @click="submitQuickSort()" :disabled="quickSort.busy"
                 class="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
           <span x-text="quickSort.busy ? 'Sorting…' : 'Sort folder'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Apply-changes restart-confirm modal. Only opens when applying edits to
+       the ACTIVE running job would force a worker restart. -->
+  <div x-show="applyConfirm.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="applyConfirm.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-md w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Restart pipeline?</h3>
+        <button @click="applyConfirm.open = false" class="text-slate-400 hover:text-slate-100" aria-label="Close">✕</button>
+      </div>
+      <p class="text-sm text-slate-300 mb-4">
+        If you apply these changes, the current workers need to be restarted
+        to pick up the changes. Confirm you want to restart the pipeline?
+      </p>
+      <div class="flex justify-end gap-2">
+        <button @click="applyConfirm.open = false" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">Cancel</button>
+        <button @click="confirmApplyRestart()" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 rounded text-sm font-medium disabled:opacity-50">
+          <span x-text="applyConfirm.submitting ? 'Restarting…' : 'Confirm — apply + restart'"></span>
         </button>
       </div>
     </div>
@@ -5320,13 +5686,30 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </template>
         </select>
       </label>
+      <!-- Drop-zone: single source of truth is dryRun.file. Native <input> is
+           sr-only so its "No file chosen" text never surfaces; a labelled
+           button routes clicks to it. Preview swaps in once a file is set. -->
       <div class="border-2 border-dashed border-slate-700 rounded p-6 text-center text-xs text-slate-400 mb-3"
            @dragover.prevent="dryRun.dragOver = true" @dragleave.prevent="dryRun.dragOver = false"
            :class="dryRun.dragOver ? 'border-indigo-500' : ''"
            @drop.prevent="handleDryRunDrop($event)">
-        <div x-show="!dryRun.filename">Drop an image here, or</div>
-        <div x-show="dryRun.filename" class="font-mono" x-text="dryRun.filename"></div>
-        <input type="file" accept="image/*" @change="handleDryRunPick($event)" class="mt-2 text-xs"/>
+        <input x-ref="dryRunFileInput" type="file" accept="image/*"
+               @change="handleDryRunPick($event)" class="sr-only"/>
+        <template x-if="!dryRun.file">
+          <div>
+            <div class="mb-2">Drop an image here or click to browse</div>
+            <button type="button" @click="$refs.dryRunFileInput.click()"
+                    class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs">Choose file</button>
+          </div>
+        </template>
+        <template x-if="dryRun.file">
+          <div>
+            <img :src="dryRun.previewDataUrl" class="max-h-48 mx-auto rounded shadow" alt="uploaded"/>
+            <div class="mt-2 text-xs text-slate-300 font-mono truncate" x-text="dryRun.filename + ' · ' + formatDryRunSize(dryRun.file.size)"></div>
+            <button type="button" @click="clearDryRunFile()"
+                    class="mt-2 px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Clear</button>
+          </div>
+        </template>
       </div>
       <div class="flex justify-end gap-2 mb-3">
         <button @click="runDryRun()" :disabled="dryRun.busy || !dryRun.file"
@@ -6483,9 +6866,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="setFleetField(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
-                  <input type="checkbox" :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="fleetTest[idx] && !fleetTest[idx].testing"
@@ -6885,8 +7269,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="je.savedFlash"></span>
             <template x-if="currentJob === jobsActive && je.applyPending">
-              <button @click="applyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
-                title="Re-project + restart the running supervisor with these edits">Apply &amp; restart</button>
+              <button @click="requestApplyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
+                title="Flush pending edits and re-project the active job. Restarts the pipeline only if it is currently running.">Apply changes</button>
             </template>
           </div>
         </div>
@@ -7090,19 +7474,28 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
             <!-- Per-URL Test button (T3 #17). Extracts one URL per line, tests
                  each via /api/scrapers/gallery-dl/test-url, shows extractor + count. -->
-            <div class="mt-2 space-y-1">
-              <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
-                <div class="flex items-center gap-2 text-[11px]">
-                  <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
-                  <button @click="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
-                          class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                    <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
-                  </button>
-                  <span x-show="gdlTest[i]?.result"
-                        :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                        x-text="gdlTest[i]?.result?.ok ? (gdlTest[i]?.result?.extractor + ' · ~' + (gdlTest[i]?.result?.estimated_count ?? '?')) : (gdlTest[i]?.result?.error || 'failed')"></span>
-                </div>
-              </template>
+            <div class="mt-2">
+              <div x-show="effUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                <button @click.prevent="testGalleryDlAll()" :disabled="gdlTestAllBusy"
+                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                  <span x-text="gdlTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                </button>
+                <span class="text-[10px] text-slate-400" x-show="gdlTestAllBusy">serial — one at a time</span>
+              </div>
+              <div class="space-y-1">
+                <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
+                  <div class="flex items-center gap-2 text-[11px]">
+                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                    <button @click.prevent="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
+                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                      <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                    </button>
+                    <span x-show="gdlTest[i]?.result"
+                          :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                          x-text="gdlTest[i]?.result?.ok ? ('✓ ' + (gdlTest[i]?.result?.extractor || '?') + ' · ~' + (gdlTest[i]?.result?.sample_count ?? '?') + ' items') : ('✗ ' + (gdlTest[i]?.result?.error || gdlTest[i]?.result?.message || 'failed'))"></span>
+                  </div>
+                </template>
+              </div>
             </div>
           </label>
           <label class="block">
@@ -7126,10 +7519,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
-      <!-- yt-dlp (overridden wholesale as scrapers.yt_dlp). Mirrors gallery-dl. -->
+      <!-- Youtube scraper (yt-dlp under the hood — env vars + JSON keys keep
+           the historical name for backward compat). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">yt-dlp</h3>
+          <h3 class="font-semibold">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
           <div>
             <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
             <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
@@ -7140,7 +7534,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <label class="flex items-center gap-3 cursor-pointer">
             <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable yt-dlp for this job</span>
+            <span class="text-sm">Enable Youtube scraper for this job</span>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
@@ -7152,6 +7546,30 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
                       placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            <!-- Per-URL Test + Test-all buttons — mirror of gallery-dl. -->
+            <div class="mt-2">
+              <div x-show="ytUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                <button @click.prevent="testYtDlpAll()" :disabled="ytTestAllBusy"
+                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                  <span x-text="ytTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                </button>
+                <span class="text-[10px] text-slate-400" x-show="ytTestAllBusy">serial — one at a time</span>
+              </div>
+              <div class="space-y-1">
+                <template x-for="(u, i) in ytUrlsList()" :key="'ytu_'+i">
+                  <div class="flex items-center gap-2 text-[11px]">
+                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                    <button @click.prevent="testYtDlpUrl(u, i)" :disabled="ytTest[i]?.busy"
+                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                      <span x-text="ytTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                    </button>
+                    <span x-show="ytTest[i]?.result"
+                          :class="ytTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                          x-text="ytTest[i]?.result?.ok ? ('✓ ' + (ytTest[i]?.result?.extractor || '?') + (ytTest[i]?.result?.count_estimate != null ? (' · ~' + ytTest[i]?.result?.count_estimate + ' items') : (ytTest[i]?.result?.duration_sec != null ? (' · ' + ytTest[i]?.result?.duration_sec + 's') : ''))) : ('✗ ' + (ytTest[i]?.result?.error || 'failed'))"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
@@ -7425,19 +7843,19 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </label>
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
-            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">Youtube scraper enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }} <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="link-btn">supported sites ↗</a></span>
             <textarea :value="peUrls()" @change="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults + the global gallery-dl config. Any option from the gallery-dl docs.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
             <textarea :value="(presetEditor.cfg.scrapers.gallery_dl||{}).config_json||''" @change="peSet('scrapers.gallery_dl.config_json', $event.target.value)" rows="2" placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}' class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+            <label class="block"><span class="text-xs text-slate-400">Youtube scraper URLs{{ tip('One Youtube scraper (yt-dlp) supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
               <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
             <div class="grid grid-cols-1 gap-3">
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp frames per URL</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper frames per URL</span>
                 <input type="number" min="1" max="5000" :value="(presetEditor.cfg.scrapers.yt_dlp||{}).limit" @input="peSet('scrapers.yt_dlp.limit', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp cookies file</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper cookies file</span>
                 <input :value="(presetEditor.cfg.scrapers.yt_dlp||{}).cookies" @input="peSet('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
             </div>
           </div>
@@ -7506,7 +7924,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   </div>
                   <div class="grid md:grid-cols-12 gap-2 mt-1 items-center">
                     <input type="password" :value="w.api_key" @change="peSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)" autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-                    <label class="md:col-span-2 inline-flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/><span x-text="w.enabled ? 'On' : 'Off'"></span></label>
+                    <label class="md:col-span-2 flex items-center gap-2 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)"/><span class="text-xs text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span></label>
                     <div class="md:col-span-6 flex items-center gap-2 justify-end">
                       <span class="text-[11px] truncate max-w-[12rem]" x-show="peFleetTest[idx] && !peFleetTest[idx].testing" :class="peFleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="peFleetTest[idx]?.message"></span>
                       <button @click="peTestFleet(idx)" :disabled="!!peFleetTest[idx]?.testing" class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="peFleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span></button>
@@ -7633,15 +8051,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="gSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer select-none">
-                  <span class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
-                        :class="w.enabled ? 'bg-indigo-500' : 'bg-slate-600'">
-                    <input type="checkbox" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
-                      :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
-                    <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform pointer-events-none"
-                      :class="w.enabled ? 'translate-x-4' : 'translate-x-1'"></span>
-                  </span>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="globalFleetTest[idx] && !globalFleetTest[idx].testing"
@@ -7819,10 +8232,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">YT-DLP scraper{{ tip('Pull frames/clips from any site yt-dlp supports (YouTube, Vimeo, and 1000+ more). Enable, paste URLs (one per line or comma-separated), optionally cap per-URL items and point at a cookies.txt for gated content.') }}</h3>
+        <h3 class="font-semibold mb-3">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
         <div class="grid md:grid-cols-2 gap-4">
           <div class="self-center">
-            {{ toggle('YT_DLP_ENABLED', 'yt-dlp scraper enabled', 'Enable the yt-dlp video lane for the URLs below.') }}
+            {{ toggle('YT_DLP_ENABLED', 'Youtube scraper enabled', 'Enable the Youtube scraper (yt-dlp) video lane for the URLs below.') }}
           </div>
           <label class="block">
             <span class="text-xs text-slate-400">YT_DLP_LIMIT — max items per URL</span>
@@ -8810,11 +9223,51 @@ function dashboard() {
       })();
       try { await this._jeSaving; } finally { this._jeSaving = null; this.je.saving = false; }
     },
-    // Apply pending edits to the ACTIVE job: flush then re-project + restart once.
-    async applyActiveJob() {
+    // Apply-changes confirm modal. Shown only when the pipeline is running
+    // and applying will force a restart. Non-running jobs skip the modal
+    // entirely — apply is safe and non-disruptive.
+    applyConfirm: { open: false, slug: null, submitting: false },
+    // Entry point wired to the "Apply changes" button. Checks pipeline
+    // state and either applies immediately (not running) or opens the
+    // restart-confirm modal (running).
+    async requestApplyActiveJob() {
+      if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      const running = !!(this.status?.pipeline?.running);
+      if (!running) {
+        // Safe path: no workers to restart, just flush + re-project.
+        await this.applyActiveJob({ restart: false });
+        return;
+      }
+      this.applyConfirm = { open: true, slug: this.currentJob, submitting: false };
+    },
+    async confirmApplyRestart() {
+      if (this.applyConfirm.submitting) return;
+      this.applyConfirm.submitting = true;
+      try {
+        await this.applyActiveJob({ restart: true });
+        this.applyConfirm.open = false;
+      } finally { this.applyConfirm.submitting = false; }
+    },
+    // Apply pending edits to the ACTIVE job: flush + re-project. Restart is
+    // opt-in — callers pass { restart: true } only when the pipeline is
+    // currently running AND the user has confirmed the restart.
+    async applyActiveJob(opts) {
+      const restart = !!(opts && opts.restart);
       await this.flushJobSave();
       if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      // /activate re-projects env + categories. When the pipeline is running
+      // the supervisor picks up the new env on the next hot-reload cycle;
+      // for an explicit restart we hit /stop then /start via refresh.
       await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/activate', { method: 'POST' });
+      if (restart) {
+        try {
+          await fetch('/api/pipeline/stop', { method: 'POST' });
+          await fetch('/api/pipeline/start', { method: 'POST' });
+          this.notify('Applied and restarted', 'success');
+        } catch (e) { this.notify('Restart failed: ' + e, 'error'); }
+      } else {
+        this.notify('Changes applied', 'success');
+      }
       this.je.applyPending = false;
       this.loadJobs();
       this.refresh();
@@ -10033,7 +10486,7 @@ function dashboard() {
     wizard: {
       open: false, step: 1, subject: '', selectedPreset: '', presets: [],
       sourceMode: 'none', sourceUrl: '', sourceFolder: '',
-      submitting: false, error: '',
+      submitting: false, error: '', canRetryUnique: false,
     },
     presetsMeta: [],
     async loadPresetsMeta() {
@@ -10045,11 +10498,11 @@ function dashboard() {
     openWizard() {
       this.wizard = { ...this.wizard, open: true, step: 1, subject: '', selectedPreset: '',
                       presets: this.presetsMeta.slice(), sourceMode: 'none',
-                      sourceUrl: '', sourceFolder: '', error: '' };
+                      sourceUrl: '', sourceFolder: '', error: '', canRetryUnique: false };
       if (this.presetsMeta.length === 0) this.loadPresetsMeta().then(() => this.wizard.presets = this.presetsMeta.slice());
     },
     openWizardWithPreset(key) { this.openWizard(); this.$nextTick(() => { this.wizard.selectedPreset = key; this.wizard.step = 1; }); },
-    closeWizard() { this.wizard.open = false; },
+    closeWizard() { this.wizard.open = false; this.wizard.canRetryUnique = false; this.wizard.error = ''; },
     wizardCanAdvance() {
       if (this.wizard.step === 1) return this.wizard.subject.trim().length > 0;
       if (this.wizard.step === 2) return !!this.wizard.selectedPreset;
@@ -10057,48 +10510,83 @@ function dashboard() {
     },
     wizardNext() { if (this.wizardCanAdvance() && this.wizard.step < 3) this.wizard.step++; },
     wizardBack() { if (this.wizard.step > 1) this.wizard.step--; },
-    async wizardSubmit() {
+    // Mirror of pipeline_code/job_config.py::slugify — lowercases, collapses
+    // any non [a-z0-9_] to underscore, strips leading/trailing underscores.
+    _slugifyJs(name) {
+      return String(name || '').toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .replace(/_{2,}/g, '_');
+    },
+    // Given a desired name, return a name whose slug does not collide with
+    // any existing job. Appends -2, -3, ... until unique.
+    _uniqueJobName(name) {
+      const existing = new Set((this.jobsList || []).map(j => j.slug));
+      const baseSlug = this._slugifyJs(name);
+      if (!existing.has(baseSlug)) return name;
+      for (let i = 2; i < 500; i++) {
+        const candidate = name + ' ' + i;
+        if (!existing.has(this._slugifyJs(candidate))) return candidate;
+      }
+      // Fallback: random 4-char suffix.
+      return name + ' ' + Math.random().toString(36).slice(2, 6);
+    },
+    async wizardSubmit(_retrySalt) {
       if (!this.wizard.subject.trim() || !this.wizard.selectedPreset) {
         this.wizard.error = 'Subject and preset are required.'; return;
       }
       this.wizard.submitting = true; this.wizard.error = '';
       try {
-        const name = this.wizard.subject.trim().slice(0, 60);
+        // Refresh jobs list so uniqueness check sees the latest state.
+        try { await this.loadJobs(); } catch (e) {}
+        let desired = this.wizard.subject.trim().slice(0, 60);
+        if (_retrySalt) desired = desired + ' ' + _retrySalt;
+        const name = this._uniqueJobName(desired);
         const body = { name, preset: this.wizard.selectedPreset, subject: this.wizard.subject.trim() };
         const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
-        if (!r.ok || j.error) { this.wizard.error = j.error || ('HTTP ' + r.status); return; }
-        const slug = j.slug || j.job?.slug;
-        if (slug) {
-          if (this.wizard.sourceMode === 'url' && this.wizard.sourceUrl.trim()) {
-            try {
-              await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: 'scrapers.gallery_dl.enabled', value: true }),
-              });
-              await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: 'scrapers.gallery_dl.urls', value: [this.wizard.sourceUrl.trim()] }),
-              });
-            } catch (e) { /* best-effort */ }
-          } else if (this.wizard.sourceMode === 'folder' && this.wizard.sourceFolder.trim()) {
-            try {
-              await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: 'scrapers.local_imports', value: [
-                  { name: 'wizard', dir: this.wizard.sourceFolder.trim(), enabled: true }
-                ] }),
-              });
-            } catch (e) { /* best-effort */ }
-          }
-          try { await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', { method: 'POST' }); } catch (e) {}
-          this.notify('Job created: ' + name, 'success');
-          this.wizard.open = false;
-          await this.loadJobs();
-          this.openJob(slug);
+        if (!r.ok || j.error) {
+          this.wizard.error = j.error || ('HTTP ' + r.status);
+          this.wizard.canRetryUnique = true;   // reveal "Retry with new name"
+          return;
         }
+        const slug = j.slug || j.job?.slug;
+        if (!slug) { this.wizard.error = 'Server returned no slug'; return; }
+        // Close the modal immediately on the 201 — the URL/folder + activate
+        // dance below is best-effort and surfaces as toasts, not modal errors.
+        this.wizard.open = false;
+        this.wizard.canRetryUnique = false;
+        this.notify('Job created: ' + name, 'success');
+        try {
+          if (this.wizard.sourceMode === 'url' && this.wizard.sourceUrl.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.enabled', value: true }),
+            });
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.urls', value: [this.wizard.sourceUrl.trim()] }),
+            });
+          } else if (this.wizard.sourceMode === 'folder' && this.wizard.sourceFolder.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.local_imports', value: [
+                { name: 'wizard', dir: this.wizard.sourceFolder.trim(), enabled: true }
+              ] }),
+            });
+          }
+        } catch (e) { this.notify('Source override failed: ' + e, 'warn'); }
+        try { await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', { method: 'POST' }); }
+        catch (e) { this.notify('Activate failed: ' + e, 'warn'); }
+        try { await this.loadJobs(); } catch (e) {}
+        try { this.openJob(slug); } catch (e) {}
       } catch (e) { this.wizard.error = String(e); }
       finally { this.wizard.submitting = false; }
+    },
+    // Called by the "Retry with new name" button on duplicate errors.
+    wizardRetryWithNewName() {
+      const salt = Math.random().toString(36).slice(2, 6);
+      this.wizardSubmit(salt);
     },
 
     // ── T1 #3: preset marketplace ─────────────────────────────────────────
@@ -10190,15 +10678,42 @@ function dashboard() {
     },
 
     // ── T2 #9: vision dry-run ─────────────────────────────────────────────
-    dryRun: { open: false, workerId: '', file: null, filename: '', busy: false, result: null, error: '', dragOver: false },
+    // previewDataUrl is a blob: URL created via URL.createObjectURL — cheap,
+    // sync, and revoked on clear/replace to avoid leaking references.
+    dryRun: { open: false, workerId: '', file: null, filename: '', previewDataUrl: null, busy: false, result: null, error: '', dragOver: false },
+    _setDryRunPreview(f) {
+      // Revoke any prior object URL so we don't leak the previous file.
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = f;
+      this.dryRun.filename = f.name;
+      this.dryRun.previewDataUrl = URL.createObjectURL(f);
+    },
     handleDryRunPick(ev) {
       const f = ev.target.files?.[0];
-      if (f) { this.dryRun.file = f; this.dryRun.filename = f.name; }
+      if (f) { this._setDryRunPreview(f); }
     },
     handleDryRunDrop(ev) {
       this.dryRun.dragOver = false;
       const f = ev.dataTransfer.files?.[0];
-      if (f) { this.dryRun.file = f; this.dryRun.filename = f.name; }
+      if (f) { this._setDryRunPreview(f); }
+    },
+    clearDryRunFile() {
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = null;
+      this.dryRun.filename = '';
+      this.dryRun.previewDataUrl = null;
+      const inp = this.$refs.dryRunFileInput;
+      if (inp) inp.value = '';
+    },
+    formatDryRunSize(n) {
+      if (!Number.isFinite(n)) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(2) + ' MB';
     },
     async runDryRun() {
       if (!this.dryRun.file) return;
@@ -10333,6 +10848,7 @@ function dashboard() {
 
     // ── T3 #17: gallery-dl URL test ───────────────────────────────────────
     gdlTest: {},
+    gdlTestAllBusy: false,
     effUrlsList() {
       const raw = (this.effUrls && this.effUrls()) || '';
       return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
@@ -10341,13 +10857,64 @@ function dashboard() {
       this.gdlTest = { ...this.gdlTest, [idx]: { busy: true, result: null } };
       try {
         const cookies = this.je.eff?.scrapers?.gallery_dl?.cookies_file || undefined;
-        const body = { url, cookies_txt: cookies };
+        const configJson = this.je.eff?.scrapers?.gallery_dl?.config_json || undefined;
+        const body = { url, cookies_txt: cookies, config_json: configJson };
         const r = await fetch('/api/scrapers/gallery-dl/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
-        this.gdlTest = { ...this.gdlTest, [idx]: { busy: false, result: { ok: r.ok && !j.error, ...j } } };
+        // Normalise: scraper_test returns {ok, extractor, category, sample_urls,
+        // message, error}. Compute sample_count from sample_urls.length so the
+        // UI can display `extractor · ~N items`.
+        const sample_count = Array.isArray(j.sample_urls) ? j.sample_urls.length : null;
+        this.gdlTest = { ...this.gdlTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, sample_count, ...j },
+        } };
       } catch (e) {
         this.gdlTest = { ...this.gdlTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
       }
+    },
+    async testGalleryDlAll() {
+      if (this.gdlTestAllBusy) return;
+      this.gdlTestAllBusy = true;
+      try {
+        const urls = this.effUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          // Serial — polite to remote hosts; per-row state updates as we go.
+          await this.testGalleryDlUrl(urls[i], i);
+        }
+      } finally { this.gdlTestAllBusy = false; }
+    },
+
+    // ── yt-dlp / Youtube scraper URL test (mirrors gallery-dl). ───────────
+    ytTest: {},
+    ytTestAllBusy: false,
+    ytUrlsList() {
+      const raw = (this.ytUrls && this.ytUrls()) || '';
+      return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    },
+    async testYtDlpUrl(url, idx) {
+      this.ytTest = { ...this.ytTest, [idx]: { busy: true, result: null } };
+      try {
+        const body = { url };
+        const r = await fetch('/api/scrapers/yt-dlp/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        this.ytTest = { ...this.ytTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, ...j },
+        } };
+      } catch (e) {
+        this.ytTest = { ...this.ytTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
+      }
+    },
+    async testYtDlpAll() {
+      if (this.ytTestAllBusy) return;
+      this.ytTestAllBusy = true;
+      try {
+        const urls = this.ytUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          await this.testYtDlpUrl(urls[i], i);
+        }
+      } finally { this.ytTestAllBusy = false; }
     },
 
     // ── T3 #18: cookies converter ─────────────────────────────────────────

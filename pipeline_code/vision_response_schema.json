@@ -2,7 +2,7 @@
   "type": "json_schema",
   "json_schema": {
     "name": "VisionClassification",
-    "strict": "true",
+    "strict": true,
     "schema": {
       "type": "object",
       "additionalProperties": false,

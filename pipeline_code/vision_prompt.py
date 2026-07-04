@@ -786,7 +786,7 @@ def build_response_format() -> dict[str, Any]:
         "type": "json_schema",
         "json_schema": {
             "name": "VisionClassification",
-            "strict": "true",
+            "strict": True,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
