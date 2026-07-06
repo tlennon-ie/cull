@@ -70,7 +70,7 @@ dependencies = [
     "playwright>=1.49",
     "schedule>=1.2",
     "yt-dlp>=2026.6.9",
-    "huggingface_hub>=1.21.0",
+    "huggingface_hub>=1.22.0",
 ]
 
 [project.optional-dependencies]
