@@ -76,7 +76,7 @@ dependencies = [
 [project.optional-dependencies]
 # Cloud vision-provider SDKs (only needed for the cloud workers).
 cloud = [
-    "openai>=1.40",
+    "openai>=2.44.0",
     "anthropic>=0.112.0",
     "google-genai>=1.0",
 ]
