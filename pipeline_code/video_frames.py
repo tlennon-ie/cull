@@ -28,6 +28,7 @@ Design rules (load-bearing):
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -58,6 +59,57 @@ def is_enabled() -> bool:
     return os.environ.get("VIDEO_CLASSIFY_ENABLED", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+# ── backend availability probe ────────────────────────────────────────────────
+
+def available_backends() -> list[dict]:
+    """Which frame-extraction backends are importable + reachable on this host.
+
+    Returns a stable list (one entry per known backend, order preserved) with
+    shape ``[{"name": str, "available": bool, "reason": str | None}, ...]``.
+    A backend is *available* only if BOTH its Python module imports AND the
+    external dependency it wraps is actually usable — for ffmpeg that means
+    the ``ffmpeg`` binary is on ``PATH`` too (``ffmpeg-python`` shells out;
+    the import succeeds even when the binary is missing, which would have us
+    lie here). Never raises: any probe failure becomes ``available=False``
+    with the error text in ``reason`` so the caller can surface it verbatim.
+    """
+    out: list[dict] = []
+
+    # ffmpeg via ffmpeg-python: needs both the wheel and the binary on PATH.
+    ffmpeg_reason: str | None = None
+    ffmpeg_ok = False
+    try:
+        import ffmpeg  # type: ignore  # noqa: F401
+    except Exception as exc:  # noqa: BLE001 - optional dep absent
+        ffmpeg_reason = f"ffmpeg-python not installed ({exc.__class__.__name__})"
+    else:
+        if shutil.which("ffmpeg") is None:
+            ffmpeg_reason = "ffmpeg binary not found on PATH"
+        else:
+            ffmpeg_ok = True
+    out.append({"name": "ffmpeg", "available": ffmpeg_ok, "reason": ffmpeg_reason})
+
+    # scenedetect: single import is enough — the package pulls in OpenCV and
+    # will fail loudly at extraction time if the CV backend is broken.
+    scenedetect_reason: str | None = None
+    scenedetect_ok = False
+    try:
+        import scenedetect  # type: ignore  # noqa: F401
+        scenedetect_ok = True
+    except Exception as exc:  # noqa: BLE001 - optional dep absent
+        scenedetect_reason = f"scenedetect not installed ({exc.__class__.__name__})"
+    out.append({
+        "name": "scenedetect", "available": scenedetect_ok, "reason": scenedetect_reason,
+    })
+
+    return out
+
+
+def has_any_backend() -> bool:
+    """True when at least one frame-extraction backend is fully installed."""
+    return any(b["available"] for b in available_backends())
 
 
 # ── backends (each gated; each returns [] on any failure) ─────────────────────
@@ -234,7 +286,6 @@ def cleanup_frames(frames: list[Path]) -> None:
 
 def _rmdir_quietly(directory: Path) -> None:
     try:
-        import shutil
         shutil.rmtree(directory, ignore_errors=True)
     except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
         logger.debug("video_frames: temp cleanup failed for %s: %s", directory, exc)
@@ -244,6 +295,8 @@ __all__ = [
     "VIDEO_EXT",
     "is_video",
     "is_enabled",
+    "available_backends",
+    "has_any_backend",
     "extract_keyframes",
     "cleanup_frames",
 ]

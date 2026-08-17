@@ -3624,6 +3624,118 @@ def api_demo_status():
         return _err("failed to read demo status", exc, 500)
 
 
+# ── Native folder picker (localhost-only, first-run wizard) ─────────────────
+#
+# The dashboard runs on the user's own machine, so Tk is fine — but Tk plus
+# Flask's threaded dev server plus Windows dialog quirks (dismissal via Alt+F4
+# leaving Tk state alive) is fragile. We spawn a fresh subprocess whose only
+# job is opening the dialog: the parent stays responsive, Tk state can't leak,
+# and the subprocess timeout is our natural hang-guard. Serialised through a
+# module-level lock so two concurrent wizard clicks can't spawn two dialogs.
+
+_FOLDER_PICKER_LOCK = threading.Lock()
+_FOLDER_PICKER_TIMEOUT_SEC = 60
+
+
+_FOLDER_PICKER_CHILD = r"""
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception as exc:
+    sys.stderr.write('tkinter-unavailable:' + str(exc))
+    sys.exit(2)
+try:
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    root.update()
+    path = filedialog.askdirectory(
+        title='Choose a folder for cull to import', mustexist=True,
+    )
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    # Empty string = user cancelled.
+    if path:
+        sys.stdout.write(path)
+    sys.exit(0)
+except Exception as exc:
+    sys.stderr.write('picker-failed:' + str(exc))
+    sys.exit(3)
+"""
+
+
+@app.route("/api/system/folder-picker", methods=["POST"])
+def api_system_folder_picker():
+    """Open a native folder-picker dialog on the server (i.e. this machine).
+
+    Localhost-only: refuses non-loopback callers so a proxied/remote dashboard
+    can never trigger a dialog on the operator's desktop. Returns:
+        {ok, path, cancelled, error}
+    """
+    remote = (request.remote_addr or "").strip()
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "folder picker is available on localhost only"}), 403
+    # Try to serialise; if another picker is already open, tell the client
+    # cleanly rather than block a Flask worker.
+    if not _FOLDER_PICKER_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "a folder picker is already open"}), 409
+    try:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", _FOLDER_PICKER_CHILD],
+                capture_output=True, text=True,
+                timeout=_FOLDER_PICKER_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "folder picker timed out"}), 504
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": f"could not spawn picker: {exc}"}), 500
+
+        if proc.returncode == 2:
+            # tkinter missing: this is common on stripped-down Python builds.
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "tkinter not available; type the path manually"}), 200
+        if proc.returncode == 3:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or "picker failed").strip()}), 500
+        if proc.returncode != 0:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or f"picker exit {proc.returncode}").strip()}), 500
+
+        picked = (proc.stdout or "").strip()
+        if not picked:
+            return jsonify({"ok": False, "path": None, "cancelled": True, "error": None}), 200
+        return jsonify({"ok": True, "path": picked, "cancelled": False, "error": None})
+    finally:
+        _FOLDER_PICKER_LOCK.release()
+
+
+@app.route("/api/video/backend-status")
+def api_video_backend_status():
+    """Report which video-frame extraction backends are installed.
+
+    Consumed by the Settings tab to warn the operator when
+    ``VIDEO_CLASSIFY_ENABLED`` is on but no backend is available — the vision
+    worker would otherwise route every clip to Unclassified_Video, which is
+    correct but easy to miss.
+    """
+    try:
+        import video_frames
+        backends = video_frames.available_backends()
+        has_any = video_frames.has_any_backend()
+    except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return _err("failed to read video backend status", exc, 500)
+    return jsonify({"backends": backends, "has_any": has_any})
+
+
 # ── T1 #3 — Preset marketplace ────────────────────────────────────────────────
 
 def _community_preset_dir() -> Path:
@@ -5490,8 +5602,14 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                  class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
         </template>
         <template x-if="wizard.sourceMode === 'folder'">
-          <input x-model="wizard.sourceFolder" placeholder="C:\Users\you\Pictures\my-set"
-                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          <div class="flex gap-2 items-stretch mt-1">
+            <input x-model="wizard.sourceFolder" placeholder="C:\Users\you\Pictures\my-set"
+                   class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs"/>
+            <button @click="pickWizardFolder()" :disabled="wizard.pickingFolder"
+                    class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm shrink-0 disabled:opacity-50">
+              <span x-text="wizard.pickingFolder ? 'Opening…' : 'Browse…'"></span>
+            </button>
+          </div>
         </template>
       </div>
 
@@ -8293,6 +8411,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           {{ toggle('DESKTOP_NOTIFICATIONS', 'Desktop notifications', 'Fire a desktop toast when a job completes (best-effort; needs a notification backend installed).') }}
           {{ toggle('EMBEDDINGS_ENABLED', 'CLIP embeddings index', 'Build a CLIP embeddings index that powers near-duplicate detection and the “find similar” / balance tools.') }}
           {{ toggle('VIDEO_CLASSIFY_ENABLED', 'Classify video clips', 'Classify video clips from a sampled frame, not just still images.') }}
+          <template x-if="settings.VIDEO_CLASSIFY_ENABLED === 'true' && videoBackend.checked && !videoBackend.has_any">
+            <div class="md:col-span-2 rounded border border-amber-500/60 bg-amber-500/10 text-amber-200 text-xs p-2 leading-snug">
+              <div class="font-medium mb-1">Video mode is enabled but no frame-extraction backend is installed.</div>
+              <div>Install <code class="font-mono">ffmpeg</code> (recommended) or <code class="font-mono">scenedetect</code> to classify video clips. Meanwhile, scraped videos are held in <code class="font-mono">Unclassified_Video/</code> instead of being classified or deleted.</div>
+            </div>
+          </template>
           <label class="block md:col-span-2 mt-2">
             <span class="text-xs text-slate-400">WEBHOOK_URL{{ tip('POST a JSON event here when a job completes — fan out to Slack, Discord, or a home-automation hook. Leave blank to disable.') }}</span>
             <input x-model="settings.WEBHOOK_URL" placeholder="https://hooks.example.com/..."
@@ -8750,6 +8874,10 @@ function dashboard() {
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '', settingsBannerOk: true,
     settingsDirty: false, settingsErrors: {}, configImporting: false,
+    // Cached video-backend probe (used by the Settings VIDEO_CLASSIFY_ENABLED
+    // banner). `checked=false` on boot so the banner never flashes before the
+    // first probe returns.
+    videoBackend: { checked: false, has_any: true, backends: [] },
     providerTest: {},
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, local_sha: '', remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '', dirty: false, checking: false, checked: false },
@@ -9017,6 +9145,9 @@ function dashboard() {
       if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
         this.settings = out.settings;
       }
+      // Probe video-backend availability once (cheap, cached client-side) so
+      // the Settings banner has an answer to render when the user opens it.
+      if (!this.videoBackend.checked) this.loadVideoBackendStatus();
       this.lastRefresh = new Date().toLocaleTimeString();
     },
 
@@ -9064,8 +9195,11 @@ function dashboard() {
       if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newJob = { name: '', base_on: '', preset: '' };
       await this.loadJobs();
-      // The create response is the v2 job detail ({job:{slug,...}}).
-      this.openJob(j.job.job.slug);
+      // /api/jobs POST returns {success, job: _job_detail(job)} whose inner
+      // shape is {job:{slug,...}, effective, overrides, presets}. Walk both
+      // possible shapes so a flatter future response still works.
+      const slug = j.slug || j.job?.slug || j.job?.job?.slug;
+      if (slug) this.openJob(slug);
     },
     async activateJob(slug) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
@@ -9783,12 +9917,29 @@ function dashboard() {
         // Connection drop is expected once the dashboard restarts.
       }
     },
+    async loadVideoBackendStatus() {
+      // Cheap probe (importlib + shutil.which). Fire once, then again on Settings
+      // reload — the answer only changes when the operator installs a backend.
+      try {
+        const r = await fetch('/api/video/backend-status');
+        if (!r.ok) return;
+        const j = await r.json();
+        this.videoBackend = {
+          checked: true,
+          has_any: !!j.has_any,
+          backends: Array.isArray(j.backends) ? j.backends : [],
+        };
+      } catch (e) { /* leave stale; banner just won't update this cycle */ }
+    },
     async reloadSettings() {
       if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
                                   { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
       this.settingsDirty = false;
       this.settingsErrors = {};
+      // Re-probe so a freshly-installed ffmpeg is picked up without a full refresh.
+      this.videoBackend = { checked: false, has_any: true, backends: [] };
+      this.loadVideoBackendStatus();
       this.refresh();
     },
     async toggleVisionWorker(name, enabled) {
@@ -10583,6 +10734,7 @@ function dashboard() {
     wizard: {
       open: false, step: 1, subject: '', selectedPreset: '', presets: [],
       sourceMode: 'none', sourceUrl: '', sourceFolder: '',
+      pickingFolder: false,
       submitting: false, error: '', canRetryUnique: false,
     },
     presetsMeta: [],
@@ -10595,8 +10747,31 @@ function dashboard() {
     openWizard() {
       this.wizard = { ...this.wizard, open: true, step: 1, subject: '', selectedPreset: '',
                       presets: this.presetsMeta.slice(), sourceMode: 'none',
-                      sourceUrl: '', sourceFolder: '', error: '', canRetryUnique: false };
+                      sourceUrl: '', sourceFolder: '', pickingFolder: false,
+                      error: '', canRetryUnique: false };
       if (this.presetsMeta.length === 0) this.loadPresetsMeta().then(() => this.wizard.presets = this.presetsMeta.slice());
+    },
+    // Open a native folder-picker dialog on the server (localhost only). The
+    // Python side spawns a fresh subprocess for Tk, so this never blocks the
+    // Flask worker; the button just shows "Opening…" until the user picks or
+    // dismisses. Empty path == cancel (silent, no toast).
+    async pickWizardFolder() {
+      this.wizard.pickingFolder = true;
+      try {
+        const r = await fetch('/api/system/folder-picker', { method: 'POST' });
+        let j = {};
+        try { j = await r.json(); } catch (e) { j = { ok: false, error: 'bad response' }; }
+        if (j && j.cancelled) return;
+        if (!r.ok || !j || !j.ok) {
+          this.notify(j.error || 'Folder picker failed — type the path manually', 'warn');
+          return;
+        }
+        if (j.path) this.wizard.sourceFolder = j.path;
+      } catch (e) {
+        this.notify('Folder picker unavailable — type the path manually', 'warn');
+      } finally {
+        this.wizard.pickingFolder = false;
+      }
     },
     openWizardWithPreset(key) { this.openWizard(); this.$nextTick(() => { this.wizard.selectedPreset = key; this.wizard.step = 1; }); },
     closeWizard() { this.wizard.open = false; this.wizard.canRetryUnique = false; this.wizard.error = ''; },
@@ -10647,7 +10822,10 @@ function dashboard() {
           this.wizard.canRetryUnique = true;   // reveal "Retry with new name"
           return;
         }
-        const slug = j.slug || j.job?.slug;
+        // /api/jobs POST returns {success, job: _job_detail(job)} where
+        // _job_detail wraps the identity again under `.job`. Walk both shapes
+        // (and a hypothetical future flattening) so the wizard never trips.
+        const slug = j.slug || j.job?.slug || j.job?.job?.slug;
         if (!slug) { this.wizard.error = 'Server returned no slug'; return; }
         // Close the modal immediately on the 201 — the URL/folder + activate
         // dance below is best-effort and surfaces as toasts, not modal errors.
