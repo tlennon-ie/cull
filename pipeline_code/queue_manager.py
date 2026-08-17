@@ -59,13 +59,13 @@ SOURCES: dict[str, str] = {
 }
 
 _SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
-_QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif")
+_QUEUE_IMAGE_EXTS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 # Video containers the round-robin pop will surface ONLY when the video-
 # classification lane is enabled (VIDEO_CLASSIFY_ENABLED). Off by default so an
 # image-only pipeline never starts popping clips it can't classify — behaviour
 # stays byte-identical unless the flag is set. Mirrors video_frames.VIDEO_EXT /
 # export_profiles.VIDEO_EXT.
-_QUEUE_VIDEO_GLOBS = ("*.mp4", "*.mov", "*.webm", "*.mkv", "*.avi", "*.m4v")
+_QUEUE_VIDEO_EXTS: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 _DEFAULT_CACHE_TTL = 5.0  # seconds; see FSQueue docstring
 
 
@@ -77,26 +77,29 @@ def _video_classify_enabled() -> bool:
     )
 
 
-def _queue_globs() -> tuple[str, ...]:
-    """The media globs the queue pops, derived from the active media policy:
-    image extensions when the job accepts images, plus video extensions when it
-    accepts video AND the video-classification lane is enabled. Defaults mirror
-    the historical image/video globs, so an unconfigured pipeline is unchanged."""
+def _queue_exts() -> frozenset[str]:
+    """The media extensions the queue pops, derived from the active media policy.
+
+    Returns a lowercase-suffix ``frozenset`` (``.jpg`` etc). One
+    ``os.scandir`` + suffix-in-set check per source dir replaces the previous
+    N-glob-per-source scan — measurable win on directories with 10k+ items.
+    Defaults mirror the historical image/video set, so an unconfigured
+    pipeline is byte-identical."""
     try:
         import media_policy
-        globs: tuple[str, ...] = ()
+        exts: list[str] = []
         if media_policy.wants_image():
-            globs += tuple(f"*{e}" for e in media_policy.image_exts())
+            exts.extend(media_policy.image_exts())
         if media_policy.wants_video() and _video_classify_enabled():
-            globs += tuple(f"*{e}" for e in media_policy.video_exts())
-        if globs:
-            return globs
+            exts.extend(media_policy.video_exts())
+        if exts:
+            return frozenset(e.lower() for e in exts)
     except Exception:  # noqa: BLE001 - never let policy parsing break the queue
         pass
     # Fallback to the historical fixed set.
     if _video_classify_enabled():
-        return _QUEUE_IMAGE_GLOBS + _QUEUE_VIDEO_GLOBS
-    return _QUEUE_IMAGE_GLOBS
+        return frozenset(_QUEUE_IMAGE_EXTS + _QUEUE_VIDEO_EXTS)
+    return frozenset(_QUEUE_IMAGE_EXTS)
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
@@ -267,10 +270,39 @@ class FSQueue:
 
     @staticmethod
     def _images_in(source_dir: Path) -> list[Path]:
-        images: list[Path] = []
-        for pattern in _queue_globs():
-            images.extend(source_dir.glob(pattern))
-        return sorted(images)
+        """One scandir pass per source dir; suffix-filter against a frozenset.
+
+        Old code ran ``source_dir.glob(pattern)`` for each of 5-11 extension
+        globs — for a source with 10k queued items that meant 5-11 full directory
+        walks. ``os.scandir`` walks the dir once and returns ``DirEntry`` objects
+        whose ``.name`` is a fast attribute; the ``in`` check against a
+        ``frozenset`` is O(1). Sorted by name to keep the round-robin order
+        deterministic (mirrors the prior sorted-glob behaviour)."""
+        exts = _queue_exts()
+        try:
+            entries = os.scandir(source_dir)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            return []
+        matches: list[Path] = []
+        try:
+            for entry in entries:
+                # Fast-reject: suffix check on the raw name string (no Path alloc
+                # yet). ``entry.is_file()`` may stat, but only for candidates
+                # that already passed the suffix filter — the common case is
+                # cheap.
+                name = entry.name
+                dot = name.rfind(".")
+                if dot < 0 or name[dot:].lower() not in exts:
+                    continue
+                try:
+                    if entry.is_file():
+                        matches.append(Path(entry.path))
+                except OSError:
+                    continue
+        finally:
+            entries.close()
+        matches.sort(key=lambda p: p.name)
+        return matches
 
     def _build_round_robin_order(self) -> list[tuple[str, Path]]:
         source_images: dict[str, list[Path]] = {}
