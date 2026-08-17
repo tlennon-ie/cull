@@ -1682,6 +1682,86 @@ def api_presets_list():
     })
 
 
+_PRESET_THUMB_KEY_RE = re.compile(r"^[a-z0-9_]+$")
+_PRESET_THUMB_EXTS: tuple[tuple[str, str], ...] = (
+    (".gif", "image/gif"),
+    (".png", "image/png"),
+    (".jpg", "image/jpeg"),
+    (".jpeg", "image/jpeg"),
+    (".webp", "image/webp"),
+    (".svg", "image/svg+xml"),
+)
+
+
+def _preset_thumb_placeholder(key: str) -> bytes:
+    """Deterministic 16:9 SVG for a preset key that has no shipped or user
+    asset. Uses two hash-derived hues plus the key's first letter so every
+    preset still gets a distinct card without any external font/image."""
+    import colorsys
+    import hashlib
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    hue_a = (digest[0] / 255.0) * 360
+    hue_b = ((digest[1] / 255.0) * 360 + 55) % 360
+    r1, g1, b1 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_a / 360, 0.32, 0.55))
+    r2, g2, b2 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_b / 360, 0.18, 0.60))
+    letter = (key[:1] or "?").upper()
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        f"<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        f"<stop offset='0' stop-color='rgb({r1},{g1},{b1})'/>"
+        f"<stop offset='1' stop-color='rgb({r2},{g2},{b2})'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        f"<text x='160' y='112' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='88' font-weight='700' fill='#f8fafc' opacity='0.85'>{letter}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+@app.route("/api/presets/thumbnail")
+def api_presets_thumbnail():
+    """Return a preview image for a preset card.
+
+    Lookup order (traversal-safe, ``key`` restricted to ``^[a-z0-9_]+$``):
+      1. ``<repo>/presets/thumbnails/<key>.{gif,png,jpg,jpeg,webp,svg}``
+         (user-supplied override — highest priority so operators can restyle a
+         built-in preset without editing the shipped SVGs)
+      2. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
+      3. Deterministic gradient-with-letter SVG placeholder (any other key)
+    """
+    key = (request.args.get("key") or "").strip().lower()
+    if not _PRESET_THUMB_KEY_RE.match(key):
+        abort(400)
+    thumbnails_root = WORKSPACE_ROOT / "presets" / "thumbnails"
+    # Resolve then containment-check so a symlinked override can't escape the
+    # thumbnails directory even if someone plants one manually.
+    thumbnails_real = os.path.realpath(str(thumbnails_root))
+    for ext, mime in _PRESET_THUMB_EXTS:
+        candidate = thumbnails_root / f"{key}{ext}"
+        try:
+            candidate_real = os.path.realpath(str(candidate))
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if os.path.commonpath([candidate_real, thumbnails_real]) != thumbnails_real:
+                continue
+        except ValueError:
+            continue
+        return send_file(candidate, mimetype=mime, max_age=3600, conditional=True)
+    builtin = thumbnails_root / "_builtin" / f"{key}.svg"
+    if builtin.is_file():
+        return send_file(builtin, mimetype="image/svg+xml",
+                         max_age=3600, conditional=True)
+    return Response(
+        _preset_thumb_placeholder(key),
+        mimetype="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.route("/api/presets/descriptions")
 def api_presets_descriptions():
     """Return human-facing metadata for every built-in preset (T1 #2/#5).
@@ -2257,6 +2337,83 @@ def brand_asset(filename: str):
     return send_file(asset_path, mimetype="image/png", max_age=86400)
 
 
+_VIDEO_THUMB_EXTS: frozenset[str] = frozenset(
+    {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+)
+
+
+def _video_placeholder_svg(ext_label: str) -> bytes:
+    """Deterministic offline placeholder shown when no ffmpeg/scenedetect
+    backend is installed. Play triangle on a dark gradient with an extension
+    chip in the corner. No external references — safe under the strict CSP."""
+    label = (ext_label or "vid").lstrip(".").upper()[:4]
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#1e293b'/>"
+        "<stop offset='1' stop-color='#0f172a'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        "<circle cx='160' cy='90' r='34' fill='#0f172a' opacity='0.75'/>"
+        "<polygon points='150,72 150,108 184,90' fill='#e2e8f0'/>"
+        f"<rect x='268' y='150' width='42' height='20' rx='4' fill='#0f172a' opacity='0.85'/>"
+        f"<text x='289' y='164' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='11' font-weight='600' fill='#94a3b8'>{label}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
+    """Extract a single poster frame at ~1s via ffmpeg-python, cache the
+    resulting JPEG in ``data/thumb_cache/<sha>/<sha>_<size>_video.jpg`` and
+    return its path. Returns ``None`` on any failure so the caller can fall
+    back to the SVG placeholder without raising.
+    """
+    try:
+        # Reuse thumb_cache's content-hashed path so re-encoding the same
+        # (video, size) pair hits the disk cache on subsequent requests.
+        cache_file = thumb_cache.cache_path_for(video_path, size)
+    except (ValueError, FileNotFoundError):
+        return None
+    poster = cache_file.with_name(cache_file.stem + "_video.jpg")
+    if poster.exists():
+        try:
+            os.utime(poster, None)
+        except OSError:
+            pass
+        return poster
+    try:
+        import ffmpeg  # type: ignore
+    except Exception:
+        return None
+    tmp = poster.with_suffix(".tmp")
+    try:
+        (
+            ffmpeg
+            .input(str(video_path), ss=1.0)
+            .filter("scale", size, -2, force_original_aspect_ratio="decrease")
+            .output(str(tmp), vframes=1, format="image2", vcodec="mjpeg")
+            .global_args("-loglevel", "error")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - extraction is best-effort
+        logger.debug("video poster extract failed for %s: %s", video_path.name, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    if not tmp.exists() or tmp.stat().st_size == 0:
+        return None
+    try:
+        tmp.replace(poster)
+    except OSError:
+        return None
+    return poster
+
+
 @app.route("/api/thumbnail")
 def api_thumbnail():
     """Serve a JPEG thumbnail from the disk cache.
@@ -2265,6 +2422,10 @@ def api_thumbnail():
     to data/thumb_cache/<sha>/<sha>_<size>.jpg. Subsequent requests serve
     the file directly. send_file sets Last-Modified + ETag headers so
     browsers 304 on F5.
+
+    Videos: when ffmpeg is available we extract a poster frame at ~1s and cache
+    a JPEG; otherwise we return a deterministic SVG placeholder so the gallery
+    still shows *something* instead of a broken-image icon.
     """
     raw = request.args.get("path", "")
     try:
@@ -2274,6 +2435,30 @@ def api_thumbnail():
     path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
     if path is None or not path.exists():
         abort(404)
+    # Video branch — never let PIL see a container file (it raises on every
+    # video extension we accept). ffmpeg gives us a poster frame; if absent we
+    # ship an inline SVG so the UI degrades gracefully.
+    if path.suffix.lower() in _VIDEO_THUMB_EXTS:
+        try:
+            import video_frames
+            has_backend = video_frames.has_any_backend()
+        except Exception:
+            has_backend = False
+        if has_backend:
+            poster = _video_poster_jpeg(path, size)
+            if poster is not None:
+                return send_file(
+                    poster,
+                    mimetype="image/jpeg",
+                    max_age=0,
+                    conditional=True,
+                )
+        # Placeholder path — no disk write, no PIL, no external refs.
+        return Response(
+            _video_placeholder_svg(path.suffix),
+            mimetype="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
     try:
         cache_file = thumb_cache.get_or_create(path, size)
     except FileNotFoundError:
@@ -2550,8 +2735,12 @@ def _resolution_bucket(width: int, height: int) -> str:
 def _item_to_card(item: _SortedItem) -> dict[str, Any]:
     """Compact JSON representation used by gallery + stats payloads."""
     payload = item.payload
+    is_video = item.image_path.suffix.lower() in _VIDEO_THUMB_EXTS
     width, height = item.width, item.height
-    if width <= 0 or height <= 0:
+    # Videos never go through PIL — leave width/height at 0 so the resolution
+    # chip renders as "unknown" instead of triggering a decode attempt that
+    # would just fail (and pollute logs).
+    if not is_video and (width <= 0 or height <= 0):
         width, height = _resolve_image_dims(item.image_path)
         item.width, item.height = width, height
     return {
@@ -2572,6 +2761,12 @@ def _item_to_card(item: _SortedItem) -> dict[str, Any]:
         "height": height,
         "resolution_bucket": _resolution_bucket(width, height),
         "prompt_excerpt": (item.prompt_text or "").strip()[:240],
+        # Flags for a future UI pass (e.g. a play-icon overlay on gallery
+        # cards). Additive today — no template consumes them yet, but the
+        # payload contract is fixed here so the UI can adopt without a
+        # backend churn later.
+        "video": is_video,
+        "is_video": is_video,
     }
 
 
@@ -5190,6 +5385,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     --color-pill-fg: #cbd5e1;
   }
 
+  /* Sticky save-bar (used by Global Settings, Job Settings and the Preset
+     editor headers). Themed via CSS variables so the backdrop stays legible
+     across every theme without a hard-coded slate colour. color-mix gives us
+     a semi-transparent surface that still admits the blur behind it. */
+  .sticky-save-bar {
+    background: color-mix(in oklab, var(--color-bg) 92%, transparent);
+    border-bottom: 1px solid var(--color-border);
+  }
+
   /* Base defaults for elements. Dark uses the :root values; light overrides
      everything below. This block is theme-agnostic — it reads variables. */
   input, select, textarea {
@@ -7444,9 +7648,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          value with a 'global' chip (inherited) or 'reset ↺' (overridden).
          Auto-saves (debounced); the active job applies on leave / Apply. -->
     <section x-show="view === 'job' && active === 'jobSettings'" class="space-y-4">
-      <!-- Header: subject + preset + save/apply state. -->
+      <!-- Header: subject + preset + save/apply state. The header ROW itself is
+           sticky so the Apply/saved-flash indicator stays reachable while
+           scrolling long field lists; the card body scrolls under it. Themed
+           via CSS variables so the backdrop reads correctly in dark AND light. -->
       <div class="card rounded-xl p-5" x-show="je.loaded">
-        <div class="flex items-start justify-between gap-4 mb-3">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-start justify-between gap-4 backdrop-blur">
           <div>
             <h3 class="font-semibold" x-text="je.name"></h3>
             <p class="text-xs text-slate-400">
@@ -7858,17 +8066,22 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           <template x-for="p in presetsMeta" :key="'meta_'+p.key">
-            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded p-3 flex flex-col">
-              <div class="font-semibold text-sm" x-text="p.name"></div>
-              <div class="text-[11px] text-indigo-300 mb-1" x-text="p.headline"></div>
-              <div class="text-xs text-slate-300 flex-1" x-text="p.description"></div>
-              <div class="my-2">
-                <template x-for="uc in (p.use_cases || [])" :key="uc"><span class="use-case-chip" x-text="uc"></span></template>
-              </div>
-              <div class="mt-auto flex gap-2">
-                <button @click="openWizardWithPreset(p.key)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Use this preset</button>
-                <button @click="openPreset(p.key)" x-show="presetsList.includes(p.key)"
-                        class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(p.key)"
+                   :alt="p.name" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm" x-text="p.name"></div>
+                <div class="text-[11px] text-indigo-300 mb-1" x-text="p.headline"></div>
+                <div class="text-xs text-slate-300 flex-1" x-text="p.description"></div>
+                <div class="my-2">
+                  <template x-for="uc in (p.use_cases || [])" :key="uc"><span class="use-case-chip" x-text="uc"></span></template>
+                </div>
+                <div class="mt-auto flex gap-2">
+                  <button @click="openWizardWithPreset(p.key)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Use this preset</button>
+                  <button @click="openPreset(p.key)" x-show="presetsList.includes(p.key)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+                </div>
               </div>
             </div>
           </template>
@@ -7898,20 +8111,25 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div x-show="!community.loading && community.presets.length === 0" class="text-xs text-slate-500">No community presets available right now.</div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           <template x-for="p in community.presets" :key="p.url || p.filename">
-            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded p-3 flex flex-col">
-              <div class="font-semibold text-sm truncate" x-text="p.headline || p.filename"></div>
-              <div class="text-[11px] text-slate-400 truncate" x-text="p.filename || p.url"></div>
-              <div class="text-xs text-slate-300 mt-1 flex-1" x-text="p.description || ''"></div>
-              <div class="mt-2">
-                <template x-for="c in (p.categories || [])" :key="'ccat_'+c">
-                  <span class="use-case-chip" x-text="c"></span>
-                </template>
-              </div>
-              <div class="mt-2 flex gap-2">
-                <button @click="previewPresetUrl(p.url || p.download_url || p.filename)"
-                        class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Preview</button>
-                <button @click="installPresetFromUrl(p.url || p.download_url || p.filename, p.filename)"
-                        class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded">Install</button>
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(((p.filename||'').replace(/\.preset\.json$/,'').replace(/\.json$/,'').toLowerCase()))"
+                   :alt="p.headline || p.filename" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm truncate" x-text="p.headline || p.filename"></div>
+                <div class="text-[11px] text-slate-400 truncate" x-text="p.filename || p.url"></div>
+                <div class="text-xs text-slate-300 mt-1 flex-1" x-text="p.description || ''"></div>
+                <div class="mt-2">
+                  <template x-for="c in (p.categories || [])" :key="'ccat_'+c">
+                    <span class="use-case-chip" x-text="c"></span>
+                  </template>
+                </div>
+                <div class="mt-2 flex gap-2">
+                  <button @click="previewPresetUrl(p.url || p.download_url || p.filename)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Preview</button>
+                  <button @click="installPresetFromUrl(p.url || p.download_url || p.filename, p.filename)"
+                          class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded">Install</button>
+                </div>
               </div>
             </div>
           </template>
@@ -7965,9 +8183,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
-      <!-- Preset editor -->
+      <!-- Preset editor. Sticky header keeps the Close button + savedFlash
+           indicator reachable while scrolling through long category / rules
+           blocks. Same CSS-variable backdrop as the other sticky save-bars. -->
       <div class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
-        <div class="flex items-center justify-between mb-3">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-center justify-between backdrop-blur">
           <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="presetEditor.savedFlash"></span>
@@ -8138,8 +8359,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       @input="markSettingsDirty()" @change="markSettingsDirty()">
 
       <!-- Sticky action bar: Save/Reload for the .env form, always reachable at
-           the top of the page (and pinned while scrolling). -->
-      <div class="sticky top-0 z-20 py-3 bg-slate-950/90 backdrop-blur border-b border-slate-800
+           the top of the page (and pinned while scrolling). Uses CSS variables
+           so the backdrop stays legible in dark AND light themes; the previous
+           hard-coded slate-950 looked wrong on the sand-coloured light theme. -->
+      <div class="sticky-save-bar sticky top-0 z-40 py-3 backdrop-blur
                   flex items-start justify-between gap-4">
         <div>
           <h3 class="font-semibold">Global settings</h3>

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#cbd5e1"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" fill="url(#bg)"/>
+  <ellipse cx="160" cy="140" rx="90" ry="10" fill="#94a3b8" opacity="0.4"/>
+  <g>
+    <polygon points="110,60 210,60 240,80 140,80" fill="#e2e8f0" stroke="#475569" stroke-width="1"/>
+    <polygon points="110,60 140,80 140,140 110,120" fill="#cbd5e1" stroke="#475569" stroke-width="1"/>
+    <polygon points="210,60 240,80 240,140 210,120" fill="#94a3b8" stroke="#475569" stroke-width="1"/>
+    <polygon points="140,80 240,80 240,140 140,140" fill="#f1f5f9" stroke="#475569" stroke-width="1"/>
+    <line x1="110" y1="60" x2="140" y2="80" stroke="#475569" stroke-width="1"/>
+    <line x1="210" y1="60" x2="240" y2="80" stroke="#475569" stroke-width="1"/>
+  </g>
+  <g transform="translate(200 40) rotate(-14)">
+    <polygon points="0,0 34,0 44,10 34,20 0,20" fill="#4f46e5"/>
+    <circle cx="6" cy="10" r="2.6" fill="#f8fafc"/>
+  </g>
+</svg>

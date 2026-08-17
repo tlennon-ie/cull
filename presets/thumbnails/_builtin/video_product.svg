@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#94a3b8"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" fill="url(#bg)"/>
+  <ellipse cx="160" cy="140" rx="80" ry="10" fill="#334155" opacity="0.35"/>
+  <g transform="translate(160 90)">
+    <g fill="none" stroke="#4f46e5" stroke-width="2" opacity="0.7">
+      <polygon points="-40,-20 40,-20 55,-6 -25,-6" stroke-dasharray="4 3"/>
+      <polygon points="-40,-20 -25,-6 -25,32 -40,18" stroke-dasharray="4 3"/>
+      <polygon points="40,-20 55,-6 55,32 40,18" stroke-dasharray="4 3"/>
+    </g>
+    <polygon points="-40,-20 40,-20 55,-6 -25,-6" fill="#c7d2fe" stroke="#4338ca" stroke-width="1.4"/>
+    <polygon points="-40,-20 -25,-6 -25,32 -40,18" fill="#a5b4fc" stroke="#4338ca" stroke-width="1.4"/>
+    <polygon points="40,-20 55,-6 55,32 40,18" fill="#818cf8" stroke="#4338ca" stroke-width="1.4"/>
+    <polygon points="-25,-6 55,-6 55,32 -25,32" fill="#eef2ff" stroke="#4338ca" stroke-width="1.4"/>
+  </g>
+  <g fill="none" stroke="#4f46e5" stroke-width="2" opacity="0.9">
+    <path d="M 40 90 A 120 26 0 0 1 280 90" stroke-dasharray="5 4"/>
+    <polygon points="275,84 288,90 275,96" fill="#4f46e5"/>
+  </g>
+</svg>
