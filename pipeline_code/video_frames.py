@@ -45,6 +45,57 @@ VIDEO_EXT: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 _FRAME_TMP_PREFIX = "cull_frames_"
 
 
+# ── ffmpeg binary resolution ──────────────────────────────────────────────────
+#
+# ``ffmpeg-python`` shells out to the ``ffmpeg`` executable, so ``import ffmpeg``
+# succeeding is not enough — we also need a binary we can invoke. Preference:
+#   1. ``FFMPEG_BINARY`` env var (operator override, absolute path expected)
+#   2. ``shutil.which("ffmpeg")``   (system install on PATH)
+#   3. ``imageio_ffmpeg.get_ffmpeg_exe()`` (the pip-bundled static binary — the
+#      reason the base install now Just Works on Windows/macOS with no chocolatey
+#      or Homebrew step)
+# Resolved lazily and cached — the answer only changes across process restarts
+# (installing a new binary or setting the env var requires a restart anyway).
+_FFMPEG_BIN_CACHE: tuple[str | None, str | None] | None = None
+
+
+def _resolve_ffmpeg_bin() -> tuple[str | None, str | None]:
+    """Return ``(binary_path, source_label)`` for the ffmpeg executable to use.
+
+    ``source_label`` is one of ``"env-override"`` / ``"system"`` /
+    ``"imageio-ffmpeg"`` when a binary is found, else ``None`` alongside a
+    ``None`` binary path. Cached module-side after the first call.
+    """
+    global _FFMPEG_BIN_CACHE
+    if _FFMPEG_BIN_CACHE is not None:
+        return _FFMPEG_BIN_CACHE
+
+    override = os.environ.get("FFMPEG_BINARY", "").strip()
+    if override and os.path.isfile(override):
+        _FFMPEG_BIN_CACHE = (override, "env-override")
+        return _FFMPEG_BIN_CACHE
+
+    system = shutil.which("ffmpeg")
+    if system:
+        _FFMPEG_BIN_CACHE = (system, "system")
+        return _FFMPEG_BIN_CACHE
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:  # noqa: BLE001 - optional dep absent OR download failed
+        logger.debug("video_frames: imageio-ffmpeg unavailable: %s", exc)
+        bundled = None
+    if bundled and os.path.isfile(bundled):
+        # Expose to child processes / other libs that honour the env var.
+        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", bundled)
+        _FFMPEG_BIN_CACHE = (bundled, "imageio-ffmpeg")
+        return _FFMPEG_BIN_CACHE
+
+    _FFMPEG_BIN_CACHE = (None, None)
+    return _FFMPEG_BIN_CACHE
+
+
 def is_video(path: Path) -> bool:
     """True when ``path`` has a known video container extension."""
     return path.suffix.lower() in VIDEO_EXT
@@ -77,19 +128,33 @@ def available_backends() -> list[dict]:
     """
     out: list[dict] = []
 
-    # ffmpeg via ffmpeg-python: needs both the wheel and the binary on PATH.
+    # ffmpeg via ffmpeg-python: needs both the wheel and a resolvable binary.
+    # The binary can come from PATH, the FFMPEG_BINARY env override, OR the
+    # imageio-ffmpeg fallback (a pip-bundled static build). ``source`` tells
+    # the caller which one so the dashboard can hide the "no backend" banner
+    # when we're using the bundled binary — it IS installed, just via pip.
     ffmpeg_reason: str | None = None
     ffmpeg_ok = False
+    ffmpeg_source: str | None = None
     try:
         import ffmpeg  # type: ignore  # noqa: F401
     except Exception as exc:  # noqa: BLE001 - optional dep absent
         ffmpeg_reason = f"ffmpeg-python not installed ({exc.__class__.__name__})"
     else:
-        if shutil.which("ffmpeg") is None:
-            ffmpeg_reason = "ffmpeg binary not found on PATH"
+        bin_path, source = _resolve_ffmpeg_bin()
+        if bin_path is None:
+            ffmpeg_reason = (
+                "ffmpeg binary not found on PATH and imageio-ffmpeg not installed"
+            )
         else:
             ffmpeg_ok = True
-    out.append({"name": "ffmpeg", "available": ffmpeg_ok, "reason": ffmpeg_reason})
+            ffmpeg_source = source
+    out.append({
+        "name": "ffmpeg",
+        "available": ffmpeg_ok,
+        "reason": ffmpeg_reason,
+        "source": ffmpeg_source,
+    })
 
     # scenedetect: single import is enough — the package pulls in OpenCV and
     # will fail loudly at extraction time if the CV backend is broken.
@@ -101,7 +166,10 @@ def available_backends() -> list[dict]:
     except Exception as exc:  # noqa: BLE001 - optional dep absent
         scenedetect_reason = f"scenedetect not installed ({exc.__class__.__name__})"
     out.append({
-        "name": "scenedetect", "available": scenedetect_ok, "reason": scenedetect_reason,
+        "name": "scenedetect",
+        "available": scenedetect_ok,
+        "reason": scenedetect_reason,
+        "source": "pip" if scenedetect_ok else None,
     })
 
     return out
@@ -126,11 +194,23 @@ def _extract_with_ffmpeg(video_path: Path, max_frames: int, out_dir: Path) -> li
     except Exception:  # noqa: BLE001 - optional dep absent
         return []
 
+    # Resolve the ffmpeg binary once (system PATH, env override, or the
+    # imageio-ffmpeg bundled build). ``None`` means no binary is available at
+    # all — ffmpeg-python would try to invoke bare ``ffmpeg`` and crash, so we
+    # bail early. When we DID resolve one, pass it via ``cmd=`` so the wrapper
+    # doesn't rely on PATH containing the same binary.
+    bin_path, _source = _resolve_ffmpeg_bin()
+    if bin_path is None:
+        logger.debug("video_frames: no ffmpeg binary resolvable for %s", video_path)
+        return []
+    probe_kwargs = {"cmd": bin_path}
+    run_kwargs = {"cmd": bin_path, "capture_stdout": True, "capture_stderr": True}
+
     # Probe duration so we can seek to representative offsets. A probe failure is
     # non-fatal — we fall back to grabbing from the very start (offset 0).
     duration = 0.0
     try:
-        info = ffmpeg.probe(str(video_path))
+        info = ffmpeg.probe(str(video_path), **probe_kwargs)
         raw = (info.get("format") or {}).get("duration")
         if raw:
             duration = float(raw)
@@ -148,7 +228,7 @@ def _extract_with_ffmpeg(video_path: Path, max_frames: int, out_dir: Path) -> li
                 .output(str(out_path), vframes=1, format="image2", vcodec="mjpeg")
                 .global_args("-loglevel", "error")
                 .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
+                .run(**run_kwargs)
             )
         except Exception as exc:  # noqa: BLE001 - per-frame failure shouldn't abort the rest
             logger.debug("video_frames: ffmpeg frame at %.2fs failed for %s: %s",
@@ -299,4 +379,5 @@ __all__ = [
     "has_any_backend",
     "extract_keyframes",
     "cleanup_frames",
+    "_resolve_ffmpeg_bin",
 ]
