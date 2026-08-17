@@ -2495,6 +2495,63 @@ def api_prompt():
         abort(404)
 
 
+# ── raw media serving ─────────────────────────────────────────────────────────
+#
+# ``/api/thumbnail`` degrades videos to a JPEG poster / SVG placeholder because
+# it always returns an *image*. When the operator opens the detail modal for a
+# video item we need the actual clip so the ``<video>`` element can play it.
+# This endpoint serves the raw file with proper MIME + Range support so the
+# browser can seek/buffer without loading the whole file into memory.
+
+_MEDIA_MIME_BY_EXT: dict[str, str] = {
+    # Videos — the whole point of this endpoint.
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    # Images — fall-through so the modal can share a single URL scheme when it
+    # wants the full-fidelity original instead of a re-encoded thumbnail.
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".avif": "image/avif",
+}
+
+
+@app.route("/api/media/raw")
+def api_media_raw():
+    """Serve the raw media file at ``?path=<abs_path>`` with Range support.
+
+    Guarded by the same ``safe_inside`` sanitiser as ``/api/thumbnail`` so
+    nothing outside the queue/sorted trees is reachable. Uses Flask's
+    ``send_file(..., conditional=True)`` which handles If-Modified-Since AND
+    HTTP Range requests natively — that's what makes the ``<video>`` element
+    in the detail modal seek/buffer instead of downloading the whole clip.
+    ``Accept-Ranges: bytes`` is set explicitly so proxies that strip Flask's
+    header don't disable seeking.
+    """
+    raw = request.args.get("path", "")
+    path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if path is None or not path.exists() or not path.is_file():
+        abort(404)
+    mimetype = _MEDIA_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    response = send_file(
+        path,
+        mimetype=mimetype,
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["Accept-Ranges"] = "bytes"
+    return response
+
+
 @app.route("/api/logs/history")
 def api_logs_history():
     """Historical log of every classification, newest first.
@@ -8931,11 +8988,22 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
       <div class="grid lg:grid-cols-2 gap-4 overflow-hidden">
         <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto relative">
-          <img :src="modal.imageUrl" :alt="modal.name"
-               class="max-w-full max-h-[75vh] object-contain"
-               :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          <template x-if="!modal.isVideo">
+            <img :src="modal.imageUrl" :alt="modal.name"
+                 class="max-w-full max-h-[75vh] object-contain"
+                 :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          </template>
+          <template x-if="modal.isVideo">
+            <video :src="modalVideoSrc()" controls preload="metadata" playsinline
+                   class="max-w-full max-h-[75vh]"
+                   :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }">
+              Your browser does not support HTML5 video.
+            </video>
+          </template>
+          <!-- NSFW reveal only for still-image modals: overlaying a click target
+               on top of the <video> would swallow the play-button click. -->
           <span class="nsfw-eye" style="background:rgba(15,23,42,0.55);"
-                x-show="shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
+                x-show="!modal.isVideo && shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
                 @click="revealNsfw({ path: modal.imageUrl })" title="Reveal NSFW">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
@@ -10249,9 +10317,31 @@ function dashboard() {
       this.refresh();
     },
 
+    // URL for the <video> element in the detail modal. Uses ``modal.path``
+    // (set by every openModalFrom*() variant) when available, otherwise falls
+    // back to parsing ``path=<encoded>`` out of the thumbnail URL — the shape
+    // the /api/thumbnail endpoint uses. /api/media/raw serves the raw file with
+    // Range support, which is what makes <video> seek/buffer smoothly.
+    modalVideoSrc() {
+      let p = this.modal && this.modal.path ? this.modal.path : '';
+      if (!p && this.modal && this.modal.imageUrl) {
+        try {
+          const u = new URL(this.modal.imageUrl, window.location.origin);
+          p = u.searchParams.get('path') || '';
+        } catch (_) { /* malformed URL — leave blank so <video> shows an empty state */ }
+      }
+      if (!p) return '';
+      return '/api/media/raw?path=' + encodeURIComponent(p);
+    },
+
     async openModal({imageUrl, promptUrl, name, source, category, summary, path, meta}) {
       // Remember the trigger so we can restore focus on close (a11y).
       this.modalReturnFocus = document.activeElement;
+      // Detect a video item from the filename/path so the modal template
+      // renders <video> instead of <img>. Extension check mirrors the
+      // server-side _VIDEO_THUMB_EXTS set — keep in lockstep if that grows.
+      const videoRe = /\.(mp4|webm|mov|mkv|avi|m4v)(\?|$)/i;
+      const isVideo = videoRe.test(name || '') || videoRe.test(path || '');
       this.modal = {
         open: true, imageUrl,
         prompt: 'Loading...', promptOriginal: '',
@@ -10259,6 +10349,7 @@ function dashboard() {
         name: name || '', source: source || '', category: category || '',
         summary: summary || '', path: path || '', meta: meta || null,
         caption: '', captionOriginal: '', captionSaving: false, captionFlash: '',
+        isVideo,
       };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
@@ -10313,6 +10404,11 @@ function dashboard() {
       this.modal.open = false;
       this.modal.editing = false;
       this.modal.savedFlash = '';
+      // Flip isVideo=false so the <template x-if="modal.isVideo"> unmounts the
+      // <video> element entirely — otherwise Alpine's x-show on the outer
+      // container only hides it and playback (and audio!) continues in the
+      // background until the modal is reopened.
+      this.modal.isVideo = false;
       // Restore focus to whatever opened the modal (a11y).
       if (this.modalReturnFocus && this.modalReturnFocus.focus) {
         try { this.modalReturnFocus.focus(); } catch (_) { /* element gone */ }

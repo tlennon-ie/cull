@@ -71,6 +71,11 @@ dependencies = [
     "schedule>=1.2",
     "yt-dlp>=2026.6.9",
     "huggingface_hub>=1.21.0",
+    # Bundled static ffmpeg binary (~5MB, cross-platform). Base-installed so
+    # videos work out of the box: dashboard playback + poster frames, and the
+    # video-classify lane (paired with the [video] extra) can extract frames
+    # with zero system-ffmpeg install. See video_frames._resolve_ffmpeg_bin().
+    "imageio-ffmpeg>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -81,9 +86,14 @@ cloud = [
     "google-genai>=1.0",
 ]
 # Video lane — frame extraction / scene detection.
+# ``imageio-ffmpeg`` is already in the base dependencies (the bundled binary is
+# small enough to ship by default and lets ``ffmpeg-python`` work without a
+# system install); it is also listed here so ``pip install .[video]`` still
+# pulls it explicitly when the base requirements are ignored.
 video = [
     "scenedetect>=0.7",
     "ffmpeg-python>=0.2",
+    "imageio-ffmpeg>=0.4",
 ]
 # Embeddings / aesthetic prefilter / ML.
 ml = [
