@@ -31,9 +31,51 @@ from __future__ import annotations
 
 import copy
 
-__all__ = ["DEFAULT_PRESET", "PRESET_NAMES", "builtin_library"]
+__all__ = [
+    "DEFAULT_PRESET", "PRESET_NAMES", "PRESET_DESCRIPTIONS", "PRESET_TAGS",
+    "builtin_library",
+]
 
 DEFAULT_PRESET = "default"
+
+
+# One-line, use-case-oriented descriptions for the shipped presets. Surfaced
+# in the dashboard's job-create form so users can pick without opening docs.
+# Keep each ≤ 90 chars — they render in a single line inside a card.
+PRESET_DESCRIPTIONS: dict[str, str] = {
+    "default": "General dataset triage — keeps quality wins, sends the maybes to review.",
+    "aerial_drone": "Drone / satellite imagery — rejects ground-level shots, penalises haze.",
+    "underwater_marine": "Below-the-surface scenes — rewards visibility, penalises backscatter.",
+    "wildlife_macro": "Wildlife + macro-nature — rewards eye sharpness, penalises captivity.",
+    "product_ecommerce": "Product / e-commerce photography — clean packshots vs lifestyle.",
+    "anime_illustration": "Anime + illustration only — drops photoreal, keeps clean linework.",
+    "photoreal_portrait": "Original influencer/portrait taxonomy — real humans with strict gates.",
+    "quality_only": "Topic-agnostic quality triage — pure OVR bucketing (Top/Mid/Low).",
+    "video_default": "General video clip triage — rewards intentional motion, drops static.",
+    "video_cinematic": "Cinematic film-look — dolly/crane/tracking, penalises phone/webcam.",
+    "video_anime": "Animated 2D motion — smooth in-betweens, drops live-action footage.",
+    "video_product": "Product turntables / demos — clean orbits and controlled push-ins.",
+    "video_nature": "Nature b-roll — drone, timelapse, slow-mo — rewards coherent motion.",
+}
+
+
+# Category tags for grouping/filtering presets in the UI. Each preset can carry
+# multiple tags; the dashboard uses these to render tag chips + a quick filter.
+PRESET_TAGS: dict[str, tuple[str, ...]] = {
+    "default": ("general", "photo"),
+    "aerial_drone": ("photo", "landscape"),
+    "underwater_marine": ("photo", "landscape"),
+    "wildlife_macro": ("photo", "nature"),
+    "product_ecommerce": ("photo", "product"),
+    "anime_illustration": ("art", "anime"),
+    "photoreal_portrait": ("photo", "portrait"),
+    "quality_only": ("general", "photo"),
+    "video_default": ("video", "general"),
+    "video_cinematic": ("video", "cinematic"),
+    "video_anime": ("video", "anime"),
+    "video_product": ("video", "product"),
+    "video_nature": ("video", "nature"),
+}
 
 
 # ── shared judgement-rule preamble ───────────────────────────────────────────

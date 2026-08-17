@@ -1672,10 +1672,20 @@ def _valid_preset_name(name: str) -> bool:
 @app.route("/api/presets")
 def api_presets_list():
     lib = job_config.list_presets()
+    # Surface the builtin preset descriptions + tag chips so the onboarding
+    # form doesn't have to guess what each preset is for. Names not shipped
+    # by cull (user-created / imported presets) return empty entries.
+    try:
+        from builtin_presets import PRESET_DESCRIPTIONS, PRESET_TAGS
+    except Exception:  # pragma: no cover - defensive
+        PRESET_DESCRIPTIONS, PRESET_TAGS = {}, {}
+    names = sorted(lib.get("presets", {}).keys())
     return jsonify({
         "default": lib.get("default", "default"),
-        "presets": sorted(lib.get("presets", {}).keys()),
+        "presets": names,
         "builtins": sorted(job_config.builtin_preset_names()),
+        "descriptions": {n: PRESET_DESCRIPTIONS.get(n, "") for n in names},
+        "tags": {n: list(PRESET_TAGS.get(n, ())) for n in names},
     })
 
 
@@ -3696,7 +3706,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="active = tab.id; sidebarOpen = false"
             class="w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            x-text="tab.label"></button>
+            :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -3705,7 +3715,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     <template x-if="view === 'job'">
       <div class="space-y-1">
         <button @click="backToJobs()"
-          class="w-full text-left px-3 py-2 rounded text-sm text-slate-300 hover:bg-slate-800 transition flex items-center gap-2">
+          class="w-full text-left px-3 py-2 rounded text-sm text-slate-300 hover:bg-slate-800 transition flex items-center gap-2"
+          title="Back to all jobs">
           <span aria-hidden="true">←</span> Jobs
         </button>
         <div class="px-3 py-1 text-xs text-slate-500 truncate" x-text="currentJob"></div>
@@ -3713,7 +3724,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="active = tab.id; sidebarOpen = false"
             class="w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            x-text="tab.label"></button>
+            :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -3764,10 +3775,64 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     </header>
 
     <!-- JOBS LANDING ──────────────────────────────────────────────────────
-         The first thing the user sees: a grid of job cards + a New Job card.
+         The first thing the user sees. On a fresh install the empty-state
+         hero is the sole surface; once jobs exist we surface the run-queue
+         strip + a grid of job cards + the New Job composer.
          Each job is its own curation target; activating one makes the
          supervisor run it. -->
     <section x-show="view === 'jobs' && active === 'jobs'" class="space-y-4">
+
+      <!-- First-run welcome hero: only when there are zero jobs on disk AND
+           the user hasn't dismissed it. Dismissal persists across reloads
+           (localStorage key `cull_welcome_dismissed`). Reappears if the user
+           deletes every job — that's on purpose, they're back to zero. -->
+      <template x-if="!jobsLoading && jobsList.length === 0 && !welcome.dismissed">
+        <div class="card rounded-xl p-6 relative overflow-hidden">
+          <button @click="dismissWelcome()" aria-label="Dismiss welcome"
+            class="absolute top-3 right-3 text-slate-400 hover:text-slate-100 text-lg leading-none">✕</button>
+          <div class="flex items-start gap-4">
+            <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64" class="shrink-0 hidden sm:block"/>
+            <div class="flex-1 min-w-0">
+              <div class="text-xs uppercase tracking-wider text-amber-300 mb-1">Welcome to cull</div>
+              <h3 class="font-brand text-2xl font-medium tracking-tight">Curate an AI image dataset in three steps.</h3>
+              <ol class="mt-3 grid gap-3 md:grid-cols-3 text-sm">
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">1. Pick a starting preset</div>
+                  <div class="text-slate-300 mt-1">Aerial, wildlife, product, anime, video… 13 shipped, plus your own.</div>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">2. Point it at sources</div>
+                  <div class="text-slate-300 mt-1">Reddit, X, Civitai, Discord, gallery-dl URLs, or your local folder.</div>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">3. Start the pipeline</div>
+                  <div class="text-slate-300 mt-1">Vision workers classify each image against your taxonomy — you keep the wins.</div>
+                </li>
+              </ol>
+              <div class="mt-4 flex flex-wrap items-center gap-2">
+                <button @click="focusNewJob()"
+                  class="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-900 rounded text-sm font-semibold">
+                  Create your first job
+                </button>
+                <button @click="active='presets'"
+                  class="px-3 py-2 bg-slate-800 hover:bg-slate-700 rounded text-sm">
+                  Browse presets
+                </button>
+                <button @click="showShortcuts = true"
+                  class="px-3 py-2 bg-slate-800 hover:bg-slate-700 rounded text-sm"
+                  title="Press ? at any time">
+                  Keyboard shortcuts
+                </button>
+                <span class="text-[11px] text-slate-500 ml-auto">
+                  Want a demo?
+                  <button class="link-btn" @click="copyToClipboard('python tools/seed_demo_data.py')">python tools/seed_demo_data.py</button>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <!-- Job queue strip: active job + next queued, with advance control. -->
       <div class="card rounded-xl p-5" x-show="jobsActive || jobsQueue.length">
         <div class="flex items-center justify-between mb-3">
@@ -3791,6 +3856,22 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <!-- Loading skeletons: shown only on the first fetch, so a slow disk
+             scan doesn't leave the grid blank for seconds. -->
+        <template x-if="jobsLoading && jobsList.length === 0">
+          <template x-for="i in 3" :key="'skel_'+i">
+            <div class="card rounded-xl p-5 animate-pulse">
+              <div class="h-4 w-2/3 bg-slate-800 rounded mb-2"></div>
+              <div class="h-3 w-1/3 bg-slate-800/60 rounded mb-4"></div>
+              <div class="grid grid-cols-2 gap-2 my-2">
+                <div class="h-12 bg-slate-800/60 rounded"></div>
+                <div class="h-12 bg-slate-800/60 rounded"></div>
+              </div>
+              <div class="h-6 w-24 bg-slate-800/60 rounded mt-3"></div>
+            </div>
+          </template>
+        </template>
+
         <!-- Existing jobs -->
         <template x-for="jb in jobsList" :key="jb.slug">
           <div class="card rounded-xl p-5 flex flex-col">
@@ -3832,19 +3913,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </div>
         </template>
 
-        <!-- New Job card -->
-        <div class="card rounded-xl p-5 border-dashed border-2 border-slate-700 flex flex-col justify-center">
+        <!-- New Job composer. Preset filter kicks in above 6 shown presets so a
+             library with 13+ built-ins + the user's own doesn't drown the picker.
+             The description hint updates live from `/api/presets` metadata. -->
+        <div class="card rounded-xl p-5 border-dashed border-2 border-slate-700 flex flex-col justify-center" x-ref="newJobCard">
           <h3 class="font-semibold mb-2">New job</h3>
-          <input x-model="newJob.name" @keydown.enter="createJob()"
+          <input x-model="newJob.name" @keydown.enter="createJob()" x-ref="newJobName"
             placeholder="Job name (e.g. Car Ads)"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2"/>
+          <input x-show="presetsList.length > 6 && !newJob.base_on" x-cloak
+            x-model="newJob.presetFilter" placeholder="Filter presets…"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs mb-1"/>
           <select x-model="newJob.preset" :disabled="!!newJob.base_on"
-            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2 disabled:opacity-50">
-            <option value="">Preset: default</option>
-            <template x-for="p in presetsList" :key="'np_'+p">
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-1 disabled:opacity-50">
+            <option value="">Preset: default (general triage)</option>
+            <template x-for="p in filteredPresets()" :key="'np_'+p">
               <option :value="p" x-text="'Preset: ' + p"></option>
             </template>
           </select>
+          <p class="text-[11px] text-slate-500 min-h-[1.25rem] mb-2"
+             x-text="presetDescription(newJob.preset || presetsDefault) || 'Applies the shipped default triage (Keep / Borderline / OffTopic).'"></p>
           <select x-model="newJob.base_on"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-3">
             <option value="">Start fresh from preset</option>
@@ -3855,10 +3943,6 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="createJob()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Create job</button>
         </div>
       </div>
-
-      <template x-if="!jobsLoading && jobsList.length === 0">
-        <div class="text-xs text-slate-500">No jobs yet — create one above to begin curating.</div>
-      </template>
     </section>
 
     <!-- SCHEDULES (per-job cadence → scrape/curate/export) -->
@@ -3903,7 +3987,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <h4 class="font-semibold text-sm">Active schedules</h4>
           <button @click="loadSchedules()" class="text-xs link-btn">refresh</button>
         </div>
-        <div x-show="!schedules.rows.length" class="text-sm text-slate-500">No schedules yet.</div>
+        <div x-show="!schedules.rows.length" class="text-sm text-slate-500 py-3">
+          No schedules yet. Add one above to run a job on a cadence — handy for jobs that pull from live feeds.
+        </div>
         <table x-show="schedules.rows.length" class="w-full text-sm">
           <thead><tr class="text-left text-xs text-slate-400 border-b border-slate-700">
             <th class="py-1">Job</th><th>Cadence</th><th>Action</th><th>Enabled</th><th>Last run</th><th></th>
@@ -4337,6 +4423,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="text-xs text-slate-500 mt-1">
                 Start a scraper, or run
                 <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">python tools/seed_demo_data.py</code>
+                <button class="link-btn ml-1" @click="copyToClipboard('python tools/seed_demo_data.py')" title="Copy command">copy</button>
                 from the repo root to populate a synthetic preview.
               </div>
             </div>
@@ -4879,24 +4966,40 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <!-- First-run welcome card: shown only when nothing has been queued OR
-           classified yet for THIS job. Keeps the empty state from looking like a bug. -->
+           classified yet for THIS job. Keeps the empty state from looking like a bug.
+           Steps are numbered so a new user knows the ordering isn't arbitrary. -->
       <template x-if="(status.queue?.total ?? 0) === 0 && (status.sorted?.total ?? 0) === 0">
         <div class="card rounded-xl p-6">
           <div class="flex items-start gap-4">
             <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64"
                  class="shrink-0"/>
-            <div class="flex-1">
+            <div class="flex-1 min-w-0">
               <h3 class="font-brand text-2xl font-medium tracking-tight">Nothing here yet</h3>
               <p class="text-sm text-slate-300 mt-1 mb-4">
-                This job has no queued or sorted images. Configure its scrapers and target, activate it, then start the pipeline.
+                This job has no queued or sorted images. Wire up sources, confirm a vision worker, then start the pipeline.
               </p>
-              <div class="flex flex-wrap gap-2">
-                <button @click="active = 'scrapers'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure scrapers</button>
-                <button @click="active = 'jobSettings'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Job settings</button>
-                <button @click="active = 'vision'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Vision worker</button>
-              </div>
-              <p class="text-xs text-slate-500 mt-4">
-                Want a demo first? Run <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code> from the repo root.
+              <ol class="grid gap-3 md:grid-cols-3 text-xs mb-4">
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">1 · Sources</div>
+                  <div class="text-slate-300">Toggle scrapers on and add subs / accounts / gallery-dl URLs.</div>
+                  <button @click="active = 'scrapers'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Scrapers</button>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">2 · Vision</div>
+                  <div class="text-slate-300">Point at LM Studio / Ollama / Groq and click Test.</div>
+                  <button @click="active = 'vision'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Vision</button>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">3 · Taxonomy</div>
+                  <div class="text-slate-300">Tune the topic, categories, and scoring gates.</div>
+                  <button @click="active = 'jobSettings'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Job Settings</button>
+                </li>
+              </ol>
+              <p class="text-xs text-slate-500">
+                Want a demo first? Run
+                <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code>
+                from the repo root.
+                <button class="link-btn ml-1" @click="copyToClipboard('python tools/seed_demo_data.py')" title="Copy command">copy</button>
               </p>
             </div>
           </div>
@@ -4926,16 +5029,24 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             </tr>
           </template>
           <template x-if="queueFiles.length === 0">
-            <tr><td colspan="6" class="text-center text-slate-500 py-6">Queue is empty.</td></tr>
+            <tr><td colspan="6" class="text-center text-slate-500 py-8">
+              <div class="opacity-70">Queue is empty.</div>
+              <div class="text-[11px] text-slate-500 mt-1">Scrapers deposit here — the vision workers drain it.</div>
+            </td></tr>
           </template>
         </tbody>
       </table></div>
       </div>
     </section>
 
-    <!-- LOGS (job-scoped Historical) -->
+    <!-- ACTIVITY (job-scoped classification log, newest first) -->
     <section x-show="view === 'job' && active === 'logs'" class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Historical sorter log</h3>
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="font-semibold">Recent classifications</h3>
+          <p class="text-xs text-slate-400">Every image the vision worker has decided about, newest first. Use Gallery to browse and re-cull what you've kept.</p>
+        </div>
+      </div>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Time</th><th>Image</th><th>Source</th><th>Classification</th></tr></thead>
         <tbody>
@@ -4966,7 +5077,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             </tr>
           </template>
           <template x-if="history.length === 0">
-            <tr><td colspan="5" class="text-center text-slate-500 py-6">No historical entries yet.</td></tr>
+            <tr><td colspan="5" class="text-center text-slate-500 py-8">
+              <div class="opacity-70">No classifications yet.</div>
+              <div class="text-[11px] text-slate-500 mt-1">Start the pipeline (top-right) once you've added sources + a vision worker.</div>
+            </td></tr>
           </template>
         </tbody>
       </table></div>
@@ -5330,21 +5444,31 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          inheritable field set. Presets have no inheritance — values are absolute. -->
     <section x-show="view === 'jobs' && active === 'presets'" class="space-y-4">
       <div class="card rounded-xl p-5">
-        <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
           <div>
             <h3 class="font-semibold">Presets</h3>
             <p class="text-xs text-slate-400">Named default bundles a job inherits from. Edits auto-save.</p>
           </div>
+          <input x-model="newJob.presetFilter" placeholder="Filter presets…"
+                 class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-xs w-56"/>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          <template x-for="p in presetsList" :key="p">
-            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 flex items-center justify-between gap-2"
+          <template x-for="p in filteredPresets()" :key="p">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 flex flex-col gap-2"
                  :class="presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : ''">
-              <div class="min-w-0">
-                <div class="font-mono text-sm truncate" x-text="p"></div>
-                <div class="text-[11px] text-amber-300" x-show="p === presetsDefault">default</div>
+              <div class="flex items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <div class="font-mono text-sm truncate" x-text="p"></div>
+                  <div class="text-[11px] text-amber-300" x-show="p === presetsDefault">default</div>
+                </div>
+                <div class="flex flex-wrap gap-1 shrink-0 justify-end">
+                  <template x-for="t in (presetsMeta.tags?.[p] || [])" :key="p+'_t_'+t">
+                    <span class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-300" x-text="t"></span>
+                  </template>
+                </div>
               </div>
-              <div class="flex flex-wrap gap-1 shrink-0">
+              <p class="text-[11px] text-slate-400 leading-snug" x-text="presetDescription(p) || '(no description)'"></p>
+              <div class="flex flex-wrap gap-1">
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
                 <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
@@ -5354,6 +5478,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
                 <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
               </div>
+            </div>
+          </template>
+          <template x-if="filteredPresets().length === 0">
+            <div class="col-span-full text-center py-6 text-sm text-slate-500">
+              No presets match "<span class="font-mono" x-text="newJob.presetFilter"></span>".
+              <button class="link-btn ml-2" @click="newJob.presetFilter = ''">clear</button>
             </div>
           </template>
           <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
@@ -5948,16 +6078,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- ERRORS (job-scoped) -->
     <section x-show="view === 'job' && active === 'errors'" class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3 text-rose-300">Recent errors</h3>
+      <div class="flex items-start justify-between mb-3 gap-3">
+        <div>
+          <h3 class="font-semibold text-rose-300">Recent errors</h3>
+          <p class="text-xs text-slate-400">Scraped from the tail of every log file. Click a line to copy the message.</p>
+        </div>
+        <button @click="refresh()" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded shrink-0">Refresh</button>
+      </div>
       <div class="space-y-2">
         <template x-for="e in status.errors ?? []" :key="e.timestamp + e.message">
-          <div class="bg-rose-950/40 border border-rose-800/50 rounded px-3 py-2 text-sm">
-            <div class="text-xs text-rose-300 font-mono" x-text="e.file + ' - ' + e.timestamp"></div>
+          <div class="bg-rose-950/40 border border-rose-800/50 rounded px-3 py-2 text-sm cursor-pointer hover:border-rose-600 transition"
+               @click="copyToClipboard(e.message)" title="Click to copy the full error message">
+            <div class="text-xs text-rose-300 font-mono" x-text="e.file + ' · ' + e.timestamp"></div>
             <div class="font-mono text-xs whitespace-pre-wrap" x-text="e.message"></div>
           </div>
         </template>
         <template x-if="(status.errors ?? []).length === 0">
-          <div class="text-sm text-slate-500">No errors logged recently.</div>
+          <div class="text-sm text-slate-500 py-4 text-center">
+            <div class="opacity-70">No errors logged recently.</div>
+            <div class="text-[11px] text-slate-500 mt-1">If a scraper is failing silently, check its Test button in the Scrapers tab.</div>
+          </div>
         </template>
       </div>
     </section>
@@ -6040,6 +6180,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <div class="text-xs font-brand mt-2" x-text="status.pipeline?.vision_worker || '-'"></div>
           </div>
         </div>
+        <div class="mt-5 pt-5 border-t border-slate-800 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+          <span>Press <kbd class="kbd">?</kbd> anywhere for keyboard shortcuts.</span>
+          <button @click="showShortcuts = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Open shortcuts</button>
+          <button @click="welcome.dismissed = false; try { localStorage.removeItem('cull_welcome_dismissed'); } catch(_) {}; active='jobs'"
+                  class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded"
+                  title="Re-show the welcome hero on the Jobs landing.">Reset welcome</button>
+        </div>
       </div>
 
       <div class="card rounded-xl p-6">
@@ -6065,6 +6212,54 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     </footer>
 
   </main>
+
+  <!-- KEYBOARD SHORTCUTS CHEAT-SHEET
+       Opened via `?` at any time (unless a modal / field owns the keyboard),
+       via the welcome hero, or via the About page. Uses the same backdrop-click
+       + Escape close contract as the confirm dialog. -->
+  <div x-show="showShortcuts" x-cloak x-transition.opacity
+       role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle"
+       @click.self="showShortcuts = false"
+       @keydown.escape.window="showShortcuts && (showShortcuts = false)"
+       class="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl max-w-xl w-full p-5 max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 id="shortcutsTitle" class="font-semibold">Keyboard shortcuts</h3>
+        <button @click="showShortcuts = false" class="text-slate-400 hover:text-slate-100 text-lg leading-none" aria-label="Close">✕</button>
+      </div>
+      <div class="grid gap-4 text-sm">
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Anywhere</div>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">?</kbd></span><span>Open this cheat-sheet</span>
+            <span><kbd class="kbd">Esc</kbd></span><span>Close a modal / cancel a dialog</span>
+          </div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Gallery (keyboard culling)</div>
+          <p class="text-[11px] text-slate-500 mb-2">Focus a card by clicking it, then drive with the keyboard. Gated when you're typing in a field.</p>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">←</kbd> <kbd class="kbd">↑</kbd> <kbd class="kbd">↓</kbd> <kbd class="kbd">→</kbd></span><span>Move focus (also <kbd class="kbd">h j k l</kbd> — vim)</span>
+            <span><kbd class="kbd">k</kbd></span><span>Keep → primary keep bucket</span>
+            <span><kbd class="kbd">x</kbd></span><span>Reject → DISCARD</span>
+            <span><kbd class="kbd">1</kbd>–<kbd class="kbd">9</kbd></span><span>Move to Nth category in the taxonomy</span>
+            <span><kbd class="kbd">u</kbd></span><span>Undo the last move</span>
+            <span><kbd class="kbd">Esc</kbd></span><span>Clear focus (from a card)</span>
+          </div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Detail modal</div>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">Esc</kbd></span><span>Close (prompts on unsaved edits)</span>
+            <span><kbd class="kbd">Enter</kbd></span><span>Prepend trigger word to caption</span>
+          </div>
+        </div>
+      </div>
+      <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-500">
+        Tip: the sidebar's job-scoped tabs cover the same actions with the mouse.
+      </div>
+    </div>
+  </div>
 
   <!-- DETAIL MODAL -->
   <div x-show="modal.open" x-cloak role="dialog" aria-modal="true" aria-labelledby="modalName"
@@ -6098,6 +6293,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <h4 class="text-xs uppercase tracking-wider text-slate-400">Full prompt</h4>
             <div class="flex items-center gap-2 text-xs">
               <span class="text-emerald-300" x-text="modal.savedFlash" x-show="modal.savedFlash"></span>
+              <template x-if="!modal.editing && modal.prompt && modal.prompt !== '(empty)' && modal.prompt !== '(no prompt saved for this image)'">
+                <button @click="copyToClipboard(modal.prompt)"
+                        class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded"
+                        title="Copy the prompt to clipboard">Copy</button>
+              </template>
               <template x-if="!modal.editing && modal.path">
                 <button @click="modal.editing = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Edit</button>
               </template>
@@ -6183,35 +6383,50 @@ function dashboard() {
     currentJob: null,         // slug of the job being viewed, when view==='job'
     active: 'jobs',           // active section id within the current view
     sidebarOpen: false,
-    // Job-scoped tabs (shown when view==='job'). Job Settings is the per-job
-    // config editor; the rest reuse today's sections filtered by currentJob.
+    // Job-scoped tabs (shown when view==='job'). Ordered by frequency of use:
+    // Overview first (dashboard-of-dashboards), then curation surfaces
+    // (Gallery / Queue / Activity / Stats), then config, then troubleshooting.
+    // Job Settings is the per-job config editor; the rest reuse today's
+    // sections filtered by currentJob. IDs are load-bearing (matched by
+    // this.active + server routes) — labels + hints are the free bits.
     jobTabs: [
-      {id:'logs',         label:'Historical'},
-      {id:'queue',        label:'Queue'},
-      {id:'gallery',      label:'Gallery'},
-      {id:'duplicates',   label:'Duplicates'},
-      {id:'export',       label:'Export'},
-      {id:'stats',        label:'Stats'},
-      {id:'overview',     label:'Overview'},
-      {id:'scrapers',     label:'Scrapers'},
-      {id:'vision',       label:'Vision'},
-      {id:'jobSettings',  label:'Job Settings'},
-      {id:'errors',       label:'Errors'},
+      {id:'overview',     label:'Overview',    hint:'Live totals + recent classifications'},
+      {id:'gallery',      label:'Gallery',     hint:'Browse the kept library and re-cull with the keyboard'},
+      {id:'queue',        label:'Queue',       hint:'Images waiting for the vision worker'},
+      {id:'logs',         label:'Activity',    hint:'Every classification, newest first'},
+      {id:'stats',        label:'Stats',       hint:'Leaderboards + per-source analytics'},
+      {id:'duplicates',   label:'Duplicates',  hint:'Perceptual-hash near-duplicate scan'},
+      {id:'export',       label:'Export',      hint:'Pack kept images into a training-ready folder'},
+      {id:'scrapers',     label:'Scrapers',    hint:'Enable / disable sources for THIS job'},
+      {id:'vision',       label:'Vision',      hint:'This job\'s captioning + scoring; test a worker end-to-end'},
+      {id:'jobSettings',  label:'Job Settings',hint:'Topic, categories, media types, and every override'},
+      {id:'errors',       label:'Errors',      hint:'Recent worker / scraper errors from the log tail'},
     ],
-    // Global sections (shown when view==='jobs').
+    // Global sections (shown when view==='jobs'). Jobs is the home / landing
+    // and stays first; About + FAQ are informational tail. Presets and
+    // Schedules cluster with Jobs; Global Stats/Settings cluster with config.
     globalTabs: [
-      {id:'jobs',      label:'Jobs'},
-      {id:'presets',   label:'Presets'},
-      {id:'schedules', label:'Schedules'},
-      {id:'gstats',    label:'Global Stats'},
-      {id:'settings',  label:'Global Settings'},
-      {id:'faq',       label:'FAQ'},
-      {id:'about',     label:'About'},
+      {id:'jobs',      label:'Jobs',            hint:'Curation targets — activate one to run it'},
+      {id:'presets',   label:'Presets',         hint:'Reusable config bundles jobs inherit from'},
+      {id:'schedules', label:'Schedules',       hint:'Run jobs on a cadence (hourly, daily, custom)'},
+      {id:'gstats',    label:'Global Stats',    hint:'Aggregate analytics across every job'},
+      {id:'settings',  label:'Global Settings', hint:'Credentials, model endpoints, storage roots'},
+      {id:'faq',       label:'FAQ',             hint:'Common questions about how cull works'},
+      {id:'about',     label:'About',           hint:'Version, brand, keyboard shortcuts'},
     ],
-    // Jobs landing state.
-    jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
-    newJob: { name: '', base_on: '', preset: '' },
+    // Jobs landing state. `jobsLoading` starts true so the skeleton grid shows
+    // first-paint — otherwise the empty-list branch would flash the welcome
+    // hero before the API call resolves.
+    jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: true,
+    newJob: { name: '', base_on: '', preset: '', presetFilter: '' },
     presetsList: [], presetsDefault: '', presetsBuiltins: [],
+    presetsMeta: { descriptions: {}, tags: {} },
+    // Welcome hero visibility: sticky-dismissed via localStorage. Independent
+    // of the update / indexer toasts so dismissing one doesn't affect others.
+    welcome: { dismissed: false },
+    // Keyboard-shortcut cheat-sheet modal. Opened by `?` (and the Welcome + About
+    // buttons). Closed on Esc or backdrop click.
+    showShortcuts: false,
     // Per-job config editor (Job Settings tab) — v2 inherit/override model.
     // eff = effective (resolved) cfg; overrides = the sparse override map.
     je: {
@@ -6257,7 +6472,8 @@ function dashboard() {
     _toastSeq: 0,
     confirmDialog: { open: false, title: 'Please confirm', message: '',
                      confirmLabel: 'Confirm', cancelLabel: 'Cancel', danger: false,
-                     input: false, inputValue: '', inputPlaceholder: '', _resolve: null },
+                     input: false, inputValue: '', inputPlaceholder: '',
+                     _resolve: null, _returnFocus: null },
     scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
     // Wave-2 surfaces (all on-demand — never on the status poll).
     dup: { loading: false, threshold: 10, groups: [], scanned: false, error: '' },
@@ -6301,6 +6517,7 @@ function dashboard() {
     askConfirm(message, opts = {}) {
       // Cancel-resolve any dialog already open so its awaiter can't hang.
       if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      const returnFocus = document.activeElement;
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -6308,7 +6525,7 @@ function dashboard() {
           confirmLabel: opts.confirmLabel || 'Confirm',
           cancelLabel: opts.cancelLabel || 'Cancel',
           danger: !!opts.danger, input: false, inputValue: '', inputPlaceholder: '',
-          _resolve: resolve,
+          _resolve: resolve, _returnFocus: returnFocus,
         };
         this.$nextTick(() => { try { this.$refs.confirmBtn?.focus(); } catch (e) {} });
       });
@@ -6316,6 +6533,7 @@ function dashboard() {
     // Styled replacement for window.prompt(): resolves to the string, or null on cancel.
     askPrompt(message, defaultValue = '', opts = {}) {
       if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      const returnFocus = document.activeElement;
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -6323,7 +6541,7 @@ function dashboard() {
           confirmLabel: opts.confirmLabel || 'OK',
           cancelLabel: opts.cancelLabel || 'Cancel',
           danger: !!opts.danger, input: true, inputValue: String(defaultValue || ''),
-          inputPlaceholder: opts.placeholder || '', _resolve: resolve,
+          inputPlaceholder: opts.placeholder || '', _resolve: resolve, _returnFocus: returnFocus,
         };
         this.$nextTick(() => { try { this.$refs.dialogInput?.focus(); this.$refs.dialogInput?.select(); } catch (e) {} });
       });
@@ -6331,8 +6549,14 @@ function dashboard() {
     _closeConfirm(result) {
       const d = this.confirmDialog;
       const resolve = d._resolve;
+      const returnFocus = d._returnFocus;
       const value = d.input ? (result ? d.inputValue : null) : result;
-      this.confirmDialog = { ...d, open: false, _resolve: null };
+      this.confirmDialog = { ...d, open: false, _resolve: null, _returnFocus: null };
+      // Restore focus so the keyboard doesn't land on <body> — matches the
+      // same a11y contract the detail modal uses on close.
+      if (returnFocus && returnFocus.focus) {
+        try { returnFocus.focus(); } catch (_) {}
+      }
       if (resolve) resolve(value);
     },
     // Live connectivity/auth test for one scraper. Sends the current Settings
@@ -6559,7 +6783,7 @@ function dashboard() {
         body: JSON.stringify(body)});
       const j = await r.json();
       if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
-      this.newJob = { name: '', base_on: '', preset: '' };
+      this.newJob = { name: '', base_on: '', preset: '', presetFilter: '' };
       await this.loadJobs();
       // The create response is the v2 job detail ({job:{slug,...}}).
       this.openJob(j.job.job.slug);
@@ -6625,7 +6849,10 @@ function dashboard() {
       }
       this.view = 'job';
       this.currentJob = slug;
-      this.active = 'logs';            // default tab: Historical
+      // Land users on Overview. On a fresh job it shows the first-run welcome
+      // card with clear next-actions; on a warm job it shows queue/sorted/error
+      // totals + a live activity strip — better first-look than a blank log.
+      this.active = 'overview';
       this.sidebarOpen = false;
       // Reset per-job tab data so we don't show the previous job's rows.
       this.fleetTest = {};             // drop stale vision-worker test results
@@ -6807,12 +7034,64 @@ function dashboard() {
         this.presetsList = p.presets || [];
         this.presetsDefault = p.default || '';
         this.presetsBuiltins = p.builtins || [];
+        this.presetsMeta = { descriptions: p.descriptions || {}, tags: p.tags || {} };
         // Default the "Start from" picker to the library default (no more
         // redundant empty "Clone the default" option). Keep a valid selection.
         if (!this.presetsList.includes(this.newPreset.base_on)) {
           this.newPreset.base_on = this.presetsDefault || (this.presetsList[0] || '');
         }
       } catch (e) { /* swallow */ }
+    },
+    // One-line description for a preset name, or '' if unknown.
+    presetDescription(name) {
+      if (!name) return '';
+      return (this.presetsMeta.descriptions || {})[name] || '';
+    },
+    // Filter the preset dropdown by the composer's search box (case-insensitive
+    // substring across name + tags + description).
+    filteredPresets() {
+      const q = (this.newJob.presetFilter || '').trim().toLowerCase();
+      if (!q) return this.presetsList;
+      const meta = this.presetsMeta || { descriptions: {}, tags: {} };
+      return this.presetsList.filter(p => {
+        if (p.toLowerCase().includes(q)) return true;
+        const desc = (meta.descriptions[p] || '').toLowerCase();
+        if (desc.includes(q)) return true;
+        const tags = (meta.tags[p] || []).join(' ').toLowerCase();
+        return tags.includes(q);
+      });
+    },
+    // Move focus into the New Job composer + scroll it into view. Called by
+    // the welcome hero's primary CTA.
+    focusNewJob() {
+      const el = this.$refs.newJobName;
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      this.$nextTick(() => { try { el?.focus(); } catch (_) {} });
+    },
+    // Hide the welcome hero and remember the choice. Toggling in DevTools
+    // clears the flag; the hero also reappears whenever jobsList is empty
+    // AND localStorage is missing, so a fresh install always onboards.
+    dismissWelcome() {
+      this.welcome.dismissed = true;
+      try { localStorage.setItem('cull_welcome_dismissed', '1'); } catch (_) {}
+    },
+    // Copy small strings (mostly terminal snippets) with a success toast.
+    // Falls back to a hidden textarea for non-secure contexts / older Safari.
+    async copyToClipboard(text) {
+      const t = String(text ?? '');
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(t);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          document.execCommand('copy'); document.body.removeChild(ta);
+        }
+        this.notify('Copied to clipboard', 'success', 1500);
+      } catch (e) {
+        this.notify('Copy failed — select and copy manually', 'warn', 2500);
+      }
     },
     async createPreset() {
       const name = (this.newPreset.name || '').trim();
@@ -7650,6 +7929,21 @@ function dashboard() {
         default: return;
       }
     },
+    // Global `?` opens the keyboard cheat-sheet. Suppressed while a field
+    // owns focus, while a modal is up (Esc handles that first), and when any
+    // modifier is held so browser combos still fire (Ctrl+/, ⌘+/, etc.).
+    onHelpKeydown(ev) {
+      if (ev.key !== '?' && !(ev.key === '/' && ev.shiftKey)) return;
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (this.modal?.open || this.confirmDialog?.open || this.showShortcuts) return;
+      const el = document.activeElement;
+      if (el) {
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) return;
+      }
+      ev.preventDefault();
+      this.showShortcuts = true;
+    },
     // 'k' is BOTH "move focus down a row" (vim) AND "keep". We resolve the
     // ambiguity in favour of keep (the headline action); use ArrowDown/j to move
     // down a row. cullRowStride approximates the column count of the responsive
@@ -7919,12 +8213,18 @@ function dashboard() {
     },
 
     start() {
+      // Hydrate sticky-dismissal for the welcome hero BEFORE loading jobs so
+      // the first render doesn't flash the banner and then hide it.
+      try { this.welcome.dismissed = localStorage.getItem('cull_welcome_dismissed') === '1'; } catch (_) {}
       this.loadJobs();
       this.loadPresets();
       this.refresh();
       // Global keyboard-cull listener. Gated entirely by cullHotkeysActive()
       // (gallery tab open, no modal, not typing) so it's inert everywhere else.
       window.addEventListener('keydown', (ev) => this.onCullKeydown(ev));
+      // Global help shortcut. `?` opens the keyboard cheat-sheet unless the
+      // user is typing into a field or a modal already owns the keyboard.
+      window.addEventListener('keydown', (ev) => this.onHelpKeydown(ev));
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
       // auto-refreshes alongside the rest of the dashboard. Gallery stays
