@@ -401,6 +401,21 @@ class BaseVisionWorker(ABC):
         except FileNotFoundError:
             return _Outcome.SKIPPED
 
+        # Move the scraper-side .meta.json sidecar (distinct from the
+        # vision-worker's .vision.json audit record written just below). Without
+        # this the sibling metadata gets orphaned in the queue root when the
+        # image moves to sorted/, breaking any downstream tool that keys off it.
+        # Best-effort: an orphan is preferable to a crash, so any OSError is
+        # swallowed after the primary image move already succeeded.
+        src_scraper_meta = ctx.image_path.parent / f"{ctx.image_path.stem}.meta.json"
+        if src_scraper_meta.exists():
+            dest_scraper_meta = dest_dir / f"{safe_name}.meta.json"
+            try:
+                shutil.move(str(src_scraper_meta), str(dest_scraper_meta))
+            except OSError as exc:
+                logger.debug("scraper .meta.json move failed for %s: %s",
+                             ctx.image_path.name, exc)
+
         # Auto-caption: write the model's caption to .txt when enabled. The
         # source-side prompt (if any) was just moved to `final_txt`; we only
         # overwrite it when the admin has explicitly opted in. This is the
