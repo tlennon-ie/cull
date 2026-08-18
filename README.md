@@ -23,13 +23,21 @@
 
 ## What's new
 
-- **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg`. Videos play inline in the gallery modal. Toggle with `VIDEO_CLASSIFY_ENABLED` (needs the `[video]` extra).
-- **First-run wizard.** New installs land on a guided flow that creates the first job, picks a preset, and verifies at least one scraper + one vision worker before turning the pipeline on.
-- **Preset marketplace.** Import / export presets as portable JSON; a public gallery of curated starter presets ships with each release.
+The **user-acquisition wave** landed a first-run wizard, a demo mode, a
+publishable preset marketplace, video-as-first-class-media, and a cost-aware
+cloud-vision fleet. Highlights:
+
+- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/seed_demo_data.py` seeds synthetic queue/sorted rows so the dashboard shows real numbers before you configure anything.
+- **Preset marketplace + community presets + editable thumbnails + git-based Publish.** The Presets tab now has a dedicated editor detail view, a comparison grid of built-in starters, a community strip that browses `presets/community/*.preset.json`, and drag-and-drop thumbnail upload per preset. Publish sends the preset (+ its thumbnail) to `presets/community/` and commits+pushes to `origin` with `git commit -o` — your other working-tree edits stay uncommitted. Cleaner than the old Gist flow: no GitHub PAT required.
+- **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg` (via `imageio-ffmpeg`, no OS install needed). Videos play inline in the gallery modal. When the video backend is missing the pipeline **holds unclassifiable videos** (does NOT auto-DISCARD) so nothing is lost while you install the `[video]` extra.
+- **LM Studio strict-schema + a registry of cloud workers.** LM Studio's grammar backend now accepts our response schema (strict-mode-forbidden keywords stripped). Groq / Anthropic Claude / OpenAI / OpenRouter / Google Gemini all ship as first-class registered workers alongside the local fleet, with prompt caching + a per-provider **cost tracker** (`data/cost_ledger.json`) so a runaway cloud pass can't sneak up on you.
+- **Query-language keywords.** `topic_filter` now accepts `AND` / `OR` / `NOT`, parens, and `"quoted phrases"` — a keyword filter like `(portrait OR headshot) AND NOT anime` does what it says.
+- **Unified scraper cards + draggable priority.** Every scraper (Civitai, X, Reddit, Discord, gallery-dl, yt-dlp, Kohya import, local folders) lives on ONE Scrapers tab with per-source URL/target editors, per-URL Test buttons, and draggable priority (order + weight). No more hunting through Settings for the right toggle.
+- **Kohya + gallery-dl + yt-dlp scrapers.** Kohya-format LoRA training folders re-import through the same pipeline; gallery-dl covers 340+ sites out of the box; yt-dlp is now a first-class per-job scraper with cookies + custom args.
+- **Security hardening.** CSP + `X-Frame-Options: DENY` + `nosniff` on every response; `safe_inside()` on every user-supplied path; `SECRET_MASK` on every credential leaving the server; `allow_redirects=False` on every outbound HTTP probe. Full policy in [`SECURITY.md`](SECURITY.md), how-to-contribute in [`CONTRIBUTING.md`](CONTRIBUTING.md), community norms in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and every PR uses the [PR template](.github/pull_request_template.md).
 - **Kohya + HuggingFace exporters.** ZIP a filtered gallery view directly into a trainer, or push a curated set to a private HuggingFace dataset repo (`hf_export.py`).
 - **Digest webhook + desktop toasts.** Job completion fires a POST to `WEBHOOK_URL` (SSRF-guarded — http/s only, no redirects) and, optionally, a local desktop notification.
 - **Local vision fleet.** Multiple LM Studio / llama.cpp / Ollama endpoints run in parallel, each as its own subprocess, with gated failover and llama.cpp GBNF grammar support.
-- **Security hardening.** CSP + `X-Frame-Options: DENY` + `nosniff` on every response; `safe_inside()` on every user-supplied path; `SECRET_MASK` on every credential leaving the server; `allow_redirects=False` on every outbound HTTP probe. See [`SECURITY.md`](SECURITY.md).
 
 ## What it is
 
@@ -191,6 +199,8 @@ cull is **job-centric**. A *job* is a named curation target — one subject, its
 **Presets + inherit-by-default.** Shared config lives in a **preset library** (`data/jobs/_presets.json`). A job picks a preset and **inherits everything**; you only override the fields you want to change for that job. Every field in the editor shows its effective value with a "global" chip when it's inherited and a "reset to global" affordance once you override it — so a job file stays tiny (just its `subject` + the handful of overridden leaves). Edit the preset to change the default for every job that inherits it. Hover the ⓘ next to any field for guidance and example values.
 
 cull ships a **starter preset library** so a new job lands on sensible defaults: a general `default` (a topic-agnostic Keep / Borderline / OffTopic triage with **no** person/subject gates) plus themed starters for **aerial/drone**, **underwater**, **wildlife & macro**, **product**, and **anime/illustration** — with a **photoreal-portrait** and a **quality-only** preset retained. Clone any of them and tweak its categories, judgement rules, scoring and topic filters.
+
+**Community presets + Publish.** The Presets tab also lists everything under `presets/community/*.preset.json` — install with one click, or paste any HTTPS URL that returns the same envelope. Every preset (built-in or user-authored) has an **editor detail view** with a drag-and-drop **thumbnail card** — upload a GIF / PNG / JPG / WebP up to 2 MB and it becomes the cover across the built-in grid, the community strip, and the preset picker in the first-run wizard. The **Publish** button on a preset commits the envelope (and its thumbnail, if any) to `presets/community/` and pushes to `origin` — a real `git commit -o` scoped to just those files, so your other working-tree edits stay uncommitted. No GitHub PAT required (that's why the old Gist flow retired).
 
 **Auto-saving.** Job and preset settings save themselves as you type — there are no Save buttons. For the job that's currently running, your edits are held and **applied when you leave the editor** (or hit Apply), so the pipeline re-projects and restarts once instead of on every keystroke.
 
