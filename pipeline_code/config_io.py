@@ -74,12 +74,21 @@ _INHERITABLE_KEYS: frozenset[str] = frozenset({
 })
 _MEDIA_TYPES: frozenset[str] = frozenset({"image", "video"})
 _MAX_MEDIA_EXTS: int = 40
-_CAPTION_STYLES: frozenset[str] = frozenset(
-    {"sd_prompt", "booru_tags", "natural_language"})
+# Source of truth for caption styles is vision_prompt so adding a new style
+# there (e.g. "motion" for video LoRA trainers) doesn't require a parallel
+# edit here.
+try:
+    import vision_prompt as _vp
+    _CAPTION_STYLES: frozenset[str] = frozenset(_vp.CAPTION_STYLES)
+except Exception:  # noqa: BLE001 - fallback keeps the validator strict
+    _CAPTION_STYLES = frozenset(
+        {"sd_prompt", "booru_tags", "natural_language", "motion"})
 _VISION_PROVIDERS: frozenset[str] = frozenset(job_config.VISION_PROVIDERS)
 
 # Caps mirror the dashboard validators (single contract, two call sites).
-_MAX_CATEGORIES = 40
+# 12 categories is the shipped ceiling — more than that swamps the vision
+# schema's enum + the UI grid becomes unusable.
+_MAX_CATEGORIES = 12
 _MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
 _MAX_HINT = 2000
@@ -307,10 +316,35 @@ def _validate_local_imports(li: Any) -> list[dict]:
     return out
 
 
+def _validate_kohya_import(ki: Any) -> dict:
+    """Validate scrapers.kohya_import — a single per-job Kohya dataset root.
+
+    Shape mirrors the default preset in job_config._default_preset_cfg
+    (fields: enabled, dir, name, move, allow_flat). Same defensive path check
+    as local_imports; ``name`` reuses _LOCAL_NAME_RE so it can safely become a
+    filesystem component downstream.
+    """
+    _require_object(ki, "scrapers.kohya_import")
+    if _bad_path_str(ki.get("dir", "")):
+        raise ValidationError("scrapers.kohya_import.dir is not a valid path string")
+    name = ki.get("name", "kohya") or "kohya"
+    if not isinstance(name, str) or not _LOCAL_NAME_RE.match(name):
+        raise ValidationError(
+            "scrapers.kohya_import.name must match [A-Za-z0-9_-] (1-40 chars)")
+    return {
+        "enabled": bool(ki.get("enabled", False)),
+        "dir": str(ki.get("dir", "") or ""),
+        "name": name,
+        "move": bool(ki.get("move", False)),
+        "allow_flat": bool(ki.get("allow_flat", False)),
+    }
+
+
 def _validate_scrapers(s: Any) -> dict:
     _require_object(s, "scrapers")
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports",
+               "kohya_import"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -332,6 +366,8 @@ def _validate_scrapers(s: Any) -> dict:
             out[k] = _validate_gallery_dl(v)
         elif k == "yt_dlp":
             out[k] = _validate_yt_dlp(v)
+        elif k == "kohya_import":
+            out[k] = _validate_kohya_import(v)
         else:  # local_imports
             out[k] = _validate_local_imports(v)
     return out

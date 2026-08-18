@@ -84,22 +84,37 @@ def _queue_exts() -> frozenset[str]:
     ``os.scandir`` + suffix-in-set check per source dir replaces the previous
     N-glob-per-source scan — measurable win on directories with 10k+ items.
     Defaults mirror the historical image/video set, so an unconfigured
-    pipeline is byte-identical."""
+    pipeline is byte-identical unless VIDEO_CLASSIFY_ENABLED is set (which
+    always widens the set to include the standard video containers so the
+    env gate alone is enough to surface clips)."""
+    include_video = _video_classify_enabled()
     try:
         import media_policy
         exts: list[str] = []
         if media_policy.wants_image():
             exts.extend(media_policy.image_exts())
-        if media_policy.wants_video() and _video_classify_enabled():
+        if media_policy.wants_video() and include_video:
             exts.extend(media_policy.video_exts())
         if exts:
-            return frozenset(e.lower() for e in exts)
+            lowered = frozenset(e.lower() for e in exts)
+            # env-gate override: if video is on but policy didn't emit video
+            # exts (image-only default policy), append the standard video set.
+            if include_video and not (lowered & frozenset(_QUEUE_VIDEO_EXTS)):
+                return frozenset(lowered | frozenset(_QUEUE_VIDEO_EXTS))
+            return lowered
     except Exception:  # noqa: BLE001 - never let policy parsing break the queue
         pass
     # Fallback to the historical fixed set.
-    if _video_classify_enabled():
+    if include_video:
         return frozenset(_QUEUE_IMAGE_EXTS + _QUEUE_VIDEO_EXTS)
     return frozenset(_QUEUE_IMAGE_EXTS)
+
+
+def _queue_globs() -> tuple[str, ...]:
+    """Legacy glob view of the queue extensions — used by tests and by
+    callers that still consume the ``('*.jpg', ...)`` shape. Thin adapter
+    over :func:`_queue_exts` so the two views can never drift."""
+    return tuple(f"*{e}" for e in sorted(_queue_exts()))
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────────

@@ -126,6 +126,9 @@ import scheduler
 import fleet_health
 import vision_prompt
 import credentials
+import demo_seed
+import digest as _digest_mod
+import requeue_sorted as _requeue_mod
 
 # Now that job_config is importable, derive the canonical scraper toggle list
 # from its SCRAPER_NAMES (single source of truth) annotated with UI descriptions.
@@ -1679,6 +1682,110 @@ def api_presets_list():
     })
 
 
+_PRESET_THUMB_KEY_RE = re.compile(r"^[a-z0-9_]+$")
+_PRESET_THUMB_EXTS: tuple[tuple[str, str], ...] = (
+    (".gif", "image/gif"),
+    (".png", "image/png"),
+    (".jpg", "image/jpeg"),
+    (".jpeg", "image/jpeg"),
+    (".webp", "image/webp"),
+    (".svg", "image/svg+xml"),
+)
+
+
+def _preset_thumb_placeholder(key: str) -> bytes:
+    """Deterministic 16:9 SVG for a preset key that has no shipped or user
+    asset. Uses two hash-derived hues plus the key's first letter so every
+    preset still gets a distinct card without any external font/image."""
+    import colorsys
+    import hashlib
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    hue_a = (digest[0] / 255.0) * 360
+    hue_b = ((digest[1] / 255.0) * 360 + 55) % 360
+    r1, g1, b1 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_a / 360, 0.32, 0.55))
+    r2, g2, b2 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_b / 360, 0.18, 0.60))
+    letter = (key[:1] or "?").upper()
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        f"<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        f"<stop offset='0' stop-color='rgb({r1},{g1},{b1})'/>"
+        f"<stop offset='1' stop-color='rgb({r2},{g2},{b2})'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        f"<text x='160' y='112' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='88' font-weight='700' fill='#f8fafc' opacity='0.85'>{letter}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+@app.route("/api/presets/thumbnail")
+def api_presets_thumbnail():
+    """Return a preview image for a preset card.
+
+    Lookup order (traversal-safe, ``key`` restricted to ``^[a-z0-9_]+$``):
+      1. ``<repo>/presets/thumbnails/<key>.{gif,png,jpg,jpeg,webp,svg}``
+         (user-supplied override — highest priority so operators can restyle a
+         built-in preset without editing the shipped SVGs)
+      2. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
+      3. Deterministic gradient-with-letter SVG placeholder (any other key)
+    """
+    key = (request.args.get("key") or "").strip().lower()
+    if not _PRESET_THUMB_KEY_RE.match(key):
+        abort(400)
+    thumbnails_root = WORKSPACE_ROOT / "presets" / "thumbnails"
+    # Resolve then containment-check so a symlinked override can't escape the
+    # thumbnails directory even if someone plants one manually.
+    thumbnails_real = os.path.realpath(str(thumbnails_root))
+    for ext, mime in _PRESET_THUMB_EXTS:
+        candidate = thumbnails_root / f"{key}{ext}"
+        try:
+            candidate_real = os.path.realpath(str(candidate))
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if os.path.commonpath([candidate_real, thumbnails_real]) != thumbnails_real:
+                continue
+        except ValueError:
+            continue
+        return send_file(candidate, mimetype=mime, max_age=3600, conditional=True)
+    builtin = thumbnails_root / "_builtin" / f"{key}.svg"
+    if builtin.is_file():
+        return send_file(builtin, mimetype="image/svg+xml",
+                         max_age=3600, conditional=True)
+    return Response(
+        _preset_thumb_placeholder(key),
+        mimetype="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.route("/api/presets/descriptions")
+def api_presets_descriptions():
+    """Return human-facing metadata for every built-in preset (T1 #2/#5).
+
+    Shape: ``[{key, name, headline, description, use_cases: [str, ...]}]``.
+    Powers the first-run wizard's preset picker and the comparison card grid
+    in the Presets tab. Uses :mod:`builtin_presets` as the source of truth so
+    it never drifts from the shipped preset library.
+    """
+    try:
+        import builtin_presets  # local import — cheap and keeps the top clean
+    except Exception as exc:
+        return jsonify({"error": f"builtin_presets import failed: {exc}"}), 500
+    out: list[dict] = []
+    for key in builtin_presets.PRESET_NAMES:
+        try:
+            meta = builtin_presets.get_preset_display_meta(key)
+            meta["use_cases"] = builtin_presets.preset_use_cases(key)
+            out.append(meta)
+        except Exception:
+            continue
+    return jsonify({"presets": out})
+
+
 @app.route("/api/presets", methods=["POST"])
 def api_presets_create():
     data = request.get_json() or {}
@@ -2230,6 +2337,83 @@ def brand_asset(filename: str):
     return send_file(asset_path, mimetype="image/png", max_age=86400)
 
 
+_VIDEO_THUMB_EXTS: frozenset[str] = frozenset(
+    {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+)
+
+
+def _video_placeholder_svg(ext_label: str) -> bytes:
+    """Deterministic offline placeholder shown when no ffmpeg/scenedetect
+    backend is installed. Play triangle on a dark gradient with an extension
+    chip in the corner. No external references — safe under the strict CSP."""
+    label = (ext_label or "vid").lstrip(".").upper()[:4]
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#1e293b'/>"
+        "<stop offset='1' stop-color='#0f172a'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        "<circle cx='160' cy='90' r='34' fill='#0f172a' opacity='0.75'/>"
+        "<polygon points='150,72 150,108 184,90' fill='#e2e8f0'/>"
+        f"<rect x='268' y='150' width='42' height='20' rx='4' fill='#0f172a' opacity='0.85'/>"
+        f"<text x='289' y='164' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='11' font-weight='600' fill='#94a3b8'>{label}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
+    """Extract a single poster frame at ~1s via ffmpeg-python, cache the
+    resulting JPEG in ``data/thumb_cache/<sha>/<sha>_<size>_video.jpg`` and
+    return its path. Returns ``None`` on any failure so the caller can fall
+    back to the SVG placeholder without raising.
+    """
+    try:
+        # Reuse thumb_cache's content-hashed path so re-encoding the same
+        # (video, size) pair hits the disk cache on subsequent requests.
+        cache_file = thumb_cache.cache_path_for(video_path, size)
+    except (ValueError, FileNotFoundError):
+        return None
+    poster = cache_file.with_name(cache_file.stem + "_video.jpg")
+    if poster.exists():
+        try:
+            os.utime(poster, None)
+        except OSError:
+            pass
+        return poster
+    try:
+        import ffmpeg  # type: ignore
+    except Exception:
+        return None
+    tmp = poster.with_suffix(".tmp")
+    try:
+        (
+            ffmpeg
+            .input(str(video_path), ss=1.0)
+            .filter("scale", size, -2, force_original_aspect_ratio="decrease")
+            .output(str(tmp), vframes=1, format="image2", vcodec="mjpeg")
+            .global_args("-loglevel", "error")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - extraction is best-effort
+        logger.debug("video poster extract failed for %s: %s", video_path.name, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    if not tmp.exists() or tmp.stat().st_size == 0:
+        return None
+    try:
+        tmp.replace(poster)
+    except OSError:
+        return None
+    return poster
+
+
 @app.route("/api/thumbnail")
 def api_thumbnail():
     """Serve a JPEG thumbnail from the disk cache.
@@ -2238,6 +2422,10 @@ def api_thumbnail():
     to data/thumb_cache/<sha>/<sha>_<size>.jpg. Subsequent requests serve
     the file directly. send_file sets Last-Modified + ETag headers so
     browsers 304 on F5.
+
+    Videos: when ffmpeg is available we extract a poster frame at ~1s and cache
+    a JPEG; otherwise we return a deterministic SVG placeholder so the gallery
+    still shows *something* instead of a broken-image icon.
     """
     raw = request.args.get("path", "")
     try:
@@ -2247,6 +2435,30 @@ def api_thumbnail():
     path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
     if path is None or not path.exists():
         abort(404)
+    # Video branch — never let PIL see a container file (it raises on every
+    # video extension we accept). ffmpeg gives us a poster frame; if absent we
+    # ship an inline SVG so the UI degrades gracefully.
+    if path.suffix.lower() in _VIDEO_THUMB_EXTS:
+        try:
+            import video_frames
+            has_backend = video_frames.has_any_backend()
+        except Exception:
+            has_backend = False
+        if has_backend:
+            poster = _video_poster_jpeg(path, size)
+            if poster is not None:
+                return send_file(
+                    poster,
+                    mimetype="image/jpeg",
+                    max_age=0,
+                    conditional=True,
+                )
+        # Placeholder path — no disk write, no PIL, no external refs.
+        return Response(
+            _video_placeholder_svg(path.suffix),
+            mimetype="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
     try:
         cache_file = thumb_cache.get_or_create(path, size)
     except FileNotFoundError:
@@ -2281,6 +2493,63 @@ def api_prompt():
         return Response(txt.read_text(encoding="utf-8", errors="replace"), mimetype="text/plain")
     except OSError:
         abort(404)
+
+
+# ── raw media serving ─────────────────────────────────────────────────────────
+#
+# ``/api/thumbnail`` degrades videos to a JPEG poster / SVG placeholder because
+# it always returns an *image*. When the operator opens the detail modal for a
+# video item we need the actual clip so the ``<video>`` element can play it.
+# This endpoint serves the raw file with proper MIME + Range support so the
+# browser can seek/buffer without loading the whole file into memory.
+
+_MEDIA_MIME_BY_EXT: dict[str, str] = {
+    # Videos — the whole point of this endpoint.
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    # Images — fall-through so the modal can share a single URL scheme when it
+    # wants the full-fidelity original instead of a re-encoded thumbnail.
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".avif": "image/avif",
+}
+
+
+@app.route("/api/media/raw")
+def api_media_raw():
+    """Serve the raw media file at ``?path=<abs_path>`` with Range support.
+
+    Guarded by the same ``safe_inside`` sanitiser as ``/api/thumbnail`` so
+    nothing outside the queue/sorted trees is reachable. Uses Flask's
+    ``send_file(..., conditional=True)`` which handles If-Modified-Since AND
+    HTTP Range requests natively — that's what makes the ``<video>`` element
+    in the detail modal seek/buffer instead of downloading the whole clip.
+    ``Accept-Ranges: bytes`` is set explicitly so proxies that strip Flask's
+    header don't disable seeking.
+    """
+    raw = request.args.get("path", "")
+    path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if path is None or not path.exists() or not path.is_file():
+        abort(404)
+    mimetype = _MEDIA_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    response = send_file(
+        path,
+        mimetype=mimetype,
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["Accept-Ranges"] = "bytes"
+    return response
 
 
 @app.route("/api/logs/history")
@@ -2337,13 +2606,25 @@ def _is_in_archive(path: Path) -> bool:
 @app.route("/api/activity")
 def api_activity():
     """Newest classified items, served from the SQLite index. Scoped to
-    ?job=<slug> (default active)."""
+    ?job=<slug> (default active).
+
+    Extended for the reasoning panel: each row now includes ``reason``,
+    ``OVR_Quality_Score``, ``REL_Quality_Score`` and ``caption`` sourced from the
+    same ``.vision.json`` sidecar the indexer stored. Missing fields fall back
+    to ``None`` (or an empty string for ``reason``/``caption``) so pre-schema
+    rows still render.
+    """
     limit = int(request.args.get("limit", 12))
     slug = _resolve_job_slug()
     results: list[dict[str, Any]] = []
     for item in _list_recent_sorted_scoped(slug, limit):
         if not Path(item.path).exists():
             continue  # indexer hasn't caught up to a deletion / move
+        vj = item.vision_json or {}
+        ovr = vj.get("OVR_Quality_Score") if isinstance(vj, dict) else None
+        rel = vj.get("REL_Quality_Score") if isinstance(vj, dict) else None
+        reason = vj.get("reason", "") if isinstance(vj, dict) else ""
+        caption = vj.get("caption", "") if isinstance(vj, dict) else ""
         results.append({
             "name": Path(item.path).name,
             "path": item.path,
@@ -2352,8 +2633,14 @@ def api_activity():
             "modified": datetime.fromtimestamp(item.mtime).isoformat(),
             "thumbnail": f"/api/thumbnail?path={item.path}",
             "prompt_url": f"/api/prompt?path={item.path}",
-            "summary": (item.vision_json or {}).get("reason", "") if item.vision_json else "",
+            "summary": reason,
             "quality": item.quality,
+            # Extended fields for the reasoning panel — additive; existing
+            # clients that ignore them keep working.
+            "reason": reason,
+            "OVR_Quality_Score": ovr,
+            "REL_Quality_Score": rel,
+            "caption": caption,
         })
     return jsonify(results)
 
@@ -2505,8 +2792,12 @@ def _resolution_bucket(width: int, height: int) -> str:
 def _item_to_card(item: _SortedItem) -> dict[str, Any]:
     """Compact JSON representation used by gallery + stats payloads."""
     payload = item.payload
+    is_video = item.image_path.suffix.lower() in _VIDEO_THUMB_EXTS
     width, height = item.width, item.height
-    if width <= 0 or height <= 0:
+    # Videos never go through PIL — leave width/height at 0 so the resolution
+    # chip renders as "unknown" instead of triggering a decode attempt that
+    # would just fail (and pollute logs).
+    if not is_video and (width <= 0 or height <= 0):
         width, height = _resolve_image_dims(item.image_path)
         item.width, item.height = width, height
     return {
@@ -2527,6 +2818,12 @@ def _item_to_card(item: _SortedItem) -> dict[str, Any]:
         "height": height,
         "resolution_bucket": _resolution_bucket(width, height),
         "prompt_excerpt": (item.prompt_text or "").strip()[:240],
+        # Flags for a future UI pass (e.g. a play-icon overlay on gallery
+        # cards). Additive today — no template consumes them yet, but the
+        # payload contract is fixed here so the UI can adopt without a
+        # backend churn later.
+        "video": is_video,
+        "is_video": is_video,
     }
 
 
@@ -3434,6 +3731,1566 @@ def api_vision_health():
                     "error": None})
 
 
+# ── User-acquisition wave endpoints (T1–T3) ───────────────────────────────────
+#
+# These are the endpoints added by the user-acquisition wave: demo mode, preset
+# marketplace, quick-sort, vision-worker discovery + dry-run, export preview,
+# bulk gallery actions, undo/requeue, gallery-dl URL test, cookies converter,
+# log tail (SSE), VRAM hint, Gist publishing, and digest build/send. Grouped
+# together so the block stays easy to find and audit.
+#
+# Every user-supplied path is guarded by ``safe_inside``. Fetches from remote
+# hosts (preset marketplace, gist publish) reuse ``scheduler._is_public_http_url``
+# as the SSRF sanitiser plus a per-host allowlist. Cookies + gist endpoints
+# reject any request whose ``remote_addr`` isn't loopback — they are single-user
+# admin-only.
+
+import mimetypes
+import tempfile as _tempfile
+import time as _wave_time
+from urllib.parse import urlparse as _wave_urlparse
+
+# SSRF guard: reuse the one that ships with scheduler. Keeps the invariant that
+# there's exactly ONE public/private classifier for the whole codebase.
+from scheduler import _is_public_http_url as _wave_is_public_http_url
+
+# 15s cap on every remote fetch (presets, gists, LM Studio model info).
+_WAVE_HTTP_TIMEOUT: float = 15.0
+# 512 KB cap on preset payloads — a preset is JSON config, not a dataset.
+_WAVE_PRESET_MAX_BYTES: int = 512 * 1024
+# 20 MB cap on the dry-run image upload.
+_WAVE_UPLOAD_MAX_BYTES: int = 20 * 1024 * 1024
+# Allowlisted preset-hosting origins for the marketplace fetch.
+_WAVE_PRESET_ALLOWED_HOSTS: frozenset[str] = frozenset({
+    "github.com",
+    "gist.github.com",
+    "raw.githubusercontent.com",
+    "codeberg.org",
+    "huggingface.co",
+    "huggingface.io",
+})
+
+
+def _wave_data_root() -> Path:
+    """Return the resolved data root (mirrors the module-level ``_DATA_ROOT``).
+
+    Read via a helper so tests that monkeypatch ``os.environ`` see the current
+    value, not the snapshot taken at import time.
+    """
+    return _DATA_ROOT
+
+
+def _wave_is_loopback_request() -> bool:
+    """True iff ``request.remote_addr`` looks like loopback.
+
+    Localhost-only endpoints (cookies converter, gist publish) hard-refuse
+    non-loopback callers regardless of what proxy is in front. We check the
+    string form directly — ipaddress.ip_address would need an extra strip for
+    the IPv6-mapped IPv4 form (``::ffff:127.0.0.1``).
+    """
+    addr = (request.remote_addr or "").strip()
+    if not addr:
+        return False
+    if addr in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if addr.startswith("::ffff:127."):
+        return True
+    return False
+
+
+def _wave_fetch_preset_body(url: str) -> tuple[bool, str, dict | None]:
+    """Fetch a preset JSON body from ``url`` with SSRF + host + size guards.
+
+    Returns ``(ok, error, body)``. On success ``body`` is the parsed JSON dict.
+    On failure ``error`` carries a short user-facing reason and ``body`` is
+    None.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False, "url is required", None
+    url = url.strip()
+    try:
+        parsed = _wave_urlparse(url)
+    except ValueError:
+        return False, "invalid url", None
+    if parsed.scheme.lower() != "https":
+        return False, "url must be https", None
+    host = (parsed.hostname or "").strip().lower()
+    if host not in _WAVE_PRESET_ALLOWED_HOSTS:
+        return False, f"host not allowed: {host!r}", None
+    # SSRF guard: reject DNS names that resolve to private / loopback / link-
+    # local / metadata addresses even when the string-level allowlist matches.
+    if not _wave_is_public_http_url(url):
+        return False, "url must resolve to a public host", None
+    try:
+        import requests as _requests
+        # allow_redirects=False so a hostile host can't 302 to a private URL.
+        resp = _requests.get(url, timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+    except Exception as exc:  # noqa: BLE001 - network failure is user-facing, not a 500
+        logger.warning("preset fetch failed for %s: %s", host, exc)
+        return False, "fetch failed", None
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}", None
+    # Enforce the size cap on the raw body BEFORE parsing.
+    raw = resp.content or b""
+    if len(raw) > _WAVE_PRESET_MAX_BYTES:
+        return False, f"payload too large ({len(raw)} bytes, max {_WAVE_PRESET_MAX_BYTES})", None
+    try:
+        parsed_body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return False, f"invalid JSON: {exc}", None
+    if not isinstance(parsed_body, dict):
+        return False, "payload must be a JSON object", None
+    return True, "", parsed_body
+
+
+# ── T1 #1 — Demo mode ─────────────────────────────────────────────────────────
+
+@app.route("/api/demo/seed", methods=["POST"])
+def api_demo_seed():
+    """Seed the demo dataset (idempotent). Body: ``{"force": bool}`` (optional)."""
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force"))
+    try:
+        result = demo_seed.seed_demo(force=force)
+    except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return _err("failed to seed demo dataset", exc, 500)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/demo/unseed", methods=["POST"])
+def api_demo_unseed():
+    """Remove the demo dataset (guarded by the marker file)."""
+    try:
+        result = demo_seed.unseed_demo()
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to unseed demo dataset", exc, 500)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/demo/status")
+def api_demo_status():
+    """Return whether the demo dataset is seeded + basic counts."""
+    try:
+        return jsonify(demo_seed.demo_status())
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to read demo status", exc, 500)
+
+
+# ── Native folder picker (localhost-only, first-run wizard) ─────────────────
+#
+# The dashboard runs on the user's own machine, so Tk is fine — but Tk plus
+# Flask's threaded dev server plus Windows dialog quirks (dismissal via Alt+F4
+# leaving Tk state alive) is fragile. We spawn a fresh subprocess whose only
+# job is opening the dialog: the parent stays responsive, Tk state can't leak,
+# and the subprocess timeout is our natural hang-guard. Serialised through a
+# module-level lock so two concurrent wizard clicks can't spawn two dialogs.
+
+_FOLDER_PICKER_LOCK = threading.Lock()
+_FOLDER_PICKER_TIMEOUT_SEC = 60
+
+
+_FOLDER_PICKER_CHILD = r"""
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception as exc:
+    sys.stderr.write('tkinter-unavailable:' + str(exc))
+    sys.exit(2)
+try:
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    root.update()
+    path = filedialog.askdirectory(
+        title='Choose a folder for cull to import', mustexist=True,
+    )
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    # Empty string = user cancelled.
+    if path:
+        sys.stdout.write(path)
+    sys.exit(0)
+except Exception as exc:
+    sys.stderr.write('picker-failed:' + str(exc))
+    sys.exit(3)
+"""
+
+
+@app.route("/api/system/folder-picker", methods=["POST"])
+def api_system_folder_picker():
+    """Open a native folder-picker dialog on the server (i.e. this machine).
+
+    Localhost-only: refuses non-loopback callers so a proxied/remote dashboard
+    can never trigger a dialog on the operator's desktop. Returns:
+        {ok, path, cancelled, error}
+    """
+    remote = (request.remote_addr or "").strip()
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "folder picker is available on localhost only"}), 403
+    # Try to serialise; if another picker is already open, tell the client
+    # cleanly rather than block a Flask worker.
+    if not _FOLDER_PICKER_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "a folder picker is already open"}), 409
+    try:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", _FOLDER_PICKER_CHILD],
+                capture_output=True, text=True,
+                timeout=_FOLDER_PICKER_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "folder picker timed out"}), 504
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": f"could not spawn picker: {exc}"}), 500
+
+        if proc.returncode == 2:
+            # tkinter missing: this is common on stripped-down Python builds.
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "tkinter not available; type the path manually"}), 200
+        if proc.returncode == 3:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or "picker failed").strip()}), 500
+        if proc.returncode != 0:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or f"picker exit {proc.returncode}").strip()}), 500
+
+        picked = (proc.stdout or "").strip()
+        if not picked:
+            return jsonify({"ok": False, "path": None, "cancelled": True, "error": None}), 200
+        return jsonify({"ok": True, "path": picked, "cancelled": False, "error": None})
+    finally:
+        _FOLDER_PICKER_LOCK.release()
+
+
+@app.route("/api/video/backend-status")
+def api_video_backend_status():
+    """Report which video-frame extraction backends are installed.
+
+    Consumed by the Settings tab to warn the operator when
+    ``VIDEO_CLASSIFY_ENABLED`` is on but no backend is available — the vision
+    worker would otherwise route every clip to Unclassified_Video, which is
+    correct but easy to miss.
+    """
+    try:
+        import video_frames
+        backends = video_frames.available_backends()
+        has_any = video_frames.has_any_backend()
+    except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return _err("failed to read video backend status", exc, 500)
+    return jsonify({"backends": backends, "has_any": has_any})
+
+
+# ── T1 #3 — Preset marketplace ────────────────────────────────────────────────
+
+def _community_preset_dir() -> Path:
+    """Repo-relative folder holding shipped community presets."""
+    return WORKSPACE_ROOT / "presets" / "community"
+
+
+@app.route("/api/presets/community")
+def api_presets_community():
+    """List presets shipped under ``<repo>/presets/community/``.
+
+    Each preset is a JSON envelope; we read the ``_meta`` block for a
+    headline / description / category tags where present, and fall back to
+    the filename otherwise. Never fails — an empty directory returns [].
+    """
+    root = _community_preset_dir()
+    out: list[dict[str, Any]] = []
+    if not root.exists() or not root.is_dir():
+        return jsonify(out)
+    for path in sorted(root.glob("*.json")):
+        try:
+            stat = path.stat()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        meta = payload.get("_meta") if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+        headline = str(meta.get("headline") or path.stem.replace("_", " ").title()).strip()
+        description = str(meta.get("description") or "").strip()
+        cats = meta.get("categories")
+        if not isinstance(cats, list):
+            cats = []
+        out.append({
+            "filename": path.name,
+            "headline": headline,
+            "description": description,
+            "categories": [str(c) for c in cats if isinstance(c, (str, int))],
+            "size_bytes": int(stat.st_size),
+        })
+    return jsonify(out)
+
+
+@app.route("/api/presets/preview")
+def api_presets_preview():
+    """SSRF-guarded PREVIEW of a remote preset — does NOT install anything.
+
+    Query: ``?url=<https://…>``. The URL is host-allowlisted, SSRF-guarded,
+    fetched with a 15s + 512 KB cap, then run through the same validator that
+    guards imports (``config_io.import_preset`` if the payload looks like a
+    portable envelope; ``_validate_inheritable_cfg`` otherwise). Returns
+    ``{ok, cfg, warnings, error}`` — ``cfg`` is the cleaned config the caller
+    would install; nothing is written to disk.
+    """
+    url = (request.args.get("url") or "").strip()
+    ok, err, body = _wave_fetch_preset_body(url)
+    if not ok:
+        return jsonify({"ok": False, "cfg": None, "warnings": [], "error": err}), 400
+    warnings: list[str] = []
+    try:
+        # Portable envelope form: {kind, name, preset|cfg, version}.
+        _name, cfg = config_io.import_preset(body)
+    except config_io.ValidationError as exc:
+        # Fall back to treating the raw payload as a bare inheritable cfg.
+        cleaned, err = _validate_inheritable_cfg(body, partial=False)
+        if err or cleaned is None:
+            return jsonify({"ok": False, "cfg": None, "warnings": [],
+                            "error": f"validation failed: {exc}"}), 400
+        cfg = cleaned
+        warnings.append("payload was not a portable preset envelope; validated as raw cfg")
+    return jsonify({"ok": True, "cfg": cfg, "warnings": warnings, "error": None})
+
+
+@app.route("/api/presets/install", methods=["POST"])
+def api_presets_install():
+    """Fetch + validate + install a remote preset under ``name``.
+
+    Body: ``{url, name}``. Rejects the request if ``name`` already exists
+    (mirrors ``/api/presets/import``). SSRF + host + size guards match
+    ``/api/presets/preview``; the validated cfg is saved via
+    ``_import_one_preset`` so the on-disk shape is identical to a normal
+    import.
+    """
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not _valid_preset_name(name):
+        return jsonify({"ok": False, "error": "invalid preset name"}), 400
+    if _preset_exists(name):
+        return jsonify({"ok": False, "error": "preset already exists", "exists": True}), 409
+    ok_fetch, err, body = _wave_fetch_preset_body(url)
+    if not ok_fetch:
+        return jsonify({"ok": False, "error": err}), 400
+    # Accept both a portable envelope and a bare cfg — same as the preview.
+    try:
+        _name, cfg = config_io.import_preset(body)
+    except config_io.ValidationError:
+        cleaned, verr = _validate_inheritable_cfg(body, partial=False)
+        if verr or cleaned is None:
+            return jsonify({"ok": False, "error": f"invalid preset: {verr}"}), 400
+        cfg = cleaned
+    ok_save, reason = _import_one_preset(name, cfg, overwrite=False)
+    if not ok_save:
+        return jsonify({"ok": False, "error": f"install failed: {reason}"}), 400
+    return jsonify({"ok": True, "key": name})
+
+
+# ── T1 #4 — Quick-sort folder ─────────────────────────────────────────────────
+
+_QUICK_SORT_TEMPLATES: dict[str, str] = {
+    "quality_only": "quality_only",  # references a preset key if present
+    "default": "default",
+}
+
+
+@app.route("/api/quick-sort", methods=["POST"])
+def api_quick_sort():
+    """Spin up an ephemeral job that sorts one local folder, then start pipeline.
+
+    Body: ``{folder: str, template: "quality_only"|"default", vision_worker_id: str|None}``.
+
+    * ``folder`` is validated to exist + be a directory. We deliberately allow
+      any path the local user can already read; this is a single-user admin
+      tool.
+    * ``template`` selects a preset — falls back to ``default`` if the named
+      one isn't in the library.
+    * A fresh job with slug ``_quick_<unix ts>`` is created, its
+      ``scrapers.local_imports`` override is set to the folder, then the job
+      is activated and the pipeline started.
+    """
+    data = request.get_json() or {}
+    folder_raw = (data.get("folder") or "").strip()
+    template = (data.get("template") or "default").strip() or "default"
+    if not folder_raw:
+        return jsonify({"ok": False, "error": "folder is required"}), 400
+    folder = Path(folder_raw)
+    try:
+        resolved = folder.resolve(strict=True)
+    except (OSError, FileNotFoundError):
+        return jsonify({"ok": False, "error": "folder does not exist"}), 400
+    if not resolved.is_dir():
+        return jsonify({"ok": False, "error": "folder is not a directory"}), 400
+
+    # Pick a preset. Prefer the requested template; if it doesn't exist,
+    # fall back to the library's default so quick-sort still boots.
+    presets = job_config.list_presets().get("presets", {}) or {}
+    if template not in presets:
+        template = job_config.default_preset_name()
+
+    # Generate a slug of the form "_quick_<timestamp>". Job slugs must match
+    # JOB_SLUG_RE (^[a-z0-9_]+$), so we replace the leading underscore with
+    # 'quick' — a leading underscore is technically valid but the slugify path
+    # normalises names into that shape anyway. Add a trailing rand for
+    # uniqueness within one wall-clock second.
+    ts = int(_wave_time.time())
+    rand = uuid.uuid4().hex[:4]
+    slug = f"quick_{ts}_{rand}"
+    name = f"Quick sort {ts}"
+    try:
+        job = job_config.create_job(name, preset=template)
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to create ephemeral job", exc, 500)
+
+    # If create_job derived a different slug from the name, use ours. We
+    # rewrite the on-disk job to carry the deterministic slug so the caller's
+    # returned identity matches later listings.
+    if job.slug != slug:
+        # Deleting the collision-free auto-slug and saving under our slug
+        # keeps the job model's invariants intact.
+        try:
+            job_config.delete_job(job.slug)
+        except Exception:  # noqa: BLE001
+            pass
+        job = job.with_updates(slug=slug)
+        job_config.save_job(job)
+
+    # Point the local-imports list at the requested folder.
+    quick_local = [{
+        "name": "quick",
+        "dir": str(resolved),
+        "enabled": True,
+        "migrate_from": None,
+    }]
+    job = job_config.set_override(job, "scrapers.local_imports", quick_local)
+    # Optional: pin the fleet to a single named worker if the caller wants
+    # to route the batch through a specific GPU.
+    vwid = (data.get("vision_worker_id") or "").strip()
+    if vwid:
+        eff = job_config.effective_config(job)
+        fleet = job_config.clean_vision_fleet(
+            (eff.get("vision") or {}).get("workers"))
+        chosen = [w for w in fleet if w.get("id") == vwid]
+        if chosen:
+            job = job_config.set_override(job, "vision.workers", chosen)
+
+    job_config.save_job(job)
+    try:
+        job_config.activate(slug)
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to activate quick-sort job", exc, 500)
+
+    # Piggy-back on the same pipeline-start machinery the UI button uses.
+    # Silently no-op if it's already running so the caller's second click
+    # doesn't 500.
+    global _pipeline_proc
+    with _pipeline_lock:
+        if not pipeline_running():
+            try:
+                env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+                args = [sys.executable, "-u", "run_pipeline.py"]
+                kwargs: dict[str, Any] = {"cwd": str(PIPELINE_CODE_DIR), "env": env}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                _pipeline_proc = subprocess.Popen(args, **kwargs)
+                update_env("DASHBOARD_PAUSED", "false")
+            except Exception as exc:  # noqa: BLE001
+                return _err("failed to start pipeline", exc, 500)
+    return jsonify({"ok": True, "slug": slug})
+
+
+# ── T2 #9 — Test-drive one image (dry run against the fleet) ──────────────────
+
+@app.route("/api/vision/dry-run", methods=["POST"])
+def api_vision_dry_run():
+    """Classify ONE uploaded image against a chosen worker without saving anything.
+
+    Multipart form: ``image`` (file, ≤ 20 MB), ``worker_id`` (string). Reads the
+    active job's effective config for the prompt + scoring, calls the worker's
+    endpoint OpenAI-compatibly, runs the response through ``apply_scores``, and
+    reports where the sorter WOULD have moved the image. Never writes anything.
+    """
+    image = request.files.get("image")
+    worker_id = (request.form.get("worker_id") or "").strip()
+    if image is None:
+        return jsonify({"ok": False, "error": "image file is required"}), 400
+
+    # Read the upload, enforcing the 20 MB cap without touching disk.
+    stream = image.stream
+    stream.seek(0, io.SEEK_END)
+    size = stream.tell()
+    stream.seek(0)
+    if size > _WAVE_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False,
+                        "error": f"image too large ({size} bytes; max {_WAVE_UPLOAD_MAX_BYTES})"}), 413
+    raw_bytes = stream.read(_WAVE_UPLOAD_MAX_BYTES + 1)
+    if len(raw_bytes) > _WAVE_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+
+    # Resolve the active job so the prompt matches what production sees.
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    vision = eff.get("vision") if isinstance(eff.get("vision"), dict) else {}
+    fleet = job_config.clean_vision_fleet(vision.get("workers"))
+    chosen = next((w for w in fleet if w.get("id") == worker_id), None)
+    if chosen is None:
+        return jsonify({"ok": False,
+                        "error": f"worker not found in active job's fleet: {worker_id!r}"}), 404
+
+    # Compress to JPEG + b64 the same way BaseVisionWorker does before an
+    # API call. We keep it in-memory throughout; no temp files.
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.thumbnail((512, 512), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=90)
+        b64 = _b64encode_bytes(buf.getvalue())
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": f"could not read image: {exc}"}), 400
+
+    # ``build_classification_prompt`` reads the score / caption config from env,
+    # which the supervisor projects from the active job. Nothing else to wire.
+    prompt = vision_prompt.build_classification_prompt()
+    schema = vision_prompt.build_response_format()
+
+    # Dispatch to the worker's provider. LM Studio / llama.cpp / OpenAI-
+    # compat all speak OpenAI /v1/chat/completions; Ollama speaks
+    # /api/chat. We keep the fanout small — this endpoint is a DEV probe.
+    provider = (chosen.get("provider") or "").strip().lower()
+    base_url = (chosen.get("base_url") or "").strip().rstrip("/")
+    model = (chosen.get("model") or "").strip()
+    api_key = (chosen.get("api_key") or "").strip()
+    if not base_url:
+        return jsonify({"ok": False, "error": "worker has no base_url"}), 400
+
+    import requests as _requests
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    raw_response: dict[str, Any] = {}
+    parsed: dict[str, Any] = {}
+    # Preserve the upstream URL for diagnostics — showing the endpoint we
+    # actually hit is half the battle when a user misconfigures base_url.
+    try:
+        if provider == "ollama":
+            call_url = f"{base_url}/api/chat"
+            payload = {
+                "model": model or "llama3.2-vision",
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": [b64],
+                }],
+                "format": schema.get("json_schema", {}).get("schema") if isinstance(schema, dict) else "json",
+                "stream": False,
+                "options": {"temperature": 0},
+            }
+            resp = _requests.post(
+                call_url, headers=headers, json=payload,
+                timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
+            raw_response = resp.json() if resp.content else {}
+            content = ((raw_response.get("message") or {}).get("content") or "")
+        else:
+            # Default OpenAI-compat path: lmstudio / llamacpp / openai / openrouter.
+            call_url = f"{base_url}/v1/chat/completions"
+            payload = {
+                "model": model or "gpt-4o-mini",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                }],
+                "response_format": schema,
+                "temperature": 0,
+            }
+            resp = _requests.post(
+                call_url, headers=headers, json=payload,
+                timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
+            raw_response = resp.json() if resp.content else {}
+            choices = raw_response.get("choices") or []
+            content = (choices[0].get("message", {}).get("content") or "") if choices else ""
+    except Exception as exc:  # noqa: BLE001 - never 500 the dry-run
+        # Network-level failures (ConnectionError, Timeout, DNS, etc.).
+        return jsonify({"ok": False, "error": f"worker call failed: {exc}"}), 502
+
+    # Parse + score-apply the model's JSON exactly like the worker would.
+    try:
+        parsed = vision_prompt._safe_parse_vision_json(content) or {}
+    except Exception:  # noqa: BLE001 - degrade to raw text
+        parsed = {}
+    try:
+        score_result = vision_prompt.apply_scores(parsed) if parsed else {}
+    except Exception:  # noqa: BLE001
+        score_result = {}
+    would_land = (score_result.get("category")
+                  or parsed.get("category")
+                  or "Unknown")
+
+    return jsonify({
+        "ok": True,
+        "raw_response": raw_response,
+        "parsed": parsed,
+        "would_land_in": would_land,
+        "score_result": score_result,
+    })
+
+
+def _b64encode_bytes(data: bytes) -> str:
+    """Base64-encode bytes to a UTF-8 string (helper for dry-run)."""
+    import base64 as _b64
+    return _b64.b64encode(data).decode("ascii")
+
+
+def _format_upstream_error(resp: Any, url: str) -> str:
+    """Format a rich diagnostic string from a non-2xx upstream response.
+
+    LM Studio / llama.cpp / Ollama frequently return 400 with a JSON body that
+    explains WHY (bad model name, unsupported field, schema issue). Surfacing
+    that body — status + url + up to ~800 chars, pretty-printed if JSON — turns
+    "worker call failed: 400 Client Error" into an actually actionable error.
+    """
+    body_text = ""
+    try:
+        # Prefer the parsed JSON body when the upstream sent one, so the
+        # keys the model rejected show up cleanly instead of as escaped text.
+        payload = resp.json()
+        body_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - fall through to raw text
+        try:
+            body_text = resp.text or ""
+        except Exception:  # noqa: BLE001
+            body_text = ""
+    if len(body_text) > 800:
+        body_text = body_text[:800] + "…"
+    status = getattr(resp, "status_code", "?")
+    return f"upstream {status} from {url}: {body_text}".strip()
+
+
+# ── T2 #10 — Endpoint discovery ───────────────────────────────────────────────
+
+@app.route("/api/vision/discover")
+def api_vision_discover():
+    """Probe common loopback endpoints (LM Studio / llama.cpp / Ollama)."""
+    try:
+        result = fleet_health.discover_local_endpoints()
+    except Exception as exc:  # noqa: BLE001
+        return _err("discovery failed", exc, 500)
+    return jsonify(result)
+
+
+@app.route("/api/vision/discover/add", methods=["POST"])
+def api_vision_discover_add():
+    """Append a discovered endpoint to the active job's vision.workers list.
+
+    Body: ``{provider, base_url, name, model?}``. The addition is stored as an
+    override on the active job so it takes effect on the next pipeline restart
+    without touching the shared preset library.
+    """
+    data = request.get_json() or {}
+    provider = (data.get("provider") or "").strip().lower()
+    base_url = (data.get("base_url") or "").strip()
+    name = (data.get("name") or "").strip()
+    model = (data.get("model") or "").strip()
+    if provider not in {"lmstudio", "llamacpp", "ollama"}:
+        return jsonify({"ok": False, "error": "provider must be lmstudio/llamacpp/ollama"}), 400
+    if not base_url or not name:
+        return jsonify({"ok": False, "error": "base_url and name are required"}), 400
+    if not re.match(r"^https?://", base_url, re.I):
+        return jsonify({"ok": False, "error": "base_url must be http(s)"}), 400
+
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    vision = eff.get("vision") if isinstance(eff.get("vision"), dict) else {}
+    fleet = list(job_config.clean_vision_fleet(vision.get("workers")))
+    new_worker: dict[str, Any] = {
+        "id": uuid.uuid4().hex[:12],
+        "name": name,
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": "",
+        "enabled": True,
+    }
+    fleet.append(new_worker)
+    job = job_config.set_override(job, "vision.workers", fleet)
+    job_config.save_job(job)
+    # Never ship raw api_keys back — mirror the /api/vision/health scrubber.
+    return jsonify(_scrub_fleet(fleet))
+
+
+# ── T2 #11 — Digest webhook (build + send) ────────────────────────────────────
+
+@app.route("/api/digest/build", methods=["POST"])
+def api_digest_build():
+    """Assemble a digest payload for ``slug`` over the last ``since_hours``.
+
+    Body: ``{slug, since_hours, top_n}``. Returns the payload verbatim plus a
+    pre-rendered Markdown body under ``markdown``.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip()
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"ok": False, "error": "invalid slug"}), 400
+    hours = max(1, int(data.get("since_hours") or 24))
+    top_n = max(0, int(data.get("top_n") or 20))
+    import datetime as _dt
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+    try:
+        payload = _digest_mod.build_digest(slug, since=since, top_n=top_n)
+        markdown = _digest_mod.render_markdown(payload)
+    except Exception as exc:  # noqa: BLE001
+        return _err("digest build failed", exc, 500)
+    return jsonify({"ok": True, "payload": payload, "markdown": markdown})
+
+
+@app.route("/api/digest/send", methods=["POST"])
+def api_digest_send():
+    """Build a digest AND POST it to ``webhook_url`` (Discord / Slack style).
+
+    Body: ``{slug, webhook_url, webhook_style, since_hours, top_n}``. The
+    webhook URL is passed to ``scheduler.run_digest`` which owns the SSRF
+    guard and the 15s POST cap.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip()
+    webhook_url = (data.get("webhook_url") or "").strip()
+    style = (data.get("webhook_style") or "discord").strip().lower()
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"ok": False, "error": "invalid slug"}), 400
+    if not webhook_url:
+        return jsonify({"ok": False, "error": "webhook_url is required"}), 400
+    hours = max(1, int(data.get("since_hours") or 24))
+    top_n = max(0, int(data.get("top_n") or 20))
+    try:
+        scheduler.run_digest(slug, since_hours=hours, top_n=top_n,
+                             webhook_url=webhook_url, webhook_style=style)
+    except Exception as exc:  # noqa: BLE001
+        return _err("digest send failed", exc, 500)
+    return jsonify({"ok": True})
+
+
+# ── T2 #12 — Export dry-run preview ───────────────────────────────────────────
+
+@app.route("/api/export/preview", methods=["POST"])
+def api_export_preview():
+    """Sample-iterate an export profile without copying anything.
+
+    Body: ``{profile, job_slug?, sample_size?}``. We iterate
+    ``export_profiles.iter_samples`` for the effective slug, sample up to
+    ``sample_size`` (default 200), and report counts + a resolution histogram
+    + the average caption length.
+    """
+    data = request.get_json() or {}
+    profile = (data.get("profile") or "").strip()
+    slug = (data.get("job_slug") or "").strip() or _resolve_job_slug()
+    sample_size = int(data.get("sample_size") or 200)
+    if sample_size < 1:
+        sample_size = 1
+    if profile and profile not in export_profiles.PROFILES:
+        return jsonify({"ok": False, "error": f"unknown profile: {profile}"}), 400
+    if not slug:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+
+    total = 0
+    kept = 0
+    category_counts: dict[str, int] = {}
+    resolution_hist: dict[str, int] = {"< 512": 0, "512-1024": 0, "1024-2048": 0, "2048+": 0}
+    caption_lengths: list[int] = []
+    orphans = 0
+    sample_paths: list[str] = []
+    try:
+        for sample in export_profiles.iter_samples(slug):
+            total += 1
+            category_counts[sample.category] = category_counts.get(sample.category, 0) + 1
+            if sample.caption:
+                kept += 1
+                caption_lengths.append(len(sample.caption))
+            else:
+                orphans += 1
+            # Cheap dimension read from meta (already stored in .vision.json)
+            width = 0
+            height = 0
+            if isinstance(sample.meta, dict):
+                width = int(sample.meta.get("width") or 0)
+                height = int(sample.meta.get("height") or 0)
+            if width <= 0 or height <= 0:
+                try:
+                    with Image.open(sample.image_path) as img:
+                        width, height = img.size
+                except (OSError, ValueError):
+                    pass
+            longest = max(width, height)
+            if longest <= 0:
+                pass
+            elif longest < 512:
+                resolution_hist["< 512"] += 1
+            elif longest < 1024:
+                resolution_hist["512-1024"] += 1
+            elif longest < 2048:
+                resolution_hist["1024-2048"] += 1
+            else:
+                resolution_hist["2048+"] += 1
+            if len(sample_paths) < 12:
+                sample_paths.append(str(sample.image_path))
+            if total >= sample_size:
+                break
+    except Exception as exc:  # noqa: BLE001 - never 500 the preview
+        return _err("export preview failed", exc, 500)
+
+    avg_caption_len = int(round(sum(caption_lengths) / len(caption_lengths))) if caption_lengths else 0
+    return jsonify({
+        "ok": True,
+        "profile": profile,
+        "slug": slug,
+        "total": total,
+        "kept": kept,
+        "category_counts": category_counts,
+        "resolution_histogram": resolution_hist,
+        "avg_caption_length": avg_caption_len,
+        "orphan_count": orphans,
+        "sample_paths": sample_paths,
+    })
+
+
+# ── T3 #13 — Bulk gallery actions ─────────────────────────────────────────────
+
+def _trash_dir_for(slug: str | None) -> Path:
+    """Recoverable trash folder for one slug (created lazily)."""
+    root = _wave_data_root() / "trash" / (slug or "default")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@app.route("/api/gallery/bulk-action", methods=["POST"])
+def api_gallery_bulk_action():
+    """Batch move / delete / reclassify sorted images.
+
+    Body: ``{paths: [str], action: "move"|"delete"|"reclassify",
+              target_category?: str, reason?: str}``. Every path is
+    ``safe_inside``-guarded against PIPELINE_SORTED. ``delete`` moves the file
+    (and its sidecars) into ``data/trash/<slug>/`` — never :func:`os.remove`
+    directly — so the operation is recoverable. Returns ``{moved: int,
+    failed: [{path, error}]}``.
+    """
+    data = request.get_json() or {}
+    paths = data.get("paths")
+    action = (data.get("action") or "").strip().lower()
+    target = (data.get("target_category") or "").strip()
+    if not isinstance(paths, list) or not paths:
+        return jsonify({"moved": 0, "failed": [{"path": "", "error": "paths list required"}]}), 400
+    if action not in {"move", "delete", "reclassify"}:
+        return jsonify({"moved": 0, "failed": [{"path": "", "error": f"unknown action: {action}"}]}), 400
+    if action in {"move", "reclassify"} and not target:
+        return jsonify({"moved": 0,
+                        "failed": [{"path": "", "error": "target_category required for move/reclassify"}]}), 400
+    if action in {"move", "reclassify"} and target not in set(_categories_mod.get_all_categories()):
+        return jsonify({"moved": 0,
+                        "failed": [{"path": "", "error": f"unknown target category: {target}"}]}), 400
+
+    moved = 0
+    failed: list[dict[str, str]] = []
+    slug = _resolve_job_slug()
+    for raw in paths:
+        if not isinstance(raw, str):
+            failed.append({"path": str(raw), "error": "path must be a string"})
+            continue
+        safe = safe_inside(raw, [PIPELINE_SORTED])
+        if safe is None or not safe.exists():
+            failed.append({"path": raw, "error": "path outside sorted roots or missing"})
+            continue
+        try:
+            if action == "delete":
+                trash = _trash_dir_for(slug)
+                for sibling in safe.parent.glob(f"{safe.stem}.*"):
+                    shutil.move(str(sibling), str(trash / sibling.name))
+                moved += 1
+                continue
+            # move + reclassify share the same destination-resolution path.
+            raw_dest = _recategorise_dest_dir(safe, target)
+            dest_dir = safe_inside(str(raw_dest), [PIPELINE_SORTED]) if raw_dest is not None else None
+            if dest_dir is None:
+                failed.append({"path": raw, "error": "could not resolve destination inside sorted"})
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for sibling in safe.parent.glob(f"{safe.stem}.*"):
+                shutil.move(str(sibling), str(dest_dir / sibling.name))
+            # Update the .vision.json category so the sidecar stays in sync.
+            new_meta = dest_dir / f"{safe.stem}.vision.json"
+            if new_meta.exists():
+                try:
+                    payload = json.loads(new_meta.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        payload["category"] = target
+                        new_meta.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+                except (OSError, json.JSONDecodeError):
+                    pass  # non-fatal — the move already succeeded
+            moved += 1
+        except OSError as exc:
+            failed.append({"path": raw, "error": f"filesystem error: {exc}"})
+    # Invalidate the sorted cache so the gallery reflects the moves.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"moved": moved, "failed": failed})
+
+
+# ── T3 #14 — Undo / requeue ───────────────────────────────────────────────────
+
+@app.route("/api/gallery/requeue", methods=["POST"])
+def api_gallery_requeue():
+    """Move classified images back to the queue for re-classification.
+
+    Body variants:
+      - ``{paths: [str]}`` — a specific list.
+      - ``{category, since, job_slug}`` — every image in ``category`` for
+        ``job_slug`` whose mtime is >= ``since`` (ISO8601).
+    Delegates the actual moves to ``requeue_sorted.requeue_triples`` so the
+    file-shuffling logic remains in one place.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("job_slug") or "").strip() or _resolve_job_slug() or "default"
+    category = (data.get("category") or "").strip() or None
+    since_raw = (data.get("since") or "").strip()
+    paths_arg = data.get("paths")
+
+    # Build buckets the way requeue_sorted does — but filter to the caller's
+    # scope (an explicit path list wins over the since/category form).
+    try:
+        buckets = _requeue_mod.collect_buckets(category=category)
+    except Exception as exc:  # noqa: BLE001
+        return _err("collect_buckets failed", exc, 500)
+
+    if isinstance(paths_arg, list) and paths_arg:
+        # Filter buckets to just the requested stems (safe_inside-guarded).
+        wanted_stems: set[str] = set()
+        for raw in paths_arg:
+            if not isinstance(raw, str):
+                continue
+            safe = safe_inside(raw, [PIPELINE_SORTED])
+            if safe is None:
+                continue
+            wanted_stems.add(safe.stem)
+        filtered: dict = {}
+        for key, items in buckets.items():
+            keep = {stem: flags for stem, flags in items.items() if stem in wanted_stems}
+            if keep:
+                filtered[key] = keep
+        buckets = filtered
+    elif since_raw:
+        try:
+            import datetime as _dt
+            since_dt = _dt.datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            since_epoch = since_dt.timestamp()
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "invalid ISO8601 since"}), 400
+        filtered = {}
+        for key, items in buckets.items():
+            keep = {}
+            for stem, flags in items.items():
+                any_new = False
+                for p in flags.get("files", []):
+                    try:
+                        if p.stat().st_mtime >= since_epoch:
+                            any_new = True
+                            break
+                    except OSError:
+                        continue
+                if any_new:
+                    keep[stem] = flags
+            if keep:
+                filtered[key] = keep
+        buckets = filtered
+
+    try:
+        requeued = _requeue_mod.requeue_triples(buckets, dry_run=False, limit=None)
+    except Exception as exc:  # noqa: BLE001
+        return _err("requeue failed", exc, 500)
+    # Invalidate caches so the next gallery/stats read reflects the move.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"requeued": int(requeued), "failed": []})
+
+
+# ── T3 #17 — gallery-dl URL test ──────────────────────────────────────────────
+
+@app.route("/api/scrapers/gallery-dl/test-url", methods=["POST"])
+def api_scrapers_gallery_dl_test_url():
+    """Preflight one URL through gallery-dl's extractor (no downloads).
+
+    Accepts either ``cookies_txt`` (raw Netscape-format cookie content) OR
+    ``cookies_file`` (a filesystem PATH to a cookies file). When both are
+    present the PATH wins — the field is unambiguous, and this matches how
+    the scraper config already stores it. When ``cookies_file`` is supplied
+    we read the file server-side (bound to 127.0.0.1) and pass the content
+    down as ``cookies_txt`` so the underlying probe sees exactly one shape.
+    """
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    cookies_txt = data.get("cookies_txt")
+    cookies_file = data.get("cookies_file")
+    config_json = data.get("config_json")
+
+    # cookies_file (path) beats inline cookies_txt — surfaces a clearer error
+    # than gallery-dl's cryptic "not enough values to unpack" when the caller
+    # accidentally sent a PATH string as CONTENT.
+    if isinstance(cookies_file, str) and cookies_file.strip():
+        raw_path = cookies_file.strip()
+        # Reject Windows special-device paths outright — Path.resolve() can
+        # silently accept them, which is not what a "pick your local cookies
+        # file" flow should ever hit.
+        if raw_path.startswith(("\\\\?\\", "\\\\.\\", "//?/", "//./")):
+            return jsonify({"ok": False, "error": f"cookies file path not allowed: {raw_path}"})
+        try:
+            cp = Path(raw_path).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            return jsonify({"ok": False, "error": f"invalid cookies file path: {exc}"})
+        if not cp.exists() or not cp.is_file():
+            return jsonify({"ok": False, "error": f"cookies file not found: {cp}"})
+        try:
+            size = cp.stat().st_size
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot stat cookies file: {exc}"})
+        if size > 1_048_576:  # 1 MB defensive cap
+            return jsonify({"ok": False, "error": "cookies file too large (>1 MB)"})
+        try:
+            content = cp.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot read cookies file: {exc}"})
+        # Netscape-format sanity check — saves users a bewildering downstream
+        # ValueError from gallery-dl's cookiejar parser.
+        first_line = content.lstrip().splitlines()[0] if content.strip() else ""
+        if not first_line.lower().startswith("# netscape http cookie file"):
+            return jsonify({
+                "ok": False,
+                "error": ("cookies file is not in Netscape format "
+                          "(expected first line '# Netscape HTTP Cookie File')"),
+            })
+        cookies_txt = content
+
+    try:
+        result = scraper_test._check_gallery_dl_url(
+            url,
+            cookies_txt=cookies_txt if isinstance(cookies_txt, str) else None,
+            config_json=config_json if isinstance(config_json, str) else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err("gallery-dl url test failed", exc, 500)
+    return jsonify(result)
+
+
+# yt-dlp URL preflight — parallels gallery-dl's endpoint. Uses the yt_dlp
+# Python package in extract_info(download=False) mode inside a 15s watchdog
+# so a slow / hostile remote can't stall the request thread.
+_YT_DLP_URL_TIMEOUT_SECONDS = 15.0
+
+
+@app.route("/api/scrapers/yt-dlp/test-url", methods=["POST"])
+def api_scrapers_yt_dlp_test_url():
+    """Preflight one URL through yt-dlp's extract_info (no downloads)."""
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"})
+    try:
+        scheme = _wave_urlparse(url).scheme.lower()
+    except Exception:  # noqa: BLE001
+        return jsonify({"ok": False, "error": "invalid url"})
+    if scheme not in ("http", "https"):
+        return jsonify({"ok": False, "error": "only http(s) URLs are allowed"})
+
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp not importable: %s", exc)
+        return jsonify({"ok": False, "error": "yt-dlp not installed"})
+
+    import concurrent.futures as _cf_ytdlp
+
+    # Heuristic: for a single video, extract_flat='in_playlist' makes yt-dlp
+    # skip metadata extraction on some paths and report "not available". Only
+    # keep flat mode for URLs that look like a playlist / channel / list.
+    _u_lower = url.lower()
+    _is_playlist = ("/playlist" in _u_lower
+                    or "/channel" in _u_lower
+                    or "list=" in _u_lower)
+
+    def _probe() -> dict:
+        opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            # Playlists → flat; single videos → full metadata pass.
+            "extract_flat": "in_playlist" if _is_playlist else False,
+            "socket_timeout": 10,
+            # A realistic UA + Accept-Language shuts down the vast majority
+            # of YouTube's "Sign in to confirm you're not a bot" refusals
+            # on server-hosted IPs.
+            "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[attr-defined]
+            info = ydl.extract_info(url, download=False)
+        info = info or {}
+        # Playlists / channels expose `entries` (may be a generator).
+        entries = info.get("entries")
+        count_estimate: int | None = None
+        if isinstance(entries, list):
+            count_estimate = len(entries)
+        elif entries is not None:
+            try:
+                # Best-effort: bounded iteration so a huge playlist doesn't
+                # eat memory.
+                count_estimate = 0
+                for _ in entries:
+                    count_estimate += 1
+                    if count_estimate >= 200:
+                        break
+            except Exception:  # noqa: BLE001
+                count_estimate = None
+        duration = info.get("duration")
+        return {
+            "ok": True,
+            "extractor": info.get("extractor") or info.get("extractor_key"),
+            "title": info.get("title"),
+            "duration_sec": int(duration) if isinstance(duration, (int, float)) else None,
+            "count_estimate": count_estimate,
+            "error": None,
+        }
+
+    try:
+        with _cf_ytdlp.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_probe)
+            result = fut.result(timeout=_YT_DLP_URL_TIMEOUT_SECONDS)
+        return jsonify(result)
+    except _cf_ytdlp.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": f"timed out after {int(_YT_DLP_URL_TIMEOUT_SECONDS)}s",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp test-url error for %s: %s", url, exc)
+        msg = str(exc)[:200]
+        # Bot-check / geo / age-gate / private → point the user at cookies.
+        if "not available" in msg.lower() or "sign in" in msg.lower():
+            msg = (f"{msg} — May be geo-blocked, age-restricted, private, or "
+                   "requiring a signed-in browser cookie file — try adding "
+                   "cookies in the scraper config.")
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {msg}",
+        })
+
+
+# ── T3 #18 — Cookies converter ────────────────────────────────────────────────
+
+# Netscape cookies.txt header the browser extensions all emit.
+_COOKIES_HEADER = (
+    "# Netscape HTTP Cookie File\n"
+    "# Generated by cull dashboard — https://github.com\n"
+    "# This is a generated file! Do not edit.\n"
+)
+# 30 days from now for cookies with no expiry set — matches the extension defaults.
+_COOKIES_DEFAULT_TTL_SECONDS = 30 * 24 * 3600
+_COOKIES_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _parse_devtools_cookies(raw: str, target_domain: str) -> list[dict]:
+    """Convert a semicolon-separated ``k=v`` string OR a JSON array of cookie
+    objects into a list of ``{name, value, domain, path, expires, secure,
+    http_only}`` dicts."""
+    text = raw.strip()
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        out: list[dict] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            value = str(entry.get("value") or "")
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "value": value,
+                "domain": str(entry.get("domain") or target_domain).strip(),
+                "path": str(entry.get("path") or "/").strip() or "/",
+                "expires": int(entry.get("expires") or 0) or 0,
+                "secure": bool(entry.get("secure", True)),
+                "http_only": bool(entry.get("httpOnly") or entry.get("http_only")),
+            })
+        return out
+    # Fall through: semicolon-separated ``k=v`` pairs (DevTools "Copy request
+    # cookies" output).
+    out = []
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, _, value = chunk.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "value": value.strip(),
+            "domain": target_domain,
+            "path": "/",
+            "expires": 0,
+            "secure": True,
+            "http_only": False,
+        })
+    return out
+
+
+def _render_netscape_cookies(cookies: list[dict]) -> str:
+    """Format cookies as Netscape cookies.txt."""
+    lines: list[str] = [_COOKIES_HEADER]
+    now = int(_wave_time.time())
+    for c in cookies:
+        domain = c.get("domain") or ""
+        if domain and not domain.startswith("."):
+            domain = "." + domain
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = c.get("path") or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        expires = int(c.get("expires") or 0)
+        if expires <= 0:
+            expires = now + _COOKIES_DEFAULT_TTL_SECONDS
+        lines.append(
+            "\t".join([domain, flag, path, secure, str(expires),
+                       c.get("name", ""), c.get("value", "")])
+        )
+    return "\n".join(lines) + "\n"
+
+
+@app.route("/api/cookies/convert", methods=["POST"])
+def api_cookies_convert():
+    """Convert pasted DevTools cookies into a Netscape ``cookies.txt`` on disk.
+
+    Body: ``{raw, target_domain, output_name}``. Loopback-only (rejects any
+    non-127.0.0.1 caller). Writes to ``<data_root>/cookies/<safe_name>.txt``
+    via ``safe_inside`` so the destination can never escape the cookies dir.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    data = request.get_json() or {}
+    raw = (data.get("raw") or "").strip()
+    domain = (data.get("target_domain") or "").strip()
+    output_name = (data.get("output_name") or "").strip()
+    if not raw:
+        return jsonify({"ok": False, "error": "raw is required"}), 400
+    if not domain:
+        return jsonify({"ok": False, "error": "target_domain is required"}), 400
+    if not _COOKIES_NAME_RE.match(output_name):
+        return jsonify({"ok": False,
+                        "error": "output_name must be [A-Za-z0-9._-]{1,64}"}), 400
+
+    cookies = _parse_devtools_cookies(raw, domain)
+    if not cookies:
+        return jsonify({"ok": False, "error": "no cookies parsed"}), 400
+    body = _render_netscape_cookies(cookies)
+
+    cookies_dir = _wave_data_root() / "cookies"
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+    # safe_inside guards the write destination against traversal via a
+    # malicious output_name (belt-and-braces — the regex already rejects it).
+    dest_raw = cookies_dir / f"{output_name}.txt"
+    dest = safe_inside(str(dest_raw), [cookies_dir])
+    if dest is None:
+        # `safe_inside` returns None when the resolved path doesn't yet exist;
+        # fall back to a manual containment check via commonpath. dest_raw's
+        # parent is guaranteed to be cookies_dir here (from the regex), so
+        # this is a hard confirm rather than a computation.
+        try:
+            resolved_parent = os.path.realpath(str(dest_raw.parent))
+            cookies_real = os.path.realpath(str(cookies_dir))
+            if os.path.commonpath([resolved_parent, cookies_real]) != cookies_real:
+                return jsonify({"ok": False, "error": "output path escapes cookies dir"}), 400
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "error": "invalid output path"}), 400
+        dest = dest_raw
+    try:
+        dest.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        return _err("could not write cookies file", exc, 500)
+    return jsonify({"ok": True, "path": str(dest), "count": len(cookies)})
+
+
+# ── T3 #19 — Log tail (SSE) ───────────────────────────────────────────────────
+
+def _newest_log_file() -> Path | None:
+    """Return the most-recently modified ``.log`` under LOG_DIR, or None."""
+    log_dir = LOG_DIR
+    if not log_dir.exists():
+        # Fall back to the paths.py resolution so the SSE stream works even
+        # when the module was imported before LOG_DIR was set.
+        try:
+            log_dir = _paths.log_dir()
+        except Exception:  # noqa: BLE001
+            return None
+    if not log_dir.exists():
+        return None
+    files = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+@app.route("/api/logs/stream")
+def api_logs_stream():
+    """Server-Sent Events stream of new lines appended to the newest log file.
+
+    Sends at most 1 line per 100 ms and a keepalive comment every 15 seconds.
+    Client disconnects propagate as a broken pipe on the send — the generator
+    exits cleanly.
+    """
+
+    def generate():
+        current: Path | None = _newest_log_file()
+        position = 0
+        if current is not None:
+            try:
+                position = current.stat().st_size
+            except OSError:
+                position = 0
+        last_keepalive = _wave_time.monotonic()
+        while True:
+            new_current = _newest_log_file()
+            if new_current is None:
+                # Nothing to tail yet — keepalive + short sleep.
+                if _wave_time.monotonic() - last_keepalive > 15:
+                    yield ": keepalive\n\n"
+                    last_keepalive = _wave_time.monotonic()
+                _wave_time.sleep(0.5)
+                continue
+            if current is None or new_current != current:
+                current = new_current
+                position = 0
+            try:
+                stat = current.stat()
+                if stat.st_size < position:
+                    position = 0  # file was rotated/truncated
+                if stat.st_size > position:
+                    with current.open("r", encoding="utf-8", errors="replace") as fh:
+                        fh.seek(position)
+                        chunk = fh.read(stat.st_size - position)
+                        position = fh.tell()
+                    for line in chunk.splitlines():
+                        if not line.strip():
+                            continue
+                        payload = {
+                            "file": current.name,
+                            "line": line,
+                            "ts": datetime.utcnow().isoformat() + "Z",
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        last_keepalive = _wave_time.monotonic()
+                        # Rate-limit: at most 1 line / 100 ms.
+                        _wave_time.sleep(0.1)
+            except OSError:
+                _wave_time.sleep(0.5)
+                continue
+            if _wave_time.monotonic() - last_keepalive > 15:
+                yield ": keepalive\n\n"
+                last_keepalive = _wave_time.monotonic()
+            _wave_time.sleep(0.25)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
+
+
+# ── T3 #20 — VRAM hint ────────────────────────────────────────────────────────
+
+# Rough per-quant memory footprint per billion params. Numbers are the widely
+# quoted "napkin math" for a 7B model as a base; scale linearly with param
+# count. Anything not on this list falls back to the FP16 estimate.
+_QUANT_GB_PER_B: dict[str, float] = {
+    "fp16": 2.0, "f16": 2.0,
+    "q8_0": 1.05, "q6_k": 0.85, "q5_k_m": 0.72, "q5_k_s": 0.68,
+    "q4_k_m": 0.60, "q4_k_s": 0.55, "q4_0": 0.55,
+    "q3_k_m": 0.48, "q3_k_s": 0.44,
+    "q2_k": 0.38,
+}
+_PARAM_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*[Bb](?!\w)")
+_QUANT_RE = re.compile(r"(fp16|f16|q[2-8][_.-]?[0-9km_s]{0,4})", re.I)
+
+
+def _estimate_worker_metadata(model_id: str, model_meta: dict[str, Any]) -> dict[str, Any]:
+    """Rough VRAM / quant / context-window estimate for one LM Studio model."""
+    mid = str(model_id or "")
+    # Try the loaded-model API's numeric fields first — they beat any guess.
+    ctx = model_meta.get("loaded_context_length") or model_meta.get("context_length")
+    quant = model_meta.get("quantization") or ""
+    size_bytes = model_meta.get("size") or model_meta.get("file_size")
+    if not quant:
+        q = _QUANT_RE.search(mid)
+        if q:
+            quant = q.group(1).lower().replace(".", "_").replace("-", "_")
+    vram_gb: float | None = None
+    if isinstance(size_bytes, (int, float)) and size_bytes > 0:
+        vram_gb = round(float(size_bytes) / 1_073_741_824, 2)
+    else:
+        # Fall back to param-count × per-quant scaling.
+        params_b = 0.0
+        m = _PARAM_RE.search(mid)
+        if m:
+            try:
+                params_b = float(m.group(1))
+            except ValueError:
+                params_b = 0.0
+        if params_b > 0:
+            scale = _QUANT_GB_PER_B.get((quant or "").lower(), _QUANT_GB_PER_B["fp16"])
+            vram_gb = round(params_b * scale, 2)
+    return {
+        "estimated_vram_gb": vram_gb,
+        "context_window": int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else None,
+        "quantization": quant or None,
+    }
+
+
+@app.route("/api/vision/worker-info")
+def api_vision_worker_info():
+    """Best-effort loaded-model info for an LM Studio worker.
+
+    Query: ``?worker_id=<id>``. Looks up the worker in the active job's fleet,
+    hits its ``/api/v0/models`` (LM Studio-specific, richer payload) with a
+    fallback to ``/v1/models``, and derives a VRAM/context/quant hint.
+    """
+    worker_id = (request.args.get("worker_id") or "").strip()
+    if not worker_id:
+        return jsonify({"error": "worker_id is required"}), 400
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    fleet = job_config.clean_vision_fleet(
+        (eff.get("vision") or {}).get("workers"))
+    chosen = next((w for w in fleet if w.get("id") == worker_id), None)
+    if chosen is None:
+        return jsonify({"error": f"unknown worker: {worker_id!r}"}), 404
+    base_url = (chosen.get("base_url") or "").rstrip("/")
+    model = (chosen.get("model") or "").strip()
+    api_key = (chosen.get("api_key") or "").strip()
+    if not base_url:
+        return jsonify({"error": "worker has no base_url"}), 400
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    import requests as _requests
+    meta: dict[str, Any] = {}
+    for path in ("/api/v0/models", "/v1/models"):
+        try:
+            resp = _requests.get(f"{base_url}{path}", headers=headers,
+                                 timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code == 200:
+                payload = resp.json() if resp.content else {}
+                for item in (payload.get("data") or []):
+                    if isinstance(item, dict) and (not model or item.get("id") == model):
+                        meta = item
+                        break
+                if meta:
+                    break
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort
+            logger.debug("worker-info probe %s%s failed: %s", base_url, path, exc)
+    hints = _estimate_worker_metadata(model or meta.get("id", ""), meta)
+    return jsonify({"worker_id": worker_id, "model": model or meta.get("id"),
+                    **hints})
+
+
+# ── T3 #21 — Gist sharing ─────────────────────────────────────────────────────
+
+@app.route("/api/presets/publish-gist", methods=["POST"])
+def api_presets_publish_gist():
+    """Upload a preset export as a GitHub gist.
+
+    Body: ``{preset_key, gist_token, public}``. Loopback-only (the token is a
+    write-scope PAT). The token is NEVER logged — even the warning branches
+    stringify the request without it. Returns ``{ok, gist_url}``.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    data = request.get_json() or {}
+    preset_key = (data.get("preset_key") or "").strip()
+    gist_token = (data.get("gist_token") or "").strip()
+    public = bool(data.get("public", False))
+    if not _valid_preset_name(preset_key):
+        return jsonify({"ok": False, "error": "invalid preset name"}), 400
+    if not _preset_exists(preset_key):
+        return jsonify({"ok": False, "error": "preset not found"}), 404
+    if not gist_token:
+        return jsonify({"ok": False, "error": "gist_token is required"}), 400
+
+    try:
+        envelope = config_io.export_preset(preset_key)
+        body = json.dumps(envelope, indent=2, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001 - export failure is user-facing, never leak token
+        return _err("failed to export preset", exc, 500)
+
+    payload = {
+        "description": f"cull preset export — {preset_key}",
+        "public": bool(public),
+        "files": {f"{preset_key}.preset.json": {"content": body}},
+    }
+    try:
+        import requests as _requests
+        resp = _requests.post(
+            "https://api.github.com/gists",
+            headers={
+                "Authorization": f"Bearer {gist_token}",
+                "Accept": "application/vnd.github+json",
+                # UA is required by GitHub's API.
+                "User-Agent": "cull-dashboard",
+            },
+            json=payload,
+            timeout=_WAVE_HTTP_TIMEOUT,
+            allow_redirects=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - never leak the token
+        logger.warning("gist publish failed (no token in log)")
+        return jsonify({"ok": False, "error": f"gist publish failed: {type(exc).__name__}"}), 502
+    if resp.status_code not in (200, 201):
+        logger.warning("gist publish HTTP %s (no token in log)", resp.status_code)
+        return jsonify({"ok": False,
+                        "error": f"GitHub returned HTTP {resp.status_code}"}), 502
+    body_json = resp.json() if resp.content else {}
+    return jsonify({"ok": True, "gist_url": body_json.get("html_url") or ""})
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
@@ -3555,6 +5412,280 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .tip-pop b { color:#f1f5f9; font-weight:600; }
   .tip-pop code { background:#0f172a; border:1px solid #334155; border-radius:3px; padding:0 .25rem; color:#fcd34d; }
   .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
+
+  /* ── Theme system (T3 #22) — three color modes stored on <html>. Dark
+     stays the default; light + high-contrast override the full token set so
+     hard-coded Tailwind-esque utility classes across the tree flip
+     automatically via blanket selector overrides below. */
+  :root {
+    --color-bg: #020617;
+    --color-bg-elev: #0f172a;
+    --color-fg: #f1f5f9;
+    --color-fg-muted: #94a3b8;
+    --color-surface: rgba(15,23,42,0.78);
+    --color-surface-alt: #1e293b;
+    --color-border: rgba(51,65,85,0.5);
+    --color-border-strong: #334155;
+    --color-accent: #6366f1;
+    --color-accent-hover: #4f46e5;
+    --color-accent-fg: #ffffff;
+    --color-success: #10b981;
+    --color-success-fg: #ffffff;
+    --color-warn: #f59e0b;
+    --color-warn-fg: #0f172a;
+    --color-danger: #e11d48;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #0f172a;
+    --color-input-fg: #f1f5f9;
+    --color-input-placeholder: #64748b;
+    --color-pill-bg: rgba(30,41,59,0.6);
+    --color-pill-fg: #cbd5e1;
+  }
+
+  /* Sticky save-bar (used by Global Settings, Job Settings and the Preset
+     editor headers). Themed via CSS variables so the backdrop stays legible
+     across every theme without a hard-coded slate colour. color-mix gives us
+     a semi-transparent surface that still admits the blur behind it. */
+  .sticky-save-bar {
+    background: color-mix(in oklab, var(--color-bg) 92%, transparent);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  /* Base defaults for elements. Dark uses the :root values; light overrides
+     everything below. This block is theme-agnostic — it reads variables. */
+  input, select, textarea {
+    color: var(--color-input-fg);
+    background: var(--color-input-bg);
+    border-color: var(--color-border);
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--color-input-placeholder);
+    opacity: 1;
+    font-style: italic;
+  }
+  input:not(:placeholder-shown):not([type=checkbox]):not([type=radio]),
+  textarea:not(:placeholder-shown) {
+    color: var(--color-input-fg);
+    font-weight: 500;
+  }
+
+  /* ── LIGHT THEME ── comprehensive coverage. Overrides tokens + then blanket
+     selectors so existing utility classes flip without editing markup. */
+  html.theme-light {
+    --color-bg: #f5f2ec;
+    --color-bg-elev: #ffffff;
+    --color-fg: #0f172a;
+    --color-fg-muted: #475569;
+    --color-surface: #ffffff;
+    --color-surface-alt: #f1f5f9;
+    --color-border: #e2e8f0;
+    --color-border-strong: #cbd5e1;
+    --color-accent: #4f46e5;
+    --color-accent-hover: #4338ca;
+    --color-accent-fg: #ffffff;
+    --color-success: #059669;
+    --color-success-fg: #ffffff;
+    --color-warn: #d97706;
+    --color-warn-fg: #ffffff;
+    --color-danger: #dc2626;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #ffffff;
+    --color-input-fg: #0f172a;
+    --color-input-placeholder: #94a3b8;
+    --color-pill-bg: #eef2ff;
+    --color-pill-fg: #3730a3;
+  }
+  html.theme-light body { background: var(--color-bg) !important; color: var(--color-fg) !important; }
+  html.theme-light aside,
+  html.theme-light aside.bg-slate-900\/70,
+  html.theme-light .bg-slate-900\/70 {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html.theme-light .card {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Surface / panel backgrounds. */
+  html.theme-light .bg-slate-800,
+  html.theme-light .bg-slate-800\/60,
+  html.theme-light .bg-slate-800\/50,
+  html.theme-light .bg-slate-800\/40,
+  html.theme-light .bg-slate-900,
+  html.theme-light .bg-slate-900\/60,
+  html.theme-light .bg-slate-900\/50,
+  html.theme-light .bg-slate-900\/40,
+  html.theme-light .bg-slate-900\/30,
+  html.theme-light .bg-slate-950,
+  html.theme-light .bg-slate-950\/60,
+  html.theme-light .bg-slate-700,
+  html.theme-light .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Text tokens. */
+  html.theme-light .text-slate-100,
+  html.theme-light .text-slate-200,
+  html.theme-light .text-slate-300,
+  html.theme-light .text-white { color: var(--color-fg) !important; }
+  html.theme-light .text-slate-400,
+  html.theme-light .text-slate-500,
+  html.theme-light .text-slate-600 { color: var(--color-fg-muted) !important; }
+  /* Borders. */
+  html.theme-light .border-slate-600,
+  html.theme-light .border-slate-700,
+  html.theme-light .border-slate-800,
+  html.theme-light .border-slate-900 { border-color: var(--color-border) !important; }
+  /* Accent buttons. */
+  html.theme-light .bg-indigo-500,
+  html.theme-light .bg-indigo-600,
+  html.theme-light .hover\:bg-indigo-500:hover,
+  html.theme-light .hover\:bg-indigo-600:hover,
+  html.theme-light .hover\:bg-indigo-700:hover {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-fg) !important;
+  }
+  html.theme-light .text-indigo-300,
+  html.theme-light .text-indigo-400,
+  html.theme-light .text-indigo-500 { color: var(--color-accent) !important; }
+  /* Success (emerald). */
+  html.theme-light .bg-emerald-500,
+  html.theme-light .bg-emerald-600,
+  html.theme-light .hover\:bg-emerald-500:hover,
+  html.theme-light .hover\:bg-emerald-600:hover,
+  html.theme-light .bg-emerald-800,
+  html.theme-light .bg-emerald-800\/60 {
+    background: var(--color-success) !important;
+    color: var(--color-success-fg) !important;
+  }
+  html.theme-light .text-emerald-100,
+  html.theme-light .text-emerald-200,
+  html.theme-light .text-emerald-300,
+  html.theme-light .text-emerald-400 { color: var(--color-success) !important; }
+  /* Warn (amber). */
+  html.theme-light .bg-amber-500,
+  html.theme-light .bg-amber-600,
+  html.theme-light .hover\:bg-amber-400:hover,
+  html.theme-light .hover\:bg-amber-500:hover {
+    background: var(--color-warn) !important;
+    color: var(--color-warn-fg) !important;
+  }
+  html.theme-light .text-amber-300,
+  html.theme-light .text-amber-400 { color: var(--color-warn) !important; }
+  /* Danger (rose / red). */
+  html.theme-light .bg-rose-500,
+  html.theme-light .bg-rose-600,
+  html.theme-light .bg-red-500,
+  html.theme-light .bg-red-600,
+  html.theme-light .bg-rose-900\/60,
+  html.theme-light .bg-rose-950\/60,
+  html.theme-light .hover\:bg-rose-500:hover,
+  html.theme-light .hover\:bg-rose-800:hover {
+    background: var(--color-danger) !important;
+    color: var(--color-danger-fg) !important;
+  }
+  html.theme-light .text-rose-100,
+  html.theme-light .text-rose-200,
+  html.theme-light .text-rose-300,
+  html.theme-light .text-rose-400,
+  html.theme-light .text-red-400 { color: var(--color-danger) !important; }
+  /* Inputs / selects / textareas — already set via :root; enforce for
+     Tailwind-classed inputs that hard-code dark bgs. */
+  html.theme-light input,
+  html.theme-light select,
+  html.theme-light textarea {
+    background: var(--color-input-bg) !important;
+    color: var(--color-input-fg) !important;
+    border-color: var(--color-border-strong) !important;
+  }
+  html.theme-light input::placeholder,
+  html.theme-light textarea::placeholder { color: var(--color-input-placeholder) !important; }
+  /* Pills. */
+  html.theme-light .pill { background: var(--color-pill-bg) !important; color: var(--color-pill-fg) !important; }
+  /* Table headers with hardcoded dark bg (Global Stats etc.). */
+  html.theme-light thead,
+  html.theme-light thead tr,
+  html.theme-light th { background: var(--color-surface-alt) !important; color: var(--color-fg) !important; }
+  /* Code + <code> spans. */
+  html.theme-light code {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-accent) !important;
+    border-color: var(--color-border) !important;
+  }
+  /* Links. */
+  html.theme-light a, html.theme-light .link-btn { color: var(--color-accent) !important; }
+
+  /* ── HIGH-CONTRAST THEME ── pure black/white/yellow, comprehensive. */
+  html.theme-hc {
+    --color-bg: #000000;
+    --color-bg-elev: #000000;
+    --color-fg: #ffffff;
+    --color-fg-muted: #ffffff;
+    --color-surface: #000000;
+    --color-surface-alt: #000000;
+    --color-border: #ffffff;
+    --color-border-strong: #ffffff;
+    --color-accent: #ffe600;
+    --color-accent-hover: #ffd400;
+    --color-accent-fg: #000000;
+    --color-success: #00ff88;
+    --color-success-fg: #000000;
+    --color-warn: #ffe600;
+    --color-warn-fg: #000000;
+    --color-danger: #ff5c5c;
+    --color-danger-fg: #000000;
+    --color-input-bg: #000000;
+    --color-input-fg: #ffffff;
+    --color-input-placeholder: #cccccc;
+    --color-pill-bg: #000000;
+    --color-pill-fg: #ffe600;
+  }
+  html.theme-hc body { background: #000 !important; color: #fff !important; }
+  html.theme-hc .card { background: #000 !important; border: 2px solid #fff !important; color: #fff !important; }
+  html.theme-hc aside { background: #000 !important; border-color: #fff !important; color: #fff !important; }
+  html.theme-hc .link-btn, html.theme-hc a { color: #ffe600 !important; text-decoration: underline !important; }
+  html.theme-hc input, html.theme-hc select, html.theme-hc textarea {
+    background: #000 !important; color: #fff !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc input::placeholder, html.theme-hc textarea::placeholder { color: #cccccc !important; font-style: italic; }
+  html.theme-hc .pill { background: #000 !important; color: #ffe600 !important; border: 1px solid #ffe600 !important; }
+  html.theme-hc .bg-slate-800, html.theme-hc .bg-slate-900, html.theme-hc .bg-slate-900\/60,
+  html.theme-hc .bg-slate-900\/40, html.theme-hc .bg-slate-950, html.theme-hc .bg-slate-700 {
+    background: #000 !important; color: #fff !important;
+  }
+  html.theme-hc .text-slate-100, html.theme-hc .text-slate-200, html.theme-hc .text-slate-300,
+  html.theme-hc .text-slate-400, html.theme-hc .text-slate-500 { color: #fff !important; }
+  html.theme-hc .border-slate-600, html.theme-hc .border-slate-700,
+  html.theme-hc .border-slate-800 { border-color: #fff !important; }
+  html.theme-hc .bg-indigo-500, html.theme-hc .bg-indigo-600, html.theme-hc .bg-emerald-500,
+  html.theme-hc .bg-emerald-600, html.theme-hc .bg-amber-500, html.theme-hc .bg-amber-600,
+  html.theme-hc .bg-rose-500, html.theme-hc .bg-rose-600 {
+    background: #ffe600 !important; color: #000 !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc thead, html.theme-hc th { background: #000 !important; color: #ffe600 !important; border-color: #fff !important; }
+
+  /* Preset marketplace + wizard shared card styling. */
+  .preset-card { transition: transform .12s, border-color .12s; }
+  .preset-card:hover { transform: translateY(-2px); border-color:#818cf8 !important; }
+  .use-case-chip { display:inline-block; font-size:.65rem; padding:.15rem .5rem; border-radius:9999px;
+                   background:rgba(99,102,241,.12); border:1px solid rgba(99,102,241,.35); color:#c7d2fe;
+                   margin-right:.25rem; margin-top:.25rem; }
+
+  /* Bulk-select overlay checkbox on gallery cards. */
+  .bulk-check { position:absolute; top:.35rem; left:.35rem; z-index:5; width:1.1rem; height:1.1rem;
+                accent-color:#6366f1; cursor:pointer; background:rgba(15,23,42,.85);
+                border-radius:3px; }
+  .bulk-bar { position:sticky; bottom:1rem; z-index:15; }
+
+  /* Live-log stream viewer. */
+  .log-stream { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.72rem;
+                line-height:1.4; background:#020617; border:1px solid #334155; border-radius:.5rem;
+                padding:.65rem .75rem; max-height:60vh; overflow-y:auto; white-space:pre-wrap;
+                word-break:break-word; color:#cbd5e1; }
+  .log-stream .lvl-error { color:#f87171; }
+  .log-stream .lvl-warn { color:#fbbf24; }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -3659,6 +5790,403 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     </div>
   </div>
 
+  <!-- First-run wizard modal (T1 #2). 3 steps: subject → preset → URL/folder.
+       Uses the /api/presets/descriptions endpoint for the preset picker. -->
+  <div x-show="wizard.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="closeWizard()">
+    <div class="card rounded-xl shadow-2xl max-w-2xl w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-lg">Create your first curation job</h3>
+        <button @click="closeWizard()" class="text-slate-400 hover:text-slate-100" aria-label="Close">✕</button>
+      </div>
+      <div class="flex items-center gap-1 mb-4 text-xs">
+        <template x-for="s in [1,2,3]" :key="'wz'+s">
+          <span class="px-2 py-1 rounded"
+                :class="wizard.step === s ? 'bg-indigo-600 text-white' : (wizard.step > s ? 'bg-emerald-800 text-emerald-100' : 'bg-slate-800 text-slate-400')"
+                x-text="'Step ' + s"></span>
+        </template>
+      </div>
+      <div x-show="wizard.error" x-cloak class="text-xs text-rose-300 mb-2 flex items-center gap-2">
+        <span x-text="wizard.error"></span>
+        <button x-show="wizard.canRetryUnique" @click="wizardRetryWithNewName()"
+                :disabled="wizard.submitting"
+                class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] disabled:opacity-50">
+          Retry with new name
+        </button>
+      </div>
+
+      <div x-show="wizard.step === 1">
+        <label class="block">
+          <span class="text-sm text-slate-300">What are you curating?</span>
+          <input x-model="wizard.subject" @keydown.enter.prevent="wizardNext()"
+                 placeholder="e.g. Aerial drone photography over cities"
+                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          <p class="text-[11px] text-slate-500 mt-1">This becomes the job's topic line — used for relevance scoring.</p>
+        </label>
+      </div>
+
+      <div x-show="wizard.step === 2">
+        <div class="text-sm text-slate-300 mb-2">Pick a starter preset</div>
+        <div class="grid md:grid-cols-2 gap-2 max-h-[50vh] overflow-y-auto pr-1">
+          <template x-for="p in wizard.presets" :key="p.key">
+            <div class="preset-card border rounded p-3 cursor-pointer"
+                 :class="wizard.selectedPreset === p.key ? 'border-indigo-500 bg-indigo-950/30' : 'border-slate-700 bg-slate-900/40'"
+                 @click="wizard.selectedPreset = p.key">
+              <div class="font-semibold text-sm" x-text="p.name"></div>
+              <div class="text-[11px] text-slate-400 mb-1" x-text="p.headline"></div>
+              <div class="text-xs text-slate-300" x-text="p.description"></div>
+              <div class="mt-1">
+                <template x-for="uc in (p.use_cases || [])" :key="uc">
+                  <span class="use-case-chip" x-text="uc"></span>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <div x-show="wizard.step === 3">
+        <div class="text-sm text-slate-300 mb-2">Optional starting source (skip if unsure)</div>
+        <div class="flex gap-2 mb-2 text-xs">
+          <button @click="wizard.sourceMode = 'none'"
+                  :class="wizard.sourceMode === 'none' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">None</button>
+          <button @click="wizard.sourceMode = 'url'"
+                  :class="wizard.sourceMode === 'url' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">Paste a URL</button>
+          <button @click="wizard.sourceMode = 'folder'"
+                  :class="wizard.sourceMode === 'folder' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">Local folder</button>
+        </div>
+        <template x-if="wizard.sourceMode === 'url'">
+          <input x-model="wizard.sourceUrl" placeholder="https://www.pixiv.net/en/users/12345"
+                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+        </template>
+        <template x-if="wizard.sourceMode === 'folder'">
+          <div class="flex gap-2 items-stretch mt-1">
+            <input x-model="wizard.sourceFolder" placeholder="C:\Users\you\Pictures\my-set"
+                   class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs"/>
+            <button @click="pickWizardFolder()" :disabled="wizard.pickingFolder"
+                    class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm shrink-0 disabled:opacity-50">
+              <span x-text="wizard.pickingFolder ? 'Opening…' : 'Browse…'"></span>
+            </button>
+          </div>
+        </template>
+      </div>
+
+      <div class="flex items-center justify-between mt-5">
+        <button @click="wizardBack()" x-show="wizard.step > 1" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Back</button>
+        <span x-show="wizard.step === 1"></span>
+        <div class="flex gap-2">
+          <button @click="closeWizard()" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+          <button x-show="wizard.step < 3" @click="wizardNext()" :disabled="!wizardCanAdvance()"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">Next →</button>
+          <button x-show="wizard.step === 3" @click="wizardSubmit()" :disabled="wizard.submitting"
+                  class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm disabled:opacity-50">
+            <span x-text="wizard.submitting ? 'Creating…' : 'Create job'"></span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick-sort modal (T1 #4). Sorts an existing folder into a new job. -->
+  <div x-show="quickSort.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="quickSort.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-lg w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Quick-sort a folder</h3>
+        <button @click="quickSort.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">Points cull at a folder and creates a new job. The existing files stay put; classifications land in <code>data/sorted/&lt;slug&gt;</code>.</p>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Folder path</span>
+        <input x-model="quickSort.folder" placeholder="C:\Users\you\Pictures\to-sort"
+               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+      </label>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Preset</span>
+        <select x-model="quickSort.preset" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="quality_only">quality_only (topic-agnostic)</option>
+          <option value="default">default</option>
+          <template x-for="p in presetsList" :key="'qs_'+p">
+            <option :value="p" x-text="p"></option>
+          </template>
+        </select>
+      </label>
+      <label class="block mb-3">
+        <span class="text-xs text-slate-400">Vision worker</span>
+        <select x-model="quickSort.worker" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="">(active fleet default)</option>
+          <template x-for="w in quickSortWorkers()" :key="w.id || w.name">
+            <option :value="w.id || w.name" x-text="(w.name || w.id) + ' — ' + (w.provider || '')"></option>
+          </template>
+        </select>
+      </label>
+      <div x-show="quickSort.error" class="text-xs text-rose-300 mb-2" x-text="quickSort.error"></div>
+      <div class="flex justify-end gap-2">
+        <button @click="quickSort.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+        <button @click="submitQuickSort()" :disabled="quickSort.busy"
+                class="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
+          <span x-text="quickSort.busy ? 'Sorting…' : 'Sort folder'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Apply-changes restart-confirm modal. Only opens when applying edits to
+       the ACTIVE running job would force a worker restart. -->
+  <div x-show="applyConfirm.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="applyConfirm.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-md w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Restart pipeline?</h3>
+        <button @click="applyConfirm.open = false" class="text-slate-400 hover:text-slate-100" aria-label="Close">✕</button>
+      </div>
+      <p class="text-sm text-slate-300 mb-4">
+        If you apply these changes, the current workers need to be restarted
+        to pick up the changes. Confirm you want to restart the pipeline?
+      </p>
+      <div class="flex justify-end gap-2">
+        <button @click="applyConfirm.open = false" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">Cancel</button>
+        <button @click="confirmApplyRestart()" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 rounded text-sm font-medium disabled:opacity-50">
+          <span x-text="applyConfirm.submitting ? 'Restarting…' : 'Confirm — apply + restart'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Preset preview modal (T1 #3). Fetches /api/presets/preview and shows the
+       cfg alongside install / gist actions. -->
+  <div x-show="presetPreview.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="presetPreview.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-2xl w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold" x-text="'Preset preview — ' + (presetPreview.meta?.headline || presetPreview.source)"></h3>
+        <button @click="presetPreview.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div x-show="presetPreview.loading" class="text-xs text-slate-400">Fetching…</div>
+      <div x-show="presetPreview.error" class="text-xs text-rose-300" x-text="presetPreview.error"></div>
+      <template x-if="!presetPreview.loading && presetPreview.cfg">
+        <div class="space-y-2">
+          <div class="text-xs text-slate-400" x-text="presetPreview.meta?.description || ''"></div>
+          <div class="text-xs">
+            <span class="font-semibold">Categories:</span>
+            <template x-for="c in (presetPreview.cfg.categories || [])" :key="c.name">
+              <span class="use-case-chip" x-text="c.name"></span>
+            </template>
+          </div>
+          <label class="block">
+            <span class="text-xs text-slate-400">Install as</span>
+            <input x-model="presetPreview.installName" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <div class="mt-3 max-h-64 overflow-y-auto bg-slate-950 border border-slate-700 rounded p-2 text-[11px] font-mono whitespace-pre-wrap"
+               x-text="JSON.stringify(presetPreview.cfg, null, 2)"></div>
+        </div>
+      </template>
+      <div class="mt-4 flex justify-end gap-2">
+        <button @click="presetPreview.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
+        <button @click="installPreviewedPreset()" :disabled="presetPreview.installing || !presetPreview.cfg"
+                class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm disabled:opacity-50">
+          <span x-text="presetPreview.installing ? 'Installing…' : 'Install'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Publish-to-Gist modal (T1 #3). PAT stays in-memory only. -->
+  <div x-show="publishGist.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="publishGist.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-md w-full p-5">
+      <h3 class="font-semibold mb-2">Publish preset to Gist</h3>
+      <p class="text-[11px] text-amber-300 mb-2">Your GitHub PAT is kept only in this browser session — never persisted or sent anywhere except GitHub's Gist API.</p>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Preset</span>
+        <input :value="publishGist.presetName" disabled class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs opacity-70"/>
+      </label>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">GitHub personal access token (gist scope)</span>
+        <input type="password" x-model="publishGist.token" placeholder="ghp_..."
+               autocomplete="off"
+               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+      </label>
+      <label class="flex items-center gap-2 mb-3">
+        <input type="checkbox" x-model="publishGist.publicGist" class="accent-indigo-500"/>
+        <span class="text-sm">Public Gist</span>
+      </label>
+      <div x-show="publishGist.result" class="text-xs text-emerald-300 mb-2">
+        Published — <a :href="publishGist.result?.gist_url" target="_blank" rel="noopener noreferrer" class="link-btn" x-text="publishGist.result?.gist_url"></a>
+      </div>
+      <div x-show="publishGist.error" class="text-xs text-rose-300 mb-2" x-text="publishGist.error"></div>
+      <div class="flex justify-end gap-2">
+        <button @click="publishGist.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
+        <button @click="submitPublishGist()" :disabled="publishGist.busy || !publishGist.token"
+                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+          <span x-text="publishGist.busy ? 'Publishing…' : 'Publish'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cookies-paste converter modal (T3 #18). Accepts JSON or header-format
+       cookies, POSTs /api/cookies/convert, and returns a filesystem path. -->
+  <div x-show="cookiesModal.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="cookiesModal.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-lg w-full p-5">
+      <h3 class="font-semibold mb-2">Paste cookies</h3>
+      <p class="text-[11px] text-slate-400 mb-2">Paste browser cookies (JSON export or <code>name=value; name2=value2</code>) — cull converts them into a Netscape <code>cookies.txt</code> for <span class="font-mono" x-text="cookiesModal.domain || '(target)'"></span>.</p>
+      <textarea x-model="cookiesModal.raw" rows="6" placeholder='[{"name":"sessionid","value":"..."}] or name=value; other=value'
+                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs"></textarea>
+      <div x-show="cookiesModal.error" class="text-xs text-rose-300 mt-2" x-text="cookiesModal.error"></div>
+      <div x-show="cookiesModal.result" class="text-xs text-emerald-300 mt-2">
+        Saved to <span class="font-mono" x-text="cookiesModal.result?.path"></span>
+      </div>
+      <div class="flex justify-end gap-2 mt-3">
+        <button @click="cookiesModal.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
+        <button @click="submitCookies()" :disabled="cookiesModal.busy || !cookiesModal.raw"
+                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+          <span x-text="cookiesModal.busy ? 'Converting…' : 'Convert & save'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export preview modal (T2 #12). -->
+  <div x-show="exportPreview.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="exportPreview.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Export preview — <span class="font-mono" x-text="currentJob"></span></h3>
+        <button @click="exportPreview.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div x-show="exportPreview.loading" class="text-xs text-slate-400">Computing…</div>
+      <div x-show="exportPreview.error" class="text-xs text-rose-300" x-text="exportPreview.error"></div>
+      <template x-if="!exportPreview.loading && exportPreview.data">
+        <div class="space-y-3">
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-emerald-300">Total kept</div>
+              <div class="text-2xl font-mono mt-1" x-text="exportPreview.data.totals?.kept ?? 0"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-indigo-300">Avg caption</div>
+              <div class="text-2xl font-mono mt-1" x-text="(exportPreview.data.totals?.avg_caption_length ?? 0) + ' ch'"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-amber-300">Orphans</div>
+              <div class="text-2xl font-mono mt-1" x-text="exportPreview.data.totals?.orphans ?? 0"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-slate-300">Distinct cats</div>
+              <div class="text-2xl font-mono mt-1" x-text="Object.keys(exportPreview.data.by_category || {}).length"></div>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">By category</div>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs">
+              <template x-for="[k,v] in Object.entries(exportPreview.data.by_category || {})" :key="k">
+                <div class="flex justify-between bg-slate-900/40 border border-slate-800 rounded px-2 py-1">
+                  <span x-text="k"></span><span class="font-mono" x-text="v"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">Resolution histogram</div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-1 text-xs">
+              <template x-for="[k,v] in Object.entries(exportPreview.data.resolution_histogram || {})" :key="k">
+                <div class="flex justify-between bg-slate-900/40 border border-slate-800 rounded px-2 py-1">
+                  <span x-text="k"></span><span class="font-mono" x-text="v"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div x-show="(exportPreview.data.samples || []).length">
+            <div class="text-xs text-slate-400 mb-1">Sample paths</div>
+            <div class="grid grid-cols-3 md:grid-cols-4 gap-2">
+              <template x-for="s in (exportPreview.data.samples || []).slice(0,12)" :key="s.path || s">
+                <div class="text-[10px] font-mono truncate" :title="s.path || s" x-text="s.name || s.path || s"></div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- Vision test-drive modal (T2 #9 companion). File-drop + result panel. -->
+  <div x-show="dryRun.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="dryRun.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Test-drive vision worker</h3>
+        <button @click="dryRun.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div class="text-xs text-slate-400 mb-2">Sends one image through the selected worker WITHOUT saving anything, so you can preview the classifier's response before batching.</div>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Worker</span>
+        <select x-model="dryRun.workerId" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="">(active fleet default)</option>
+          <template x-for="w in quickSortWorkers()" :key="'dry_'+(w.id || w.name)">
+            <option :value="w.id || w.name" x-text="(w.name || w.id) + ' — ' + (w.provider || '')"></option>
+          </template>
+        </select>
+      </label>
+      <!-- Drop-zone: single source of truth is dryRun.file. Native <input> is
+           sr-only so its "No file chosen" text never surfaces; a labelled
+           button routes clicks to it. Preview swaps in once a file is set. -->
+      <div class="border-2 border-dashed border-slate-700 rounded p-6 text-center text-xs text-slate-400 mb-3"
+           @dragover.prevent="dryRun.dragOver = true" @dragleave.prevent="dryRun.dragOver = false"
+           :class="dryRun.dragOver ? 'border-indigo-500' : ''"
+           @drop.prevent="handleDryRunDrop($event)">
+        <input x-ref="dryRunFileInput" type="file" accept="image/*"
+               @change="handleDryRunPick($event)" class="sr-only"/>
+        <template x-if="!dryRun.file">
+          <div>
+            <div class="mb-2">Drop an image here or click to browse</div>
+            <button type="button" @click="$refs.dryRunFileInput.click()"
+                    class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs">Choose file</button>
+          </div>
+        </template>
+        <template x-if="dryRun.file">
+          <div>
+            <img :src="dryRun.previewDataUrl" class="max-h-48 mx-auto rounded shadow" alt="uploaded"/>
+            <div class="mt-2 text-xs text-slate-300 font-mono truncate" x-text="dryRun.filename + ' · ' + formatDryRunSize(dryRun.file.size)"></div>
+            <button type="button" @click="clearDryRunFile()"
+                    class="mt-2 px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Clear</button>
+          </div>
+        </template>
+      </div>
+      <div class="flex justify-end gap-2 mb-3">
+        <button @click="runDryRun()" :disabled="dryRun.busy || !dryRun.file"
+                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+          <span x-text="dryRun.busy ? 'Classifying…' : 'Run'"></span>
+        </button>
+      </div>
+      <div x-show="dryRun.error" class="text-xs text-rose-300" x-text="dryRun.error"></div>
+      <template x-if="dryRun.result">
+        <div class="space-y-2">
+          <div class="text-xs">
+            <span class="font-semibold">Would land in:</span>
+            <span class="font-mono ml-2" x-text="dryRun.result.would_land_in || '(unclassified)'"></span>
+          </div>
+          <div class="text-xs">
+            <span class="font-semibold">Score result:</span>
+            <span class="font-mono ml-2" x-text="dryRun.result.score_result ? JSON.stringify(dryRun.result.score_result) : ''"></span>
+          </div>
+          <details><summary class="text-xs text-slate-300 cursor-pointer">Parsed</summary>
+            <pre class="mt-2 bg-slate-950 border border-slate-700 rounded p-2 text-[11px] whitespace-pre-wrap overflow-x-auto" x-text="JSON.stringify(dryRun.result.parsed, null, 2)"></pre>
+          </details>
+          <details><summary class="text-xs text-slate-300 cursor-pointer">Raw model response</summary>
+            <pre class="mt-2 bg-slate-950 border border-slate-700 rounded p-2 text-[11px] whitespace-pre-wrap overflow-x-auto" x-text="dryRun.result.raw_response || ''"></pre>
+          </details>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- Mobile hamburger - hidden on lg+ where the sidebar is always visible. -->
   <button @click="sidebarOpen = !sidebarOpen" aria-label="Toggle navigation"
     class="lg:hidden fixed top-3 left-3 z-40 bg-slate-800 hover:bg-slate-700 rounded p-2">
@@ -3680,12 +6208,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <span class="font-brand text-2xl font-medium tracking-tight">cull</span>
       </a>
       <p class="text-xs text-slate-400 mt-1" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
-      <div class="mt-2">
-        <span class="pill px-2 py-0.5 rounded"
+      <div class="mt-2 min-w-0 flex flex-wrap items-center gap-1">
+        <span class="pill px-2 py-0.5 rounded shrink-0"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
           x-text="status.pipeline?.running ? 'running' : 'stopped'"></span>
-        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 ml-1"
-          x-show="jobsActive" x-text="'active: ' + (jobsActive || '')"></span>
+        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 truncate max-w-full inline-block"
+          x-show="jobsActive" :title="jobsActive"
+          x-text="'active: ' + (jobsActive || '')"></span>
       </div>
     </div>
 
@@ -3752,14 +6281,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <span x-show="view === 'job' && active === 'gallery'" x-text="'Filter, browse, edit, and export ' + currentJob + '\'s sorted library'"></span>
         </p>
       </div>
-      <div class="flex gap-2" x-show="view === 'job'">
-        <template x-if="!status.pipeline?.running">
-          <button @click="startPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-emerald-600 hover:bg-emerald-500">Start pipeline</button>
+      <div class="flex items-center gap-2">
+        <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>. -->
+        <select :value="theme" @change="setTheme($event.target.value)"
+                title="Colour theme"
+                class="text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1.5 mr-1">
+          <option value="dark">Theme: Dark</option>
+          <option value="light">Theme: Light</option>
+          <option value="hc">Theme: High-contrast</option>
+        </select>
+        <template x-if="view === 'job'">
+          <div class="flex gap-2">
+            <template x-if="!status.pipeline?.running">
+              <button @click="startPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-emerald-600 hover:bg-emerald-500">Start pipeline</button>
+            </template>
+            <template x-if="status.pipeline?.running">
+              <button @click="stopPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-rose-600 hover:bg-rose-500">Stop pipeline</button>
+            </template>
+            <button @click="refresh()" class="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-sm">Refresh</button>
+          </div>
         </template>
-        <template x-if="status.pipeline?.running">
-          <button @click="stopPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-rose-600 hover:bg-rose-500">Stop pipeline</button>
-        </template>
-        <button @click="refresh()" class="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-sm">Refresh</button>
       </div>
     </header>
 
@@ -3768,6 +6309,39 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          Each job is its own curation target; activating one makes the
          supervisor run it. -->
     <section x-show="view === 'jobs' && active === 'jobs'" class="space-y-4">
+      <!-- Empty-jobs onboarding (T1 #1/#2/#4). Shows only when there is not
+           yet a job on disk. Three parallel entry points: seed sample data
+           + open a first-run wizard + quick-sort an existing folder. -->
+      <div x-show="!jobsLoading && jobsList.length === 0" x-cloak class="grid md:grid-cols-3 gap-4">
+        <div class="card rounded-xl p-5 border-2 border-dashed border-indigo-700 flex flex-col">
+          <div class="pill text-indigo-300 mb-1">Get started</div>
+          <h3 class="font-semibold mb-1">Try cull with sample data</h3>
+          <p class="text-xs text-slate-400 mb-3">Seed a demo job with pre-classified images so you can explore the gallery, stats, and export flow without a scraper run.</p>
+          <div class="mt-auto flex flex-wrap gap-2">
+            <button @click="seedDemo()" :disabled="demoStatus.busy"
+                    class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50">
+              <span x-text="demoStatus.busy ? 'Seeding…' : 'Load demo data'"></span>
+            </button>
+            <button x-show="demoStatus.exists" @click="unseedDemo()" :disabled="demoStatus.busy"
+                    class="px-3 py-2 bg-rose-900/60 hover:bg-rose-800 rounded text-sm text-rose-100 disabled:opacity-50">Remove demo</button>
+          </div>
+        </div>
+        <div class="card rounded-xl p-5 border-2 border-dashed border-emerald-700 flex flex-col">
+          <div class="pill text-emerald-300 mb-1">Create</div>
+          <h3 class="font-semibold mb-1">Create your first curation job</h3>
+          <p class="text-xs text-slate-400 mb-3">Pick a subject, choose a starter preset, and optionally point at a URL or a folder. Takes ~1 minute.</p>
+          <button @click="openWizard()"
+                  class="mt-auto px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Start wizard</button>
+        </div>
+        <div class="card rounded-xl p-5 border-2 border-dashed border-amber-700 flex flex-col">
+          <div class="pill text-amber-300 mb-1">Already have images?</div>
+          <h3 class="font-semibold mb-1">Sort a folder you already have</h3>
+          <p class="text-xs text-slate-400 mb-3">Point cull at a local directory of images and it will classify them into buckets — no scraping required.</p>
+          <button @click="openQuickSort()"
+                  class="mt-auto px-3 py-2 bg-amber-600 hover:bg-amber-500 rounded text-sm font-medium">Quick-sort a folder</button>
+        </div>
+      </div>
+
       <!-- Job queue strip: active job + next queued, with advance control. -->
       <div class="card rounded-xl p-5" x-show="jobsActive || jobsQueue.length">
         <div class="flex items-center justify-between mb-3">
@@ -3896,6 +6470,52 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="addSchedule()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Add / update</button>
         </div>
         <div x-show="schedules.error" x-cloak class="text-xs text-rose-300 mt-2" x-text="schedules.error"></div>
+      </div>
+
+      <!-- Daily digest webhook (T2 #11). Discord/Slack markdown summary of
+           the last N hours of curation activity — post to a webhook URL. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Daily digest</h3>
+        <p class="text-xs text-slate-400 mb-3">Post a summary of the last <span x-text="digest.since_hours"></span>h of activity to a Discord or Slack webhook. Preview shows the markdown before you commit.</p>
+        <div class="grid md:grid-cols-4 gap-3 mb-3">
+          <label class="md:col-span-2 block">
+            <span class="text-xs text-slate-400">Webhook URL</span>
+            <input x-model="digest.webhook_url" placeholder="https://discord.com/api/webhooks/..." autocomplete="off"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Style</span>
+            <select x-model="digest.webhook_style" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="discord">Discord</option>
+              <option value="slack">Slack</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Since (hours)</span>
+            <input type="number" min="1" max="168" x-model.number="digest.since_hours"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Top N per bucket</span>
+            <input type="number" min="1" max="50" x-model.number="digest.top_n"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button @click="previewDigest()" :disabled="digest.busy"
+                  class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
+            <span x-text="digest.busy && digest.action === 'preview' ? 'Building…' : 'Preview'"></span>
+          </button>
+          <button @click="sendDigest()" :disabled="digest.busy || !digest.webhook_url"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+            <span x-text="digest.busy && digest.action === 'send' ? 'Sending…' : 'Test send'"></span>
+          </button>
+          <span x-show="digest.status" x-text="digest.status" class="text-xs text-emerald-300"></span>
+          <span x-show="digest.error" x-text="digest.error" class="text-xs text-rose-300"></span>
+        </div>
+        <pre x-show="digest.markdown" x-cloak
+             class="mt-3 bg-slate-950 border border-slate-700 rounded p-3 text-[11px] whitespace-pre-wrap max-h-64 overflow-y-auto"
+             x-text="digest.markdown"></pre>
       </div>
 
       <div class="card rounded-xl p-5">
@@ -4032,6 +6652,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   <div class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-200" x-text="a.category"></div>
                   <div class="mt-1 font-mono truncate" x-text="a.name"></div>
                   <div class="text-slate-400 mt-0.5" x-text="a.source + ' - Q:' + (a.quality ?? '?')"></div>
+                  <!-- T2 #7: reasoning + score breakdown from /api/activity. -->
+                  <div class="mt-0.5 flex gap-1 text-[10px]" x-show="a.OVR_Quality_Score != null || a.REL_Quality_Score != null">
+                    <span class="bg-slate-800/60 rounded px-1" x-show="a.OVR_Quality_Score != null" :title="'Overall quality ' + a.OVR_Quality_Score">O <span x-text="a.OVR_Quality_Score"></span></span>
+                    <span class="bg-slate-800/60 rounded px-1" x-show="a.REL_Quality_Score != null" :title="'Relevance ' + a.REL_Quality_Score">R <span x-text="a.REL_Quality_Score"></span></span>
+                  </div>
+                  <div class="mt-0.5 text-slate-400 line-clamp-2" x-show="a.reason" :title="a.reason"
+                       x-text="(a.reason || '').slice(0, 200) + ((a.reason || '').length > 200 ? '…' : '')"></div>
+                  <div class="mt-0.5 text-emerald-300 truncate" x-show="a.caption" :title="a.caption"
+                       x-text="'caption: ' + (a.caption || '').slice(0, 80)"></div>
                   <span class="link-btn" @click="openModalFromActivity(a)">See more</span>
                 </div>
               </div>
@@ -4265,6 +6894,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold">Results</h3>
           <div class="flex items-center gap-2 text-xs">
+            <!-- Bulk-select toggle + Select all / Clear (T3 #13). -->
+            <label class="flex items-center gap-1 cursor-pointer">
+              <input type="checkbox" x-model="bulk.mode" @change="!bulk.mode && bulkClear()" class="accent-indigo-500"/>
+              <span>Select</span>
+            </label>
+            <button x-show="bulk.mode" @click="bulkSelectAllPage()"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Select all</button>
+            <button x-show="bulk.mode && bulk.selected.length" @click="bulkClear()"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Clear</button>
             <button @click="galleryPrev()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50" :disabled="gallery.page <= 1">Prev</button>
             <span>Page <span x-text="gallery.page"></span> / <span x-text="Math.max(1, Math.ceil(gallery.total / gallery.pageSize))"></span></span>
             <button @click="galleryNext()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50"
@@ -4298,10 +6936,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
           <template x-for="(c, idx) in gallery.items" :key="c.path">
-            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow"
+            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow relative"
                  :data-cull-idx="idx"
-                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : 'border-slate-800'"
+                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : (bulk.selected.includes(c.path) ? 'border-emerald-400 ring-1 ring-emerald-400/60' : 'border-slate-800')"
                  @click="cullFocus = idx">
+              <input x-show="bulk.mode" type="checkbox" class="bulk-check"
+                     :checked="bulk.selected.includes(c.path)"
+                     @click.stop="bulkToggle(c.path)"/>
               <span class="nsfw-wrap block">
                 <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
@@ -4341,6 +6982,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </div>
           </template>
+        </div>
+        <!-- Floating bulk action bar (T3 #13/#14). -->
+        <div x-show="bulk.mode && bulk.selected.length > 0" x-cloak
+             class="bulk-bar mt-3 flex flex-wrap items-center gap-2 bg-slate-900 border border-indigo-500 rounded p-3 shadow-2xl">
+          <span class="text-sm font-semibold" x-text="bulk.selected.length + ' selected'"></span>
+          <select x-model="bulk.targetCategory" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+            <option value="">Category…</option>
+            <template x-for="cat in cullCategories" :key="'bcat_'+cat.name">
+              <option :value="cat.name" x-text="cat.name"></option>
+            </template>
+          </select>
+          <button @click="bulkAction('move')" :disabled="!bulk.targetCategory || bulk.busy"
+                  class="px-3 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded disabled:opacity-50">Move to</button>
+          <button @click="bulkAction('reclassify')" :disabled="!bulk.targetCategory || bulk.busy"
+                  class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">Reclassify to</button>
+          <button @click="bulkRequeue()" :disabled="bulk.busy"
+                  class="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-500 rounded disabled:opacity-50">Requeue</button>
+          <button @click="bulkAction('delete')" :disabled="bulk.busy"
+                  class="px-3 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-50">Move to trash</button>
+          <span x-show="bulk.error" class="text-xs text-rose-300" x-text="bulk.error"></span>
         </div>
       </div>
 
@@ -4491,6 +7152,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
             <span x-text="exportForm.running ? 'Exporting…' : 'Run export'"></span>
           </button>
+          <button @click="openExportPreview()" :disabled="exportForm.running"
+                  class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50"
+                  title="Compute totals + category breakdown + resolution histogram + sample paths before you commit to a full export">Preview</button>
           <span x-show="exportForm.error" class="text-xs text-rose-300" x-text="exportForm.error"></span>
         </div>
         <div x-show="exportForm.summary" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="exportForm.summary ? JSON.stringify(exportForm.summary, null, 2) : ''"></div>
@@ -4575,6 +7239,45 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- VISION (global endpoints readout + this job's captioning/scoring) -->
     <section x-show="view === 'job' && active === 'vision'" class="space-y-4">
+      <!-- Endpoint discovery strip (T2 #10). Scans the local network for
+           reachable OpenAI-compatible / Ollama vision endpoints not already in
+           the fleet, so a user can add them with one click. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <div>
+            <h3 class="font-semibold">Discovered endpoints{{ tip('Auto-probes common LM Studio / llama.cpp / Ollama ports on your machine. Endpoints already in the fleet are hidden.') }}</h3>
+            <p class="text-xs text-slate-400">Endpoints found on this machine that speak a supported vision API.</p>
+          </div>
+          <button @click="rescanDiscovery()" :disabled="discovery.loading"
+                  class="text-xs link-btn disabled:opacity-50">
+            <span x-text="discovery.loading ? 'Scanning…' : 'Rescan'"></span>
+          </button>
+        </div>
+        <div x-show="discovery.error" class="text-xs text-rose-300" x-text="discovery.error"></div>
+        <div x-show="!discovery.loading && discovery.candidates.length === 0" class="text-xs text-slate-500">Nothing new found. Add one manually below.</div>
+        <div class="flex flex-wrap gap-2">
+          <template x-for="d in discovery.candidates" :key="d.base_url + '_' + d.provider">
+            <div class="flex items-center gap-2 bg-slate-900/60 border border-slate-800 rounded px-2 py-1 text-xs">
+              <span class="font-mono" x-text="d.provider + ' · ' + d.base_url"></span>
+              <span class="text-emerald-400" x-show="d.reachable" title="reachable">✓</span>
+              <button @click="addDiscoveredEndpoint(d)" :disabled="d.adding"
+                      class="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-500 rounded text-xs disabled:opacity-50">
+                <span x-text="d.adding ? 'Adding…' : 'Add'"></span>
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Test-drive card (T2 #9). File-drop + Run against selected worker. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Test drive{{ tip('Send one image through the classifier without saving. Fastest way to sanity-check a new worker or preset before batching.') }}</h3>
+          <button @click="dryRun.open = true" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Open test-drive</button>
+        </div>
+        <p class="text-xs text-slate-400">Drops one image into the vision pipeline in dry-run mode — see what category it would land in and the raw model output, without side effects.</p>
+      </div>
+
       <!-- Vision workers — the local-LLM fleet (per-job inherit/override). One
            row per GPU/host; lmstudio + llamacpp speak the OpenAI /v1 API, ollama
            its native API. Inherits the preset's global fleet until overridden. -->
@@ -4612,9 +7315,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="setFleetField(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
-                  <input type="checkbox" :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="fleetTest[idx] && !fleetTest[idx].testing"
@@ -4623,8 +7327,16 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                           class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
                     <span x-text="fleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span>
                   </button>
+                  <button @click="loadWorkerInfo(w)" class="px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 rounded" title="Model + VRAM estimate">info</button>
                   <button @click="removeFleetWorker(idx)" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Remove</button>
                 </div>
+              </div>
+              <!-- VRAM hint chip (T3 #20). Filled by loadWorkerInfo. -->
+              <div x-show="workerInfo[w.id || w.name]" x-cloak class="mt-1 text-[11px] text-slate-400 flex flex-wrap gap-2">
+                <span x-show="workerInfo[w.id || w.name]?.model" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'model: ' + workerInfo[w.id || w.name]?.model"></span>
+                <span x-show="workerInfo[w.id || w.name]?.estimated_vram_gb != null" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'~' + workerInfo[w.id || w.name]?.estimated_vram_gb + ' GB VRAM'"></span>
+                <span x-show="workerInfo[w.id || w.name]?.context_window" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'ctx: ' + workerInfo[w.id || w.name]?.context_window"></span>
+                <span x-show="workerInfo[w.id || w.name]?.quantization" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'quant: ' + workerInfo[w.id || w.name]?.quantization"></span>
               </div>
             </div>
           </template>
@@ -4820,6 +7532,21 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scoring.notes') ? 'text-slate-400' : ''"></textarea>
           </div>
+          <!-- Aesthetic pre-filter toggle (T3 #15). Inheritable field. -->
+          <div class="md:col-span-2 border-t border-slate-800 pt-3">
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 cursor-pointer flex-1">
+                <input type="checkbox" :checked="effVal('prefilter.enabled')"
+                       @change="setOverride('prefilter.enabled', $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                <span class="text-sm">Aesthetic pre-filter{{ tip('When on, runs a lightweight (CLIP-based) aesthetic gate before the vision model. Cheap frames drop early and never hit the model — saves VLM calls on obviously bad images.', 'saves ~30-50% of calls on scraped batches') }}</span>
+              </label>
+              <span x-show="!isOver('prefilter.enabled')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('prefilter.enabled')" @click="resetOverride('prefilter.enabled')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <div class="text-[11px] text-slate-500 mt-1" x-show="status.prefilter?.calls_saved_24h != null"
+                 x-text="(status.prefilter?.calls_saved_24h || 0).toLocaleString() + ' model calls saved (last 24h)'"></div>
+          </div>
         </div>
         </template>
       </div>
@@ -4978,9 +7705,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          value with a 'global' chip (inherited) or 'reset ↺' (overridden).
          Auto-saves (debounced); the active job applies on leave / Apply. -->
     <section x-show="view === 'job' && active === 'jobSettings'" class="space-y-4">
-      <!-- Header: subject + preset + save/apply state. -->
+      <!-- Header: subject + preset + save/apply state. The header ROW itself is
+           sticky so the Apply/saved-flash indicator stays reachable while
+           scrolling long field lists; the card body scrolls under it. Themed
+           via CSS variables so the backdrop reads correctly in dark AND light. -->
       <div class="card rounded-xl p-5" x-show="je.loaded">
-        <div class="flex items-start justify-between gap-4 mb-3">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-start justify-between gap-4 backdrop-blur">
           <div>
             <h3 class="font-semibold" x-text="je.name"></h3>
             <p class="text-xs text-slate-400">
@@ -4991,8 +7722,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="je.savedFlash"></span>
             <template x-if="currentJob === jobsActive && je.applyPending">
-              <button @click="applyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
-                title="Re-project + restart the running supervisor with these edits">Apply &amp; restart</button>
+              <button @click="requestApplyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
+                title="Flush pending edits and re-project the active job. Restarts the pipeline only if it is currently running.">Apply changes</button>
             </template>
           </div>
         </div>
@@ -5194,9 +7925,35 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
                       placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            <!-- Per-URL Test button (T3 #17). Extracts one URL per line, tests
+                 each via /api/scrapers/gallery-dl/test-url, shows extractor + count. -->
+            <div class="mt-2">
+              <div x-show="effUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                <button @click.prevent="testGalleryDlAll()" :disabled="gdlTestAllBusy"
+                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                  <span x-text="gdlTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                </button>
+                <span class="text-[10px] text-slate-400" x-show="gdlTestAllBusy">serial — one at a time</span>
+              </div>
+              <div class="space-y-1">
+                <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
+                  <div class="flex items-center gap-2 text-[11px]">
+                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                    <button @click.prevent="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
+                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                      <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                    </button>
+                    <span x-show="gdlTest[i]?.result"
+                          :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                          x-text="gdlTest[i]?.result?.ok ? ('✓ ' + (gdlTest[i]?.result?.extractor || '?') + ' · ~' + (gdlTest[i]?.result?.sample_count ?? '?') + ' items') : ('✗ ' + (gdlTest[i]?.result?.error || gdlTest[i]?.result?.message || 'failed'))"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
           </label>
           <label class="block">
-            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
+            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}
+              <a class="link-btn ml-2" @click.prevent="openCookiesModal('gallery-dl')">Paste cookies</a></span>
             <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
           </label>
@@ -5215,10 +7972,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
-      <!-- yt-dlp (overridden wholesale as scrapers.yt_dlp). Mirrors gallery-dl. -->
+      <!-- Youtube scraper (yt-dlp under the hood — env vars + JSON keys keep
+           the historical name for backward compat). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">yt-dlp</h3>
+          <h3 class="font-semibold">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
           <div>
             <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
             <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
@@ -5229,7 +7987,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <label class="flex items-center gap-3 cursor-pointer">
             <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable yt-dlp for this job</span>
+            <span class="text-sm">Enable Youtube scraper for this job</span>
           </label>
           <label class="block">
             <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
@@ -5241,6 +7999,30 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
                       placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            <!-- Per-URL Test + Test-all buttons — mirror of gallery-dl. -->
+            <div class="mt-2">
+              <div x-show="ytUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                <button @click.prevent="testYtDlpAll()" :disabled="ytTestAllBusy"
+                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                  <span x-text="ytTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                </button>
+                <span class="text-[10px] text-slate-400" x-show="ytTestAllBusy">serial — one at a time</span>
+              </div>
+              <div class="space-y-1">
+                <template x-for="(u, i) in ytUrlsList()" :key="'ytu_'+i">
+                  <div class="flex items-center gap-2 text-[11px]">
+                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                    <button @click.prevent="testYtDlpUrl(u, i)" :disabled="ytTest[i]?.busy"
+                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                      <span x-text="ytTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                    </button>
+                    <span x-show="ytTest[i]?.result"
+                          :class="ytTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                          x-text="ytTest[i]?.result?.ok ? ('✓ ' + (ytTest[i]?.result?.extractor || '?') + (ytTest[i]?.result?.count_estimate != null ? (' · ~' + ytTest[i]?.result?.count_estimate + ' items') : (ytTest[i]?.result?.duration_sec != null ? (' · ' + ytTest[i]?.result?.duration_sec + 's') : ''))) : ('✗ ' + (ytTest[i]?.result?.error || 'failed'))"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
           </label>
           <label class="block md:col-span-2">
             <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
@@ -5329,6 +8111,88 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          List/create/clone/delete/set-default + a preset editor over the same
          inheritable field set. Presets have no inheritance — values are absolute. -->
     <section x-show="view === 'jobs' && active === 'presets'" class="space-y-4">
+      <!-- Built-in preset comparison grid (T1 #5). Card per built-in preset
+           with headline / description / use-cases. Clicking "Use" opens the
+           first-run wizard pre-filled with this preset. -->
+      <div class="card rounded-xl p-5" x-show="presetsMeta.length">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Built-in presets</h3>
+            <p class="text-xs text-slate-400">Every preset that ships with cull. Pick one as the starting point for a new job.</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="p in presetsMeta" :key="'meta_'+p.key">
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(p.key)"
+                   :alt="p.name" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm" x-text="p.name"></div>
+                <div class="text-[11px] text-indigo-300 mb-1" x-text="p.headline"></div>
+                <div class="text-xs text-slate-300 flex-1" x-text="p.description"></div>
+                <div class="my-2">
+                  <template x-for="uc in (p.use_cases || [])" :key="uc"><span class="use-case-chip" x-text="uc"></span></template>
+                </div>
+                <div class="mt-auto flex gap-2">
+                  <button @click="openWizardWithPreset(p.key)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Use this preset</button>
+                  <button @click="openPreset(p.key)" x-show="presetsList.includes(p.key)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Community presets marketplace (T1 #3). Lists community-authored
+           presets from /api/presets/community and supports install-from-URL. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <div>
+            <h3 class="font-semibold">Community presets</h3>
+            <p class="text-xs text-slate-400">Install shared presets by URL, or browse the curated list.</p>
+          </div>
+          <button @click="loadCommunityPresets()" :disabled="community.loading"
+                  class="text-xs link-btn disabled:opacity-50">
+            <span x-text="community.loading ? 'Loading…' : 'Refresh'"></span>
+          </button>
+        </div>
+        <div class="flex gap-2 mb-3">
+          <input x-model="community.urlInput" placeholder="https://example.com/preset.json"
+                 class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono text-xs"/>
+          <button @click="previewPresetUrl(community.urlInput)" :disabled="!community.urlInput"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">Preview from URL</button>
+        </div>
+        <div x-show="community.error" class="text-xs text-rose-300 mb-2" x-text="community.error"></div>
+        <div x-show="!community.loading && community.presets.length === 0" class="text-xs text-slate-500">No community presets available right now.</div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="p in community.presets" :key="p.url || p.filename">
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(((p.filename||'').replace(/\.preset\.json$/,'').replace(/\.json$/,'').toLowerCase()))"
+                   :alt="p.headline || p.filename" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm truncate" x-text="p.headline || p.filename"></div>
+                <div class="text-[11px] text-slate-400 truncate" x-text="p.filename || p.url"></div>
+                <div class="text-xs text-slate-300 mt-1 flex-1" x-text="p.description || ''"></div>
+                <div class="mt-2">
+                  <template x-for="c in (p.categories || [])" :key="'ccat_'+c">
+                    <span class="use-case-chip" x-text="c"></span>
+                  </template>
+                </div>
+                <div class="mt-2 flex gap-2">
+                  <button @click="previewPresetUrl(p.url || p.download_url || p.filename)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Preview</button>
+                  <button @click="installPresetFromUrl(p.url || p.download_url || p.filename, p.filename)"
+                          class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded">Install</button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <div class="card rounded-xl p-5">
         <div class="flex items-center justify-between mb-3">
           <div>
@@ -5348,6 +8212,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
                 <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
+                <button @click="openPublishGist(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this preset as a public/private GitHub Gist">Publish</button>
                 <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
                         title="Restore this shipped preset to its built-in defaults"
                         class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
@@ -5375,9 +8240,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
-      <!-- Preset editor -->
+      <!-- Preset editor. Sticky header keeps the Close button + savedFlash
+           indicator reachable while scrolling through long category / rules
+           blocks. Same CSS-variable backdrop as the other sticky save-bars. -->
       <div class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
-        <div class="flex items-center justify-between mb-3">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-center justify-between backdrop-blur">
           <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="presetEditor.savedFlash"></span>
@@ -5441,19 +8309,19 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </label>
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
-            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">Youtube scraper enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }} <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="link-btn">supported sites ↗</a></span>
             <textarea :value="peUrls()" @change="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults + the global gallery-dl config. Any option from the gallery-dl docs.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
             <textarea :value="(presetEditor.cfg.scrapers.gallery_dl||{}).config_json||''" @change="peSet('scrapers.gallery_dl.config_json', $event.target.value)" rows="2" placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}' class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+            <label class="block"><span class="text-xs text-slate-400">Youtube scraper URLs{{ tip('One Youtube scraper (yt-dlp) supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
               <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
             <div class="grid grid-cols-1 gap-3">
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp frames per URL</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper frames per URL</span>
                 <input type="number" min="1" max="5000" :value="(presetEditor.cfg.scrapers.yt_dlp||{}).limit" @input="peSet('scrapers.yt_dlp.limit', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp cookies file</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper cookies file</span>
                 <input :value="(presetEditor.cfg.scrapers.yt_dlp||{}).cookies" @input="peSet('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
             </div>
           </div>
@@ -5522,7 +8390,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   </div>
                   <div class="grid md:grid-cols-12 gap-2 mt-1 items-center">
                     <input type="password" :value="w.api_key" @change="peSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)" autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-                    <label class="md:col-span-2 inline-flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/><span x-text="w.enabled ? 'On' : 'Off'"></span></label>
+                    <label class="md:col-span-2 flex items-center gap-2 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)"/><span class="text-xs text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span></label>
                     <div class="md:col-span-6 flex items-center gap-2 justify-end">
                       <span class="text-[11px] truncate max-w-[12rem]" x-show="peFleetTest[idx] && !peFleetTest[idx].testing" :class="peFleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="peFleetTest[idx]?.message"></span>
                       <button @click="peTestFleet(idx)" :disabled="!!peFleetTest[idx]?.testing" class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="peFleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span></button>
@@ -5548,8 +8416,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       @input="markSettingsDirty()" @change="markSettingsDirty()">
 
       <!-- Sticky action bar: Save/Reload for the .env form, always reachable at
-           the top of the page (and pinned while scrolling). -->
-      <div class="sticky top-0 z-20 py-3 bg-slate-950/90 backdrop-blur border-b border-slate-800
+           the top of the page (and pinned while scrolling). Uses CSS variables
+           so the backdrop stays legible in dark AND light themes; the previous
+           hard-coded slate-950 looked wrong on the sand-coloured light theme. -->
+      <div class="sticky-save-bar sticky top-0 z-40 py-3 backdrop-blur
                   flex items-start justify-between gap-4">
         <div>
           <h3 class="font-semibold">Global settings</h3>
@@ -5649,15 +8519,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="gSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer select-none">
-                  <span class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
-                        :class="w.enabled ? 'bg-indigo-500' : 'bg-slate-600'">
-                    <input type="checkbox" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
-                      :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
-                    <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform pointer-events-none"
-                      :class="w.enabled ? 'translate-x-4' : 'translate-x-1'"></span>
-                  </span>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="globalFleetTest[idx] && !globalFleetTest[idx].testing"
@@ -5826,6 +8691,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           {{ toggle('DESKTOP_NOTIFICATIONS', 'Desktop notifications', 'Fire a desktop toast when a job completes (best-effort; needs a notification backend installed).') }}
           {{ toggle('EMBEDDINGS_ENABLED', 'CLIP embeddings index', 'Build a CLIP embeddings index that powers near-duplicate detection and the “find similar” / balance tools.') }}
           {{ toggle('VIDEO_CLASSIFY_ENABLED', 'Classify video clips', 'Classify video clips from a sampled frame, not just still images.') }}
+          <template x-if="settings.VIDEO_CLASSIFY_ENABLED === 'true' && videoBackend.checked && !videoBackend.has_any">
+            <div class="md:col-span-2 rounded border border-amber-500/60 bg-amber-500/10 text-amber-200 text-xs p-2 leading-snug">
+              <div class="font-medium mb-1">Video mode is enabled but no frame-extraction backend is installed.</div>
+              <div>Install <code class="font-mono">ffmpeg</code> (recommended) or <code class="font-mono">scenedetect</code> to classify video clips. Meanwhile, scraped videos are held in <code class="font-mono">Unclassified_Video/</code> instead of being classified or deleted.</div>
+            </div>
+          </template>
           <label class="block md:col-span-2 mt-2">
             <span class="text-xs text-slate-400">WEBHOOK_URL{{ tip('POST a JSON event here when a job completes — fan out to Slack, Discord, or a home-automation hook. Leave blank to disable.') }}</span>
             <input x-model="settings.WEBHOOK_URL" placeholder="https://hooks.example.com/..."
@@ -5835,10 +8706,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">YT-DLP scraper{{ tip('Pull frames/clips from any site yt-dlp supports (YouTube, Vimeo, and 1000+ more). Enable, paste URLs (one per line or comma-separated), optionally cap per-URL items and point at a cookies.txt for gated content.') }}</h3>
+        <h3 class="font-semibold mb-3">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
         <div class="grid md:grid-cols-2 gap-4">
           <div class="self-center">
-            {{ toggle('YT_DLP_ENABLED', 'yt-dlp scraper enabled', 'Enable the yt-dlp video lane for the URLs below.') }}
+            {{ toggle('YT_DLP_ENABLED', 'Youtube scraper enabled', 'Enable the Youtube scraper (yt-dlp) video lane for the URLs below.') }}
           </div>
           <label class="block">
             <span class="text-xs text-slate-400">YT_DLP_LIMIT — max items per URL</span>
@@ -5876,7 +8747,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             {{ testbtn('Civitai-Red') }}
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}</span>
+            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}
+              <a class="link-btn ml-2" @click.prevent="openCookiesModal('x.com', 'TWITTER_COOKIES')">Paste cookies</a></span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
@@ -5899,7 +8771,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             {{ testbtn('Reddit') }}
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}</span>
+            <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}
+              <a class="link-btn ml-2" @click.prevent="openCookiesModal('reddit.com', 'REDDIT_COOKIES')">Paste cookies</a></span>
             <textarea x-model="settings.REDDIT_COOKIES" rows="2"
               placeholder="reddit_session=...; token_v2=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
@@ -5959,6 +8832,39 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <template x-if="(status.errors ?? []).length === 0">
           <div class="text-sm text-slate-500">No errors logged recently.</div>
         </template>
+      </div>
+    </section>
+
+    <!-- LIVE LOG TAIL (T3 #19) ──────────────────────────────────────────
+         SSE-based tail from /api/logs/stream + a Follow toggle + Copy. -->
+    <section x-show="view === 'jobs' && active === 'liveLogs'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <div>
+            <h3 class="font-semibold">Live logs</h3>
+            <p class="text-xs text-slate-400">Streams supervisor + worker output from <code>/api/logs/stream</code>. Use Follow to autoscroll.</p>
+          </div>
+          <div class="flex items-center gap-2 text-xs">
+            <label class="flex items-center gap-1 cursor-pointer">
+              <input type="checkbox" x-model="liveLogs.follow" class="accent-indigo-500"/>
+              <span>Follow</span>
+            </label>
+            <button @click="liveLogs.lines = []" class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Clear</button>
+            <button @click="copyLogsToClipboard()" class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Copy</button>
+            <template x-if="!liveLogs.connected">
+              <button @click="startLogStream()" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded">Start stream</button>
+            </template>
+            <template x-if="liveLogs.connected">
+              <button @click="stopLogStream()" class="px-2 py-1 bg-rose-700 hover:bg-rose-600 rounded">Stop</button>
+            </template>
+          </div>
+        </div>
+        <div x-show="liveLogs.recent.length" class="mb-2">
+          <div class="text-xs text-slate-400 mb-1">Recent history</div>
+          <pre class="log-stream max-h-40" x-text="liveLogs.recent.join('\n')"></pre>
+        </div>
+        <pre class="log-stream" x-ref="liveLogsPane" x-text="liveLogs.lines.join('\n')"></pre>
+        <div x-show="liveLogs.error" class="text-xs text-rose-300 mt-2" x-text="liveLogs.error"></div>
       </div>
     </section>
 
@@ -6082,11 +8988,22 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
       <div class="grid lg:grid-cols-2 gap-4 overflow-hidden">
         <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto relative">
-          <img :src="modal.imageUrl" :alt="modal.name"
-               class="max-w-full max-h-[75vh] object-contain"
-               :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          <template x-if="!modal.isVideo">
+            <img :src="modal.imageUrl" :alt="modal.name"
+                 class="max-w-full max-h-[75vh] object-contain"
+                 :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          </template>
+          <template x-if="modal.isVideo">
+            <video :src="modalVideoSrc()" controls preload="metadata" playsinline
+                   class="max-w-full max-h-[75vh]"
+                   :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }">
+              Your browser does not support HTML5 video.
+            </video>
+          </template>
+          <!-- NSFW reveal only for still-image modals: overlaying a click target
+               on top of the <video> would swallow the play-button click. -->
           <span class="nsfw-eye" style="background:rgba(15,23,42,0.55);"
-                x-show="shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
+                x-show="!modal.isVideo && shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
                 @click="revealNsfw({ path: modal.imageUrl })" title="Reveal NSFW">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
@@ -6205,6 +9122,7 @@ function dashboard() {
       {id:'schedules', label:'Schedules'},
       {id:'gstats',    label:'Global Stats'},
       {id:'settings',  label:'Global Settings'},
+      {id:'liveLogs',  label:'Logs'},
       {id:'faq',       label:'FAQ'},
       {id:'about',     label:'About'},
     ],
@@ -6247,6 +9165,10 @@ function dashboard() {
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '', settingsBannerOk: true,
     settingsDirty: false, settingsErrors: {}, configImporting: false,
+    // Cached video-backend probe (used by the Settings VIDEO_CLASSIFY_ENABLED
+    // banner). `checked=false` on boot so the banner never flashes before the
+    // first probe returns.
+    videoBackend: { checked: false, has_any: true, backends: [] },
     providerTest: {},
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, local_sha: '', remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '', dirty: false, checking: false, checked: false },
@@ -6514,6 +9436,9 @@ function dashboard() {
       if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
         this.settings = out.settings;
       }
+      // Probe video-backend availability once (cheap, cached client-side) so
+      // the Settings banner has an answer to render when the user opens it.
+      if (!this.videoBackend.checked) this.loadVideoBackendStatus();
       this.lastRefresh = new Date().toLocaleTimeString();
     },
 
@@ -6561,8 +9486,11 @@ function dashboard() {
       if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
       this.newJob = { name: '', base_on: '', preset: '' };
       await this.loadJobs();
-      // The create response is the v2 job detail ({job:{slug,...}}).
-      this.openJob(j.job.job.slug);
+      // /api/jobs POST returns {success, job: _job_detail(job)} whose inner
+      // shape is {job:{slug,...}, effective, overrides, presets}. Walk both
+      // possible shapes so a flatter future response still works.
+      const slug = j.slug || j.job?.slug || j.job?.job?.slug;
+      if (slug) this.openJob(slug);
     },
     async activateJob(slug) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
@@ -6790,11 +9718,51 @@ function dashboard() {
       })();
       try { await this._jeSaving; } finally { this._jeSaving = null; this.je.saving = false; }
     },
-    // Apply pending edits to the ACTIVE job: flush then re-project + restart once.
-    async applyActiveJob() {
+    // Apply-changes confirm modal. Shown only when the pipeline is running
+    // and applying will force a restart. Non-running jobs skip the modal
+    // entirely — apply is safe and non-disruptive.
+    applyConfirm: { open: false, slug: null, submitting: false },
+    // Entry point wired to the "Apply changes" button. Checks pipeline
+    // state and either applies immediately (not running) or opens the
+    // restart-confirm modal (running).
+    async requestApplyActiveJob() {
+      if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      const running = !!(this.status?.pipeline?.running);
+      if (!running) {
+        // Safe path: no workers to restart, just flush + re-project.
+        await this.applyActiveJob({ restart: false });
+        return;
+      }
+      this.applyConfirm = { open: true, slug: this.currentJob, submitting: false };
+    },
+    async confirmApplyRestart() {
+      if (this.applyConfirm.submitting) return;
+      this.applyConfirm.submitting = true;
+      try {
+        await this.applyActiveJob({ restart: true });
+        this.applyConfirm.open = false;
+      } finally { this.applyConfirm.submitting = false; }
+    },
+    // Apply pending edits to the ACTIVE job: flush + re-project. Restart is
+    // opt-in — callers pass { restart: true } only when the pipeline is
+    // currently running AND the user has confirmed the restart.
+    async applyActiveJob(opts) {
+      const restart = !!(opts && opts.restart);
       await this.flushJobSave();
       if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      // /activate re-projects env + categories. When the pipeline is running
+      // the supervisor picks up the new env on the next hot-reload cycle;
+      // for an explicit restart we hit /stop then /start via refresh.
       await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/activate', { method: 'POST' });
+      if (restart) {
+        try {
+          await fetch('/api/pipeline/stop', { method: 'POST' });
+          await fetch('/api/pipeline/start', { method: 'POST' });
+          this.notify('Applied and restarted', 'success');
+        } catch (e) { this.notify('Restart failed: ' + e, 'error'); }
+      } else {
+        this.notify('Changes applied', 'success');
+      }
       this.je.applyPending = false;
       this.loadJobs();
       this.refresh();
@@ -7069,6 +10037,33 @@ function dashboard() {
         const typedKey = (this.settings[this.cloudApiKey(name)] || '').trim();
         if (typedKey) body.api_key = typedKey;
       }
+      // Legacy runtime tests (lmstudio/llamacpp/openai-compat) used to read
+      // LMSTUDIO_PRIMARY_URL from .env, which is empty in fleet-based
+      // deployments. Feed the endpoint URL from the actual fleet instead so
+      // the button works against the same worker that will run classification.
+      if (!isCloud && (name === 'lmstudio' || name === 'llamacpp' || name === 'openai-compat' || name === 'openai_compat')) {
+        // Prefer legacy .env URL if the user still has one; otherwise use the
+        // first enabled fleet entry matching the provider.
+        const legacyKey = name === 'lmstudio' ? 'LMSTUDIO_PRIMARY_URL' : 'OPENAI_COMPAT_URL';
+        const legacyUrl = (this.settings && this.settings[legacyKey] || '').trim();
+        if (legacyUrl) {
+          body.url = legacyUrl;
+        } else {
+          const fleet = (typeof this.gFleet === 'function' ? this.gFleet() : []) || [];
+          const target = (name === 'lmstudio')
+            ? fleet.find(w => w && w.enabled !== false && w.provider === 'lmstudio')
+            : fleet.find(w => w && w.enabled !== false && (w.provider === 'llamacpp' || w.provider === 'lmstudio'));
+          if (target) {
+            if (target.base_url) body.url = String(target.base_url).trim();
+            if (target.api_key) body.api_key = String(target.api_key).trim();
+          } else if (name === 'lmstudio') {
+            this.providerTest[name] = { testing: false, ok: false,
+              message: '✗ No LM Studio worker configured in the fleet — add one above first.',
+              models: [] };
+            return;
+          }
+        }
+      }
       try {
         const r = await fetch('/api/vision/test', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -7213,12 +10208,29 @@ function dashboard() {
         // Connection drop is expected once the dashboard restarts.
       }
     },
+    async loadVideoBackendStatus() {
+      // Cheap probe (importlib + shutil.which). Fire once, then again on Settings
+      // reload — the answer only changes when the operator installs a backend.
+      try {
+        const r = await fetch('/api/video/backend-status');
+        if (!r.ok) return;
+        const j = await r.json();
+        this.videoBackend = {
+          checked: true,
+          has_any: !!j.has_any,
+          backends: Array.isArray(j.backends) ? j.backends : [],
+        };
+      } catch (e) { /* leave stale; banner just won't update this cycle */ }
+    },
     async reloadSettings() {
       if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
                                   { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
       this.settingsDirty = false;
       this.settingsErrors = {};
+      // Re-probe so a freshly-installed ffmpeg is picked up without a full refresh.
+      this.videoBackend = { checked: false, has_any: true, backends: [] };
+      this.loadVideoBackendStatus();
       this.refresh();
     },
     async toggleVisionWorker(name, enabled) {
@@ -7305,9 +10317,31 @@ function dashboard() {
       this.refresh();
     },
 
+    // URL for the <video> element in the detail modal. Uses ``modal.path``
+    // (set by every openModalFrom*() variant) when available, otherwise falls
+    // back to parsing ``path=<encoded>`` out of the thumbnail URL — the shape
+    // the /api/thumbnail endpoint uses. /api/media/raw serves the raw file with
+    // Range support, which is what makes <video> seek/buffer smoothly.
+    modalVideoSrc() {
+      let p = this.modal && this.modal.path ? this.modal.path : '';
+      if (!p && this.modal && this.modal.imageUrl) {
+        try {
+          const u = new URL(this.modal.imageUrl, window.location.origin);
+          p = u.searchParams.get('path') || '';
+        } catch (_) { /* malformed URL — leave blank so <video> shows an empty state */ }
+      }
+      if (!p) return '';
+      return '/api/media/raw?path=' + encodeURIComponent(p);
+    },
+
     async openModal({imageUrl, promptUrl, name, source, category, summary, path, meta}) {
       // Remember the trigger so we can restore focus on close (a11y).
       this.modalReturnFocus = document.activeElement;
+      // Detect a video item from the filename/path so the modal template
+      // renders <video> instead of <img>. Extension check mirrors the
+      // server-side _VIDEO_THUMB_EXTS set — keep in lockstep if that grows.
+      const videoRe = /\.(mp4|webm|mov|mkv|avi|m4v)(\?|$)/i;
+      const isVideo = videoRe.test(name || '') || videoRe.test(path || '');
       this.modal = {
         open: true, imageUrl,
         prompt: 'Loading...', promptOriginal: '',
@@ -7315,6 +10349,7 @@ function dashboard() {
         name: name || '', source: source || '', category: category || '',
         summary: summary || '', path: path || '', meta: meta || null,
         caption: '', captionOriginal: '', captionSaving: false, captionFlash: '',
+        isVideo,
       };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
@@ -7369,6 +10404,11 @@ function dashboard() {
       this.modal.open = false;
       this.modal.editing = false;
       this.modal.savedFlash = '';
+      // Flip isVideo=false so the <template x-if="modal.isVideo"> unmounts the
+      // <video> element entirely — otherwise Alpine's x-show on the outer
+      // container only hides it and playback (and audio!) continues in the
+      // background until the modal is reopened.
+      this.modal.isVideo = false;
       // Restore focus to whatever opened the modal (a11y).
       if (this.modalReturnFocus && this.modalReturnFocus.focus) {
         try { this.modalReturnFocus.focus(); } catch (_) { /* element gone */ }
@@ -7955,7 +10995,600 @@ function dashboard() {
       // server-side cached for 5 minutes so polls are cheap.
       this.checkUpdate();
       setInterval(() => this.checkUpdate(), 30 * 60 * 1000);
+      // Wave-2 UI bootstrap: apply persisted theme, poll demo status,
+      // and preload preset metadata for wizard + comparison grid.
+      this.applyTheme();
+      this.loadDemoStatus();
+      this.loadPresetsMeta();
     },
+
+    // ── T3 #22: theme selector ────────────────────────────────────────────
+    theme: (typeof localStorage !== 'undefined' && localStorage.getItem('cull.theme')) || 'dark',
+    applyTheme() {
+      const t = ['dark','light','hc'].includes(this.theme) ? this.theme : 'dark';
+      document.documentElement.classList.remove('theme-dark','theme-light','theme-hc');
+      document.documentElement.classList.add('theme-' + t);
+    },
+    setTheme(t) {
+      if (!['dark','light','hc'].includes(t)) t = 'dark';
+      this.theme = t;
+      try { localStorage.setItem('cull.theme', t); } catch (e) {}
+      this.applyTheme();
+    },
+
+    // ── T1 #1: demo seed / unseed ─────────────────────────────────────────
+    demoStatus: { exists: false, slug: null, busy: false },
+    async loadDemoStatus() {
+      try {
+        const j = await fetch('/api/demo/status').then(r => r.json());
+        this.demoStatus = { ...this.demoStatus, exists: !!j.exists, slug: j.slug || null };
+      } catch (e) { /* silent — endpoint may not be reachable during a stop */ }
+    },
+    async seedDemo() {
+      this.demoStatus.busy = true;
+      try {
+        const j = await fetch('/api/demo/seed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+        if (j.error) { this.notify(j.error, 'error'); return; }
+        this.notify('Demo data seeded' + (j.slug ? (' as ' + j.slug) : ''), 'success');
+        await this.loadDemoStatus();
+        await this.loadJobs();
+        if (j.slug) { try { await this.activateJob(j.slug); this.openJob(j.slug); } catch (e) {} }
+      } catch (e) { this.notify('Seed failed: ' + e, 'error'); }
+      finally { this.demoStatus.busy = false; }
+    },
+    async unseedDemo() {
+      if (!(await this.askConfirm('Remove the demo job and its seeded data?', { danger: true, confirmLabel: 'Remove' }))) return;
+      this.demoStatus.busy = true;
+      try {
+        const j = await fetch('/api/demo/unseed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+        if (j.error) { this.notify(j.error, 'error'); }
+        else this.notify('Demo data removed', 'success');
+        await this.loadDemoStatus();
+        await this.loadJobs();
+      } catch (e) { this.notify('Unseed failed: ' + e, 'error'); }
+      finally { this.demoStatus.busy = false; }
+    },
+
+    // ── T1 #2: first-run wizard ───────────────────────────────────────────
+    wizard: {
+      open: false, step: 1, subject: '', selectedPreset: '', presets: [],
+      sourceMode: 'none', sourceUrl: '', sourceFolder: '',
+      pickingFolder: false,
+      submitting: false, error: '', canRetryUnique: false,
+    },
+    presetsMeta: [],
+    async loadPresetsMeta() {
+      try {
+        const j = await fetch('/api/presets/descriptions').then(r => r.json());
+        this.presetsMeta = Array.isArray(j.presets) ? j.presets : [];
+      } catch (e) { this.presetsMeta = []; }
+    },
+    openWizard() {
+      this.wizard = { ...this.wizard, open: true, step: 1, subject: '', selectedPreset: '',
+                      presets: this.presetsMeta.slice(), sourceMode: 'none',
+                      sourceUrl: '', sourceFolder: '', pickingFolder: false,
+                      error: '', canRetryUnique: false };
+      if (this.presetsMeta.length === 0) this.loadPresetsMeta().then(() => this.wizard.presets = this.presetsMeta.slice());
+    },
+    // Open a native folder-picker dialog on the server (localhost only). The
+    // Python side spawns a fresh subprocess for Tk, so this never blocks the
+    // Flask worker; the button just shows "Opening…" until the user picks or
+    // dismisses. Empty path == cancel (silent, no toast).
+    async pickWizardFolder() {
+      this.wizard.pickingFolder = true;
+      try {
+        const r = await fetch('/api/system/folder-picker', { method: 'POST' });
+        let j = {};
+        try { j = await r.json(); } catch (e) { j = { ok: false, error: 'bad response' }; }
+        if (j && j.cancelled) return;
+        if (!r.ok || !j || !j.ok) {
+          this.notify(j.error || 'Folder picker failed — type the path manually', 'warn');
+          return;
+        }
+        if (j.path) this.wizard.sourceFolder = j.path;
+      } catch (e) {
+        this.notify('Folder picker unavailable — type the path manually', 'warn');
+      } finally {
+        this.wizard.pickingFolder = false;
+      }
+    },
+    openWizardWithPreset(key) { this.openWizard(); this.$nextTick(() => { this.wizard.selectedPreset = key; this.wizard.step = 1; }); },
+    closeWizard() { this.wizard.open = false; this.wizard.canRetryUnique = false; this.wizard.error = ''; },
+    wizardCanAdvance() {
+      if (this.wizard.step === 1) return this.wizard.subject.trim().length > 0;
+      if (this.wizard.step === 2) return !!this.wizard.selectedPreset;
+      return true;
+    },
+    wizardNext() { if (this.wizardCanAdvance() && this.wizard.step < 3) this.wizard.step++; },
+    wizardBack() { if (this.wizard.step > 1) this.wizard.step--; },
+    // Mirror of pipeline_code/job_config.py::slugify — lowercases, collapses
+    // any non [a-z0-9_] to underscore, strips leading/trailing underscores.
+    _slugifyJs(name) {
+      return String(name || '').toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .replace(/_{2,}/g, '_');
+    },
+    // Given a desired name, return a name whose slug does not collide with
+    // any existing job. Appends -2, -3, ... until unique.
+    _uniqueJobName(name) {
+      const existing = new Set((this.jobsList || []).map(j => j.slug));
+      const baseSlug = this._slugifyJs(name);
+      if (!existing.has(baseSlug)) return name;
+      for (let i = 2; i < 500; i++) {
+        const candidate = name + ' ' + i;
+        if (!existing.has(this._slugifyJs(candidate))) return candidate;
+      }
+      // Fallback: random 4-char suffix.
+      return name + ' ' + Math.random().toString(36).slice(2, 6);
+    },
+    async wizardSubmit(_retrySalt) {
+      if (!this.wizard.subject.trim() || !this.wizard.selectedPreset) {
+        this.wizard.error = 'Subject and preset are required.'; return;
+      }
+      this.wizard.submitting = true; this.wizard.error = '';
+      try {
+        // Refresh jobs list so uniqueness check sees the latest state.
+        try { await this.loadJobs(); } catch (e) {}
+        let desired = this.wizard.subject.trim().slice(0, 60);
+        if (_retrySalt) desired = desired + ' ' + _retrySalt;
+        const name = this._uniqueJobName(desired);
+        const body = { name, preset: this.wizard.selectedPreset, subject: this.wizard.subject.trim() };
+        const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) {
+          this.wizard.error = j.error || ('HTTP ' + r.status);
+          this.wizard.canRetryUnique = true;   // reveal "Retry with new name"
+          return;
+        }
+        // /api/jobs POST returns {success, job: _job_detail(job)} where
+        // _job_detail wraps the identity again under `.job`. Walk both shapes
+        // (and a hypothetical future flattening) so the wizard never trips.
+        const slug = j.slug || j.job?.slug || j.job?.job?.slug;
+        if (!slug) { this.wizard.error = 'Server returned no slug'; return; }
+        // Close the modal immediately on the 201 — the URL/folder + activate
+        // dance below is best-effort and surfaces as toasts, not modal errors.
+        this.wizard.open = false;
+        this.wizard.canRetryUnique = false;
+        this.notify('Job created: ' + name, 'success');
+        try {
+          if (this.wizard.sourceMode === 'url' && this.wizard.sourceUrl.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.enabled', value: true }),
+            });
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.urls', value: [this.wizard.sourceUrl.trim()] }),
+            });
+          } else if (this.wizard.sourceMode === 'folder' && this.wizard.sourceFolder.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.local_imports', value: [
+                { name: 'wizard', dir: this.wizard.sourceFolder.trim(), enabled: true }
+              ] }),
+            });
+          }
+        } catch (e) { this.notify('Source override failed: ' + e, 'warn'); }
+        try { await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', { method: 'POST' }); }
+        catch (e) { this.notify('Activate failed: ' + e, 'warn'); }
+        try { await this.loadJobs(); } catch (e) {}
+        try { this.openJob(slug); } catch (e) {}
+      } catch (e) { this.wizard.error = String(e); }
+      finally { this.wizard.submitting = false; }
+    },
+    // Called by the "Retry with new name" button on duplicate errors.
+    wizardRetryWithNewName() {
+      const salt = Math.random().toString(36).slice(2, 6);
+      this.wizardSubmit(salt);
+    },
+
+    // ── T1 #3: preset marketplace ─────────────────────────────────────────
+    community: { loading: false, presets: [], urlInput: '', error: '' },
+    async loadCommunityPresets() {
+      this.community.loading = true; this.community.error = '';
+      try {
+        const j = await fetch('/api/presets/community').then(r => r.json());
+        this.community.presets = Array.isArray(j.presets) ? j.presets : (Array.isArray(j) ? j : []);
+      } catch (e) { this.community.error = String(e); }
+      finally { this.community.loading = false; }
+    },
+    presetPreview: { open: false, loading: false, error: '', cfg: null, meta: null, source: '', installName: '', installing: false },
+    async previewPresetUrl(url) {
+      if (!url) return;
+      this.presetPreview = { open: true, loading: true, error: '', cfg: null, meta: null, source: url, installName: '', installing: false };
+      try {
+        const r = await fetch('/api/presets/preview?url=' + encodeURIComponent(url));
+        const j = await r.json();
+        if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
+        this.presetPreview.cfg = j.cfg || j.preset || j;
+        this.presetPreview.meta = j.meta || { headline: j.headline, description: j.description };
+        this.presetPreview.installName = (j.filename || url.split('/').pop() || 'community').replace(/\.json$/, '');
+      } catch (e) { this.presetPreview.error = String(e); }
+      finally { this.presetPreview.loading = false; }
+    },
+    async installPreviewedPreset() {
+      if (!this.presetPreview.cfg) return;
+      this.presetPreview.installing = true;
+      try {
+        const body = { url: this.presetPreview.source, name: this.presetPreview.installName };
+        const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify('Preset installed: ' + (j.name || this.presetPreview.installName), 'success');
+        this.presetPreview.open = false;
+        await this.loadPresets();
+      } catch (e) { this.presetPreview.error = String(e); }
+      finally { this.presetPreview.installing = false; }
+    },
+    async installPresetFromUrl(url, filename) {
+      if (!url) return;
+      try {
+        const body = { url, name: (filename || '').replace(/\.json$/, '') || undefined };
+        const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
+        this.notify('Preset installed', 'success');
+        await this.loadPresets();
+      } catch (e) { this.notify('Install failed: ' + e, 'error'); }
+    },
+    publishGist: { open: false, presetName: '', token: '', publicGist: false, busy: false, result: null, error: '' },
+    openPublishGist(name) { this.publishGist = { open: true, presetName: name, token: '', publicGist: false, busy: false, result: null, error: '' }; },
+    async submitPublishGist() {
+      if (!this.publishGist.token) return;
+      this.publishGist.busy = true; this.publishGist.error = ''; this.publishGist.result = null;
+      try {
+        const body = { name: this.publishGist.presetName, github_token: this.publishGist.token, public: this.publishGist.publicGist };
+        const r = await fetch('/api/presets/publish-gist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.publishGist.error = j.error || ('HTTP ' + r.status); return; }
+        this.publishGist.result = j;
+        this.notify('Published to Gist', 'success');
+      } catch (e) { this.publishGist.error = String(e); }
+      finally { this.publishGist.busy = false; }
+    },
+
+    // ── T1 #4: quick-sort ─────────────────────────────────────────────────
+    quickSort: { open: false, folder: '', preset: 'quality_only', worker: '', busy: false, error: '' },
+    openQuickSort() { this.quickSort = { open: true, folder: '', preset: 'quality_only', worker: '', busy: false, error: '' }; },
+    quickSortWorkers() {
+      const fleet = (this.je.eff?.vision?.workers || this.globalVision.cfg?.vision?.workers || []);
+      return (fleet || []).filter(w => w.enabled !== false);
+    },
+    async submitQuickSort() {
+      if (!this.quickSort.folder.trim()) { this.quickSort.error = 'Folder path required.'; return; }
+      this.quickSort.busy = true; this.quickSort.error = '';
+      try {
+        const body = { folder: this.quickSort.folder.trim(), preset: this.quickSort.preset, worker_id: this.quickSort.worker || undefined };
+        const r = await fetch('/api/quick-sort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.quickSort.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify('Quick-sort started', 'success');
+        this.quickSort.open = false;
+        await this.loadJobs();
+        if (j.slug) this.openJob(j.slug);
+      } catch (e) { this.quickSort.error = String(e); }
+      finally { this.quickSort.busy = false; }
+    },
+
+    // ── T2 #9: vision dry-run ─────────────────────────────────────────────
+    // previewDataUrl is a blob: URL created via URL.createObjectURL — cheap,
+    // sync, and revoked on clear/replace to avoid leaking references.
+    dryRun: { open: false, workerId: '', file: null, filename: '', previewDataUrl: null, busy: false, result: null, error: '', dragOver: false },
+    _setDryRunPreview(f) {
+      // Revoke any prior object URL so we don't leak the previous file.
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = f;
+      this.dryRun.filename = f.name;
+      this.dryRun.previewDataUrl = URL.createObjectURL(f);
+    },
+    handleDryRunPick(ev) {
+      const f = ev.target.files?.[0];
+      if (f) { this._setDryRunPreview(f); }
+    },
+    handleDryRunDrop(ev) {
+      this.dryRun.dragOver = false;
+      const f = ev.dataTransfer.files?.[0];
+      if (f) { this._setDryRunPreview(f); }
+    },
+    clearDryRunFile() {
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = null;
+      this.dryRun.filename = '';
+      this.dryRun.previewDataUrl = null;
+      const inp = this.$refs.dryRunFileInput;
+      if (inp) inp.value = '';
+    },
+    formatDryRunSize(n) {
+      if (!Number.isFinite(n)) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(2) + ' MB';
+    },
+    async runDryRun() {
+      if (!this.dryRun.file) return;
+      this.dryRun.busy = true; this.dryRun.error = ''; this.dryRun.result = null;
+      try {
+        const fd = new FormData();
+        fd.append('image', this.dryRun.file);
+        if (this.dryRun.workerId) fd.append('worker_id', this.dryRun.workerId);
+        const r = await fetch('/api/vision/dry-run', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.dryRun.error = j.error || ('HTTP ' + r.status); return; }
+        this.dryRun.result = j;
+      } catch (e) { this.dryRun.error = String(e); }
+      finally { this.dryRun.busy = false; }
+    },
+
+    // ── T2 #10: endpoint discovery ────────────────────────────────────────
+    discovery: { loading: false, candidates: [], error: '' },
+    async rescanDiscovery() {
+      this.discovery.loading = true; this.discovery.error = '';
+      try {
+        const j = await fetch('/api/vision/discover').then(r => r.json());
+        this.discovery.candidates = (Array.isArray(j.candidates) ? j.candidates : (Array.isArray(j) ? j : []))
+          .map(d => ({ ...d, adding: false }));
+      } catch (e) { this.discovery.error = String(e); }
+      finally { this.discovery.loading = false; }
+    },
+    async addDiscoveredEndpoint(d) {
+      d.adding = true;
+      try {
+        const r = await fetch('/api/vision/discover/add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: d.provider, base_url: d.base_url, model: d.model || '' }) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
+        this.notify('Endpoint added', 'success');
+        this.discovery.candidates = this.discovery.candidates.filter(x => !(x.base_url === d.base_url && x.provider === d.provider));
+        this.loadJobEditor();
+      } catch (e) { this.notify('Add failed: ' + e, 'error'); }
+      finally { d.adding = false; }
+    },
+
+    // ── T2 #11: digest webhook ────────────────────────────────────────────
+    digest: { webhook_url: '', webhook_style: 'discord', since_hours: 24, top_n: 5,
+              busy: false, action: '', markdown: '', status: '', error: '' },
+    async previewDigest() {
+      this.digest.busy = true; this.digest.action = 'preview'; this.digest.error = ''; this.digest.status = '';
+      try {
+        const body = { since_hours: this.digest.since_hours, top_n: this.digest.top_n, style: this.digest.webhook_style };
+        const r = await fetch('/api/digest/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.digest.error = j.error || ('HTTP ' + r.status); return; }
+        this.digest.markdown = j.markdown || j.text || JSON.stringify(j, null, 2);
+      } catch (e) { this.digest.error = String(e); }
+      finally { this.digest.busy = false; }
+    },
+    async sendDigest() {
+      if (!this.digest.webhook_url) return;
+      this.digest.busy = true; this.digest.action = 'send'; this.digest.error = ''; this.digest.status = '';
+      try {
+        const body = { webhook_url: this.digest.webhook_url, webhook_style: this.digest.webhook_style,
+                       since_hours: this.digest.since_hours, top_n: this.digest.top_n };
+        const r = await fetch('/api/digest/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.digest.error = j.error || ('HTTP ' + r.status); return; }
+        this.digest.status = 'Sent — ' + (j.status || 'OK');
+      } catch (e) { this.digest.error = String(e); }
+      finally { this.digest.busy = false; }
+    },
+
+    // ── T2 #12: export preview ────────────────────────────────────────────
+    exportPreview: { open: false, loading: false, data: null, error: '' },
+    async openExportPreview() {
+      this.exportPreview = { open: true, loading: true, data: null, error: '' };
+      try {
+        const body = { ...this.exportForm };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/export/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.exportPreview.error = j.error || ('HTTP ' + r.status); return; }
+        this.exportPreview.data = j;
+      } catch (e) { this.exportPreview.error = String(e); }
+      finally { this.exportPreview.loading = false; }
+    },
+
+    // ── T3 #13/#14: gallery bulk-select ───────────────────────────────────
+    bulk: { mode: false, selected: [], targetCategory: '', busy: false, error: '' },
+    bulkToggle(path) {
+      const i = this.bulk.selected.indexOf(path);
+      if (i >= 0) this.bulk.selected.splice(i, 1);
+      else this.bulk.selected.push(path);
+    },
+    bulkSelectAllPage() {
+      const paths = (this.gallery.items || []).map(c => c.path);
+      const set = new Set(this.bulk.selected);
+      paths.forEach(p => set.add(p));
+      this.bulk.selected = [...set];
+    },
+    bulkClear() { this.bulk.selected = []; this.bulk.error = ''; },
+    async bulkAction(action) {
+      if (!this.bulk.selected.length || this.bulk.busy) return;
+      if (action !== 'delete' && !this.bulk.targetCategory) return;
+      if (action === 'delete' && !(await this.askConfirm('Move ' + this.bulk.selected.length + ' item(s) to trash?', { danger: true }))) return;
+      this.bulk.busy = true; this.bulk.error = '';
+      try {
+        const body = { action, paths: this.bulk.selected, target_category: this.bulk.targetCategory || undefined };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/gallery/bulk-action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.bulk.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify((j.moved ?? j.count ?? this.bulk.selected.length) + ' items updated', 'success');
+        this.bulk.selected = []; this.bulk.targetCategory = '';
+        this.loadGallery();
+      } catch (e) { this.bulk.error = String(e); }
+      finally { this.bulk.busy = false; }
+    },
+    async bulkRequeue() {
+      if (!this.bulk.selected.length || this.bulk.busy) return;
+      if (!(await this.askConfirm('Requeue ' + this.bulk.selected.length + ' item(s) for reclassification?'))) return;
+      this.bulk.busy = true; this.bulk.error = '';
+      try {
+        const body = { paths: this.bulk.selected };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/gallery/requeue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.bulk.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify((j.requeued ?? this.bulk.selected.length) + ' requeued', 'success');
+        this.bulk.selected = [];
+        this.loadGallery();
+      } catch (e) { this.bulk.error = String(e); }
+      finally { this.bulk.busy = false; }
+    },
+
+    // ── T3 #17: gallery-dl URL test ───────────────────────────────────────
+    gdlTest: {},
+    gdlTestAllBusy: false,
+    effUrlsList() {
+      const raw = (this.effUrls && this.effUrls()) || '';
+      return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    },
+    async testGalleryDlUrl(url, idx) {
+      this.gdlTest = { ...this.gdlTest, [idx]: { busy: true, result: null } };
+      try {
+        // cookies_file is a filesystem PATH — the backend reads it and
+        // resolves to Netscape-format content. Sending it as cookies_txt
+        // (raw content) mis-decodes and confuses gallery-dl's cookiejar.
+        const cookiesFile = this.je.eff?.scrapers?.gallery_dl?.cookies_file || undefined;
+        const configJson = this.je.eff?.scrapers?.gallery_dl?.config_json || undefined;
+        const body = { url, cookies_file: cookiesFile, config_json: configJson };
+        const r = await fetch('/api/scrapers/gallery-dl/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        // Normalise: scraper_test returns {ok, extractor, category, sample_urls,
+        // message, error}. Compute sample_count from sample_urls.length so the
+        // UI can display `extractor · ~N items`.
+        const sample_count = Array.isArray(j.sample_urls) ? j.sample_urls.length : null;
+        this.gdlTest = { ...this.gdlTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, sample_count, ...j },
+        } };
+      } catch (e) {
+        this.gdlTest = { ...this.gdlTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
+      }
+    },
+    async testGalleryDlAll() {
+      if (this.gdlTestAllBusy) return;
+      this.gdlTestAllBusy = true;
+      try {
+        const urls = this.effUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          // Serial — polite to remote hosts; per-row state updates as we go.
+          await this.testGalleryDlUrl(urls[i], i);
+        }
+      } finally { this.gdlTestAllBusy = false; }
+    },
+
+    // ── yt-dlp / Youtube scraper URL test (mirrors gallery-dl). ───────────
+    ytTest: {},
+    ytTestAllBusy: false,
+    ytUrlsList() {
+      const raw = (this.ytUrls && this.ytUrls()) || '';
+      return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    },
+    async testYtDlpUrl(url, idx) {
+      this.ytTest = { ...this.ytTest, [idx]: { busy: true, result: null } };
+      try {
+        const body = { url };
+        const r = await fetch('/api/scrapers/yt-dlp/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        this.ytTest = { ...this.ytTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, ...j },
+        } };
+      } catch (e) {
+        this.ytTest = { ...this.ytTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
+      }
+    },
+    async testYtDlpAll() {
+      if (this.ytTestAllBusy) return;
+      this.ytTestAllBusy = true;
+      try {
+        const urls = this.ytUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          await this.testYtDlpUrl(urls[i], i);
+        }
+      } finally { this.ytTestAllBusy = false; }
+    },
+
+    // ── T3 #18: cookies converter ─────────────────────────────────────────
+    cookiesModal: { open: false, domain: '', settingsKey: '', raw: '', busy: false, result: null, error: '' },
+    openCookiesModal(domain, settingsKey) {
+      this.cookiesModal = { open: true, domain: domain || '', settingsKey: settingsKey || '', raw: '', busy: false, result: null, error: '' };
+    },
+    async submitCookies() {
+      if (!this.cookiesModal.raw) return;
+      this.cookiesModal.busy = true; this.cookiesModal.error = ''; this.cookiesModal.result = null;
+      try {
+        const body = { target_domain: this.cookiesModal.domain, raw: this.cookiesModal.raw,
+                       output_name: (this.cookiesModal.domain || 'site').replace(/[^a-z0-9_.-]/gi, '_') };
+        const r = await fetch('/api/cookies/convert', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.cookiesModal.error = j.error || ('HTTP ' + r.status); return; }
+        this.cookiesModal.result = j;
+        if (this.cookiesModal.settingsKey && j.path) {
+          this.settings[this.cookiesModal.settingsKey] = j.path;
+          this.markSettingsDirty();
+        } else if (j.path && this.je.eff?.scrapers?.gallery_dl) {
+          try { this.setOverride('scrapers.gallery_dl.cookies_file', j.path); } catch (e) {}
+        }
+        this.notify('Cookies saved', 'success');
+      } catch (e) { this.cookiesModal.error = String(e); }
+      finally { this.cookiesModal.busy = false; }
+    },
+
+    // ── T3 #19: live log tail (SSE) ───────────────────────────────────────
+    liveLogs: { connected: false, follow: true, lines: [], recent: [], error: '', _es: null },
+    async startLogStream() {
+      this.stopLogStream();
+      this.liveLogs.error = '';
+      try {
+        const h = await fetch('/api/logs/history?limit=200').then(r => r.json()).catch(() => ({ lines: [] }));
+        this.liveLogs.recent = (h.lines || h.log || []).slice(-200);
+      } catch (e) { /* non-fatal */ }
+      try {
+        const es = new EventSource('/api/logs/stream');
+        es.onmessage = (ev) => {
+          const line = String(ev.data || '');
+          this.liveLogs.lines.push(line);
+          if (this.liveLogs.lines.length > 2000) this.liveLogs.lines.shift();
+          if (this.liveLogs.follow) this.$nextTick(() => {
+            const el = this.$refs.liveLogsPane;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        };
+        es.onerror = () => { this.liveLogs.error = 'Stream disconnected'; this.stopLogStream(); };
+        this.liveLogs._es = es;
+        this.liveLogs.connected = true;
+      } catch (e) { this.liveLogs.error = String(e); }
+    },
+    stopLogStream() {
+      if (this.liveLogs._es) { try { this.liveLogs._es.close(); } catch (e) {} }
+      this.liveLogs._es = null; this.liveLogs.connected = false;
+    },
+    async copyLogsToClipboard() {
+      try {
+        await navigator.clipboard.writeText(this.liveLogs.lines.join('\n'));
+        this.notify('Logs copied', 'success');
+      } catch (e) { this.notify('Copy failed: ' + e, 'error'); }
+    },
+
+    // ── T3 #20: VRAM hint ─────────────────────────────────────────────────
+    workerInfo: {},
+    async loadWorkerInfo(w) {
+      const key = w.id || w.name;
+      if (!key) return;
+      try {
+        const q = 'worker_id=' + encodeURIComponent(key);
+        const r = await fetch('/api/vision/worker-info?' + q);
+        const j = await r.json();
+        this.workerInfo = { ...this.workerInfo, [key]: j };
+      } catch (e) { this.notify('Info fetch failed: ' + e, 'error'); }
+    },
+
   };
 }
 </script>

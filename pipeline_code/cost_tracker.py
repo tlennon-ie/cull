@@ -5,7 +5,7 @@ real money per image. Historically we logged neither token counts nor a
 running dollar estimate, so an admin could only find out about a spend spike
 by looking at the provider's own billing dashboard hours later.
 
-This module is a tiny, thread-safe, process-shared ledger:
+This module is a tiny, thread-safe, per-process ledger:
 
     record_usage(
         provider="openai", model="gpt-4o",
@@ -26,6 +26,18 @@ Zero mandatory deps and NEVER raises: every entry point catches its own IO /
 validation errors and no-ops on failure, so a ledger fault can never break
 classification. Fully backward-compatible: without any call sites wired up
 the file simply stays empty.
+
+Concurrency caveat
+------------------
+The ``threading.Lock`` here only serialises writers WITHIN one process. Cull's
+supervisor spawns one subprocess per vision worker, so parallel workers on the
+same box are separate processes and CAN interleave read-modify-write cycles
+under load — last writer wins, and each process can emit its own hourly-spend
+warning. That's acceptable given the module's positioning as a coarse smoke
+alarm (see paragraph above); adding an interprocess file lock would trade
+that intentional simplicity for a mandatory dep or a per-OS filelock branch.
+If exact multi-process accounting ever matters, swap ``_write`` to use a
+proper filelock (e.g. the ``filelock`` package) and drop this caveat.
 """
 from __future__ import annotations
 
