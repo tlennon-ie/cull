@@ -1826,6 +1826,46 @@ def _preset_thumb_placeholder(key: str) -> bytes:
     return svg.encode("utf-8")
 
 
+# Directories the thumbnail lookup + upload endpoints reach into. Kept as
+# helpers so tests can monkeypatch ``WORKSPACE_ROOT`` and the resolution
+# picks up the new value on every call.
+def _preset_user_thumbnail_dir() -> Path:
+    """Where user-uploaded overrides for shipped preset thumbnails live."""
+    return WORKSPACE_ROOT / "presets" / "thumbnails"
+
+
+def _preset_community_thumbnail_dir() -> Path:
+    """Where community-preset thumbnails ship AND land on upload."""
+    return WORKSPACE_ROOT / "presets" / "community" / "thumbnails"
+
+
+def _preset_thumb_lookup_in(root: Path, key: str) -> tuple[Path, str] | None:
+    """Return the first ``<root>/<key>.<ext>`` match with a traversal-safe check.
+
+    ``key`` is regex-restricted upstream. We still normalise-then-contain each
+    candidate so a hostile symlink planted under ``root`` can never escape it.
+    """
+    try:
+        root_real = os.path.realpath(str(root))
+    except OSError:
+        return None
+    for ext, mime in _PRESET_THUMB_EXTS:
+        candidate = root / f"{key}{ext}"
+        try:
+            candidate_real = os.path.realpath(str(candidate))
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if os.path.commonpath([candidate_real, root_real]) != root_real:
+                continue
+        except ValueError:
+            continue
+        return candidate, mime
+    return None
+
+
 @app.route("/api/presets/thumbnail")
 def api_presets_thumbnail():
     """Return a preview image for a preset card.
@@ -1834,36 +1874,26 @@ def api_presets_thumbnail():
       1. ``<repo>/presets/thumbnails/<key>.{gif,png,jpg,jpeg,webp,svg}``
          (user-supplied override — highest priority so operators can restyle a
          built-in preset without editing the shipped SVGs)
-      2. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
-      3. Deterministic gradient-with-letter SVG placeholder (any other key)
+      2. ``<repo>/presets/community/thumbnails/<key>.{...}`` (community-shipped
+         thumbnail colocated with the preset JSON, or a user upload for a
+         community preset)
+      3. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
+      4. Deterministic gradient-with-letter SVG placeholder (any other key)
     """
     key = (request.args.get("key") or "").strip().lower()
     if not _PRESET_THUMB_KEY_RE.match(key):
         abort(400)
-    thumbnails_root = WORKSPACE_ROOT / "presets" / "thumbnails"
-    # Resolve then containment-check so a symlinked override can't escape the
-    # thumbnails directory even if someone plants one manually.
-    thumbnails_real = os.path.realpath(str(thumbnails_root))
-    for ext, mime in _PRESET_THUMB_EXTS:
-        candidate = thumbnails_root / f"{key}{ext}"
-        try:
-            candidate_real = os.path.realpath(str(candidate))
-        except OSError:
-            continue
-        if not candidate.is_file():
-            continue
-        try:
-            if os.path.commonpath([candidate_real, thumbnails_real]) != thumbnails_real:
-                continue
-        except ValueError:
-            continue
-        # max_age=0 forces the browser to revalidate via ETag on every load.
-        # send_file(conditional=True) still emits Last-Modified + ETag, so
-        # unchanged files return a cheap 304 — but a shipped JPG replacing a
-        # cached SVG for the same key becomes visible on the very next page
-        # load instead of after the 1-hour Cache-Control expiry.
-        return send_file(candidate, mimetype=mime, max_age=0, conditional=True)
-    builtin = thumbnails_root / "_builtin" / f"{key}.svg"
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is not None:
+            candidate, mime = hit
+            # max_age=0 forces the browser to revalidate via ETag on every load.
+            # send_file(conditional=True) still emits Last-Modified + ETag, so
+            # unchanged files return a cheap 304 — but a shipped JPG replacing a
+            # cached SVG for the same key becomes visible on the very next page
+            # load instead of after the 1-hour Cache-Control expiry.
+            return send_file(candidate, mimetype=mime, max_age=0, conditional=True)
+    builtin = _preset_user_thumbnail_dir() / "_builtin" / f"{key}.svg"
     if builtin.is_file():
         return send_file(builtin, mimetype="image/svg+xml",
                          max_age=0, conditional=True)
@@ -1872,6 +1902,200 @@ def api_presets_thumbnail():
         mimetype="image/svg+xml",
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+# Upload constraints for /api/presets/<key>/thumbnail. Keep in step with the
+# GET lookup: only formats listed here are accepted, and each carries a magic-
+# byte prefix we verify server-side (mime-type strings from the browser are
+# advisory only).
+_PRESET_THUMB_UPLOAD_MAX_BYTES = 2 * 1024 * 1024   # 2 MB hard cap
+
+# (ext, mime, [magic-byte prefixes]) — every prefix is checked against the
+# first 32 bytes of the upload. Empty prefix list disables the magic check
+# (SVG is text; we accept it as long as it starts with '<').
+_PRESET_THUMB_UPLOAD_SPECS: tuple[tuple[str, str, tuple[bytes, ...]], ...] = (
+    (".gif",  "image/gif",     (b"GIF87a", b"GIF89a")),
+    (".png",  "image/png",     (b"\x89PNG\r\n\x1a\n",)),
+    (".jpg",  "image/jpeg",    (b"\xff\xd8\xff",)),
+    (".jpeg", "image/jpeg",    (b"\xff\xd8\xff",)),
+    (".webp", "image/webp",    (b"RIFF",)),  # RIFF....WEBP; header check below tightens
+)
+
+
+def _detect_upload_ext(head: bytes, declared_ext: str, declared_mime: str) -> tuple[str, str] | None:
+    """Return (ext, mime) if ``head`` matches any accepted image format.
+
+    Preference order: (1) match by magic bytes; (2) fall back to the declared
+    extension IFF its magic-byte spec allows an empty prefix list. We never
+    trust the browser-supplied mime type alone — spoofed content-type headers
+    are a classic upload-bypass vector.
+    """
+    for ext, mime, prefixes in _PRESET_THUMB_UPLOAD_SPECS:
+        if not prefixes:
+            continue
+        for prefix in prefixes:
+            if head.startswith(prefix):
+                if ext == ".webp":
+                    # RIFF...WEBP — the WEBP marker sits at bytes 8..12.
+                    if len(head) >= 12 and head[8:12] == b"WEBP":
+                        return ext, mime
+                    continue
+                return ext, mime
+    # Reject unknown formats — declared ext is not authoritative.
+    _ = (declared_ext, declared_mime)
+    return None
+
+
+@app.route("/api/presets/<key>/thumbnail", methods=["POST"])
+def api_presets_thumbnail_upload(key: str):
+    """Accept a user-uploaded thumbnail for preset ``key``.
+
+    Loopback-only. Multipart form upload under the ``file`` field. Accepts
+    .gif/.png/.jpg/.jpeg/.webp with magic-byte verification, capped at 2 MB.
+    Built-in preset keys land in ``presets/thumbnails/``; community preset
+    keys (matched by the presence of ``presets/community/<key>.preset.json``)
+    land in ``presets/community/thumbnails/`` so the file ships alongside
+    its preset when it's later published.
+
+    Returns ``{ok, path, url}`` — ``url`` is cache-busted so a stale browser
+    cache of the previous thumbnail becomes visible on the next paint.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = (key or "").strip().lower()
+    if not _PRESET_THUMB_KEY_RE.match(key):
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify({"ok": False, "error": "missing 'file' upload"}), 400
+    # Peek the head bytes for magic-byte validation without reading the whole
+    # file into memory twice. request.files streams from a SpooledTemporaryFile.
+    stream = upload.stream
+    try:
+        stream.seek(0)
+    except (OSError, AttributeError):
+        pass
+    head = stream.read(32)
+    declared_ext = ("." + (upload.filename or "").rsplit(".", 1)[-1].lower()) if "." in (upload.filename or "") else ""
+    detected = _detect_upload_ext(head, declared_ext, upload.mimetype or "")
+    if detected is None:
+        return jsonify({"ok": False, "error": "unsupported image format"}), 400
+    ext, mime = detected
+    try:
+        stream.seek(0)
+    except (OSError, AttributeError):
+        return jsonify({"ok": False, "error": "upload stream not seekable"}), 400
+    body = stream.read(_PRESET_THUMB_UPLOAD_MAX_BYTES + 1)
+    if len(body) > _PRESET_THUMB_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "error": f"file exceeds {_PRESET_THUMB_UPLOAD_MAX_BYTES} bytes"}), 400
+    if not body:
+        return jsonify({"ok": False, "error": "empty upload"}), 400
+
+    # Decide destination:
+    #  - built-in preset key → presets/thumbnails/ (existing user-override slot)
+    #  - community preset (matched by presets/community/<key>.preset.json)
+    #    → presets/community/thumbnails/ (colocated for git-based publish)
+    #  - anything else → user-override slot (a user-created preset name is
+    #    treated the same as a built-in override — they own the file).
+    dest_dir = _preset_user_thumbnail_dir()
+    try:
+        import builtin_presets as _bp
+        builtin_names = set(_bp.PRESET_NAMES)
+    except Exception:  # noqa: BLE001 - defensive: still allow uploads if the import fails
+        builtin_names = set()
+    community_file = _community_preset_dir() / f"{key}.preset.json"
+    if key not in builtin_names and community_file.is_file():
+        dest_dir = _preset_community_thumbnail_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove any stale thumbnail for this key (different extension) so the
+    # GET lookup doesn't return an older file after the browser cache-busts.
+    for spec_ext, _mime, _prefixes in _PRESET_THUMB_UPLOAD_SPECS:
+        if spec_ext == ext:
+            continue
+        stale = dest_dir / f"{key}{spec_ext}"
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                logger.warning("could not remove stale thumbnail: %s", stale)
+
+    dest = dest_dir / f"{key}{ext}"
+    # Extra containment check: dest must resolve inside dest_dir.
+    try:
+        dest_real = os.path.realpath(str(dest))
+        dir_real = os.path.realpath(str(dest_dir))
+        if os.path.commonpath([dest_real, dir_real]) != dir_real:
+            return jsonify({"ok": False, "error": "destination escapes thumbnail dir"}), 400
+    except (OSError, ValueError):
+        return jsonify({"ok": False, "error": "invalid destination path"}), 400
+    try:
+        dest.write_bytes(body)
+    except OSError as exc:
+        return _err("could not write thumbnail file", exc, 500)
+
+    ts = int(_wave_time.time())
+    return jsonify({
+        "ok": True,
+        "path": str(dest.relative_to(WORKSPACE_ROOT)).replace("\\", "/"),
+        "url": f"/api/presets/thumbnail?key={_urlquote(key, safe='')}&v={ts}",
+        "mime": mime,
+        "bytes": len(body),
+    })
+
+
+@app.route("/api/presets/<key>/thumbnail/status", methods=["GET"])
+def api_presets_thumbnail_status(key: str):
+    """Report whether preset ``key`` has a user-uploaded thumbnail on disk.
+
+    Powers the editor's "Remove custom thumbnail" affordance so the button
+    only appears for real uploads (not the shipped SVG or gradient
+    placeholder). Loopback-only — this is admin-side metadata, not something
+    a normal viewer needs.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = (key or "").strip().lower()
+    if not _PRESET_THUMB_KEY_RE.match(key):
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    path = None
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is not None:
+            path = str(hit[0].relative_to(WORKSPACE_ROOT)).replace("\\", "/")
+            break
+    return jsonify({"ok": True, "has_custom": bool(path), "path": path})
+
+
+@app.route("/api/presets/<key>/thumbnail", methods=["DELETE"])
+def api_presets_thumbnail_delete(key: str):
+    """Remove the user-uploaded thumbnail override for preset ``key``.
+
+    Loopback-only. Deletes only the first hit under ``presets/thumbnails/``
+    (built-in override slot) OR ``presets/community/thumbnails/`` (community
+    slot) — whichever ships as the user upload. The shipped ``_builtin/*.svg``
+    is never touched, so the preset falls back to its shipped thumbnail (or
+    the gradient placeholder) on the next GET.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = (key or "").strip().lower()
+    if not _PRESET_THUMB_KEY_RE.match(key):
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    removed: list[str] = []
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is None:
+            continue
+        candidate, _mime = hit
+        try:
+            candidate.unlink()
+            removed.append(str(candidate.relative_to(WORKSPACE_ROOT)).replace("\\", "/"))
+        except OSError as exc:
+            return _err("could not remove thumbnail file", exc, 500)
+    if not removed:
+        return jsonify({"ok": True, "removed": [], "message": "no user thumbnail to remove"})
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.route("/api/presets/descriptions")
@@ -5407,63 +5631,211 @@ def api_vision_worker_info():
                     **hints})
 
 
-# ── T3 #21 — Gist sharing ─────────────────────────────────────────────────────
+# ── Community publish via git add / commit / push ─────────────────────────────
+#
+# Replaces the earlier gist-based sharing flow. The dashboard already lives in
+# the operator's git checkout, so the natural way to share a preset is to
+# commit it to presets/community/ and push. This keeps the commit path-scoped
+# (git commit -o) so the user's OTHER working-tree edits are NEVER swept into
+# the publish commit — that's a hard product requirement.
 
-@app.route("/api/presets/publish-gist", methods=["POST"])
-def api_presets_publish_gist():
-    """Upload a preset export as a GitHub gist.
+# Subprocess timeout for every git call this endpoint drives. 30 s matches the
+# task spec; a slow push (large repo, poor network) will fail loudly instead
+# of hanging the dashboard's Flask worker.
+_PRESET_PUBLISH_GIT_TIMEOUT: float = 30.0
 
-    Body: ``{preset_key, gist_token, public}``. Loopback-only (the token is a
-    write-scope PAT). The token is NEVER logged — even the warning branches
-    stringify the request without it. Returns ``{ok, gist_url}``.
+
+def _git_run(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    """Run a git command with strict, non-interactive settings.
+
+    Returns (returncode, stdout, stderr). shell=False and args-as-list to
+    keep the operator-supplied ``key`` out of a shell parse. Environment is
+    frozen with ``GIT_TERMINAL_PROMPT=0`` so a missing credential helper can
+    never block the dashboard waiting for input.
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = subprocess.run(  # noqa: S603 - args are a fixed literal + validated key
+        args,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_PRESET_PUBLISH_GIT_TIMEOUT,
+        shell=False,
+        check=False,
+    )
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def _clean_git_error(stderr: str, cap: int = 400) -> str:
+    """Strip control chars from git's stderr and truncate for a user-facing error."""
+    if not stderr:
+        return "(git produced no error output)"
+    # Strip terminal control sequences and CR/LF noise; keep printable ASCII/UTF.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", stderr).strip()
+    if len(text) > cap:
+        text = text[: cap - 1] + "…"
+    return text or "(git error was empty after sanitisation)"
+
+
+@app.route("/api/presets/<key>/publish", methods=["POST"])
+def api_presets_publish(key: str):
+    """Publish preset ``key`` (+ thumbnail if any) via git add / commit / push.
+
+    Loopback-only. Empty body. Writes ``presets/community/<key>.preset.json``
+    from ``config_io.export_preset_bytes(key)`` and copies the user's
+    thumbnail (from either ``presets/thumbnails/<key>.<ext>`` or the community
+    slot) to ``presets/community/thumbnails/<key>.<ext>``. Commits ONLY those
+    files (``git commit -o``) so unrelated working-tree changes stay
+    uncommitted, then pushes to ``origin HEAD``.
+
+    Returns ``{ok, commit, pushed_to, files}`` on success, ``{ok:false, error, hint}``
+    on any failure — with human-actionable hints for the common "git isn't set
+    up" cases (missing git, not a repo, no origin) so users don't need to read
+    stderr.
     """
     if not _wave_is_loopback_request():
         return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
-    data = request.get_json() or {}
-    preset_key = (data.get("preset_key") or "").strip()
-    gist_token = (data.get("gist_token") or "").strip()
-    public = bool(data.get("public", False))
-    if not _valid_preset_name(preset_key):
+    key = (key or "").strip()
+    if not _valid_preset_name(key):
         return jsonify({"ok": False, "error": "invalid preset name"}), 400
-    if not _preset_exists(preset_key):
+    if not _preset_exists(key):
         return jsonify({"ok": False, "error": "preset not found"}), 404
-    if not gist_token:
-        return jsonify({"ok": False, "error": "gist_token is required"}), 400
+    # We also lock the key against the thumbnail regex so nothing sneaks a
+    # dodgy value into a subprocess path.
+    if not _PRESET_THUMB_KEY_RE.match(key.lower()):
+        return jsonify({"ok": False, "error": "preset key must be lowercase [a-z0-9_]"}), 400
+    key_lower = key.lower()
 
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return jsonify({
+            "ok": False,
+            "error": "git not installed",
+            "hint": "Install git and clone the cull repo (see README).",
+        }), 400
+    if not (WORKSPACE_ROOT / ".git").exists():
+        return jsonify({
+            "ok": False,
+            "error": "not a git repository",
+            "hint": "cull was likely downloaded as a zip. Clone the repo instead: git clone https://github.com/tlennon-ie/cull",
+        }), 400
+
+    # Verify origin exists.
+    rc, out, err = _git_run([git_bin, "remote", "get-url", "origin"], WORKSPACE_ROOT)
+    if rc != 0 or not out.strip():
+        return jsonify({
+            "ok": False,
+            "error": "no 'origin' remote configured",
+            "hint": "git remote add origin <url> (see README).",
+        }), 400
+    remote_url = out.strip().splitlines()[0]
+
+    # Serialize the preset envelope to disk.
     try:
-        envelope = config_io.export_preset(preset_key)
-        body = json.dumps(envelope, indent=2, ensure_ascii=False)
-    except Exception as exc:  # noqa: BLE001 - export failure is user-facing, never leak token
+        envelope_bytes = config_io.export_preset_bytes(key)
+    except Exception as exc:  # noqa: BLE001 - export failures surface as user-facing error
         return _err("failed to export preset", exc, 500)
-
-    payload = {
-        "description": f"cull preset export — {preset_key}",
-        "public": bool(public),
-        "files": {f"{preset_key}.preset.json": {"content": body}},
-    }
+    community_dir = _community_preset_dir()
+    community_dir.mkdir(parents=True, exist_ok=True)
+    preset_path = community_dir / f"{key_lower}.preset.json"
     try:
-        import requests as _requests
-        resp = _requests.post(
-            "https://api.github.com/gists",
-            headers={
-                "Authorization": f"Bearer {gist_token}",
-                "Accept": "application/vnd.github+json",
-                # UA is required by GitHub's API.
-                "User-Agent": "cull-dashboard",
-            },
-            json=payload,
-            timeout=_WAVE_HTTP_TIMEOUT,
-            allow_redirects=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - never leak the token
-        logger.warning("gist publish failed (no token in log)")
-        return jsonify({"ok": False, "error": f"gist publish failed: {type(exc).__name__}"}), 502
-    if resp.status_code not in (200, 201):
-        logger.warning("gist publish HTTP %s (no token in log)", resp.status_code)
-        return jsonify({"ok": False,
-                        "error": f"GitHub returned HTTP {resp.status_code}"}), 502
-    body_json = resp.json() if resp.content else {}
-    return jsonify({"ok": True, "gist_url": body_json.get("html_url") or ""})
+        preset_path.write_bytes(envelope_bytes)
+    except OSError as exc:
+        return _err("could not write community preset file", exc, 500)
+
+    files_to_commit: list[Path] = [preset_path]
+
+    # Copy a user thumbnail (if any) into the community slot so publish ships
+    # both files atomically. We look in the user-override slot AND the
+    # community slot itself (user may have uploaded straight there via the
+    # thumbnail endpoint) so a re-publish never drops a colocated image.
+    thumb_source: Path | None = None
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key_lower)
+        if hit is not None:
+            thumb_source = hit[0]
+            break
+    if thumb_source is not None:
+        _preset_community_thumbnail_dir().mkdir(parents=True, exist_ok=True)
+        thumb_dest = _preset_community_thumbnail_dir() / f"{key_lower}{thumb_source.suffix.lower()}"
+        try:
+            # If source and destination are the same file this is a no-op copy.
+            if os.path.realpath(str(thumb_source)) != os.path.realpath(str(thumb_dest)):
+                shutil.copyfile(str(thumb_source), str(thumb_dest))
+        except OSError as exc:
+            return _err("could not copy thumbnail into community dir", exc, 500)
+        files_to_commit.append(thumb_dest)
+
+    # Build repo-relative paths for git subcommands. We pass paths WITHOUT a
+    # leading ./ so git output stays clean; the -o (only) flag ensures nothing
+    # else in the working tree is committed.
+    rel_paths = [str(p.relative_to(WORKSPACE_ROOT)).replace("\\", "/") for p in files_to_commit]
+
+    # Stage the files (add is a no-op for already-tracked files whose contents
+    # have not changed, but harmless).
+    rc, _out, err = _git_run([git_bin, "add", "--", *rel_paths], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git add failed: {_clean_git_error(err)}",
+        }), 500
+
+    # Path-only commit. The -o flag makes git ignore everything else in the
+    # index for this commit — the user's OTHER WIP stays uncommitted.
+    commit_msg = f"community preset: {key_lower}"
+    rc, _out, err = _git_run(
+        [git_bin, "commit", "-o", *rel_paths, "-m", commit_msg],
+        WORKSPACE_ROOT,
+    )
+    if rc != 0:
+        cleaned = _clean_git_error(err)
+        # An empty commit ("nothing to commit") is not an error from the
+        # user's perspective — the preset is already on this branch as-is.
+        if "nothing to commit" in cleaned.lower() or "no changes added to commit" in cleaned.lower():
+            # Grab the HEAD sha so the response still points at the commit
+            # that already carries this preset.
+            _rc, sha, _e = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+            return jsonify({
+                "ok": True,
+                "commit": sha.strip(),
+                "pushed_to": None,
+                "files": rel_paths,
+                "message": "no changes — preset already committed as-is",
+            })
+        return jsonify({
+            "ok": False,
+            "error": f"git commit failed: {cleaned}",
+        }), 500
+
+    # Capture the new commit sha.
+    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+
+    # Push the current HEAD to origin.
+    rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git push failed: {_clean_git_error(err)}",
+            "commit": new_sha,
+            "files": rel_paths,
+            "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
+        }), 500
+
+    # Best-effort branch name for the friendly response line.
+    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
+    branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
+
+    return jsonify({
+        "ok": True,
+        "commit": new_sha,
+        "pushed_to": f"{remote_url} ({branch})",
+        "remote": remote_url,
+        "branch": branch,
+        "files": rel_paths,
+    })
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -6210,40 +6582,6 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <button @click="installPreviewedPreset()" :disabled="presetPreview.installing || !presetPreview.cfg"
                 class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm disabled:opacity-50">
           <span x-text="presetPreview.installing ? 'Installing…' : 'Install'"></span>
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Publish-to-Gist modal (T1 #3). PAT stays in-memory only. -->
-  <div x-show="publishGist.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
-       @click.self="publishGist.open = false">
-    <div class="card rounded-xl shadow-2xl max-w-md w-full p-5">
-      <h3 class="font-semibold mb-2">Publish preset to Gist</h3>
-      <p class="text-[11px] text-amber-300 mb-2">Your GitHub PAT is kept only in this browser session — never persisted or sent anywhere except GitHub's Gist API.</p>
-      <label class="block mb-2">
-        <span class="text-xs text-slate-400">Preset</span>
-        <input :value="publishGist.presetName" disabled class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs opacity-70"/>
-      </label>
-      <label class="block mb-2">
-        <span class="text-xs text-slate-400">GitHub personal access token (gist scope)</span>
-        <input type="password" x-model="publishGist.token" placeholder="ghp_..."
-               autocomplete="off"
-               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-      </label>
-      <label class="flex items-center gap-2 mb-3">
-        <input type="checkbox" x-model="publishGist.publicGist" class="accent-indigo-500"/>
-        <span class="text-sm">Public Gist</span>
-      </label>
-      <div x-show="publishGist.result" class="text-xs text-emerald-300 mb-2">
-        Published — <a :href="publishGist.result?.gist_url" target="_blank" rel="noopener noreferrer" class="link-btn" x-text="publishGist.result?.gist_url"></a>
-      </div>
-      <div x-show="publishGist.error" class="text-xs text-rose-300 mb-2" x-text="publishGist.error"></div>
-      <div class="flex justify-end gap-2">
-        <button @click="publishGist.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
-        <button @click="submitPublishGist()" :disabled="publishGist.busy || !publishGist.token"
-                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
-          <span x-text="publishGist.busy ? 'Publishing…' : 'Publish'"></span>
         </button>
       </div>
     </div>
@@ -8495,12 +8833,20 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- PRESETS MANAGER (global) ─────────────────────────────────────────────
          List/create/clone/delete/set-default + a preset editor over the same
-         inheritable field set. Presets have no inheritance — values are absolute. -->
+         inheritable field set. Presets have no inheritance — values are absolute.
+
+         Two sub-views (Alpine state ``presetView``):
+           - 'grid'   → default: built-in comparison grid, community strip, main
+                        preset grid with per-preset Edit/Clone/Export/Publish.
+           - 'detail' → dedicated full-width editor for one preset; the grid
+                        + community strip are hidden so the editor gets the
+                        full screen and users can't miss it. Back arrow (and
+                        the browser back button) returns to 'grid'. -->
     <section x-show="view === 'jobs' && active === 'presets'" class="space-y-4">
       <!-- Built-in preset comparison grid (T1 #5). Card per built-in preset
            with headline / description / use-cases. Clicking "Use" opens the
            first-run wizard pre-filled with this preset. -->
-      <div class="card rounded-xl p-5" x-show="presetsMeta.length">
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid' && presetsMeta.length">
         <div class="flex items-center justify-between mb-3">
           <div>
             <h3 class="font-semibold">Built-in presets</h3>
@@ -8533,7 +8879,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
       <!-- Community presets marketplace (T1 #3). Lists community-authored
            presets from /api/presets/community and supports install-from-URL. -->
-      <div class="card rounded-xl p-5">
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid'">
         <div class="flex items-center justify-between mb-2">
           <div>
             <h3 class="font-semibold">Community presets</h3>
@@ -8579,7 +8925,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
-      <div class="card rounded-xl p-5">
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid'">
         <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
           <div>
             <h3 class="font-semibold">Presets</h3>
@@ -8589,6 +8935,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                  class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-xs w-56"/>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <!-- "New preset" card renders FIRST so a user landing on the tab
+               sees the primary CTA (create/import) before scrolling past a
+               long grid of existing presets. The x-for below carries the
+               existing library. -->
+          <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-sm font-semibold">New preset</div>
+              <button @click="$refs.presetImport.click()" :disabled="configImporting" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="configImporting ? 'Importing…' : 'Import…'"></span></button>
+              <input x-ref="presetImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
+            </div>
+            <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
+            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
+            <select x-model="newPreset.base_on" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
+              <template x-for="p in presetsList" :key="'b_'+p">
+                <option :value="p" x-text="p === presetsDefault ? (p + '  (default)') : p"></option>
+              </template>
+            </select>
+            <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
+          </div>
           <template x-for="p in filteredPresets()" :key="p">
             <div :id="'preset-card-' + p"
                  class="bg-slate-900/60 border border-slate-800 rounded overflow-hidden flex flex-col gap-0"
@@ -8618,7 +8984,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
                 <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
-                <button @click="openPublishGist(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this preset as a public/private GitHub Gist">Publish</button>
+                <button @click="publishPresetViaGit(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this preset to presets/community/ and push to origin">Publish</button>
                 <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
                         title="Restore this shipped preset to its built-in defaults"
                         class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
@@ -8634,23 +9000,18 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <button class="link-btn ml-2" @click="newJob.presetFilter = ''">clear</button>
             </div>
           </template>
-          <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
-            <div class="flex items-center justify-between mb-2">
-              <div class="text-sm font-semibold">New preset</div>
-              <button @click="$refs.presetImport.click()" :disabled="configImporting" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="configImporting ? 'Importing…' : 'Import…'"></span></button>
-              <input x-ref="presetImport" type="file" accept="application/json,.json" class="hidden" @change="importConfigFile($event)"/>
-            </div>
-            <input x-model="newPreset.name" @keydown.enter="createPreset()" placeholder="Preset name"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2"/>
-            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
-            <select x-model="newPreset.base_on" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
-              <template x-for="p in presetsList" :key="'b_'+p">
-                <option :value="p" x-text="p === presetsDefault ? (p + '  (default)') : p"></option>
-              </template>
-            </select>
-            <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
-          </div>
         </div>
+      </div>
+
+      <!-- Detail-view header. Only visible in presetView==='detail'; carries
+           the Back button + sticky Save flash so users always know how to
+           leave the editor. Sits ABOVE the editor card so its sticky top:0
+           inside the card doesn't fight the page scroll. -->
+      <div x-show="presetView === 'detail'" class="flex items-center justify-between gap-3 flex-wrap">
+        <button @click="closePresetDetail()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1.5">
+          <span aria-hidden="true">←</span> Back to presets
+        </button>
+        <span class="text-xs text-slate-500">Editing: <span class="font-mono" x-text="presetEditor.name"></span></span>
       </div>
 
       <!-- Preset editor. Sticky header keeps the Close button + savedFlash
@@ -8659,15 +9020,67 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
            id anchor is the scroll target from openPreset() so a click on Edit
            auto-scrolls the editor into view instead of leaving the user at
            the top of the presets grid wondering where it went. -->
-      <div id="preset-editor-anchor" class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
+      <div id="preset-editor-anchor" class="card rounded-xl p-5"
+           x-show="presetView === 'detail' && presetEditor.open && presetEditor.cfg">
         <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
                     flex items-center justify-between backdrop-blur">
-          <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
+          <div class="flex items-center gap-3 min-w-0">
+            <button @click="closePresetDetail()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1 shrink-0" title="Back to presets">
+              <span aria-hidden="true">←</span> Back
+            </button>
+            <h3 class="font-semibold truncate">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
+          </div>
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="presetEditor.savedFlash"></span>
-            <button @click="closePreset()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Close</button>
+            <button @click="closePresetDetail()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Close</button>
           </div>
         </div>
+
+        <!-- Thumbnail card: drag-drop OR click-to-browse a new thumbnail for
+             this preset. Upload lands in presets/thumbnails/ (built-in preset
+             names) or presets/community/thumbnails/ (community presets) via
+             POST /api/presets/<key>/thumbnail. Preview cache-busts on every
+             save. Remove-custom is only offered when a user file exists. -->
+        <div class="mb-4 p-3 border border-slate-800 rounded bg-slate-900/40">
+          <div class="flex items-center justify-between mb-2">
+            <div>
+              <div class="text-sm font-semibold">Thumbnail</div>
+              <div class="text-[11px] text-slate-500">Drop an image or click to pick one. GIF / PNG / JPG / WebP, up to 2 MB.</div>
+            </div>
+            <button x-show="presetThumb.hasCustom" @click="removePresetThumbnail()"
+                    :disabled="presetThumb.busy"
+                    class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-50">
+              Remove custom thumbnail
+            </button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-[240px,1fr] gap-3">
+            <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(presetEditor.name) + '&v=' + presetThumb.cacheBust"
+                 :alt="presetEditor.name + ' thumbnail preview'"
+                 class="w-full aspect-video object-cover rounded border border-slate-800 bg-slate-950"
+                 loading="lazy"/>
+            <label
+              @dragover.prevent="presetThumb.dragOver = true"
+              @dragleave.prevent="presetThumb.dragOver = false"
+              @drop.prevent="presetThumb.dragOver = false; onPresetThumbDrop($event)"
+              :class="presetThumb.dragOver ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 bg-slate-900/40 hover:border-slate-500'"
+              class="flex flex-col items-center justify-center border-2 border-dashed rounded p-4 cursor-pointer text-center transition-colors">
+              <input type="file" accept="image/gif,image/png,image/jpeg,image/webp"
+                     class="hidden" x-ref="presetThumbInput"
+                     @change="onPresetThumbPick($event)"/>
+              <div class="text-xs text-slate-300 mb-1">
+                <span x-show="!presetThumb.busy">Drop an image here, or</span>
+                <span x-show="presetThumb.busy">Uploading…</span>
+              </div>
+              <button @click.prevent="$refs.presetThumbInput.click()" :disabled="presetThumb.busy"
+                      class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                Choose file
+              </button>
+              <div x-show="presetThumb.error" class="mt-2 text-xs text-rose-300" x-text="presetThumb.error"></div>
+              <div x-show="presetThumb.status && !presetThumb.error" class="mt-2 text-xs text-emerald-300" x-text="presetThumb.status"></div>
+            </label>
+          </div>
+        </div>
+
         <div x-show="presetEditor.error" x-cloak class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="presetEditor.error"></div>
         <div class="text-[11px] text-slate-500 mb-3" x-show="presetEditor.referencedBy.length"
              x-text="'Used by ' + presetEditor.referencedBy.length + ' job(s): ' + presetEditor.referencedBy.join(', ')"></div>
@@ -9645,9 +10058,18 @@ function dashboard() {
     _jeTimer: null,
     _jeSaving: null,
     // Global presets manager state.
+    //
+    // presetView flips between 'grid' (default: comparison + community strip
+    // + main grid) and 'detail' (dedicated full-width editor for one preset).
+    // The grid + community cards are ``x-show``-gated on this flag so the
+    // detail view fills the tab without competing UI beneath it. History
+    // integration (see openPreset / popstate wiring) means the browser Back
+    // button leaves the detail view instead of the whole tab.
+    presetView: 'grid',
     presetEditor: { open: false, name: null, cfg: null, isDefault: false,
                     referencedBy: [], savedFlash: '', error: '', saving: false },
     _peTimer: null,
+    _presetPopstateBound: false,
     newPreset: { name: '', base_on: '' },
     // Dynamic vision-worker fleet (per-job + preset editor).
     visionProviders: ['lmstudio', 'llamacpp', 'ollama'],
@@ -10435,15 +10857,46 @@ function dashboard() {
         this.peFleetTest = {};
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
-        // Wait a tick for x-show to mount the editor card, then scroll it
-        // into view. Without this the editor renders far below the preset
-        // grid and users don't realise their click did anything.
+        this._resetPresetThumbState(name);
+        // Flip to the dedicated detail view + push a history entry so the
+        // browser Back button (and the mobile swipe-back gesture) closes the
+        // editor instead of leaving the tab entirely.
+        this.presetView = 'detail';
+        try {
+          history.pushState({ presetDetail: name }, '', location.href);
+        } catch (_) {}
+        this._bindPresetPopstate();
+        // Scroll to top so the sticky editor header lands under the site nav
+        // instead of behind an already-scrolled page.
         await this.$nextTick();
-        const el = document.querySelector('#preset-editor-anchor');
-        if (el && typeof el.scrollIntoView === 'function') {
-          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
+        try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (_) {}
       } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
+    },
+    // Bind ONCE per Alpine root — popstate fires on every back/forward, and
+    // we only care while a preset detail view is mounted.
+    _bindPresetPopstate() {
+      if (this._presetPopstateBound) return;
+      this._presetPopstateBound = true;
+      window.addEventListener('popstate', () => {
+        if (this.presetView === 'detail') {
+          // Same close path as the on-screen Back button, but without
+          // pushing another history entry (the browser already popped).
+          this.flushPresetSave();
+          this.presetView = 'grid';
+          this.presetEditor.open = false;
+        }
+      });
+    },
+    // Called by the on-screen Back / Close controls. Flushes the debounce
+    // timer, closes the editor, and rewinds one history entry so the URL
+    // matches the visible state.
+    closePresetDetail() {
+      this.flushPresetSave();
+      this.presetView = 'grid';
+      this.presetEditor.open = false;
+      try {
+        if (history.state && history.state.presetDetail) history.back();
+      } catch (_) {}
     },
     // Pulse a preset card + scroll it into view. Used after install / clone
     // so the newly landed row is easy to spot in a long grid.
@@ -10459,7 +10912,11 @@ function dashboard() {
         setTimeout(() => { this.recentlyInstalledPreset = null; }, 2800);
       }, delayMs);
     },
-    closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
+    closePreset() {
+      // Legacy method — keep as a thin alias so anything still calling it
+      // (e.g. delete/reset flows) leaves the detail view cleanly.
+      this.closePresetDetail();
+    },
     // Preset list editors mirror the job editor list helpers but write straight
     // into presetEditor.cfg (a preset has no inheritance — values are absolute).
     peList(path) { const v = this._deepGet(this.presetEditor.cfg, path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
@@ -12004,20 +12461,123 @@ function dashboard() {
         this._highlightPresetCard(j.name || name);
       } catch (e) { this.notify('Install failed: ' + e, 'error'); }
     },
-    publishGist: { open: false, presetName: '', token: '', publicGist: false, busy: false, result: null, error: '' },
-    openPublishGist(name) { this.publishGist = { open: true, presetName: name, token: '', publicGist: false, busy: false, result: null, error: '' }; },
-    async submitPublishGist() {
-      if (!this.publishGist.token) return;
-      this.publishGist.busy = true; this.publishGist.error = ''; this.publishGist.result = null;
+    // Publish a preset to presets/community/ via a local git add/commit/push.
+    // Uses the same styled askConfirm dialog the rest of the dashboard uses
+    // instead of a bespoke modal — the request is essentially "confirm this
+    // will touch git and push". Displays a clear success line (SHA + remote)
+    // or the server's friendly error hint if git is not set up.
+    async publishPresetViaGit(name) {
+      const key = String(name || '').trim();
+      if (!key) return;
+      const bodyText = 'This will export "' + key + '" and its thumbnail (if any) to presets/community/, commit those files, and push to origin. Your other local changes stay uncommitted.';
+      const ok = await this.askConfirm(bodyText, {
+        title: 'Publish preset to community?',
+        confirmLabel: 'Publish',
+        cancelLabel: 'Cancel',
+      });
+      if (!ok) return;
+      const toastId = this.notify('Publishing ' + key + '…', 'info', 0);
       try {
-        const body = { name: this.publishGist.presetName, github_token: this.publishGist.token, public: this.publishGist.publicGist };
-        const r = await fetch('/api/presets/publish-gist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const r = await fetch('/api/presets/' + encodeURIComponent(key) + '/publish', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const j = await r.json().catch(() => ({}));
+        this.dismissToast(toastId);
+        if (!r.ok || j.ok === false) {
+          const parts = [j.error || ('HTTP ' + r.status)];
+          if (j.hint) parts.push(j.hint);
+          this.notify('Publish failed — ' + parts.join(' · '), 'error', 9000);
+          return;
+        }
+        const sha = (j.commit || '').slice(0, 8);
+        const suffix = j.pushed_to ? (' → pushed to ' + j.pushed_to) : '';
+        this.notify('Published ' + key + ' (' + (sha || 'no change') + ')' + suffix, 'success', 6500);
+      } catch (e) {
+        this.dismissToast(toastId);
+        this.notify('Publish failed: ' + e, 'error', 6000);
+      }
+    },
+
+    // ── Preset thumbnail upload state ────────────────────────────────────
+    // cacheBust is incremented after every save/delete so the preview <img>
+    // reloads instead of showing a cached copy of the previous thumbnail.
+    presetThumb: { busy: false, dragOver: false, error: '', status: '', hasCustom: false, cacheBust: 0 },
+    _resetPresetThumbState(name) {
+      this.presetThumb = { busy: false, dragOver: false, error: '', status: '',
+                           hasCustom: false, cacheBust: Date.now() };
+      // hasCustom is populated by _refreshPresetThumbStatus so the "Remove
+      // custom thumbnail" button only shows for real uploads (not the
+      // shipped SVG / gradient placeholder).
+      this._refreshPresetThumbStatus(name);
+    },
+    async _refreshPresetThumbStatus(name) {
+      const key = String(name || '').trim();
+      if (!key) return;
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(key) + '/thumbnail/status');
+        if (!r.ok) { this.presetThumb.hasCustom = false; return; }
         const j = await r.json();
-        if (!r.ok || j.error) { this.publishGist.error = j.error || ('HTTP ' + r.status); return; }
-        this.publishGist.result = j;
-        this.notify('Published to Gist', 'success');
-      } catch (e) { this.publishGist.error = String(e); }
-      finally { this.publishGist.busy = false; }
+        this.presetThumb.hasCustom = !!(j && j.has_custom);
+      } catch (_) { this.presetThumb.hasCustom = false; }
+    },
+    onPresetThumbPick(evt) {
+      const f = evt?.target?.files?.[0];
+      if (f) this._uploadPresetThumb(f);
+      // Clear the input value so picking the same file again re-fires @change.
+      if (evt?.target) evt.target.value = '';
+    },
+    onPresetThumbDrop(evt) {
+      const files = evt?.dataTransfer?.files;
+      if (files && files[0]) this._uploadPresetThumb(files[0]);
+    },
+    async _uploadPresetThumb(file) {
+      const name = this.presetEditor.name;
+      if (!name || !file) return;
+      // Client-side quick checks — the server re-validates via magic bytes.
+      if (file.size > 2 * 1024 * 1024) {
+        this.presetThumb.error = 'File exceeds 2 MB';
+        this.presetThumb.status = '';
+        return;
+      }
+      this.presetThumb.busy = true; this.presetThumb.error = ''; this.presetThumb.status = '';
+      try {
+        const fd = new FormData(); fd.append('file', file, file.name || 'thumbnail');
+        const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/thumbnail', {
+          method: 'POST', body: fd,
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+          this.presetThumb.error = j.error || ('HTTP ' + r.status);
+          return;
+        }
+        this.presetThumb.cacheBust = Date.now();
+        this.presetThumb.status = 'Saved · ' + (j.path || '');
+        this.presetThumb.hasCustom = true;
+        this.notify('Thumbnail updated', 'success', 2500);
+      } catch (e) {
+        this.presetThumb.error = String(e);
+      } finally { this.presetThumb.busy = false; }
+    },
+    async removePresetThumbnail() {
+      const name = this.presetEditor.name;
+      if (!name) return;
+      if (!(await this.askConfirm('Remove the custom thumbnail for "' + name + '"?',
+                                   { title: 'Remove thumbnail', confirmLabel: 'Remove', danger: true }))) return;
+      this.presetThumb.busy = true; this.presetThumb.error = ''; this.presetThumb.status = '';
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/thumbnail', { method: 'DELETE' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+          this.presetThumb.error = j.error || ('HTTP ' + r.status);
+          return;
+        }
+        this.presetThumb.cacheBust = Date.now();
+        this.presetThumb.hasCustom = false;
+        this.presetThumb.status = 'Removed';
+        this.notify('Thumbnail removed', 'success', 2500);
+      } catch (e) {
+        this.presetThumb.error = String(e);
+      } finally { this.presetThumb.busy = false; }
     },
 
     // ── T1 #4: quick-sort ─────────────────────────────────────────────────
