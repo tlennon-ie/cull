@@ -74,12 +74,21 @@ _INHERITABLE_KEYS: frozenset[str] = frozenset({
 })
 _MEDIA_TYPES: frozenset[str] = frozenset({"image", "video"})
 _MAX_MEDIA_EXTS: int = 40
-_CAPTION_STYLES: frozenset[str] = frozenset(
-    {"sd_prompt", "booru_tags", "natural_language"})
+# Source of truth for caption styles is vision_prompt so adding a new style
+# there (e.g. "motion" for video LoRA trainers) doesn't require a parallel
+# edit here.
+try:
+    import vision_prompt as _vp
+    _CAPTION_STYLES: frozenset[str] = frozenset(_vp.CAPTION_STYLES)
+except Exception:  # noqa: BLE001 - fallback keeps the validator strict
+    _CAPTION_STYLES = frozenset(
+        {"sd_prompt", "booru_tags", "natural_language", "motion"})
 _VISION_PROVIDERS: frozenset[str] = frozenset(job_config.VISION_PROVIDERS)
 
 # Caps mirror the dashboard validators (single contract, two call sites).
-_MAX_CATEGORIES = 40
+# 12 categories is the shipped ceiling — more than that swamps the vision
+# schema's enum + the UI grid becomes unusable.
+_MAX_CATEGORIES = 12
 _MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
 _MAX_HINT = 2000
