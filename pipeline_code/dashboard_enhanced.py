@@ -398,16 +398,23 @@ def safe_inside(raw: str, roots: list[Path]) -> Path | None:
 RESERVED_JOB_SLUGS: frozenset[str] = frozenset({"queue", "advance"})
 
 
+_ALL_JOBS_SENTINELS: frozenset[str] = frozenset({"__all__", "all", "*"})
+
+
 def _resolve_job_slug(default: str | None = "__active__") -> str | None:
     """Effective slug for a request.
 
-    ``?job=<slug>`` wins when present and well-formed; otherwise fall back to
-    ``default`` (sentinel ``"__active__"`` means "use the active job"). A
-    malformed ``?job=`` falls back too (never silently widens scope to *all*
-    jobs). Returns None only when there is no active job and none was supplied —
-    callers treat that as "unscoped / behave as today" for pre-jobs installs.
+    ``?job=<slug>`` wins when present and well-formed. The special values in
+    :data:`_ALL_JOBS_SENTINELS` (``__all__`` / ``all`` / ``*``) resolve to
+    ``None`` — the caller then treats it as "no scoping, aggregate every job".
+    A malformed ``?job=`` falls back to ``default`` (sentinel ``"__active__"``
+    means "use the active job") — never silently widens scope. Returns None
+    only when there is no active job and none was supplied (pre-jobs installs)
+    OR the caller explicitly asked for all jobs.
     """
     raw = (request.args.get("job") or "").strip()
+    if raw in _ALL_JOBS_SENTINELS:
+        return None
     if raw and job_config.JOB_SLUG_RE.match(raw):
         return raw
     if default == "__active__":
@@ -5496,14 +5503,33 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .tip:hover .tip-i, .tip:focus-within .tip-i { border-color:#38bdf8; color:#7dd3fc; }
   .tip-pop { visibility:hidden; opacity:0; transition:opacity .12s ease; position:absolute; z-index:80;
              left:0; top:1.5em; width:18rem; max-width:min(18rem,70vw); padding:.55rem .65rem;
-             border-radius:.4rem; background:#1e293b; border:1px solid #475569; color:#e2e8f0;
-             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.45);
+             border-radius:.4rem;
+             background: var(--color-surface-alt);
+             border: 1px solid var(--color-border-strong);
+             color: var(--color-fg);
+             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.25);
              text-transform:none; letter-spacing:normal; font-weight:400; white-space:normal; }
   .tip:hover .tip-pop, .tip:focus-within .tip-pop { visibility:visible; opacity:1; }
   .tip.tip-r .tip-pop { left:auto; right:0; }
-  .tip-pop b { color:#f1f5f9; font-weight:600; }
-  .tip-pop code { background:#0f172a; border:1px solid #334155; border-radius:3px; padding:0 .25rem; color:#fcd34d; }
-  .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
+  .tip-pop b { color: var(--color-fg); font-weight:600; }
+  .tip-pop code { background: var(--color-bg); border:1px solid var(--color-border);
+                  border-radius:3px; padding:0 .25rem; color: var(--color-accent); }
+  .tip-pop .ex { color: var(--color-fg-muted); display:block; margin-top:.35rem; }
+
+  /* Theme-aware nav tooltip: replaces the browser-native `title=` attribute
+     on sidebar tabs (Chrome's default tooltip renders dark in newer versions,
+     breaking light-mode contrast). Uses [data-tooltip=...] + ::after so the
+     tooltip inherits our tokens and never mismatches the page theme. */
+  .nav-tip { position: relative; }
+  .nav-tip[data-tooltip]:hover::after,
+  .nav-tip[data-tooltip]:focus-visible::after {
+    content: attr(data-tooltip);
+    position: absolute; left: calc(100% + 6px); top: 50%; transform: translateY(-50%);
+    background: var(--color-surface-alt); color: var(--color-fg);
+    border: 1px solid var(--color-border-strong); border-radius: 4px;
+    padding: 4px 8px; font-size: 11px; white-space: nowrap; z-index: 100;
+    pointer-events: none; box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  }
 
   /* ── Theme system (T3 #22) — three color modes stored on <html>. Dark
      stays the default; light + high-contrast override the full token set so
@@ -5614,6 +5640,16 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   html.theme-light .bg-slate-950\/60,
   html.theme-light .bg-slate-700,
   html.theme-light .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Hover variants — Tailwind renders these as :hover pseudo-selectors, so the
+     bare `.bg-slate-*` overrides above don't catch them. Without these, an
+     inactive sidebar tab hovering to `hover:bg-slate-800` would land on a
+     dark surface with the light-theme's dark text (invisible). */
+  html.theme-light .hover\:bg-slate-700:hover,
+  html.theme-light .hover\:bg-slate-800:hover,
+  html.theme-light .hover\:bg-slate-900:hover {
     background: var(--color-surface-alt) !important;
     color: var(--color-fg) !important;
   }
@@ -6315,9 +6351,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <div class="space-y-1">
         <template x-for="tab in globalTabs" :key="tab.id">
           <button @click="active = tab.id; sidebarOpen = false"
-            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            class="nav-tip w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            :title="tab.hint || ''" x-text="tab.label"></button>
+            :data-tooltip="tab.hint || ''" :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -6333,9 +6369,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="px-3 py-1 text-xs text-slate-500 truncate" x-text="currentJob"></div>
         <template x-for="tab in jobTabs" :key="tab.id">
           <button @click="active = tab.id; sidebarOpen = false"
-            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            class="nav-tip w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            :title="tab.hint || ''" x-text="tab.label"></button>
+            :data-tooltip="tab.hint || ''" :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -6714,7 +6750,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <label class="text-xs text-slate-400">Job filter</label>
             <select x-model="globalStatsJob" @change="loadGlobalStats()"
               class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm">
-              <option value="">All jobs</option>
+              <option value="__all__">All jobs</option>
               <template x-for="jb in jobsList" :key="'gs_'+jb.slug">
                 <option :value="jb.slug" x-text="jb.name"></option>
               </template>
@@ -9439,7 +9475,7 @@ function dashboard() {
     globalFleetTest: {},
     _gvTimer: null,
     // Global Stats per-job filter (null = all jobs aggregate).
-    globalStatsJob: '',
+    globalStatsJob: '__all__',
     // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
     // so this can never drift from the Python source of truth. Used by the
     // preset editor's enabled-toggles.
@@ -10818,8 +10854,10 @@ function dashboard() {
     async loadGlobalStats() {
       this.statsLoading = true;
       try {
-        const q = this.globalStatsJob ? ('?job=' + encodeURIComponent(this.globalStatsJob)) : '';
-        this.stats = await fetch('/api/stats' + q).then(r=>r.json());
+        // Default the picker to __all__ so backends aggregate across every
+        // job. Empty string used to fall back to the active job server-side.
+        const scope = this.globalStatsJob || '__all__';
+        this.stats = await fetch('/api/stats?job=' + encodeURIComponent(scope)).then(r=>r.json());
       } catch (e) { /* swallow */ }
       this.statsLoading = false;
     },
