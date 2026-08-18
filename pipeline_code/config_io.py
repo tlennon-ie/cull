@@ -166,9 +166,21 @@ def _validate_topic_filters(tf: Any) -> dict:
         if k not in allowed:
             raise ValidationError(f"unknown topic_filters key: {k!r}")
         if k in ("keywords_extra", "banned_keywords", "generation_hints"):
-            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
-                raise ValidationError(f"topic_filters.{k} must be a list of strings")
-            out[k] = list(v)
+            # Each keyword field accepts EITHER the legacy list-of-strings
+            # (implicit OR of substring matches) OR a single query-expression
+            # string using AND/OR/NOT/parens (see topic_filter.parse_query).
+            # Both round-trip through _csv(): a list joins with commas, a
+            # string passes through verbatim.
+            if isinstance(v, str):
+                if len(v) > _MAX_RULES:
+                    raise ValidationError(
+                        f"topic_filters.{k} query too long (max {_MAX_RULES} chars)")
+                out[k] = v
+            elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+                out[k] = list(v)
+            else:
+                raise ValidationError(
+                    f"topic_filters.{k} must be a list of strings or a query string")
         elif k == "min_prompt_length":
             iv = _as_int(v, "topic_filters.min_prompt_length")
             if iv < 0 or iv > _MAX_PROMPT_LEN:

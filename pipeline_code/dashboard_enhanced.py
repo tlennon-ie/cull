@@ -5063,9 +5063,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <h3 class="font-semibold mb-3">Topic filters</h3>
         <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
+          <div class="md:col-span-2 -mb-2 text-xs text-slate-500">
+            Tip: keyword fields accept comma-separated terms <em>or</em> a query with <code class="px-1 rounded bg-slate-800 text-slate-300">AND</code> / <code class="px-1 rounded bg-slate-800 text-slate-300">OR</code> / <code class="px-1 rounded bg-slate-800 text-slate-300">NOT</code> and parentheses &mdash; e.g. <code class="px-1 rounded bg-slate-800 text-slate-300">(product OR packshot) AND NOT selfie</code>.
+          </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. When a source has a prompt/caption it must contain at least one of these, or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
+              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated OR a query with AND/OR/NOT/parens. When a source has a prompt/caption it must match, or the image is skipped.', 'e.g. drone, aerial, overhead — or (aerial OR drone) AND NOT indoor') }}</span>
               <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
             </div>
