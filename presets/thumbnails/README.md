@@ -34,6 +34,22 @@ Public-domain / CC0 sources (verify licence per image before shipping):
 
 If you settle on a set that would benefit other cull users, open a PR against the repo and drop them under `presets/thumbnails/` — the endpoint's precedence order automatically picks them over the shipped SVGs.
 
+## Community preset thumbnails
+
+The [community preset gallery](../community/) ships with these JPG thumbnails at the top-level path (they win over the fallback letter-gradient placeholder):
+
+| Preset key                     | Visual concept                                                    |
+|--------------------------------|-------------------------------------------------------------------|
+| `automotive_car_photography`   | Moody 3/4 hero of a supercar on wet asphalt at dusk               |
+| `clean_anime`                  | Cel-shaded key-visual of a character over a coastal sunset        |
+| `film_photography`             | 35mm-style portrait in a golden-hour alley, visible grain         |
+| `food_editorial`               | Overhead editorial plated pasta with natural window light         |
+| `interior_design`              | Scandinavian living room, corrected verticals, styled shelves     |
+| `product_flatlay`              | Nadir knolled coffee-morning flatlay on neutral concrete          |
+| `retro_pixel_art`              | 16-bit dusk castle scene with a knight, restricted palette        |
+
+All 1280x720, 16:9, JPEG q=82, generated with Higgsfield (Nano Banana) and cropped to fit the card. Overrides via a top-level drop-in still work — the endpoint's precedence order picks whatever file you place there.
+
 ## The shipped SVG defaults (offline)
 
 Fully self-contained (no external CDN references, no fonts) so they render anywhere. Small (~1–4 KB each). Distinctive per preset:
