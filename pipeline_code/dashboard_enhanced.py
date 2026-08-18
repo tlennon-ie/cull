@@ -87,7 +87,7 @@ _SCRAPER_DESCRIPTIONS: dict[str, str] = {
     "Civitai-Com": "Civitai (civitai.com)",
     "Civitai-Red": "Civitai (civitai.red)",
     "Web":         "Reddit",
-    "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
+    "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in this card.",
 }
 
 # _STATIC_SCRAPERS is derived from job_config.SCRAPER_NAMES (built just below,
@@ -606,7 +606,7 @@ def _scraper_enabled_response(job: job_config.Job | None) -> list[dict[str, Any]
                 "name": f"Local-{nm}",
                 "description": f"Local folder ({folder.get('dir') or '(no dir set)'})",
                 "enabled": bool(folder.get("enabled", False)),
-                "kind": "local",          # read-only; managed in Job Settings
+                "kind": "local",          # read-only; managed in the Scrapers → Local folders card
             })
         return rows
     disabled = disabled_set()
@@ -657,10 +657,10 @@ def api_scraper_toggle():
     job = _job_for_scope(_resolve_job_slug())
     if job is not None:
         # Only the 6 canonical scrapers are togglable; Local-<name> rows are
-        # read-only status (configure folders in Job Settings → Local folders).
+        # read-only status (configure folders in the Scrapers → Local folders card).
         if name not in job_config.SCRAPER_NAMES:
             return jsonify({
-                "error": "local folders are configured in Job Settings → Local folders",
+                "error": "local folders are configured in the Scrapers → Local folders card",
                 "name": name,
             }), 400
         # SPARSE override: merge only the toggled key into the EXISTING override
@@ -7654,9 +7654,35 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
                                 placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
                                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                      <!-- Per-URL Test button (T3 #17). Extracts one URL per line, tests
+                           each via /api/scrapers/gallery-dl/test-url, shows extractor + count. -->
+                      <div class="mt-2">
+                        <div x-show="effUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                          <button @click.prevent="testGalleryDlAll()" :disabled="gdlTestAllBusy"
+                                  class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                            <span x-text="gdlTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                          </button>
+                          <span class="text-[10px] text-slate-400" x-show="gdlTestAllBusy">serial — one at a time</span>
+                        </div>
+                        <div class="space-y-1">
+                          <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
+                            <div class="flex items-center gap-2 text-[11px]">
+                              <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                              <button @click.prevent="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
+                                      class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                                <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                              </button>
+                              <span x-show="gdlTest[i]?.result"
+                                    :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                                    x-text="gdlTest[i]?.result?.ok ? ('✓ ' + (gdlTest[i]?.result?.extractor || '?') + ' · ~' + (gdlTest[i]?.result?.sample_count ?? '?') + ' items') : ('✗ ' + (gdlTest[i]?.result?.error || gdlTest[i]?.result?.message || 'failed'))"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
                     </label>
                     <label class="block">
-                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
+                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}
+                        <a class="link-btn ml-2" @click.prevent="openCookiesModal('gallery-dl')">Paste cookies</a></span>
                       <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
                              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
                     </label>
@@ -7678,7 +7704,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <template x-if="name === 'YT-DLP'">
                 <div>
                   <div class="flex items-center justify-between mb-2">
-                    <span class="text-xs text-slate-400">yt-dlp video/frame extractor</span>
+                    <span class="text-xs text-slate-400">yt-dlp video/frame extractor — <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noopener noreferrer" class="link-btn">GitHub ↗</a></span>
                     <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
                     <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
                   </div>
@@ -7698,6 +7724,30 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
                                 placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
                                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                      <!-- Per-URL Test + Test-all buttons — mirror of gallery-dl. -->
+                      <div class="mt-2">
+                        <div x-show="ytUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                          <button @click.prevent="testYtDlpAll()" :disabled="ytTestAllBusy"
+                                  class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                            <span x-text="ytTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                          </button>
+                          <span class="text-[10px] text-slate-400" x-show="ytTestAllBusy">serial — one at a time</span>
+                        </div>
+                        <div class="space-y-1">
+                          <template x-for="(u, i) in ytUrlsList()" :key="'ytu_'+i">
+                            <div class="flex items-center gap-2 text-[11px]">
+                              <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                              <button @click.prevent="testYtDlpUrl(u, i)" :disabled="ytTest[i]?.busy"
+                                      class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                                <span x-text="ytTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                              </button>
+                              <span x-show="ytTest[i]?.result"
+                                    :class="ytTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                                    x-text="ytTest[i]?.result?.ok ? ('✓ ' + (ytTest[i]?.result?.extractor || '?') + (ytTest[i]?.result?.count_estimate != null ? (' · ~' + ytTest[i]?.result?.count_estimate + ' items') : (ytTest[i]?.result?.duration_sec != null ? (' · ' + ytTest[i]?.result?.duration_sec + 's') : ''))) : ('✗ ' + (ytTest[i]?.result?.error || 'failed'))"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
                     </label>
                     <label class="block md:col-span-2">
                       <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
@@ -8396,225 +8446,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
-      <!-- Scraper targets (inheritable lists + Discord JSON). -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <h3 class="font-semibold mb-3">Scraper targets</h3>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-1 gap-4">
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
-              <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <input :value="effList('scrapers.x_accounts')" @change="setOverrideList('scrapers.x_accounts', $event.target.value)"
-                   placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
-              <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <input :value="effList('scrapers.reddit_subreddits')" @change="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Civitai domains{{ tip('Tick which Civitai hosts to scrape (civitai.com and/or the civitai.red mirror).') }}</span>
-              <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <div class="flex items-center gap-5 py-1.5" :class="!isOver('scrapers.civitai_domains') ? 'opacity-70' : ''">
-              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
-                <input type="checkbox" :checked="civOn('civitai.com')" @change="civToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> civitai.com
-              </label>
-              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
-                <input type="checkbox" :checked="civOn('civitai.red')" @change="civToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> civitai.red
-              </label>
-            </div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
-              <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <textarea :value="effVal('scrapers.discord_channels_json')" @input="setOverride('scrapers.discord_channels_json', $event.target.value)" rows="3"
-              placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scrapers.discord_channels_json') ? 'text-slate-400' : ''"></textarea>
-          </div>
-        </div>
-        </template>
-      </div>
-
-      <!-- gallery-dl (overridden wholesale as scrapers.gallery_dl). -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">gallery-dl
-            <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="text-xs font-normal link-btn ml-1">supported sites ↗</a>
-          </h3>
-          <div>
-            <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" :checked="effVal('scrapers.gallery_dl.enabled')" @change="setOverride('scrapers.gallery_dl.enabled', $event.target.checked)"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable gallery-dl for this job</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
-            <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
-            <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
-                      placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-            <!-- Per-URL Test button (T3 #17). Extracts one URL per line, tests
-                 each via /api/scrapers/gallery-dl/test-url, shows extractor + count. -->
-            <div class="mt-2">
-              <div x-show="effUrlsList().length > 0" class="flex items-center gap-2 mb-1">
-                <button @click.prevent="testGalleryDlAll()" :disabled="gdlTestAllBusy"
-                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
-                  <span x-text="gdlTestAllBusy ? 'Testing all…' : 'Test all'"></span>
-                </button>
-                <span class="text-[10px] text-slate-400" x-show="gdlTestAllBusy">serial — one at a time</span>
-              </div>
-              <div class="space-y-1">
-                <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
-                  <div class="flex items-center gap-2 text-[11px]">
-                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
-                    <button @click.prevent="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
-                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                      <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
-                    </button>
-                    <span x-show="gdlTest[i]?.result"
-                          :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                          x-text="gdlTest[i]?.result?.ok ? ('✓ ' + (gdlTest[i]?.result?.extractor || '?') + ' · ~' + (gdlTest[i]?.result?.sample_count ?? '?') + ' items') : ('✗ ' + (gdlTest[i]?.result?.error || gdlTest[i]?.result?.message || 'failed'))"></span>
-                  </div>
-                </template>
-              </div>
-            </div>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}
-              <a class="link-btn ml-2" @click.prevent="openCookiesModal('gallery-dl')">Paste cookies</a></span>
-            <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config file to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
-            <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults AND the global gallery-dl config. Any option from the gallery-dl docs. Leave blank for none.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
-            <textarea :value="effVal('scrapers.gallery_dl.config_json')" @change="setOverride('scrapers.gallery_dl.config_json', $event.target.value)" rows="3"
-                      placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}'
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-        </div>
-        </template>
-      </div>
-
-      <!-- Youtube scraper (yt-dlp under the hood — env vars + JSON keys keep
-           the historical name for backward compat). -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
-          <div>
-            <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable Youtube scraper for this job</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
-            <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
-            <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
-                      placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-            <!-- Per-URL Test + Test-all buttons — mirror of gallery-dl. -->
-            <div class="mt-2">
-              <div x-show="ytUrlsList().length > 0" class="flex items-center gap-2 mb-1">
-                <button @click.prevent="testYtDlpAll()" :disabled="ytTestAllBusy"
-                        class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
-                  <span x-text="ytTestAllBusy ? 'Testing all…' : 'Test all'"></span>
-                </button>
-                <span class="text-[10px] text-slate-400" x-show="ytTestAllBusy">serial — one at a time</span>
-              </div>
-              <div class="space-y-1">
-                <template x-for="(u, i) in ytUrlsList()" :key="'ytu_'+i">
-                  <div class="flex items-center gap-2 text-[11px]">
-                    <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
-                    <button @click.prevent="testYtDlpUrl(u, i)" :disabled="ytTest[i]?.busy"
-                            class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                      <span x-text="ytTest[i]?.busy ? 'Testing…' : 'Test'"></span>
-                    </button>
-                    <span x-show="ytTest[i]?.result"
-                          :class="ytTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                          x-text="ytTest[i]?.result?.ok ? ('✓ ' + (ytTest[i]?.result?.extractor || '?') + (ytTest[i]?.result?.count_estimate != null ? (' · ~' + ytTest[i]?.result?.count_estimate + ' items') : (ytTest[i]?.result?.duration_sec != null ? (' · ' + ytTest[i]?.result?.duration_sec + 's') : ''))) : ('✗ ' + (ytTest[i]?.result?.error || 'failed'))"></span>
-                  </div>
-                </template>
-              </div>
-            </div>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
-            <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-        </div>
-        </template>
-      </div>
-
-      <!-- Local folders (multi): scrapers.local_imports list. Each row is its
-           own concurrent source. -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <div>
-            <h3 class="font-semibold">Local folders</h3>
-            <p class="text-xs text-slate-400">Each enabled folder is a concurrent source, surfaced on the Scrapers tab as <code>Local-&lt;name&gt;</code>.</p>
-          </div>
-          <div>
-            <span x-show="!isOver('scrapers.local_imports')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.local_imports')" @click="resetOverride('scrapers.local_imports')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="space-y-2">
-          <template x-for="(f, i) in localFolders()" :key="i">
-            <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
-              <input :value="f.name" @input="updateLocalFolder(i, 'name', $event.target.value)" placeholder="name"
-                     class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-              <input :value="f.dir" @input="updateLocalFolder(i, 'dir', $event.target.value)" placeholder="absolute folder path"
-                     class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
-              <label class="col-span-2 flex items-center gap-1 text-xs">
-                <input type="checkbox" :checked="f.enabled" @change="updateLocalFolder(i, 'enabled', $event.target.checked)"/> on
-              </label>
-              <button @click="removeLocalFolder(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
-            </div>
-          </template>
-          <button @click="addLocalFolder()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
-        </div>
-        </template>
-      </div>
+      <!-- Scraper-specific settings (targets, gallery-dl, yt-dlp, local folders)
+           are unified onto the Scrapers tab. Each scraper card carries the
+           full setting set for that source. This tab intentionally does NOT
+           duplicate those controls. -->
 
       <!-- Categories (inheritable; reject traversal/reserved at the boundary). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
@@ -8991,8 +8826,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- GLOBAL SETTINGS ────────────────────────────────────────────────────
          Credentials, model endpoints, storage roots, and global UX. Per-job
-         settings (topic / targets / scoring / captioning) live in Job Settings.
-         Writes to .env via /api/settings. -->
+         topic/scoring/captioning live in Job Settings; per-job scraper
+         targets + gallery-dl / yt-dlp / local-folder config live in the
+         Scrapers tab's per-scraper cards. Writes to .env via /api/settings. -->
     <section x-show="view === 'jobs' && active === 'settings'" class="space-y-4"
       @input="markSettingsDirty()" @change="markSettingsDirty()">
 
