@@ -1,0 +1,79 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Product Flatlay",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "flatlay", "flat lay", "top-down", "top down", "knolling",
+        "overhead product", "birds-eye product", "styled flatlay",
+        "moodboard", "arrangement", "grid layout", "still life overhead"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "selfie", "meme", "anime", "cartoon", "screenshot"
+      ],
+      "generation_hints": [
+        "flatlay photography", "top-down shot", "overhead composition",
+        "knolling", "styled flatlay", "even softbox lighting",
+        "clean background flatlay"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "flatlays", "productphotography", "knolling", "OrganizationPorn",
+        "StillLife", "commercialphotography"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Genuinely top-down (nadir) composition, considered arrangement (knolling, radial, moodboard cluster), even softbox lighting with no directional shadow, sharp across the frame, on-topic. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "Editorial",
+        "hint": "Top-down but leaning editorial / lifestyle (napkin corners visible, hand entering frame, in-context props) — useful but a different bucket from clean styled flatlay"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Overhead intent but tilted off-axis by more than a few degrees, uneven directional shadow, cluttered edges bleeding out of frame, or only-average quality -> human review"
+      },
+      {
+        "name": "Tilted",
+        "hint": "Photograph is 3/4 or eye-level rather than top-down — NOT a flatlay -> off-theme for a flatlay dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Unrelated to a product / still-life flatlay subject"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image; an overhead illustration or a 3D-rendered isometric layout is the matching label, never `photograph`.\n- The image qualifies as a flatlay ONLY if the camera axis is clearly perpendicular (or within a few degrees of it) to the flat surface — arrangement + subject-parallelism visible on all objects. A tilted 3/4 arrangement is Tilted, NOT Keep.\n- has_ai_flaws = TRUE only for SEVERE artefacts (melted product geometry, warped logos/text on labels, impossible cast shadows going in mutually inconsistent directions, floating objects).\n- A SPRITE-STYLE GRID of separate finished photos stitched together is `is_composite_grid=true` and DISCARD. A single top-down arrangement of many objects on ONE surface is NOT a composite — that IS a flatlay.\n- contains_text_overlay = TRUE for burned-in captions, price tags, brand watermarks or object labels layered on top.\n- nsfw = TRUE only for explicit nudity or sexual content.\nFlatlay dataset. Reward true nadir alignment, considered arrangement (grids, knolling, radial spreads), even diffuse lighting and a clean/consistent surface. An editorial flatlay with hands or props entering frame goes to Editorial. A 3/4 or eye-level tilted composition is Tilted (off-theme). Penalise off-axis tilt, harsh directional shadows breaking the flat plane, cluttered edges bleeding objects out of frame, and burned-in tags/watermarks. The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 55,
+      "rel_min": 25,
+      "notes": "Reward nadir alignment, considered arrangement, even soft lighting and sharpness across the frame. Penalise off-axis tilt, directional hot-spot shadows, cluttered edges and burned-in tags/watermarks."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}
