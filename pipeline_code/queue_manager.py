@@ -60,12 +60,16 @@ SOURCES: dict[str, str] = {
 
 _SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
 _QUEUE_IMAGE_EXTS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+# Legacy glob-form aliases — tests + a couple of external callers still import
+# these under the *_GLOBS names. Derived once so the two views can't drift.
+_QUEUE_IMAGE_GLOBS: tuple[str, ...] = tuple(f"*{e}" for e in _QUEUE_IMAGE_EXTS)
 # Video containers the round-robin pop will surface ONLY when the video-
 # classification lane is enabled (VIDEO_CLASSIFY_ENABLED). Off by default so an
 # image-only pipeline never starts popping clips it can't classify — behaviour
 # stays byte-identical unless the flag is set. Mirrors video_frames.VIDEO_EXT /
 # export_profiles.VIDEO_EXT.
 _QUEUE_VIDEO_EXTS: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
+_QUEUE_VIDEO_GLOBS: tuple[str, ...] = tuple(f"*{e}" for e in _QUEUE_VIDEO_EXTS)
 _DEFAULT_CACHE_TTL = 5.0  # seconds; see FSQueue docstring
 
 
@@ -113,8 +117,21 @@ def _queue_exts() -> frozenset[str]:
 def _queue_globs() -> tuple[str, ...]:
     """Legacy glob view of the queue extensions — used by tests and by
     callers that still consume the ``('*.jpg', ...)`` shape. Thin adapter
-    over :func:`_queue_exts` so the two views can never drift."""
-    return tuple(f"*{e}" for e in sorted(_queue_exts()))
+    over :func:`_queue_exts` that preserves the canonical source order
+    (image globs then video globs) so callers can identity-compare against
+    :data:`_QUEUE_IMAGE_GLOBS` / :data:`_QUEUE_VIDEO_GLOBS`."""
+    exts = _queue_exts()
+    # Preserve the canonical source order (images before videos) instead of
+    # returning a sorted-alpha tuple that would break identity comparisons.
+    ordered: list[str] = []
+    for e in _QUEUE_IMAGE_EXTS + _QUEUE_VIDEO_EXTS:
+        if e in exts:
+            ordered.append(f"*{e}")
+    # Any extra exts from a custom media_policy land at the end, sorted.
+    known = set(_QUEUE_IMAGE_EXTS) | set(_QUEUE_VIDEO_EXTS)
+    for e in sorted(exts - known):
+        ordered.append(f"*{e}")
+    return tuple(ordered)
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
