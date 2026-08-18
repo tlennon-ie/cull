@@ -247,17 +247,28 @@ def get_preset_display_meta(key: str) -> dict:
     user-friendly display name (Title Case, spaces), ``headline`` and
     ``description`` come from :data:`PRESET_DESCRIPTIONS`.
 
+    Tolerant of the legacy ``dict[str, str]`` shape (an earlier wave commit
+    stored the description as a flat string): a plain-string entry becomes
+    the ``description`` with an empty ``headline`` so downstream renderers
+    never see ``[object Object]``.
+
     Raises ``KeyError`` for an unknown key so callers don't silently fall back
     to a stale entry — the dashboard should only ask for keys it discovered
     via :data:`PRESET_NAMES`.
     """
     meta = PRESET_DESCRIPTIONS[key]  # KeyError intentional on unknown
     display_name = key.replace("_", " ").title()
+    if isinstance(meta, dict):
+        headline = str(meta.get("headline", "") or "")
+        description = str(meta.get("description", "") or "")
+    else:  # legacy flat-string entry
+        headline = ""
+        description = str(meta or "")
     return {
         "key": key,
         "name": display_name,
-        "headline": meta["headline"],
-        "description": meta["description"],
+        "headline": headline,
+        "description": description,
     }
 
 
@@ -275,9 +286,14 @@ def preset_headline(key: str) -> str:
     """Return the short one-line headline for a preset key, or empty string
     if unknown. Callers that want just the flat headline (e.g. dashboard
     picker labels) can use this instead of ``get_preset_display_meta(key)``.
+
+    Tolerant of the legacy flat-string shape — a plain string has no headline
+    (it was the description) so this returns "" for it.
     """
     entry = PRESET_DESCRIPTIONS.get(key)
-    return entry["headline"] if isinstance(entry, dict) else ""
+    if isinstance(entry, dict):
+        return str(entry.get("headline", "") or "")
+    return ""
 
 
 # ── shared judgement-rule preamble ───────────────────────────────────────────
