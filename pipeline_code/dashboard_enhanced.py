@@ -5876,6 +5876,14 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   /* Preset marketplace + wizard shared card styling. */
   .preset-card { transition: transform .12s, border-color .12s; }
   .preset-card:hover { transform: translateY(-2px); border-color:#818cf8 !important; }
+  /* Fired for ~2.5s after a community preset install so the user can spot
+     the newly landed card in the list. Uses accent-tinted ring + shadow. */
+  @keyframes preset-highlight-pulse {
+    0%   { box-shadow: 0 0 0 3px rgba(99,102,241,0.65), 0 0 24px 4px rgba(99,102,241,0.35); }
+    100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+  }
+  .preset-highlight { animation: preset-highlight-pulse 2.5s ease-out 1;
+                      border-color: var(--color-accent) !important; }
   /* Use-case chip: themed via CSS variables so light mode gets legible
      contrast (previously #c7d2fe pale-indigo text on white bg was near-
      invisible). --color-pill-* are set per-theme in :root / theme-light. */
@@ -8747,8 +8755,18 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           <template x-for="p in filteredPresets()" :key="p">
-            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 flex flex-col gap-2"
-                 :class="presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : ''">
+            <div :id="'preset-card-' + p"
+                 class="bg-slate-900/60 border border-slate-800 rounded overflow-hidden flex flex-col gap-0"
+                 :class="[
+                   presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : '',
+                   recentlyInstalledPreset === p ? 'preset-highlight' : ''
+                 ]">
+              <!-- Thumbnail: user drop-in > shipped SVG > gradient placeholder,
+                   same endpoint the marketplace + comparison grid use. -->
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(p)"
+                   :alt="p" loading="lazy"
+                   class="w-full aspect-video object-cover border-b border-slate-800"/>
+              <div class="p-3 flex flex-col gap-2">
               <div class="flex items-start justify-between gap-2">
                 <div class="min-w-0">
                   <div class="font-mono text-sm truncate" x-text="p"></div>
@@ -8771,6 +8789,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                         class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
                 <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
                 <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
+              </div>
               </div>
             </div>
           </template>
@@ -8801,8 +8820,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
       <!-- Preset editor. Sticky header keeps the Close button + savedFlash
            indicator reachable while scrolling through long category / rules
-           blocks. Same CSS-variable backdrop as the other sticky save-bars. -->
-      <div class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
+           blocks. Same CSS-variable backdrop as the other sticky save-bars.
+           id anchor is the scroll target from openPreset() so a click on Edit
+           auto-scrolls the editor into view instead of leaving the user at
+           the top of the presets grid wondering where it went. -->
+      <div id="preset-editor-anchor" class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
         <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
                     flex items-center justify-between backdrop-blur">
           <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
@@ -9768,6 +9790,9 @@ function dashboard() {
     newJob: { name: '', base_on: '', preset: '', presetFilter: '' },
     presetsList: [], presetsDefault: '', presetsBuiltins: [],
     presetsMeta: { descriptions: {}, tags: {} },
+    // Preset name that was JUST installed / cloned — pulses the matching card
+    // via .preset-highlight for ~2.5s so the user spots it in the list.
+    recentlyInstalledPreset: null,
     // Welcome hero visibility: sticky-dismissed via localStorage. Independent
     // of the update / indexer toasts so dismissing one doesn't affect others.
     welcome: { dismissed: false },
@@ -10574,7 +10599,29 @@ function dashboard() {
         this.peFleetTest = {};
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
+        // Wait a tick for x-show to mount the editor card, then scroll it
+        // into view. Without this the editor renders far below the preset
+        // grid and users don't realise their click did anything.
+        await this.$nextTick();
+        const el = document.querySelector('#preset-editor-anchor');
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
       } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
+    },
+    // Pulse a preset card + scroll it into view. Used after install / clone
+    // so the newly landed row is easy to spot in a long grid.
+    _highlightPresetCard(name, delayMs = 200) {
+      this.recentlyInstalledPreset = name;
+      setTimeout(() => {
+        const el = document.getElementById('preset-card-' + name);
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        // Clear the flag once the animation has run so the pulse doesn't
+        // re-trigger on the next re-render (e.g. from a poll refresh).
+        setTimeout(() => { this.recentlyInstalledPreset = null; }, 2800);
+      }, delayMs);
     },
     closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
     // Preset list editors mirror the job editor list helpers but write straight
@@ -11840,7 +11887,7 @@ function dashboard() {
       this.$watch('active', (tab) => {
         if (tab === 'stats') this.loadStats();
         if (tab === 'gstats') this.loadGlobalStats();
-        if (tab === 'presets') this.loadPresets();
+        if (tab === 'presets') { this.loadPresets(); this.loadCommunityPresets(); }
         if (tab === 'settings') this.loadGlobalVision();
         if (tab === 'schedules') { this.loadSchedules(); if (!this.jobsList.length) this.loadJobs(); }
         // Duplicates is on-demand: the "Scan for duplicates" button is the only
@@ -12096,16 +12143,21 @@ function dashboard() {
         const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
         if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
-        this.notify('Preset installed: ' + (j.name || this.presetPreview.installName), 'success');
+        const installed = j.name || this.presetPreview.installName;
+        this.notify('Preset installed: ' + installed, 'success');
         this.presetPreview.open = false;
         await this.loadPresets();
+        // Scroll the newly landed card into view + fire the highlight pulse
+        // so the user sees exactly what was installed.
+        this._highlightPresetCard(installed);
       } catch (e) { this.presetPreview.error = String(e); }
       finally { this.presetPreview.installing = false; }
     },
     async installPresetFromUrl(source, filename) {
       if (!source) return;
       try {
-        const body = { name: (filename || '').replace(/\.preset\.json$/i, '').replace(/\.json$/i, '') || undefined };
+        const name = (filename || '').replace(/\.preset\.json$/i, '').replace(/\.json$/i, '') || undefined;
+        const body = { name };
         if (this._isCommunityFilename(source)) body.filename = source;
         else body.url = source;
         const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -12113,6 +12165,7 @@ function dashboard() {
         if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
         this.notify('Preset installed', 'success');
         await this.loadPresets();
+        this._highlightPresetCard(j.name || name);
       } catch (e) { this.notify('Install failed: ' + e, 'error'); }
     },
     publishGist: { open: false, presetName: '', token: '', publicGist: false, busy: false, result: null, error: '' },
