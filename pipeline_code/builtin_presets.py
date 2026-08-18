@@ -342,9 +342,9 @@ def _preset(
     theme_rules: str,
     scoring_notes: str,
     caption_style: str = "sd_prompt",
-    keywords_extra: tuple[str, ...] = (),
-    banned_keywords: tuple[str, ...] = (),
-    generation_hints: tuple[str, ...] = (),
+    keywords_extra: tuple[str, ...] | str = (),
+    banned_keywords: tuple[str, ...] | str = (),
+    generation_hints: tuple[str, ...] | str = (),
     min_prompt_length: int = 0,
     ovr_min: int = 0,
     rel_min: int = 0,
@@ -356,20 +356,28 @@ def _preset(
 ) -> dict:
     """Build one sparse preset bundle. `categories` is [(name, hint), ...].
 
-    `keywords_extra` is a generous synonym list: the required-keyword gate is
-    always on (when empty it auto-derives from the subject), so a broad list
-    only *widens* what a prompt-based scraper accepts. `generation_hints` only
-    gate when require_prompt=True. `x_accounts` / `reddit_subreddits` are
+    `keywords_extra` accepts either a tuple/list of substring terms (legacy
+    OR-of-substrings behaviour) OR a single query-expression string using
+    ``AND``/``OR``/``NOT``/parens — see ``topic_filter.parse_query``. Same for
+    ``banned_keywords`` and ``generation_hints``. The required-keyword gate is
+    always on (when empty it auto-derives from the subject). `generation_hints`
+    only gate when require_prompt=True. `x_accounts` / `reddit_subreddits` are
     starter scraper targets (verify/extend per job); `civitai_domains` defaults
     to both hosts. Scraper enable/disable + gallery-dl + local imports inherit
     the default shape via get_preset's deep-merge.
     """
+
+    def _kw(v: tuple[str, ...] | str | list) -> list[str] | str:
+        # Pass strings through verbatim (they carry the query expression);
+        # otherwise materialise the iterable as a list of substring terms.
+        return v if isinstance(v, str) else list(v)
+
     rules = f"{rules_preamble}\n{theme_rules}".strip() if theme_rules else rules_preamble
     return {
         "topic_filters": {
-            "keywords_extra": list(keywords_extra),
-            "banned_keywords": list(banned_keywords),
-            "generation_hints": list(generation_hints),
+            "keywords_extra": _kw(keywords_extra),
+            "banned_keywords": _kw(banned_keywords),
+            "generation_hints": _kw(generation_hints),
             "min_prompt_length": int(min_prompt_length),
             "require_prompt": bool(require_prompt),
         },
@@ -819,10 +827,25 @@ def _build_presets() -> dict[str, dict]:
         ),
 
         # ── product / e-commerce ────────────────────────────────────────────
+        # ``keywords_extra`` is a QUERY STRING here (see
+        # ``topic_filter.parse_query``) rather than the legacy tuple-of-terms.
+        # It requires at least one product-vocabulary hit AND excludes anything
+        # read as a portrait/selfie — one line does what ``keywords_extra`` +
+        # ``banned_keywords`` used to need together. Every OTHER preset keeps
+        # the legacy list shape so backward compatibility stays proven.
         "product_ecommerce": _preset(
             require_prompt=False,
-            keywords_extra=("product", "packshot", "studio", "catalog",
-                            "e-commerce", "white background", "product photography"),
+            # Query-string form (see topic_filter.parse_query) — a single
+            # expression covers both the "must include a product vocabulary
+            # hit" AND the "must NOT read as a portrait/selfie" gates that
+            # would otherwise need keywords_extra + banned_keywords together.
+            # banned_keywords stays populated for the broader creature /
+            # fantasy vocabulary that isn't in the AND NOT clause.
+            keywords_extra=(
+                "(product OR packshot OR catalog OR studio OR e-commerce OR "
+                "\"product photography\" OR \"white background\") "
+                "AND NOT (portrait OR selfie)"
+            ),
             banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot",
                                             "portrait", "character", "fantasy",
                                             "creature", "warrior", "orc", "demon"),
