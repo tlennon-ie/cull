@@ -636,7 +636,14 @@ def _post_webhook(url: str, body: dict[str, Any]) -> bool:
     hostile responder cannot 302-bounce the POST at a metadata endpoint.
     """
     if not _is_safe_webhook_url(url):
-        logger.warning("webhook POST refused: %s is not an http(s) URL", url)
+        # Log only the scheme — the full URL may carry secret query-string
+        # tokens (Slack/Discord webhooks routinely do), and log lines outlive
+        # their SSRF-refusal context.
+        try:
+            scheme = urlparse(url).scheme or "(none)"
+        except Exception:  # noqa: BLE001
+            scheme = "(unparseable)"
+        logger.warning("webhook POST refused: scheme=%r is not http(s)", scheme)
         return False
     try:
         resp = requests.post(

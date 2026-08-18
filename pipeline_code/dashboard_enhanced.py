@@ -214,9 +214,13 @@ _SECURITY_HEADERS: dict[str, str] = {
 
 @app.after_request
 def _apply_security_headers(response):
-    """Attach the fixed security-header set to every response."""
+    """Attach the fixed security-header set to every response.
+
+    Uses direct assignment (not setdefault) so no future endpoint can weaken
+    this defensive posture by pre-setting a laxer value.
+    """
     for name, value in _SECURITY_HEADERS.items():
-        response.headers.setdefault(name, value)
+        response.headers[name] = value
     return response
 
 
