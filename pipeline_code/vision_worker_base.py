@@ -228,6 +228,8 @@ class BaseVisionWorker(ABC):
             return self._finalise_discard(ctx, reason=prefilter_reason)
 
         b64 = base64.standard_b64encode(small).decode()
+        # ``build_classification_prompt`` is memoised in vision_prompt so hot
+        # loops pay one dict lookup, not a full ~8KB string rebuild per image.
         prompt_instruction = build_classification_prompt()
 
         try:
