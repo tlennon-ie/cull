@@ -1857,11 +1857,16 @@ def api_presets_thumbnail():
                 continue
         except ValueError:
             continue
-        return send_file(candidate, mimetype=mime, max_age=3600, conditional=True)
+        # max_age=0 forces the browser to revalidate via ETag on every load.
+        # send_file(conditional=True) still emits Last-Modified + ETag, so
+        # unchanged files return a cheap 304 — but a shipped JPG replacing a
+        # cached SVG for the same key becomes visible on the very next page
+        # load instead of after the 1-hour Cache-Control expiry.
+        return send_file(candidate, mimetype=mime, max_age=0, conditional=True)
     builtin = thumbnails_root / "_builtin" / f"{key}.svg"
     if builtin.is_file():
         return send_file(builtin, mimetype="image/svg+xml",
-                         max_age=3600, conditional=True)
+                         max_age=0, conditional=True)
     return Response(
         _preset_thumb_placeholder(key),
         mimetype="image/svg+xml",
@@ -4138,19 +4143,54 @@ def api_presets_community():
     return jsonify(out)
 
 
+_COMMUNITY_FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.preset\.json$", re.IGNORECASE)
+
+
+def _load_community_preset_body(filename: str) -> tuple[bool, str, dict | None]:
+    """Read a community preset from ``presets/community/<filename>`` — no HTTP.
+
+    Community presets ship in the repo, so preview / install for them must NOT
+    go through the SSRF-guarded fetcher (they carry no https URL). The filename
+    is regex-restricted and containment-checked against the community root so a
+    crafted value can't escape the intended directory.
+    """
+    if not _COMMUNITY_FILENAME_RE.match(filename or ""):
+        return False, "invalid community filename", None
+    root = _community_preset_dir()
+    path = root / filename
+    try:
+        real = os.path.realpath(str(path))
+        if os.path.commonpath([real, os.path.realpath(str(root))]) != os.path.realpath(str(root)):
+            return False, "path escapes the community directory", None
+    except (OSError, ValueError):
+        return False, "path resolution failed", None
+    if not path.is_file():
+        return False, "community preset not found", None
+    try:
+        return True, "", json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"failed to read community preset: {exc}", None
+
+
 @app.route("/api/presets/preview")
 def api_presets_preview():
-    """SSRF-guarded PREVIEW of a remote preset — does NOT install anything.
+    """PREVIEW a preset — does NOT install anything.
 
-    Query: ``?url=<https://…>``. The URL is host-allowlisted, SSRF-guarded,
-    fetched with a 15s + 512 KB cap, then run through the same validator that
+    Query: ``?url=<https://…>`` OR ``?filename=<local community preset>``.
+    Remote URLs are host-allowlisted, SSRF-guarded, fetched with a 15s +
+    512 KB cap. Local community filenames are read from
+    ``presets/community/<filename>`` (regex-restricted + containment-checked
+    against traversal). Either payload is run through the same validator that
     guards imports (``config_io.import_preset`` if the payload looks like a
     portable envelope; ``_validate_inheritable_cfg`` otherwise). Returns
-    ``{ok, cfg, warnings, error}`` — ``cfg`` is the cleaned config the caller
-    would install; nothing is written to disk.
+    ``{ok, cfg, warnings, error}`` — nothing is written to disk.
     """
+    filename = (request.args.get("filename") or "").strip()
     url = (request.args.get("url") or "").strip()
-    ok, err, body = _wave_fetch_preset_body(url)
+    if filename and not url:
+        ok, err, body = _load_community_preset_body(filename)
+    else:
+        ok, err, body = _wave_fetch_preset_body(url)
     if not ok:
         return jsonify({"ok": False, "cfg": None, "warnings": [], "error": err}), 400
     warnings: list[str] = []
@@ -4179,13 +4219,17 @@ def api_presets_install():
     import.
     """
     data = request.get_json() or {}
+    filename = (data.get("filename") or "").strip()
     url = (data.get("url") or "").strip()
     name = (data.get("name") or "").strip()
     if not _valid_preset_name(name):
         return jsonify({"ok": False, "error": "invalid preset name"}), 400
     if _preset_exists(name):
         return jsonify({"ok": False, "error": "preset already exists", "exists": True}), 409
-    ok_fetch, err, body = _wave_fetch_preset_body(url)
+    if filename and not url:
+        ok_fetch, err, body = _load_community_preset_body(filename)
+    else:
+        ok_fetch, err, body = _wave_fetch_preset_body(url)
     if not ok_fetch:
         return jsonify({"ok": False, "error": err}), 400
     # Accept both a portable envelope and a bare cfg — same as the preview.
@@ -5746,8 +5790,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     background: var(--color-danger) !important;
     color: var(--color-danger-fg) !important;
   }
+  /* Light rose text (rose-100 / rose-200) lives ON a rose background —
+     paint it with the danger-FG (white) so it doesn't render red-on-red.
+     Darker rose text (rose-300+) is standalone error text — keep it red. */
   html.theme-light .text-rose-100,
-  html.theme-light .text-rose-200,
+  html.theme-light .text-rose-200 { color: var(--color-danger-fg) !important; }
   html.theme-light .text-rose-300,
   html.theme-light .text-rose-400,
   html.theme-light .text-red-400 { color: var(--color-danger) !important; }
@@ -5829,8 +5876,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   /* Preset marketplace + wizard shared card styling. */
   .preset-card { transition: transform .12s, border-color .12s; }
   .preset-card:hover { transform: translateY(-2px); border-color:#818cf8 !important; }
+  /* Use-case chip: themed via CSS variables so light mode gets legible
+     contrast (previously #c7d2fe pale-indigo text on white bg was near-
+     invisible). --color-pill-* are set per-theme in :root / theme-light. */
   .use-case-chip { display:inline-block; font-size:.65rem; padding:.15rem .5rem; border-radius:9999px;
-                   background:rgba(99,102,241,.12); border:1px solid rgba(99,102,241,.35); color:#c7d2fe;
+                   background: var(--color-pill-bg); border: 1px solid var(--color-border);
+                   color: var(--color-pill-fg);
                    margin-right:.25rem; margin-top:.25rem; }
 
   /* Bulk-select overlay checkbox on gallery cards. */
@@ -12011,16 +12062,27 @@ function dashboard() {
       finally { this.community.loading = false; }
     },
     presetPreview: { open: false, loading: false, error: '', cfg: null, meta: null, source: '', installName: '', installing: false },
-    async previewPresetUrl(url) {
-      if (!url) return;
-      this.presetPreview = { open: true, loading: true, error: '', cfg: null, meta: null, source: url, installName: '', installing: false };
+    // A local community preset lives at presets/community/<name>.preset.json
+    // and has no https URL to fetch. Distinguish by checking whether the
+    // value we've been handed is a filename (matches the community pattern)
+    // or an http(s) URL — the backend routes on ?filename= vs ?url=.
+    _isCommunityFilename(v) {
+      return typeof v === 'string' && /^[a-z0-9_-]+\.preset\.json$/i.test(v);
+    },
+    async previewPresetUrl(source) {
+      if (!source) return;
+      this.presetPreview = { open: true, loading: true, error: '', cfg: null, meta: null, source: source, installName: '', installing: false };
       try {
-        const r = await fetch('/api/presets/preview?url=' + encodeURIComponent(url));
+        const q = this._isCommunityFilename(source)
+          ? '/api/presets/preview?filename=' + encodeURIComponent(source)
+          : '/api/presets/preview?url=' + encodeURIComponent(source);
+        const r = await fetch(q);
         const j = await r.json();
         if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
         this.presetPreview.cfg = j.cfg || j.preset || j;
         this.presetPreview.meta = j.meta || { headline: j.headline, description: j.description };
-        this.presetPreview.installName = (j.filename || url.split('/').pop() || 'community').replace(/\.json$/, '');
+        this.presetPreview.installName = (j.filename || source.split('/').pop() || 'community')
+          .replace(/\.preset\.json$/i, '').replace(/\.json$/i, '');
       } catch (e) { this.presetPreview.error = String(e); }
       finally { this.presetPreview.loading = false; }
     },
@@ -12028,7 +12090,9 @@ function dashboard() {
       if (!this.presetPreview.cfg) return;
       this.presetPreview.installing = true;
       try {
-        const body = { url: this.presetPreview.source, name: this.presetPreview.installName };
+        const body = { name: this.presetPreview.installName };
+        if (this._isCommunityFilename(this.presetPreview.source)) body.filename = this.presetPreview.source;
+        else body.url = this.presetPreview.source;
         const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
         if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
@@ -12038,10 +12102,12 @@ function dashboard() {
       } catch (e) { this.presetPreview.error = String(e); }
       finally { this.presetPreview.installing = false; }
     },
-    async installPresetFromUrl(url, filename) {
-      if (!url) return;
+    async installPresetFromUrl(source, filename) {
+      if (!source) return;
       try {
-        const body = { url, name: (filename || '').replace(/\.json$/, '') || undefined };
+        const body = { name: (filename || '').replace(/\.preset\.json$/i, '').replace(/\.json$/i, '') || undefined };
+        if (this._isCommunityFilename(source)) body.filename = source;
+        else body.url = source;
         const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const j = await r.json();
         if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
