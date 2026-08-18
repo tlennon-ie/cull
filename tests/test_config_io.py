@@ -347,5 +347,66 @@ def test_priority_full_cfg_round_trip(isolated):
     assert cleaned["scrapers"]["priority"]["weights"]["Web"] == 6
 
 
+# ── back-compat: tolerant of pre-wave shapes ─────────────────────────────────
+
+def test_import_accepts_preset_with_more_than_soft_cap_categories(isolated):
+    """A hand-tuned preset carrying >12 categories from an older cull must still
+    import — the wave drops the dashboard's SAVE cap to 12 but keeps the file
+    validator generous so ``git pull`` on top of an existing ``_presets.json``
+    (or a shared file from a friend) never breaks. The hard cap kicks in above
+    ``_MAX_CATEGORIES`` (40 as of the wave)."""
+    cio, jc, _ = isolated
+    base = jc.get_preset("default")
+    # 15 cats — well above the soft cap (12), well under the hard cap (40).
+    base["categories"] = [
+        {"name": f"Bucket{i}", "hint": f"hint {i}"} for i in range(15)
+    ]
+    env = {"cull_preset_version": cio.PRESET_VERSION, "kind": "cull.preset",
+           "name": "legacy_wide", "preset": base}
+    name, cfg = cio.import_preset(env)
+    assert name == "legacy_wide"
+    assert len(cfg["categories"]) == 15
+
+
+def test_import_still_rejects_hard_cap_breach(isolated):
+    """The hard cap (``_MAX_CATEGORIES``) is the final line — envelopes carrying
+    an unreasonable category count are still rejected so a corrupt or hostile
+    file can't blow up the schema enum."""
+    cio, jc, _ = isolated
+    base = jc.get_preset("default")
+    base["categories"] = [
+        {"name": f"C{i}", "hint": ""} for i in range(cio._MAX_CATEGORIES + 5)
+    ]
+    env = {"cull_preset_version": cio.PRESET_VERSION, "kind": "cull.preset",
+           "name": "way_too_wide", "preset": base}
+    with pytest.raises(cio.ValidationError) as exc:
+        cio.import_preset(env)
+    assert "categor" in str(exc.value).lower()
+
+
+def test_preset_read_tolerates_oversized_on_disk(isolated, caplog):
+    """A user's ``_presets.json`` carrying >12-cat presets must still load
+    (list_presets is the runtime read path — refusing to load would strand the
+    dashboard). A soft-warning log is emitted so users know the file is out of
+    step with the dashboard cap."""
+    import logging as _lg
+    cio, jc, tmp_path = isolated
+    # Seed the library with a wide preset by writing it directly to disk.
+    lib = jc.list_presets()
+    lib["presets"]["legacy_wide"] = {
+        **jc.get_preset("default"),
+        "categories": [{"name": f"B{i}", "hint": ""} for i in range(14)],
+    }
+    jc._write_presets(lib)
+    jc._LOAD_WARN_ONCE.clear()  # allow the warning to fire on this test call
+    caplog.set_level(_lg.WARNING, logger=jc.logger.name)
+    reloaded = jc.list_presets()
+    assert "legacy_wide" in reloaded["presets"]
+    assert len(reloaded["presets"]["legacy_wide"]["categories"]) == 14
+    assert any("legacy_wide" in rec.message and "12" in rec.message
+               for rec in caplog.records), \
+        "expected a soft-cap warning naming the oversized preset"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

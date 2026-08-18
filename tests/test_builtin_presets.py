@@ -356,5 +356,23 @@ def test_reset_preset_rejects_non_builtin(isolated):
         jc.reset_preset_to_builtin("not_a_builtin_name")
 
 
+# ── back-compat: display-meta tolerates the legacy flat-string shape ─────────
+
+def test_get_preset_display_meta_tolerates_legacy_flat_string(monkeypatch):
+    """An earlier wave commit stored ``PRESET_DESCRIPTIONS`` as ``dict[str, str]``
+    (a flat description). A downstream fork or a partial cherry-pick could
+    still ship that shape — the meta helper must not raise on it."""
+    monkeypatch.setitem(bp.PRESET_DESCRIPTIONS, "default", "legacy flat description")
+    meta = bp.get_preset_display_meta("default")
+    assert meta["description"] == "legacy flat description"
+    assert meta["headline"] == ""
+    assert meta["key"] == "default"
+
+
+def test_preset_headline_tolerates_legacy_flat_string(monkeypatch):
+    monkeypatch.setitem(bp.PRESET_DESCRIPTIONS, "default", "flat")
+    assert bp.preset_headline("default") == ""
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
