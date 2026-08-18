@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import cost_tracker
 import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
@@ -69,13 +70,21 @@ class OpenAICompatibleClient:
     Both OpenAI and OpenRouter expose the same OpenAI ``/v1`` protocol, so the
     OpenRouter worker constructs one of these with a different ``base_url`` /
     key and reuses ``classify`` verbatim.
+
+    Splits the request into a ``system`` message (the long, stable classification
+    prompt) and a ``user`` message (the image + a tiny prompt reference) so
+    OpenAI's automatic prefix cache — which hashes the message-array prefix —
+    can hit on every image while the giant instruction block flows through as
+    cached tokens. See https://platform.openai.com/docs/guides/prompt-caching.
+    OpenRouter proxies the same caching where the underlying model supports it.
     """
 
     def __init__(self, *, api_key: str, base_url: str, model: str,
-                 timeout: int) -> None:
+                 timeout: int, provider: str = "openai") -> None:
         openai = _import_openai()
         self.model = model
         self.timeout = timeout
+        self.provider = provider
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
 
     def classify(self, b64_jpeg: str, prompt_instruction: str) -> dict[str, Any] | None:
@@ -84,10 +93,15 @@ class OpenAICompatibleClient:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=[
+                    # System = the long, stable rubric → maximises prefix cache
+                    # hits across calls (OpenAI caches the prefix automatically
+                    # for prompts >1024 tokens within a ~5-10min window).
+                    {"role": "system", "content": prompt_instruction},
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt_instruction},
+                            {"type": "text",
+                             "text": "Classify the following image per the system instructions."},
                             {
                                 "type": "image_url",
                                 "image_url": {
@@ -95,7 +109,7 @@ class OpenAICompatibleClient:
                                 },
                             },
                         ],
-                    }
+                    },
                 ],
                 temperature=0.1,
                 max_tokens=2000,
@@ -111,6 +125,16 @@ class OpenAICompatibleClient:
         except (AttributeError, IndexError) as exc:
             logger.warning("OpenAI-compatible: unexpected response shape: %s", exc)
             return None
+
+        # Accumulate token usage into the shared spend ledger. Best-effort:
+        # a missing usage field or a ledger fault silently drops the row rather
+        # than blocking the classification result the worker just paid for.
+        in_tok, out_tok = cost_tracker.extract_openai_usage(response)
+        if in_tok or out_tok:
+            cost_tracker.record_usage(
+                provider=self.provider, model=self.model,
+                input_tokens=in_tok, output_tokens=out_tok,
+            )
 
         msg_dict = (
             message.model_dump() if hasattr(message, "model_dump") else dict(message)

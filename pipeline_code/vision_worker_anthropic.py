@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import cost_tracker
 import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
@@ -59,10 +60,17 @@ def _import_anthropic() -> Any:
     return anthropic
 
 
-def _classification_tool() -> dict[str, Any]:
-    """The forced tool whose input_schema is the shared vision JSON schema."""
+def _classification_tool(cache: bool = True) -> dict[str, Any]:
+    """The forced tool whose input_schema is the shared vision JSON schema.
+
+    When ``cache`` is true (the default) we also attach a ``cache_control`` mark
+    so Anthropic's prompt cache treats the tool + its schema as a cacheable
+    prefix. On every subsequent call within the ~5-minute cache TTL the
+    (multi-KB) schema block is served as cached tokens at 10% of the input
+    price. See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching.
+    """
     schema = build_response_format()["json_schema"]["schema"]
-    return {
+    tool: dict[str, Any] = {
         "name": _TOOL_NAME,
         "description": (
             "Record the structured classification of the supplied image. "
@@ -70,6 +78,9 @@ def _classification_tool() -> dict[str, Any]:
         ),
         "input_schema": schema,
     }
+    if cache:
+        tool["cache_control"] = {"type": "ephemeral"}
+    return tool
 
 
 def _extract_tool_input(content: Any) -> dict[str, Any] | None:
@@ -147,6 +158,11 @@ class AnthropicVisionWorker(BaseVisionWorker):
         b64_jpeg: str,
         prompt_instruction: str,
     ) -> dict[str, Any] | None:
+        # Anthropic prompt caching: the long, stable classification prompt goes
+        # into the ``system`` field with ``cache_control: ephemeral``. Together
+        # with the cached tool definition (see _classification_tool) this makes
+        # the entire (multi-KB) instruction+schema prefix a cached block, billed
+        # at 10% of the input rate after the first call within the ~5-min TTL.
         try:
             response = self._client.messages.create(
                 model=self.model_id,
@@ -154,11 +170,17 @@ class AnthropicVisionWorker(BaseVisionWorker):
                 temperature=0.1,
                 tools=[self._tool],
                 tool_choice={"type": "tool", "name": _TOOL_NAME},
+                system=[
+                    {
+                        "type": "text",
+                        "text": prompt_instruction,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 messages=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt_instruction},
                             {
                                 "type": "image",
                                 "source": {
@@ -167,6 +189,8 @@ class AnthropicVisionWorker(BaseVisionWorker):
                                     "data": b64_jpeg,
                                 },
                             },
+                            {"type": "text",
+                             "text": "Classify this image per the system instructions and call the tool."},
                         ],
                     }
                 ],
@@ -174,6 +198,14 @@ class AnthropicVisionWorker(BaseVisionWorker):
         except Exception as exc:  # noqa: BLE001 - provider raises many error types
             logger.warning("Anthropic request failed: %s", str(exc)[:200])
             return None
+
+        # Best-effort spend tracking (input tokens include cache_read charges).
+        in_tok, out_tok = cost_tracker.extract_anthropic_usage(response)
+        if in_tok or out_tok:
+            cost_tracker.record_usage(
+                provider="anthropic", model=self.model_id,
+                input_tokens=in_tok, output_tokens=out_tok,
+            )
 
         content = getattr(response, "content", None)
         parsed = _extract_tool_input(content)

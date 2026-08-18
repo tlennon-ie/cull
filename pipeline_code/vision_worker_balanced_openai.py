@@ -89,6 +89,13 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         self.use_grammar: bool = (
             provider == "llamacpp" or grammar_flag in ("1", "true", "yes", "on")
         )
+        # Grammar is derived from the (process-stable) response schema, so we
+        # build it once at worker start and reuse the string forever. Cache it
+        # via a lazy sentinel so the first request pays the build cost, all
+        # subsequent requests pay a dict-lookup: converts a 5-20ms grammar
+        # generation into a ~50ns lookup on the hot per-image path.
+        self._cached_grammar: str | None = None
+        self._grammar_built: bool = False
         try:
             self.request_timeout = int(
                 os.environ.get("OPENAI_COMPAT_TIMEOUT", str(self.request_timeout))
@@ -157,17 +164,25 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
         is unavailable OR conversion fails — so the request silently falls back to
         the plain ``response_format`` path and never hard-fails on schema drift.
         Lazily imported so the worker has no extra import cost when the gate is off.
+
+        Memoised per-instance: the grammar depends only on the (process-stable)
+        response schema, so we build it once and reuse forever. First call:
+        ~5-20ms grammar compile; subsequent calls: attribute lookup.
         """
         if not self.use_grammar:
             return None
+        if self._grammar_built:
+            return self._cached_grammar
         try:
             import gbnf_grammar
             schema = build_response_format()["json_schema"]["schema"]
             grammar = gbnf_grammar.json_schema_to_gbnf(schema)
-            return grammar or None
+            self._cached_grammar = grammar or None
         except Exception as exc:  # noqa: BLE001 - grammar is an optional optimisation
             logger.warning("GBNF grammar build failed; using response_format: %s", exc)
-            return None
+            self._cached_grammar = None
+        self._grammar_built = True
+        return self._cached_grammar
 
     def classify_image_bytes(
         self,

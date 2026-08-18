@@ -985,6 +985,15 @@ def run_jobs_loop(vision_worker: str = "balanced-groq") -> None:
     switches internally via the supervisor's index watch; this loop only regains
     control when the active job is *cleared* (stop / advance-past-end), at which
     point it idles again. The dashboard drives advance — we never auto-advance.
+
+    TODO(scalability): jobs run STRICTLY SEQUENTIALLY today — one active
+    supervisor instance drives one active job at a time (see CLAUDE.md Jobs
+    model §"sequential queue"). Concurrent multi-job execution would need
+    either (a) one Supervisor per active slug (with disjoint queue/sorted
+    roots — already the case) sharing the .env + credentials pool, or (b) a
+    shared worker fleet that fair-shares across slugs. Vision workers ARE
+    already parallel within a single job (fleet fan-out + ThreadPoolExecutor);
+    the sequential ceiling is the JOB dimension only.
     """
     announced_idle = False
     while True:
