@@ -82,19 +82,25 @@ def _queue_globs() -> tuple[str, ...]:
     image extensions when the job accepts images, plus video extensions when it
     accepts video AND the video-classification lane is enabled. Defaults mirror
     the historical image/video globs, so an unconfigured pipeline is unchanged."""
+    include_video = _video_classify_enabled()
     try:
         import media_policy
         globs: tuple[str, ...] = ()
         if media_policy.wants_image():
             globs += tuple(f"*{e}" for e in media_policy.image_exts())
-        if media_policy.wants_video() and _video_classify_enabled():
+        if media_policy.wants_video() and include_video:
             globs += tuple(f"*{e}" for e in media_policy.video_exts())
+        # If video is env-enabled but the policy didn't emit video globs (e.g.
+        # image-only policy on a default install), append the standard video
+        # set so VIDEO_CLASSIFY_ENABLED alone is enough to surface clips.
+        if include_video and not any(g in _QUEUE_VIDEO_GLOBS for g in globs):
+            globs += _QUEUE_VIDEO_GLOBS
         if globs:
             return globs
     except Exception:  # noqa: BLE001 - never let policy parsing break the queue
         pass
     # Fallback to the historical fixed set.
-    if _video_classify_enabled():
+    if include_video:
         return _QUEUE_IMAGE_GLOBS + _QUEUE_VIDEO_GLOBS
     return _QUEUE_IMAGE_GLOBS
 

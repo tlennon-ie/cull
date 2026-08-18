@@ -116,10 +116,13 @@ def already_queued(stem: str) -> bool:
 def iter_sources() -> list[Path]:
     if SRC_DIR is None or not SRC_DIR.exists():
         return []
+    # Scan for every media type the feeder can handle. The active-job media
+    # policy filters at ingestion / classification time — but making the
+    # feeder itself narrower means a user who drops an mp4 into a
+    # default-image-only job never even sees a warning that their file was
+    # ignored.
     images: list[Path] = []
-    # Only pick up the media types this job accepts (media_policy) — so a video
-    # job ignores stray images in the folder and vice versa.
-    for suffix in media_policy.accepted_exts():
+    for suffix in MEDIA_SUFFIXES:
         images.extend(SRC_DIR.glob(f"*{suffix}"))
     return sorted(images)
 
