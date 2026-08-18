@@ -21,6 +21,24 @@
 
 ![cull dashboard preview — gallery, stats, scrapers](docs/screenshots/gallery.png)
 
+## What's new
+
+The **user-acquisition wave** landed a first-run wizard, a demo mode, a
+publishable preset marketplace, video-as-first-class-media, and a cost-aware
+cloud-vision fleet. Highlights:
+
+- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/seed_demo_data.py` seeds synthetic queue/sorted rows so the dashboard shows real numbers before you configure anything.
+- **Preset marketplace + community presets + editable thumbnails + git-based Publish.** The Presets tab now has a dedicated editor detail view, a comparison grid of built-in starters, a community strip that browses `presets/community/*.preset.json`, and drag-and-drop thumbnail upload per preset. Publish sends the preset (+ its thumbnail) to `presets/community/` and commits+pushes to `origin` with `git commit -o` — your other working-tree edits stay uncommitted. Cleaner than the old Gist flow: no GitHub PAT required.
+- **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg` (via `imageio-ffmpeg`, no OS install needed). Videos play inline in the gallery modal. When the video backend is missing the pipeline **holds unclassifiable videos** (does NOT auto-DISCARD) so nothing is lost while you install the `[video]` extra.
+- **LM Studio strict-schema + a registry of cloud workers.** LM Studio's grammar backend now accepts our response schema (strict-mode-forbidden keywords stripped). Groq / Anthropic Claude / OpenAI / OpenRouter / Google Gemini all ship as first-class registered workers alongside the local fleet, with prompt caching + a per-provider **cost tracker** (`data/cost_ledger.json`) so a runaway cloud pass can't sneak up on you.
+- **Query-language keywords.** `topic_filter` now accepts `AND` / `OR` / `NOT`, parens, and `"quoted phrases"` — a keyword filter like `(portrait OR headshot) AND NOT anime` does what it says.
+- **Unified scraper cards + draggable priority.** Every scraper (Civitai, X, Reddit, Discord, gallery-dl, yt-dlp, Kohya import, local folders) lives on ONE Scrapers tab with per-source URL/target editors, per-URL Test buttons, and draggable priority (order + weight). No more hunting through Settings for the right toggle.
+- **Kohya + gallery-dl + yt-dlp scrapers.** Kohya-format LoRA training folders re-import through the same pipeline; gallery-dl covers 340+ sites out of the box; yt-dlp is now a first-class per-job scraper with cookies + custom args.
+- **Security hardening.** CSP + `X-Frame-Options: DENY` + `nosniff` on every response; `safe_inside()` on every user-supplied path; `SECRET_MASK` on every credential leaving the server; `allow_redirects=False` on every outbound HTTP probe. Full policy in [`SECURITY.md`](SECURITY.md), how-to-contribute in [`CONTRIBUTING.md`](CONTRIBUTING.md), community norms in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and every PR uses the [PR template](.github/pull_request_template.md).
+- **Kohya + HuggingFace exporters.** ZIP a filtered gallery view directly into a trainer, or push a curated set to a private HuggingFace dataset repo (`hf_export.py`).
+- **Digest webhook + desktop toasts.** Job completion fires a POST to `WEBHOOK_URL` (SSRF-guarded — http/s only, no redirects) and, optionally, a local desktop notification.
+- **Local vision fleet.** Multiple LM Studio / llama.cpp / Ollama endpoints run in parallel, each as its own subprocess, with gated failover and llama.cpp GBNF grammar support.
+
 ## What it is
 
 cull is a single-machine curation engine for AI-generated images. It pulls from a handful of dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. Docker optional — run it from the bootstrap scripts, `pip install -e .`, or a container, whichever you prefer.
@@ -182,6 +200,8 @@ cull is **job-centric**. A *job* is a named curation target — one subject, its
 
 cull ships a **starter preset library** so a new job lands on sensible defaults: a general `default` (a topic-agnostic Keep / Borderline / OffTopic triage with **no** person/subject gates) plus themed starters for **aerial/drone**, **underwater**, **wildlife & macro**, **product**, and **anime/illustration** — with a **photoreal-portrait** and a **quality-only** preset retained. Clone any of them and tweak its categories, judgement rules, scoring and topic filters.
 
+**Community presets + Publish.** The Presets tab also lists everything under `presets/community/*.preset.json` — install with one click, or paste any HTTPS URL that returns the same envelope. Every preset (built-in or user-authored) has an **editor detail view** with a drag-and-drop **thumbnail card** — upload a GIF / PNG / JPG / WebP up to 2 MB and it becomes the cover across the built-in grid, the community strip, and the preset picker in the first-run wizard. The **Publish** button on a preset commits the envelope (and its thumbnail, if any) to `presets/community/` and pushes to `origin` — a real `git commit -o` scoped to just those files, so your other working-tree edits stay uncommitted. No GitHub PAT required (that's why the old Gist flow retired).
+
 **Auto-saving.** Job and preset settings save themselves as you type — there are no Save buttons. For the job that's currently running, your edits are held and **applied when you leave the editor** (or hit Apply), so the pipeline re-projects and restarts once instead of on every keystroke.
 
 The dashboard opens on a grid of **job cards** (name, status, queue position, queued/sorted counts). Open a job to get its own workspace — **Historical**, **Queue**, **Scrapers** (per-job on/off + targets), **Vision** (this job's captioning + score gates), **Stats**, and **Settings** (the job editor: subject, keywords, subreddits, X accounts, Discord channels, gallery-dl URLs, local folders, categories, scoring, captioning). Jobs run sequentially: activate one, queue the rest, and cull advances down the queue.
@@ -197,10 +217,38 @@ Each job is a plain JSON file at `data/jobs/<slug>.json` — just `subject`, the
 If you're coming from an older cull where everything lived in a flat `.env`, run the one-shot migration from the repo root (inside the venv):
 
 ```bash
-python tools/migrate_to_jobs.py
+python tools/migrate_to_jobs.py            # apply (default; idempotent)
+python tools/migrate_to_jobs.py --dry-run  # preview only, write nothing
 ```
 
 It seeds a `default` preset, captures your current `.env` as a `default` job (its settings stored as that job's overrides), and adopts any other slug already on disk as its own job — folding any legacy local-folder settings into the new local-folders list. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job/preset JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script, and old v1 job files auto-upgrade when read. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
+
+### Upgrading from an older main (the user-acquisition wave)
+
+If you're already on the jobs model and you're just pulling the user-acquisition wave on top of an existing install, run the wave-upgrade audit — it's **read-only by default** and prints exactly what will change before you apply it:
+
+```bash
+python tools/migrate_wave.py             # dry-run: audit only, write nothing
+python tools/migrate_wave.py --check-only # audit + exit 1 on any WARN (CI hook)
+python tools/migrate_wave.py --apply      # run the idempotent migrations
+```
+
+What auto-migrates (no action required):
+
+- **Jobs, presets, index, schedules** load unchanged — every read path is tolerant of the pre-wave shape. A user-edited `_presets.json` with more than the new 12-category dashboard cap still loads (a warning surfaces the mismatch so you can trim it via the dashboard before editing).
+- **Kohya import** (`scrapers.kohya_import`) is added to every preset with `enabled=false` on first read — nothing runs until you point it at a dataset root.
+- **Legacy single-endpoint vision env vars** (`LMSTUDIO_PRIMARY_URL`, `OLLAMA_URL`, `OPENAI_COMPAT_URL`, …) fold into the default preset's `vision.workers` fleet on first supervisor start via `migrate_legacy_vision_to_fleet()` — only while the fleet still carries the shipped localhost default, so a customised fleet is never overwritten.
+- **SQLite index** (`data/cull_index.sqlite3`) is unchanged; the wave broadens the ingested-media set (images + video clips) without a schema change, so pre-existing rows keep working and video containers get discovered on the next scan.
+- **New `data/cost_ledger.json`** is created on first LLM call — nothing to migrate.
+
+What you should check post-upgrade:
+
+1. `python tools/migrate_wave.py` shows all sections `OK` (no `WARN`).
+2. Job list in the dashboard matches your pre-upgrade list.
+3. Queue/sorted counts on the Overview tab match what you had.
+4. If you had `>12` custom categories in a preset, trim the extras (dashboard warns and refuses new saves above the cap; the file still loads).
+
+Nothing is deleted or overwritten by the migration tools — a legacy preset that exceeds the current soft cap is **reported, not truncated**. If you need to preserve the older cap for a shared-file import, `import_preset` / `import_job` keep the hard `40` category ceiling.
 
 ## The dashboard
 
@@ -267,6 +315,29 @@ gallery-dl scraper:
 - `GALLERY_DL_COOKIES_FILE` — Netscape `cookies.txt` path; required for login-walled sites.
 - `GALLERY_DL_CONFIG_PATH` — optional extra gallery-dl JSON config layered on top of cull's defaults.
 
+## Security posture
+
+cull is a **single-user local admin tool**. The dashboard trusts anyone who can
+reach its port. If that's just you on your own machine, you're fine; if the
+port is exposed to a network you don't trust, put a reverse proxy with auth in
+front of it, or bind loopback-only:
+
+```env
+# .env
+FLASK_HOST=127.0.0.1
+```
+
+The dashboard ships with CSP, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, and a restrictive `Permissions-Policy` on every
+response; every user-supplied path is validated with `safe_inside()`; every set
+credential returns as `********`; every outbound HTTP probe passes
+`allow_redirects=False`. Full threat model in [`SECURITY.md`](SECURITY.md).
+
+**Please scrape politely.** cull's scrapers hit public APIs and pages — respect
+each site's `robots.txt` and Terms of Service, don't burst-scrape, and add
+sensible rate limits via the `RATE_LIMIT_<SOURCE>_*` env vars for the sources
+you push hardest. gallery-dl and yt-dlp inherit the same responsibility.
+
 ## FAQ
 
 **Why no Redis?** Because the filesystem is already a queue. `image.jpg.processing` is the lock; `os.rename` is atomic on every platform that matters; the supervisor's stale-processing sweep recovers from crashes on restart. cull runs on a Raspberry Pi if you want it to.
@@ -289,7 +360,7 @@ gallery-dl scraper:
 
 ## Contributing
 
-Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first.
+Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first. Full guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). By participating you agree to the [`Code of Conduct`](CODE_OF_CONDUCT.md). Security issues: [`SECURITY.md`](SECURITY.md) (please email, don't file a public issue).
 
 ### Working with an AI coding agent
 

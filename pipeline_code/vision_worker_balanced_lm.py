@@ -56,6 +56,16 @@ class BalancedLMWorker(BaseVisionWorker):
         self.lms_model: str = os.environ.get(
             "LMSTUDIO_PRIMARY_MODEL", "qwen3-vl-8b-thinking-abliterated"
         )
+        # LM Studio 0.3.x forwards a ``grammar`` field to the llama.cpp backend
+        # when one is present, and GBNF is materially stricter than the JSON-
+        # schema response_format on some builds (fewer "empty JSON" failures).
+        # Off by default — flip VISION_GRAMMAR_ENABLED to opt in. Cached per
+        # instance so we pay the ~5-20ms build cost once, then reuse forever.
+        self.use_grammar: bool = os.environ.get(
+            "VISION_GRAMMAR_ENABLED", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._cached_grammar: str | None = None
+        self._grammar_built: bool = False
 
     def banner(self) -> None:
         logger.info("=== Vision Worker (LM Studio %s) ===", self.name)
@@ -69,37 +79,62 @@ class BalancedLMWorker(BaseVisionWorker):
                 self.lms_model,
             )
 
+    def _grammar(self) -> str | None:
+        """Best-effort GBNF grammar for the response schema, or None.
+
+        Off unless ``VISION_GRAMMAR_ENABLED`` is truthy. Mirrors the
+        ``balanced-openai-compat`` gate — see that worker's docstring for the
+        rationale. Cached per-instance so hot paths are attribute lookups.
+        """
+        if not self.use_grammar:
+            return None
+        if self._grammar_built:
+            return self._cached_grammar
+        try:
+            import gbnf_grammar
+            schema = build_response_format()["json_schema"]["schema"]
+            self._cached_grammar = gbnf_grammar.json_schema_to_gbnf(schema) or None
+        except Exception as exc:  # noqa: BLE001 - grammar is optional
+            logger.warning("GBNF grammar build failed; using response_format: %s", exc)
+            self._cached_grammar = None
+        self._grammar_built = True
+        return self._cached_grammar
+
     def classify_image_bytes(
         self,
         b64_jpeg: str,
         prompt_instruction: str,
     ) -> dict[str, Any] | None:
+        body: dict[str, Any] = {
+            "model": self.lms_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_instruction},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_jpeg}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+            # Thinking-style models spend tokens inside <think>...</think>
+            # before the JSON answer. 2000 leaves headroom for both.
+            "max_tokens": 2000,
+            # Force structured output so empty-string responses can't happen.
+            "response_format": build_response_format(),
+        }
+        grammar = self._grammar()
+        if grammar is not None:
+            body["grammar"] = grammar
         try:
             response = requests.post(
                 f"{self.lms_url}/v1/chat/completions",
-                json={
-                    "model": self.lms_model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_instruction},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{b64_jpeg}",
-                                    },
-                                },
-                            ],
-                        }
-                    ],
-                    "temperature": 0.1,
-                    # Thinking-style models spend tokens inside <think>...</think>
-                    # before the JSON answer. 2000 leaves headroom for both.
-                    "max_tokens": 2000,
-                    # Force structured output so empty-string responses can't happen.
-                    "response_format": build_response_format(),
-                },
+                json=body,
                 timeout=self.request_timeout,
             )
         except requests.RequestException as exc:

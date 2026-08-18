@@ -52,6 +52,22 @@ SCRAPER_NAMES: tuple[str, ...] = (
     "X.com", "Discord-1", "Civitai-Com", "Civitai-Red", "Web", "Gallery-DL",
 )
 
+# Non-canonical scrapers that still participate in per-job priority + ordering.
+# Kept out of SCRAPER_NAMES (the enable-toggle contract, load-bearing) so
+# nothing that consumes SCRAPER_NAMES for the on/off map has to grow with new
+# opt-in feeders. run_pipeline gates YT-DLP on YT_DLP_ENABLED + URLs.
+PRIORITY_EXTRA_NAMES: tuple[str, ...] = ("YT-DLP",)
+
+# Full ordered set the priority block covers (spawn order + weights). Callers
+# that need "every scraper the user can reorder" use this; toggling still uses
+# SCRAPER_NAMES.
+PRIORITY_NAMES: tuple[str, ...] = SCRAPER_NAMES + PRIORITY_EXTRA_NAMES
+
+# Priority weight bounds (1-10). Higher = more turns in the round-robin.
+PRIORITY_WEIGHT_MIN: int = 1
+PRIORITY_WEIGHT_MAX: int = 10
+PRIORITY_WEIGHT_DEFAULT: int = 5
+
 _INDEX_FILENAME = "_index.json"
 _PRESETS_FILENAME = "_presets.json"
 _MISSING = object()
@@ -196,6 +212,22 @@ def _default_preset_cfg() -> dict:
                             "cookies_file": "", "config_path": "", "config_json": ""},
             "yt_dlp": {"enabled": False, "urls": [], "limit": 200, "cookies": ""},
             "local_imports": [],
+            # Kohya training-set feeder. One per-job dataset root that follows the
+            # ``<repeats>_<concept>`` subfolder convention. See feed_kohya_folder.py.
+            "kohya_import": {
+                "enabled": False, "dir": "", "name": "kohya",
+                "move": False, "allow_flat": False,
+            },
+            # Per-job scraper priority: `order` fixes supervisor spawn order
+            # (top = fires first for a queue slot) and `weights` (1-10, default 5)
+            # scale each scraper's round-robin turns. Projected to
+            # SCRAPER_PRIORITY_JSON by resolve_env; unknown names are ignored and
+            # missing names get the default weight so a fresh install "just works"
+            # in PRIORITY_NAMES order.
+            "priority": {
+                "order": list(PRIORITY_NAMES),
+                "weights": {n: PRIORITY_WEIGHT_DEFAULT for n in PRIORITY_NAMES},
+            },
         },
         "categories": cats,
         "category_rules": rules,
@@ -314,12 +346,47 @@ def _read_presets_raw(path: Path) -> dict | None:
     return None
 
 
+#: Soft-warn ceiling for user-editable UI (mirror of dashboard cap). Presets
+#: above this still load — the dashboard's save path will refuse a new write
+#: above the cap, so the warning surfaces the mismatch on legacy files.
+_SOFT_CATEGORY_LIMIT = 12
+_LOAD_WARN_ONCE: set[str] = set()
+
+
+def _warn_oversized_presets(lib: dict) -> None:
+    """Log once per preset that exceeds the soft UI category cap.
+
+    On upgrade, users who hand-edited ``_presets.json`` before the wave dropped
+    the dashboard save cap to 12 might have >12 categories on disk. The
+    library still loads fine (preserving their data), but new dashboard saves
+    will refuse to persist a change back — surface the mismatch on read so
+    they can prune before hitting a confusing "max 12 categories" error.
+    """
+    for name, cfg in (lib.get("presets") or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        cats = cfg.get("categories") or []
+        if isinstance(cats, list) and len(cats) > _SOFT_CATEGORY_LIMIT:
+            token = f"cats:{name}"
+            if token in _LOAD_WARN_ONCE:
+                continue
+            _LOAD_WARN_ONCE.add(token)
+            logger.warning(
+                "preset %r has %d categories (>%d recommended). It will load, "
+                "but the dashboard editor caps new saves at %d — trim it there "
+                "or edit _presets.json directly before saving via the UI.",
+                name, len(cats), _SOFT_CATEGORY_LIMIT, _SOFT_CATEGORY_LIMIT,
+            )
+
+
 def _read_presets() -> dict:
     data = _read_presets_raw(_presets_path())
     if data is None:
         return _merge_builtin_presets(builtin_presets.builtin_library())
     data.setdefault("default", next(iter(data["presets"])))
-    return _merge_builtin_presets(data)
+    lib = _merge_builtin_presets(data)
+    _warn_oversized_presets(lib)
+    return lib
 
 
 def _write_presets(lib: dict) -> None:
@@ -334,12 +401,14 @@ def list_presets() -> dict:
     if raw is None:
         lib = _merge_builtin_presets(builtin_presets.builtin_library())
         _write_presets(lib)                    # seed + record baselines on first access
+        _warn_oversized_presets(lib)
         return lib
     raw.setdefault("default", next(iter(raw["presets"])))
     before = _preset_signature(raw)            # snapshot pre-merge (content, not just names)
     lib = _merge_builtin_presets(raw)
     if _preset_signature(lib) != before:
         _write_presets(lib)                    # persist refreshed/seeded builtins + baselines
+    _warn_oversized_presets(lib)
     return lib
 
 
@@ -780,6 +849,48 @@ def _project_active_learning_exemplars(slug: str, eff: dict) -> str:
         return "{}"
 
 
+def clean_scraper_priority(raw: Any) -> dict[str, Any]:
+    """Normalise a ``scrapers.priority`` blob into a canonical projected shape.
+
+    Return value is always ``{"order": [str, ...], "weights": {str: int}}``:
+      * ``order`` = user-supplied order (only names in PRIORITY_NAMES), then
+        the remaining PRIORITY_NAMES appended alphabetically so every known
+        scraper is deterministically covered.
+      * ``weights`` = clamped int 1-10 for every PRIORITY_NAME, filling
+        missing/invalid entries with PRIORITY_WEIGHT_DEFAULT.
+
+    Unknown names are dropped defensively — the runtime never spawns them, and
+    keeping them out of the projected env keeps SCRAPER_PRIORITY_JSON tight.
+    Callers may pass ``None`` or a partial dict; we always return a full shape.
+    """
+    known = set(PRIORITY_NAMES)
+    raw_dict = raw if isinstance(raw, dict) else {}
+    order_in = raw_dict.get("order")
+    weights_in = raw_dict.get("weights")
+
+    seen: set[str] = set()
+    order: list[str] = []
+    if isinstance(order_in, list):
+        for n in order_in:
+            if isinstance(n, str) and n in known and n not in seen:
+                order.append(n)
+                seen.add(n)
+    # Append any known names the user hasn't ordered (deterministic tail).
+    for n in PRIORITY_NAMES:
+        if n not in seen:
+            order.append(n)
+
+    weights: dict[str, int] = {}
+    raw_weights = weights_in if isinstance(weights_in, dict) else {}
+    for n in PRIORITY_NAMES:
+        try:
+            w = int(raw_weights.get(n, PRIORITY_WEIGHT_DEFAULT))
+        except (TypeError, ValueError):
+            w = PRIORITY_WEIGHT_DEFAULT
+        weights[n] = max(PRIORITY_WEIGHT_MIN, min(PRIORITY_WEIGHT_MAX, w))
+    return {"order": order, "weights": weights}
+
+
 def resolve_env(job: Job) -> dict[str, str]:
     """Flatten the EFFECTIVE config into the existing env-var names. Every key is
     always emitted so a job fully overrides any stale value in the global .env."""
@@ -792,6 +903,7 @@ def resolve_env(job: Job) -> dict[str, str]:
     s = _d(eff.get("scrapers"))
     gd = _d(s.get("gallery_dl"))
     yt = _d(s.get("yt_dlp"))
+    ko = _d(s.get("kohya_import"))
     sc = _d(eff.get("scoring"))
     cap = _d(eff.get("captioning"))
     md = _d(eff.get("media"))
@@ -800,6 +912,7 @@ def resolve_env(job: Job) -> dict[str, str]:
     enabled = _d(s.get("enabled"))
     vision = _d(eff.get("vision"))
     fleet = clean_vision_fleet(vision.get("workers"))
+    priority = clean_scraper_priority(s.get("priority"))
     # Only known scrapers contribute to SCRAPER_DISABLED (ignore stale/unknown names).
     disabled = sorted(n for n in SCRAPER_NAMES if not enabled.get(n, True))
     local_list = s.get("local_imports") if isinstance(s.get("local_imports"), list) else []
@@ -832,7 +945,18 @@ def resolve_env(job: Job) -> dict[str, str]:
         "YT_DLP_URLS": "\n".join(yt.get("urls", []) or []),
         "YT_DLP_LIMIT": str(int(yt.get("limit", 200) or 200)),
         "YT_DLP_COOKIES": str(yt.get("cookies", "") or ""),
+        # Kohya training-set feeder — a single per-job dataset root, projected as
+        # KOHYA_* env vars the (unchanged) feed_kohya_folder.py reads at spawn.
+        "KOHYA_IMPORT_ENABLED": _b(ko.get("enabled", False)),
+        "KOHYA_IMPORT_DIR": str(ko.get("dir", "") or ""),
+        "KOHYA_IMPORT_NAME": str(ko.get("name", "") or "kohya") or "kohya",
+        "KOHYA_MOVE": _b(ko.get("move", False)),
+        "KOHYA_ALLOW_FLAT": _b(ko.get("allow_flat", False)),
         "LOCAL_IMPORTS_JSON": json.dumps(local),
+        # Priority (order + per-scraper weight) the supervisor consumes at spawn
+        # time to fix which scraper starts first + how many round-robin turns
+        # each gets. See run_pipeline.compute_desired_agents for the reader.
+        "SCRAPER_PRIORITY_JSON": json.dumps(priority),
         "VISION_OVR_MIN_SCORE": str(int(sc.get("ovr_min", 0) or 0)),
         "VISION_REL_MIN_SCORE": str(int(sc.get("rel_min", 0) or 0)),
         "VISION_SCORE_NOTES": str(sc.get("notes", "") or ""),
@@ -1064,13 +1188,15 @@ def migrate_legacy_vision_to_fleet() -> bool:
 
 __all__ = [
     "Job", "JOB_SLUG_RE", "PRESET_NAME_RE", "JOB_STATUSES", "SCRAPER_NAMES",
+    "PRIORITY_EXTRA_NAMES", "PRIORITY_NAMES",
+    "PRIORITY_WEIGHT_MIN", "PRIORITY_WEIGHT_MAX", "PRIORITY_WEIGHT_DEFAULT",
     "slugify", "jobs_dir",
     "list_presets", "get_preset", "save_preset", "delete_preset",
     "set_default_preset", "default_preset_name",
     "effective_config", "is_overridden", "set_override", "reset_override",
     "get_job", "list_jobs", "save_job", "create_job", "delete_job",
     "get_index", "get_active_slug", "set_active", "set_queue", "enqueue", "dequeue", "advance",
-    "resolve_env", "project_categories", "activate",
+    "resolve_env", "project_categories", "activate", "clean_scraper_priority",
     "migrate_env_to_default_job", "discover_data_slugs", "migrate_existing_data",
     "migrate_legacy_vision_to_fleet", "clean_vision_fleet", "VISION_PROVIDERS",
     "reset_preset_to_builtin", "builtin_preset_names",

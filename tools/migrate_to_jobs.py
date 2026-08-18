@@ -10,12 +10,17 @@ sorted output are already namespaced per-slug on disk
 
 Run from the repo root (inside the venv)::
 
-    python tools/migrate_to_jobs.py
+    python tools/migrate_to_jobs.py             # apply (default; still idempotent)
+    python tools/migrate_to_jobs.py --dry-run   # preview only, write nothing
 
-Re-running is harmless — it reports "nothing new to migrate".
+Re-running is harmless — it reports "nothing new to migrate". For the wave-
+level upgrade audit (presets/index/schedules verification + soft-cap warnings)
+run :mod:`tools.migrate_wave` instead — it's read-only by default and can also
+apply this migration via ``--apply``.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -39,8 +44,17 @@ def _count_files(root: Path) -> int:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be migrated without writing anything.",
+    )
+    args = ap.parse_args()
+
     print("cull - migrate to jobs model", flush=True)
     print(f"  data dir: {paths.base_dir()}", flush=True)
+    if args.dry_run:
+        print("  mode:     DRY-RUN (no changes will be written)", flush=True)
 
     existing_before = {j.slug for j in job_config.list_jobs()}
     on_disk = job_config.discover_data_slugs()
@@ -48,6 +62,28 @@ def main() -> int:
         print(f"  found existing data slugs on disk: {', '.join(on_disk)}", flush=True)
     else:
         print("  no existing per-slug data folders found", flush=True)
+
+    if args.dry_run:
+        # Preview: what slugs would ``migrate_existing_data`` adopt this run?
+        would_add = sorted(s for s in on_disk if s not in existing_before
+                           and job_config.JOB_SLUG_RE.match(s))
+        if not would_add and existing_before:
+            print(
+                f"\n(dry-run) Nothing new to migrate — already on the jobs model "
+                f"({len(existing_before)} job(s)).",
+                flush=True,
+            )
+            return 0
+        if not would_add:
+            print("\n(dry-run) No jobs would be created.", flush=True)
+            return 0
+        print("\n(dry-run) Would create jobs:", flush=True)
+        for slug in would_add:
+            q = _count_files(paths.queue_dir(slug))
+            s = _count_files(paths.sorted_dir(slug))
+            print(f"  + {slug:<28} (queued files: {q}, sorted files: {s})", flush=True)
+        print("\n(dry-run) Re-run without --dry-run to apply.", flush=True)
+        return 0
 
     created = job_config.migrate_existing_data()
 

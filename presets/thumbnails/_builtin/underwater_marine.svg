@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0891b2"/>
+      <stop offset="0.6" stop-color="#065f75"/>
+      <stop offset="1" stop-color="#022b3a"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" fill="url(#water)"/>
+  <path d="M 0 12 Q 40 4 80 12 T 160 12 T 240 12 T 320 12 L 320 0 L 0 0 Z" fill="#a5f3fc" opacity="0.55"/>
+  <g stroke="#67e8f9" stroke-width="1.4" fill="none" opacity="0.35">
+    <path d="M 0 28 Q 60 22 120 28 T 240 28 T 320 28"/>
+    <path d="M 0 44 Q 60 38 120 44 T 240 44 T 320 44"/>
+  </g>
+  <g fill="#fde68a">
+    <path d="M 90 108 Q 118 82 152 108 Q 118 134 90 108 Z"/>
+    <polygon points="72,108 90,96 90,120"/>
+    <circle cx="140" cy="102" r="2.2" fill="#0f172a"/>
+  </g>
+  <g fill="#fca5a5">
+    <path d="M 200 140 Q 220 122 244 140 Q 220 158 200 140 Z"/>
+    <polygon points="188,140 200,132 200,148"/>
+    <circle cx="236" cy="136" r="1.5" fill="#0f172a"/>
+  </g>
+  <g fill="#67e8f9" opacity="0.6">
+    <circle cx="260" cy="70" r="2"/>
+    <circle cx="270" cy="55" r="1.5"/>
+    <circle cx="255" cy="45" r="1"/>
+  </g>
+</svg>

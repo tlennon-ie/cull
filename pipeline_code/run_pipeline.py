@@ -100,6 +100,11 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
     "YT_DLP_URLS", "YT_DLP_COOKIES", "YT_DLP_LIMIT",
+    # Kohya training-set feeder — a change to root/name/toggles/mode must restart
+    # the feeder so the new dataset path takes effect. KOHYA_POLL_INTERVAL is
+    # read live inside the feeder loop, so it's not structural.
+    "KOHYA_IMPORT_ENABLED", "KOHYA_IMPORT_DIR", "KOHYA_IMPORT_NAME",
+    "KOHYA_MOVE", "KOHYA_ALLOW_FLAT",
     "REQUIRE_PROMPT",
     "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
@@ -161,6 +166,40 @@ def vision_worker_list() -> list[str]:
         return [w.strip() for w in raw.split(",") if w.strip()]
     single = os.environ.get("PIPELINE_VISION_WORKER", "").strip()
     return [single] if single else []
+
+
+def _scraper_priority() -> dict:
+    """Parse SCRAPER_PRIORITY_JSON into ``{"order": [...], "weights": {...}}``.
+
+    Uses ``job_config.clean_scraper_priority`` so unknown names are dropped,
+    missing weights get PRIORITY_WEIGHT_DEFAULT, and every PRIORITY_NAME is
+    covered — the exact same shape the dashboard writes. Empty / malformed env
+    → the default (PRIORITY_NAMES order, every weight = PRIORITY_WEIGHT_DEFAULT).
+    """
+    raw = (os.environ.get("SCRAPER_PRIORITY_JSON", "") or "").strip()
+    if not raw:
+        return job_config.clean_scraper_priority(None)
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return job_config.clean_scraper_priority(None)
+    return job_config.clean_scraper_priority(data)
+
+
+def _apply_priority(agents: dict[str, "AgentSpec"]) -> dict[str, "AgentSpec"]:
+    """Re-order ``agents`` so the priority-list order wins at spawn time.
+
+    Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic Discord-N shards)
+    keep their relative insertion order behind the priority-ordered head. This
+    preserves the "top = fires first" contract without disturbing labels that
+    the priority block doesn't cover.
+    """
+    if not agents:
+        return agents
+    priority = _scraper_priority()
+    order = [n for n in priority.get("order", []) if n in agents]
+    trailing = [name for name in agents if name not in order]
+    return {name: agents[name] for name in (order + trailing)}
 
 
 def _local_import_folders() -> list[dict]:
@@ -472,6 +511,22 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
             },
         ))
 
+    # Kohya-style training-set feeder. Gated identically to gallery-dl: only
+    # desired when both the toggle is on AND a dataset root is configured, so an
+    # empty config never respawns a broken agent every loop_sleep. The feeder
+    # walks ``<repeats>_<concept>`` subdirs and (optionally) flat Danbooru-style
+    # folders — see feed_kohya_folder.py.
+    if (
+        os.environ.get("KOHYA_IMPORT_ENABLED", "false").lower() == "true"
+        and (os.environ.get("KOHYA_IMPORT_DIR", "") or "").strip()
+    ):
+        _kohya_name = (os.environ.get("KOHYA_IMPORT_NAME", "") or "kohya").strip() or "kohya"
+        add(AgentSpec(
+            label=f"Kohya-{_kohya_name}",
+            script="feed_kohya_folder.py",
+            loop_sleep=3600,
+        ))
+
     # gallery-dl URL-based scraper (Pixiv, DeviantArt, booru sites, ArtStation,
     # Tumblr, Newgrounds, X, Reddit, Imgur, Flickr — anything gallery-dl knows).
     # Only desired when both the toggle is on AND at least one URL is configured;
@@ -505,7 +560,12 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
         if spec is not None:
             add(spec)
 
-    return agents
+    # Per-job priority: reorder the agents dict so the top-priority scraper
+    # spawns first. Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic
+    # Discord-N > 1) keep their insertion order behind the priority head — see
+    # _apply_priority for the contract. Ordering is decided here so
+    # queue_manager stays untouched.
+    return _apply_priority(agents)
 
 
 # ── Supervisor ────────────────────────────────────────────────────────────────
@@ -964,6 +1024,15 @@ def run_jobs_loop(vision_worker: str = "balanced-groq") -> None:
     switches internally via the supervisor's index watch; this loop only regains
     control when the active job is *cleared* (stop / advance-past-end), at which
     point it idles again. The dashboard drives advance — we never auto-advance.
+
+    TODO(scalability): jobs run STRICTLY SEQUENTIALLY today — one active
+    supervisor instance drives one active job at a time (see CLAUDE.md Jobs
+    model §"sequential queue"). Concurrent multi-job execution would need
+    either (a) one Supervisor per active slug (with disjoint queue/sorted
+    roots — already the case) sharing the .env + credentials pool, or (b) a
+    shared worker fleet that fair-shares across slugs. Vision workers ARE
+    already parallel within a single job (fleet fan-out + ThreadPoolExecutor);
+    the sequential ceiling is the JOB dimension only.
     """
     announced_idle = False
     while True:

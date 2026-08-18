@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import cost_tracker
 from pipeline_logging import get_logger
 from vision_worker_base import (
     BaseVisionWorker,
@@ -111,10 +112,16 @@ class BalancedGroqWorker(BaseVisionWorker):
         try:
             response = client.chat.completions.create(
                 messages=[
+                    # System = the long, stable rubric → maximises server-side
+                    # prefix cache hits (Groq inherits OpenAI's message-array
+                    # shape, so caching applies when the underlying model
+                    # supports it).
+                    {"role": "system", "content": prompt_instruction},
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt_instruction},
+                            {"type": "text",
+                             "text": "Classify the following image per the system instructions."},
                             {
                                 "type": "image_url",
                                 "image_url": {
@@ -122,7 +129,7 @@ class BalancedGroqWorker(BaseVisionWorker):
                                 },
                             },
                         ],
-                    }
+                    },
                 ],
                 model=self.model_id,
                 temperature=0.1,
@@ -136,6 +143,16 @@ class BalancedGroqWorker(BaseVisionWorker):
                 return None
             logger.warning("Groq request failed: %s", err[:200])
             return None
+
+        # Best-effort spend tracking. Groq is cheap but not free; the ledger
+        # gives admins a "how much am I spending?" answer without opening the
+        # provider dashboard.
+        in_tok, out_tok = cost_tracker.extract_openai_usage(response)
+        if in_tok or out_tok:
+            cost_tracker.record_usage(
+                provider="groq", model=self.model_id,
+                input_tokens=in_tok, output_tokens=out_tok,
+            )
 
         message = response.choices[0].message
         msg_dict = (

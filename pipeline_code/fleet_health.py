@@ -267,10 +267,133 @@ class Telemetry:
         }
 
 
+# ── discover_local_endpoints ────────────────────────────────────────────────
+
+# Loopback endpoints we probe when the operator hasn't configured a fleet yet.
+# Restricted to 127.0.0.1 by design — this helper must NOT be pointed at a
+# remote host (mirrors the loopback-only guarantee documented on the function).
+_LOCAL_ENDPOINT_PROBES: tuple[tuple[str, str], ...] = (
+    ("lmstudio", "http://127.0.0.1:1234"),
+    ("llamacpp", "http://127.0.0.1:8080"),
+    ("ollama",   "http://127.0.0.1:11434"),
+)
+
+# Case-insensitive substrings hinting a listed model is vision-capable. Kept in
+# lockstep with the required-API brief and consistent with
+# ``vision_model_catalog._VISION_HINTS``.
+_VISION_HINT_RE = re.compile(
+    r"(?:vl|vision|llava|moondream|bakllava|minicpm-v|qwen2-vl|qwen2\.5-vl"
+    r"|internvl|pixtral|phi-3\.5-vision|phi-4-multimodal|gemma-3"
+    r"|granite-vision|mlm-)",
+    re.IGNORECASE,
+)
+
+
+def _looks_vision_capable(model_id: str) -> bool:
+    """True if ``model_id`` matches a known vision-model naming hint."""
+    return bool(_VISION_HINT_RE.search(model_id or ""))
+
+
+def _endpoint_result(
+    provider: str,
+    base_url: str,
+    *,
+    reachable: bool,
+    models: list[str],
+    latency_ms: int | None,
+    error: str | None,
+) -> dict[str, Any]:
+    vision_models = [m for m in models if _looks_vision_capable(m)]
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "reachable": reachable,
+        "models": vision_models,
+        "detected_vision": bool(vision_models),
+        "latency_ms": latency_ms,
+        "error": error,
+    }
+
+
+def discover_local_endpoints(timeout: float = 1.5) -> list[dict]:
+    """Probe common loopback vision endpoints and report reachability + models.
+
+    Iterates a fixed list of local providers (LM Studio :1234, llama.cpp :8080,
+    Ollama :11434) — the caller CANNOT redirect the probe elsewhere, which is
+    the security invariant that lets this be safely wired into a first-run
+    setup flow. For each endpoint:
+
+      * A cheap liveness probe (``probe``) measures reachability + latency
+        against the provider's model-list path (``/v1/models`` or
+        ``/api/tags``). Timeouts and connection errors surface as
+        ``reachable=False`` with a short human-readable ``error``.
+      * When reachable, ``vision_model_catalog.list_models`` re-parses the same
+        payload to extract model ids, and the vision-hint regex filters them
+        to the vision-capable subset (``detected_vision`` is True iff at least
+        one such id is present).
+
+    Returns a list of dicts with the shape documented in the module's callers:
+    ``{provider, base_url, reachable, models, detected_vision, latency_ms,
+    error}``. Never raises — every probe path is guarded.
+    """
+    # Local import: keeps the module import graph the same when the catalog
+    # helper isn't needed (e.g. Telemetry-only callers).
+    from vision_model_catalog import list_models
+
+    out: list[dict[str, Any]] = []
+    for provider, base_url in _LOCAL_ENDPOINT_PROBES:
+        probe_result = probe(
+            {"provider": provider, "base_url": base_url}, timeout=timeout
+        )
+        reachable = bool(probe_result.get("ok"))
+        latency_ms = probe_result.get("latency_ms")
+        error = probe_result.get("error")
+
+        if not reachable:
+            out.append(
+                _endpoint_result(
+                    provider,
+                    base_url,
+                    reachable=False,
+                    models=[],
+                    latency_ms=latency_ms,
+                    error=error,
+                )
+            )
+            continue
+
+        # Reachable — re-parse the same endpoint's payload to enumerate models.
+        # list_models is best-effort and never raises; an empty list here means
+        # "reachable but couldn't enumerate", which we surface as
+        # ``detected_vision=False`` with the probe latency retained.
+        try:
+            model_ids = list_models(
+                provider, base_url=base_url, api_key=None, timeout=max(1, int(timeout))
+            )
+        except Exception as exc:  # noqa: BLE001 - discovery must never raise
+            logger.debug(
+                "discover_local_endpoints: list_models(%s) failed: %s", provider, exc
+            )
+            model_ids = []
+
+        out.append(
+            _endpoint_result(
+                provider,
+                base_url,
+                reachable=True,
+                models=list(model_ids),
+                latency_ms=latency_ms,
+                error=None,
+            )
+        )
+    return out
+
+
 __all__ = [
     "probe",
     "probe_fleet",
     "pick_healthy",
     "Telemetry",
+    "discover_local_endpoints",
     "_http_get",
 ]

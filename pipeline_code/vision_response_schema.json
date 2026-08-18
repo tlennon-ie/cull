@@ -2,7 +2,7 @@
   "type": "json_schema",
   "json_schema": {
     "name": "VisionClassification",
-    "strict": "true",
+    "strict": true,
     "schema": {
       "type": "object",
       "additionalProperties": false,
@@ -27,15 +27,11 @@
       "properties": {
         "description": {
           "type": "string",
-          "description": "1-2 sentence literal description of the WHOLE image including any UI / labels / panels / watermarks / borders. Fill this BEFORE deciding anything else.",
-          "minLength": 10,
-          "maxLength": 1000
+          "description": "1-2 sentence literal description of the WHOLE image including any UI / labels / panels / watermarks / borders. Fill this BEFORE deciding anything else."
         },
         "primary_subject": {
           "type": "string",
-          "description": "The main subject in plain words, e.g. 'wine glass on table', 'woman seated', 'group of monsters', 'screenshot of reddit post'.",
-          "minLength": 3,
-          "maxLength": 200
+          "description": "The main subject in plain words, e.g. 'wine glass on table', 'woman seated', 'group of monsters', 'screenshot of reddit post'."
         },
         "is_screenshot": {
           "type": "boolean",
@@ -84,21 +80,15 @@
         },
         "OVR_Quality_Score": {
           "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "description": "Absolute craft quality (topic-independent). Average of: composition, lighting, colour, focus & sharpness, exposure, subject/pose, emotion, technical execution, styling/production, originality. 0-19 broken; 60-74 above average; 90-95 top 1%; 96-100 once-in-a-generation."
+          "description": "Absolute craft quality 0-100 (topic-independent). Bounds enforced in Python. Average of: composition, lighting, colour, focus & sharpness, exposure, subject/pose, emotion, technical execution, styling/production, originality. 0-19 broken; 60-74 above average; 90-95 top 1%; 96-100 once-in-a-generation."
         },
         "REL_Quality_Score": {
           "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "description": "Closeness to the curation topic at its platonic best. If photorealistic_style or woman_present is FALSE, REL must be <= 30. Reserve 90+ for images indistinguishable from a top-tier real creator's portfolio in the topic genre."
+          "description": "Closeness to the curation topic 0-100 (bounds enforced in Python). If photorealistic_style or woman_present is FALSE, REL must be <= 30. Reserve 90+ for images indistinguishable from a top-tier real creator's portfolio in the topic genre."
         },
         "quality_score": {
           "type": "integer",
-          "minimum": 1,
-          "maximum": 10,
-          "description": "Legacy 1-10 quality score, kept for backward compatibility. Roughly 1/10th of OVR."
+          "description": "Legacy 1-10 quality score, kept for backward compatibility. Roughly 1/10th of OVR. Bounds enforced in Python."
         },
         "category": {
           "type": "string",
@@ -115,9 +105,7 @@
         },
         "reason": {
           "type": "string",
-          "description": "One short sentence explaining the category call.",
-          "minLength": 5,
-          "maxLength": 300
+          "description": "One short sentence explaining the category call."
         }
       }
     }

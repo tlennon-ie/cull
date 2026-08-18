@@ -258,6 +258,55 @@ def test_scraper_names_has_no_local_folder_entry(isolated):
     assert all("local" not in n.lower() for n in jc.SCRAPER_NAMES)
 
 
+def test_priority_names_extends_scraper_names_with_yt_dlp(isolated):
+    """PRIORITY_NAMES is the reorderable set (SCRAPER_NAMES + YT-DLP). The extra
+    name is intentionally OUT of SCRAPER_NAMES so the on/off contract stays
+    exactly what scrapers/UI already read."""
+    jc, _ = isolated
+    assert set(jc.SCRAPER_NAMES).issubset(set(jc.PRIORITY_NAMES))
+    assert "YT-DLP" in jc.PRIORITY_NAMES
+    assert "YT-DLP" not in jc.SCRAPER_NAMES
+
+
+def test_clean_scraper_priority_defaults_and_clamps(isolated):
+    """The projection helper is defensive: unknown names dropped, missing
+    weights back-filled with the default, out-of-range values clamped."""
+    jc, _ = isolated
+    # None → full-default block (deterministic PRIORITY_NAMES order, all default weight).
+    p = jc.clean_scraper_priority(None)
+    assert p["order"] == list(jc.PRIORITY_NAMES)
+    assert all(w == jc.PRIORITY_WEIGHT_DEFAULT for w in p["weights"].values())
+    # Partial user order → prefix wins, missing names appended in PRIORITY_NAMES order.
+    p = jc.clean_scraper_priority({"order": ["Web", "X.com", "not-a-scraper"],
+                                   "weights": {"Web": 99, "X.com": -3, "junk": 5}})
+    assert p["order"][0] == "Web" and p["order"][1] == "X.com"
+    assert set(p["order"]) == set(jc.PRIORITY_NAMES)
+    assert p["weights"]["Web"] == jc.PRIORITY_WEIGHT_MAX          # clamped up from 99
+    assert p["weights"]["X.com"] == jc.PRIORITY_WEIGHT_MIN        # clamped up from -3
+    assert "junk" not in p["weights"]                              # unknown dropped
+
+
+def test_resolve_env_emits_scraper_priority_json(isolated):
+    """A user-set override projects into SCRAPER_PRIORITY_JSON — the string the
+    supervisor consumes at spawn to decide agent order + weights."""
+    jc, _ = isolated
+    job = jc.create_job("P", subject="s")
+    job = jc.set_override(job, "scrapers.priority", {
+        "order": ["Web", "Gallery-DL", "X.com"],
+        "weights": {"Web": 9, "Gallery-DL": 4},
+    })
+    env = jc.resolve_env(job)
+    payload = json.loads(env["SCRAPER_PRIORITY_JSON"])
+    assert payload["order"][0] == "Web"
+    assert payload["order"][1] == "Gallery-DL"
+    assert payload["order"][2] == "X.com"
+    # Every PRIORITY_NAME is covered (including untouched ones defaulted).
+    assert set(payload["order"]) == set(jc.PRIORITY_NAMES)
+    assert payload["weights"]["Web"] == 9
+    assert payload["weights"]["Gallery-DL"] == 4
+    assert payload["weights"]["Civitai-Com"] == jc.PRIORITY_WEIGHT_DEFAULT
+
+
 # ── projection ───────────────────────────────────────────────────────────────
 
 def test_project_categories_uses_effective(isolated):

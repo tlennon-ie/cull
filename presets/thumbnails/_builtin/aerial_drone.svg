@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b2545"/>
+      <stop offset="0.6" stop-color="#f4a261"/>
+      <stop offset="1" stop-color="#e76f51"/>
+    </linearGradient>
+    <linearGradient id="mtn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e3a5f"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" fill="url(#sky)"/>
+  <circle cx="230" cy="80" r="22" fill="#f5f5c9" opacity="0.9"/>
+  <path d="M 0 130 L 60 90 L 110 115 L 170 70 L 230 105 L 320 85 L 320 180 L 0 180 Z" fill="url(#mtn)"/>
+  <path d="M 0 150 L 90 120 L 160 140 L 240 115 L 320 135 L 320 180 L 0 180 Z" fill="#0b1a2e" opacity="0.85"/>
+  <g stroke="#e2e8f0" stroke-width="2" fill="none" opacity="0.85">
+    <line x1="60" y1="40" x2="80" y2="40"/>
+    <line x1="70" y1="34" x2="70" y2="46"/>
+    <circle cx="55" cy="40" r="4" fill="#e2e8f0"/>
+    <circle cx="85" cy="40" r="4" fill="#e2e8f0"/>
+    <circle cx="70" cy="30" r="1.5" fill="#e11d48" stroke="none"/>
+  </g>
+</svg>

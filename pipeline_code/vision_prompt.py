@@ -387,6 +387,45 @@ def _active_learning_exemplars_block(raw: str | None) -> str:
     )
 
 
+# ── Prompt / schema build cache ─────────────────────────────────────────────
+# ``build_classification_prompt`` and ``build_response_format`` are called on
+# EVERY image classification (once per API call) and each rebuild does a bunch
+# of string interpolation + a categories module read + env parsing. On a busy
+# fleet that's thousands of redundant kilobytes per second. Since the supervisor
+# soft-restarts children whenever any input to these functions changes (env
+# mtime, categories mtime, jobs index mtime — see run_pipeline STRUCTURAL_ENV_KEYS
+# and _current_categories_mtime), the result is process-lifetime-stable. We
+# memoise by a lightweight cache key so a mid-process env mutation (from a test
+# harness or a future in-process reload) still refreshes without a restart.
+_prompt_cache: dict[tuple, str] = {}
+_response_format_cache: dict[tuple, dict[str, Any]] = {}
+
+
+def _prompt_cache_key(cfg: "ScoreConfig", caption_cfg: "CaptionConfig") -> tuple:
+    """Bundle every input that changes the built prompt into a hashable tuple."""
+    return (
+        cfg.topic, cfg.ovr_min, cfg.rel_min, cfg.notes,
+        caption_cfg.enabled, caption_cfg.style, caption_cfg.overwrite,
+        # categories module state (schema enum + hints + rules)
+        tuple(get_schema_categories()),
+        get_global_rules(),
+        tuple(get_category_hints()),
+        # active-learning few-shot exemplars are keyed by their raw env json
+        os.environ.get("ACTIVE_LEARNING_EXEMPLARS_JSON", ""),
+    )
+
+
+def invalidate_prompt_cache() -> None:
+    """Clear the memoised prompt + response-format builds.
+
+    Called by tests and any in-process reload paths that mutate env / taxonomy
+    inputs. Not needed on the supervisor's soft-restart path because a new
+    subprocess starts with an empty cache anyway.
+    """
+    _prompt_cache.clear()
+    _response_format_cache.clear()
+
+
 def build_classification_prompt(
     cfg: ScoreConfig | None = None,
     caption_cfg: CaptionConfig | None = None,
@@ -403,9 +442,18 @@ def build_classification_prompt(
     `caption` string in the configured style (SD-prompt / Booru / natural).
     The schema always reserves the field for strict-mode consistency; when
     captioning is off the model is told to return an empty string.
+
+    Memoised: the built string is process-cached by
+    ``_prompt_cache_key(cfg, caption_cfg)``; hot loops pay one dict lookup
+    per call instead of a full rebuild. See ``invalidate_prompt_cache``.
     """
     cfg = cfg or ScoreConfig.from_env()
     caption_cfg = caption_cfg or CaptionConfig.from_env()
+
+    cache_key = _prompt_cache_key(cfg, caption_cfg)
+    cached = _prompt_cache.get(cache_key)
+    if cached is not None:
+        return cached
     notes = f"\nAdmin scoring notes (apply to REL only): {cfg.notes}\n" if cfg.notes else ""
     if caption_cfg.enabled:
         caption_field_doc = (
@@ -446,7 +494,7 @@ def build_classification_prompt(
         os.environ.get("ACTIVE_LEARNING_EXEMPLARS_JSON")
     )
 
-    return (
+    built = (
         "You are a strict, literal image auditor. You will be told the topic "
         "an admin is curating, but the topic ONLY informs REL_Quality_Score. "
         "It MUST NOT influence what you say is in the image. Judge what the "
@@ -485,6 +533,8 @@ def build_classification_prompt(
         + caption_block
         + exemplars_block
     )
+    _prompt_cache[cache_key] = built
+    return built
 
 
 def apply_scores(result: dict[str, Any], cfg: ScoreConfig | None = None) -> dict[str, Any]:
@@ -781,12 +831,21 @@ def build_response_format() -> dict[str, Any]:
 
     The same schema lives at pipeline_code/vision_response_schema.json so
     you can paste it into LM Studio's chat panel directly.
+
+    Memoised by the current taxonomy's schema-category tuple so a live edit
+    (which the supervisor picks up via categories mtime) is reflected on the
+    next worker respawn. Callers must NOT mutate the returned dict — the same
+    reference is handed out repeatedly.
     """
-    return {
+    schema_cats = tuple(get_schema_categories())
+    cached = _response_format_cache.get(schema_cats)
+    if cached is not None:
+        return cached
+    built = {
         "type": "json_schema",
         "json_schema": {
             "name": "VisionClassification",
-            "strict": "true",
+            "strict": True,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
@@ -799,9 +858,17 @@ def build_response_format() -> dict[str, Any]:
                     "OVR_Quality_Score", "REL_Quality_Score", "quality_score",
                     "category", "reason", "caption",
                 ],
+                # NOTE: OpenAI structured-output strict mode (which LM Studio
+                # enforces via a grammar sampler) does NOT support minLength,
+                # maxLength, minimum, maximum, pattern, or format keywords.
+                # See https://platform.openai.com/docs/guides/structured-outputs
+                # Bounds are re-enforced in Python by ``apply_scores`` (clamps
+                # 0-100 / 1-10) and by the prompt's rubric, so removing them
+                # from the schema is behaviourally neutral for the pipeline
+                # and unblocks strict-mode servers.
                 "properties": {
-                    "description":          {"type": "string", "minLength": 10, "maxLength": 1000},
-                    "primary_subject":      {"type": "string", "minLength": 3, "maxLength": 200},
+                    "description":          {"type": "string"},
+                    "primary_subject":      {"type": "string"},
                     "is_screenshot":        {"type": "boolean"},
                     "is_composite_grid":    {"type": "boolean"},
                     "contains_text_overlay": {"type": "boolean"},
@@ -815,19 +882,21 @@ def build_response_format() -> dict[str, Any]:
                     "has_ai_flaws":         {"type": "boolean"},
                     "woman_present":        {"type": "boolean"},
                     "nsfw":                 {"type": "boolean"},
-                    "OVR_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
-                    "REL_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
-                    "quality_score":        {"type": "integer", "minimum": 1, "maximum": 10},
+                    "OVR_Quality_Score":    {"type": "integer"},
+                    "REL_Quality_Score":    {"type": "integer"},
+                    "quality_score":        {"type": "integer"},
                     "category": {
                         "type": "string",
-                        "enum": list(get_schema_categories()),
+                        "enum": list(schema_cats),
                     },
-                    "reason": {"type": "string", "minLength": 5, "maxLength": 300},
-                    "caption": {"type": "string", "minLength": 0, "maxLength": 2000},
+                    "reason":  {"type": "string"},
+                    "caption": {"type": "string"},
                 },
             },
         },
     }
+    _response_format_cache[schema_cats] = built
+    return built
 
 
 __all__ = [
@@ -838,6 +907,7 @@ __all__ = [
     "build_classification_prompt",
     "apply_scores",
     "build_response_format",
+    "invalidate_prompt_cache",
     "_safe_parse_vision_json",
     "extract_message_text",
 ]
