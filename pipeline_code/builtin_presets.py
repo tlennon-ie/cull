@@ -807,35 +807,57 @@ def _build_presets() -> dict[str, dict]:
             require_prompt=False,
             keywords_extra=("product", "packshot", "studio", "catalog",
                             "e-commerce", "white background", "product photography"),
-            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot"),
+            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot",
+                                            "portrait", "character", "fantasy",
+                                            "creature", "warrior", "orc", "demon"),
             generation_hints=("product photography", "studio lighting",
                               "white background", "commercial shot", "packshot",
                               "catalog photo"),
             reddit_subreddits=("productphotography", "commercialphotography"),
-            ovr_min=50, rel_min=25,
+            ovr_min=55, rel_min=55,
             categories=[
-                ("Keep", "Single clearly-presented product, clean/seamless "
-                 "background, sharp, well-lit, accurate colour, no distracting "
-                 "watermark"),
-                ("Lifestyle", "Product shown in-context / lifestyle scene — "
-                 "useful but a different bucket from clean packshots"),
-                ("Borderline", "Product but cluttered background, soft focus, poor "
-                 "lighting, or a minor watermark -> review"),
-                ("OffTopic", "No clear product, or unrelated to the catalogue "
-                 "subject"),
+                ("Keep", "Single clearly-presented INANIMATE product (bottle, "
+                 "watch, food item, gadget, clothing on a mannequin/hanger, "
+                 "cosmetics, tool, packaging), clean/seamless background, sharp, "
+                 "well-lit, accurate colour, no distracting watermark"),
+                ("Lifestyle", "Product held or worn by a person, or shown in a "
+                 "real-world/lifestyle scene — the PRODUCT is still the subject, "
+                 "just contextualised (e.g. hands holding a phone, a coffee cup "
+                 "on a table). If the person / face is the subject, this is "
+                 "OffTopic, not Lifestyle."),
+                ("Borderline", "A product IS present but the shot is cluttered, "
+                 "soft-focus, poorly-lit, or carries a minor watermark -> review"),
+                ("OffTopic", "No inanimate product is the subject. Includes: any "
+                 "portrait / character / person as the subject (real or AI), "
+                 "fantasy / anime / illustration content, landscapes, animals, "
+                 "screenshots, logos-only, memes, or generic photography of "
+                 "people that happens to include an object."),
             ],
             theme_rules=(
-                "Product / e-commerce dataset. Reward a single clearly-presented "
-                "product, even studio lighting, a seamless or clean background and "
+                "Product / e-commerce dataset. The subject MUST be an inanimate "
+                "product for sale. Reward a single clearly-presented product, "
+                "even studio lighting, a seamless or clean background and "
                 "accurate colour. A product shown within a real-world/lifestyle "
-                "scene goes to Lifestyle. Penalise busy/cluttered backgrounds, "
+                "scene (hands holding a phone, a coffee cup on a table) goes to "
+                "Lifestyle — the product must still be the subject.\n\n"
+                "HARD REJECT (route to OffTopic, do NOT Keep): if primary_subject "
+                "is a person, face, character, warrior, creature, animal, "
+                "landscape, or any non-product entity, the image is OffTopic. "
+                "The rule 'a person wearing clothing' is Lifestyle ONLY when "
+                "the specific garment is clearly the product being sold (e.g. "
+                "a catalogue shot of a jacket on a model); otherwise OffTopic.\n\n"
+                "REL_Quality_Score guidance: a portrait of a person with no "
+                "product = REL <= 15; a fantasy/anime scene = REL <= 10; a "
+                "person holding a phone where the phone is clearly the focus "
+                "= REL 60-80 (Lifestyle). Penalise busy/cluttered backgrounds, "
                 "distracting reflections, and burned-in promotional text or "
                 "watermarks (contains_text_overlay=true -> Borderline at best; "
                 "DISCARD if the overlay dominates)."),
             scoring_notes=(
                 "Reward clean/seamless backgrounds, even lighting, sharpness and "
-                "accurate colour. Penalise clutter, distracting reflections and "
-                "burned-in promo text/watermarks."),
+                "accurate colour on the PRODUCT. Portraits, characters, and "
+                "landscapes get REL <= 15 (OffTopic). Penalise clutter, "
+                "distracting reflections and burned-in promo text/watermarks."),
             caption_style="natural_language",
         ),
 

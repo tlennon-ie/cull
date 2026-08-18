@@ -1752,11 +1752,24 @@ def api_presets_list():
     except Exception:  # pragma: no cover - defensive
         PRESET_DESCRIPTIONS, PRESET_TAGS = {}, {}
     names = sorted(lib.get("presets", {}).keys())
+    # PRESET_DESCRIPTIONS is dict[str, {headline, description}]; flatten to a
+    # plain str the UI can render without producing "[object Object]".
+    def _desc(n: str) -> str:
+        entry = PRESET_DESCRIPTIONS.get(n, "")
+        if isinstance(entry, dict):
+            return entry.get("description") or entry.get("headline") or ""
+        return str(entry or "")
+    def _head(n: str) -> str:
+        entry = PRESET_DESCRIPTIONS.get(n, "")
+        if isinstance(entry, dict):
+            return entry.get("headline") or ""
+        return ""
     return jsonify({
         "default": lib.get("default", "default"),
         "presets": names,
         "builtins": sorted(job_config.builtin_preset_names()),
-        "descriptions": {n: PRESET_DESCRIPTIONS.get(n, "") for n in names},
+        "descriptions": {n: _desc(n) for n in names},
+        "headlines": {n: _head(n) for n in names},
         "tags": {n: list(PRESET_TAGS.get(n, ())) for n in names},
     })
 
