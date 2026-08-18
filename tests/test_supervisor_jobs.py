@@ -466,5 +466,58 @@ def test_job_local_imports_project_into_desired_agents(isolated, monkeypatch):
     assert agents["Local-keepers"].env["LOCAL_IMPORT_MIGRATE_FROM"] == "m"
 
 
+# ── priority: order + weights round-trip through the supervisor ───────────────
+
+def test_scraper_priority_reorders_desired_agents(isolated, monkeypatch):
+    """SCRAPER_PRIORITY_JSON reorders compute_desired_agents' returned dict so
+    the top-priority scraper spawns first. Non-priority labels (Vision-*, etc.)
+    keep their relative order behind the priority head."""
+    run_pipeline, _jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")
+    monkeypatch.setenv("SCRAPER_PRIORITY_JSON", json.dumps({
+        "order": ["Web", "Civitai-Com", "X.com"],
+        "weights": {"Web": 10, "Civitai-Com": 8, "X.com": 5},
+    }))
+    agents = run_pipeline.compute_desired_agents("topic")
+    labels = list(agents.keys())
+    # Web should now come first, ahead of X.com (default is X.com first).
+    assert labels.index("Web") < labels.index("X.com")
+    assert labels.index("Civitai-Com") < labels.index("X.com")
+
+
+def test_scraper_priority_missing_env_uses_defaults(isolated, monkeypatch):
+    """Empty / malformed SCRAPER_PRIORITY_JSON falls back to PRIORITY_NAMES
+    order — no crash, no dropped agent."""
+    run_pipeline, _jc, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")
+    for blob in ("", "not json", '{"order": ["nope"]}'):
+        monkeypatch.setenv("SCRAPER_PRIORITY_JSON", blob)
+        agents = run_pipeline.compute_desired_agents("topic")
+        assert "X.com" in agents  # X.com is first in default PRIORITY_NAMES
+
+
+def test_scraper_priority_wired_from_job_override(isolated, monkeypatch):
+    """End-to-end: a job's scrapers.priority override projects into env and
+    reorders the supervisor's desired agents dict."""
+    run_pipeline, job_config, _ = isolated
+    monkeypatch.setenv("PIPELINE_VISION_WORKERS", "")
+    job = job_config.create_job("Prio")
+    job = job_config.set_override(job, "scrapers.priority", {
+        "order": ["Civitai-Red", "Web"],
+        "weights": {"Civitai-Red": 10, "Web": 8},
+    })
+    job_config.save_job(job)
+    job_config.set_active("prio")
+    env = run_pipeline.active_job_env()
+    assert env is not None
+    os.environ.update(env)
+    payload = json.loads(env["SCRAPER_PRIORITY_JSON"])
+    assert payload["order"][0] == "Civitai-Red"
+    assert payload["order"][1] == "Web"
+    agents = run_pipeline.compute_desired_agents(env.get("PIPELINE_TOPIC", ""))
+    labels = list(agents.keys())
+    assert labels.index("Civitai-Red") < labels.index("X.com")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
