@@ -4526,49 +4526,286 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
     </section>
 
-    <!-- SCRAPERS (per-job toggles via overrides; Local-<name> rows read-only) -->
-    <section x-show="view === 'job' && active === 'scrapers'" class="card rounded-xl p-5">
-      <div class="flex items-start justify-between gap-4 mb-3">
-        <div>
-          <h3 class="font-semibold">Scraper controls</h3>
-          <p class="text-xs text-slate-400 mt-1">Per-job toggles (overrides on <code>scrapers.enabled</code>). The active job applies on leave / Apply. Local folders are managed in <button class="link-btn" @click="active='jobSettings'">Job Settings → Local folders</button>.</p>
-        </div>
-        <div class="flex gap-2">
-          <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off (vision only)</button>
-          <button @click="scrapersBulk('enable_all')" class="px-3 py-1.5 text-xs bg-emerald-600/80 hover:bg-emerald-500 rounded font-medium">All on</button>
+    <!-- SCRAPERS — unified card list.
+         One card per canonical scraper (SCRAPER_NAMES + YT-DLP). Each card:
+           * drag handle (⋮⋮) — DOM order = supervisor spawn priority
+           * name + description + status pill + Enable toggle
+           * priority weight input (1-10, default 5)
+           * collapsible body with THIS scraper's settings (moved here from
+             Job Settings — nothing removed, just consolidated)
+           * footer with a Test-connection button
+         Local folders live in their own multi-row card below (Local-<name>
+         agents fan out at spawn time — they are not part of the priority
+         reorder, and share this scraper card's shell for visual consistency). -->
+    <section x-show="view === 'job' && active === 'scrapers'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-1">
+          <div>
+            <h3 class="font-semibold">Scrapers</h3>
+            <p class="text-xs text-slate-400 mt-1">Drag by the <span class="font-mono">⋮⋮</span> handle to set priority (top = fires first). <b>Weight</b> (1-10) scales this scraper's round-robin turns. Auto-saves as an override; the active job applies on leave / Apply.</p>
+          </div>
+          <div class="flex gap-2">
+            <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off</button>
+            <button @click="scrapersBulk('enable_all')" class="px-3 py-1.5 text-xs bg-emerald-600/80 hover:bg-emerald-500 rounded font-medium">All on</button>
+            <button @click="resetScraperPriority()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Reset order + weights to preset defaults">Reset priority</button>
+          </div>
         </div>
       </div>
-      <div class="grid gap-2">
-        <template x-for="s in scrapers" :key="s.name">
-          <div class="flex items-center justify-between bg-slate-900/60 border border-slate-800 rounded px-4 py-3">
-            <div>
-              <div class="font-medium" x-text="s.name"></div>
-              <div class="text-xs text-slate-400" x-text="s.description"></div>
-              <div x-show="scraperTest[s.name] && !scraperTest[s.name].pending" class="text-xs mt-0.5"
-                :class="scraperTest[s.name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                x-text="(scraperTest[s.name]?.ok ? '✓ ' : '✕ ') + (scraperTest[s.name]?.message || '') + (scraperTest[s.name]?.latency_ms != null ? ' (' + scraperTest[s.name].latency_ms + 'ms)' : '')"></div>
+
+      <!-- Cards. dragOver.prevent enables drop; @dragover-native highlight is done
+           via draggingScraper. Keyboard: focus a handle, Space toggles grab mode,
+           ArrowUp/Down reorders, Space again drops. -->
+      <div class="space-y-3" role="list" aria-label="Scrapers in priority order">
+        <template x-for="(name, sIdx) in scraperOrder()" :key="'scr_' + name">
+          <div class="card rounded-xl border border-slate-800 overflow-hidden"
+               role="listitem"
+               :class="[draggingScraper === name ? 'ring-2 ring-indigo-400' : '', dragOverScraper === name ? 'border-indigo-500' : '']"
+               @dragover.prevent="scraperDragOver(name)"
+               @dragleave="scraperDragLeave(name)"
+               @drop.prevent="scraperDrop(name)">
+            <!-- Header row — always visible, click toggles collapse. -->
+            <div class="flex items-center gap-3 px-4 py-3 bg-slate-900/40 select-none">
+              <!-- Drag handle. draggable="true" ONLY on the handle so text
+                   selection in the body isn't hijacked. -->
+              <button type="button"
+                      class="shrink-0 px-1.5 py-1 rounded text-slate-500 hover:text-slate-200 hover:bg-slate-800 cursor-grab active:cursor-grabbing font-mono"
+                      :class="scraperGrabbed === name ? 'text-indigo-300 bg-slate-800' : ''"
+                      draggable="true"
+                      @dragstart="scraperDragStart($event, name)"
+                      @dragend="scraperDragEnd()"
+                      @keydown.space.prevent="toggleScraperGrab(name)"
+                      @keydown.arrow-up.prevent="scraperGrabbed === name && moveScraper(name, -1)"
+                      @keydown.arrow-down.prevent="scraperGrabbed === name && moveScraper(name, 1)"
+                      :aria-grabbed="scraperGrabbed === name"
+                      :aria-label="'Reorder ' + name">⋮⋮</button>
+              <button type="button" class="flex-1 min-w-0 text-left" @click="toggleScraperOpen(name)"
+                      :aria-expanded="scraperOpen[name] ? 'true' : 'false'"
+                      :aria-controls="'scr-body-' + name">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium" x-text="name"></span>
+                  <span class="pill px-1.5 py-0.5 rounded text-[10px]"
+                        :class="scraperEnabledMap[name] ? 'bg-emerald-900/50 text-emerald-300' : 'bg-slate-800 text-slate-400'"
+                        x-text="scraperEnabledMap[name] ? 'on' : 'off'"></span>
+                  <span x-show="scraperTest[name] && !scraperTest[name].pending" class="pill px-1.5 py-0.5 rounded text-[10px]"
+                        :class="scraperTest[name]?.ok ? 'bg-emerald-900/40 text-emerald-300' : 'bg-rose-900/50 text-rose-300'"
+                        x-text="scraperTest[name]?.ok ? '✓ connected' : '✕ ' + (scraperTest[name]?.message || 'failed').slice(0, 60)"></span>
+                </div>
+                <div class="text-xs text-slate-400 truncate" x-text="scraperDescription(name)"></div>
+              </button>
+              <!-- Priority weight (1-10). Keeps the input independent from the
+                   drag order so the user can boost a mid-list scraper's turns. -->
+              <label class="shrink-0 flex items-center gap-1 text-xs text-slate-400" title="Priority weight 1-10 (higher = more round-robin turns)">
+                <span class="hidden md:inline">weight</span>
+                <input type="number" min="1" max="10" step="1"
+                       :value="scraperWeight(name)"
+                       @input="setScraperWeight(name, Number($event.target.value))"
+                       class="w-14 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-center"
+                       :aria-label="'Priority weight for ' + name"/>
+              </label>
+              <!-- Enable slider — copies the classic toggleScraper contract. -->
+              <label class="shrink-0 inline-flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" :checked="scraperEnabledMap[name]"
+                       :aria-label="'Toggle scraper ' + name"
+                       @change="toggleScraper(name, $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                         checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                         before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                         checked:before:translate-x-5"/>
+              </label>
+              <button type="button"
+                      class="shrink-0 text-slate-500 hover:text-slate-200 px-1"
+                      @click="toggleScraperOpen(name)"
+                      :aria-label="scraperOpen[name] ? 'Collapse ' + name : 'Expand ' + name">
+                <span x-text="scraperOpen[name] ? '▾' : '▸'"></span>
+              </button>
             </div>
-            <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
-            <template x-if="s.kind !== 'local'">
-              <div class="flex items-center gap-3 shrink-0">
-                <button type="button" @click="testScraper(s.name)" :disabled="!!scraperTest[s.name]?.pending"
-                  class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                  <span x-text="scraperTest[s.name]?.pending ? 'Testing…' : 'Test'"></span>
+
+            <!-- Body — collapsed by default. max-h scrolls so long bodies
+                 (gallery-dl with many URLs + cookies) don't push the page. -->
+            <div x-show="scraperOpen[name]" x-cloak :id="'scr-body-' + name"
+                 class="px-4 py-4 border-t border-slate-800 overflow-y-auto"
+                 style="max-height: 26rem">
+              <!-- Per-scraper body dispatch. Every branch reads/writes through
+                   the SAME effVal/setOverride pipeline used by the Job Settings
+                   tab — nothing new server-side. -->
+              <template x-if="name === 'X.com'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
+                    <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <input :value="effList('scrapers.x_accounts')" @change="setOverrideList('scrapers.x_accounts', $event.target.value)"
+                         placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
+                </div>
+              </template>
+
+              <template x-if="name === 'Discord-1'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
+                    <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <textarea :value="effVal('scrapers.discord_channels_json')" @input="setOverride('scrapers.discord_channels_json', $event.target.value)" rows="4"
+                    placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scrapers.discord_channels_json') ? 'text-slate-400' : ''"></textarea>
+                </div>
+              </template>
+
+              <template x-if="name === 'Civitai-Com' || name === 'Civitai-Red'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Civitai domain{{ tip('Tick to include this Civitai host. Both cards edit the same underlying <code>civitai_domains</code> list.') }}</span>
+                    <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="flex items-center gap-5 py-1.5" :class="!isOver('scrapers.civitai_domains') ? 'opacity-70' : ''">
+                    <label class="inline-flex items-center gap-2 text-sm cursor-pointer" x-show="name === 'Civitai-Com'">
+                      <input type="checkbox" :checked="civOn('civitai.com')" @change="civToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> Scrape civitai.com
+                    </label>
+                    <label class="inline-flex items-center gap-2 text-sm cursor-pointer" x-show="name === 'Civitai-Red'">
+                      <input type="checkbox" :checked="civOn('civitai.red')" @change="civToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> Scrape civitai.red
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="name === 'Web'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
+                    <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <input :value="effList('scrapers.reddit_subreddits')" @change="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
+                         class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
+                </div>
+              </template>
+
+              <template x-if="name === 'Gallery-DL'">
+                <div>
+                  <div class="flex items-center justify-between mb-2">
+                    <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="text-xs link-btn">supported sites ↗</a>
+                    <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="grid md:grid-cols-2 gap-4">
+                    <label class="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" :checked="effVal('scrapers.gallery_dl.enabled')" @change="setOverride('scrapers.gallery_dl.enabled', $event.target.checked)"
+                             class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                      <span class="text-sm">Enable gallery-dl for this job</span>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+                      <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
+                      <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
+                                placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
+                      <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config file to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
+                      <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">Custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults AND the global gallery-dl config. Any option from the gallery-dl docs. Leave blank for none.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
+                      <textarea :value="effVal('scrapers.gallery_dl.config_json')" @change="setOverride('scrapers.gallery_dl.config_json', $event.target.value)" rows="3"
+                                placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}'
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="name === 'YT-DLP'">
+                <div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-xs text-slate-400">yt-dlp video/frame extractor</span>
+                    <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="grid md:grid-cols-2 gap-4">
+                    <label class="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
+                             class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                      <span class="text-sm">Enable yt-dlp for this job</span>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+                      <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+                      <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
+                                placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
+                      <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Footer: Test connection. Uses the same /api/scrapers/test
+                   contract; result also renders as the header pill. -->
+              <div class="mt-4 pt-3 border-t border-slate-800 flex items-center gap-3">
+                <button type="button" @click="testScraper(name)" :disabled="!!scraperTest[name]?.pending"
+                        class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="scraperTest[name]?.pending ? 'Testing…' : 'Test connection'"></span>
                 </button>
-                <label class="inline-flex items-center cursor-pointer gap-2">
-                  <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-                  <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
-                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                      checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                      before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                      checked:before:translate-x-5"/>
-                </label>
+                <span x-show="scraperTest[name] && !scraperTest[name].pending" class="text-xs"
+                      :class="scraperTest[name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                      x-text="(scraperTest[name]?.ok ? '✓ ' : '✕ ') + (scraperTest[name]?.message || '') + (scraperTest[name]?.latency_ms != null ? ' (' + scraperTest[name].latency_ms + 'ms)' : '')"></span>
               </div>
-            </template>
-            <template x-if="s.kind === 'local'">
-              <span class="pill px-2 py-0.5 rounded" :class="s.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'" x-text="s.enabled ? 'enabled' : 'disabled'"></span>
-            </template>
+            </div>
           </div>
+        </template>
+      </div>
+
+      <!-- Local folders — same card shell, multi-row body. Each enabled folder
+           becomes its own Local-<name> agent at spawn; they aren't in the
+           priority reorder because the list is dynamic. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Local folders</h3>
+            <p class="text-xs text-slate-400">Each enabled folder is a concurrent source, surfaced elsewhere as <code>Local-&lt;name&gt;</code>.</p>
+          </div>
+          <div>
+            <span x-show="!isOver('scrapers.local_imports')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.local_imports')" @click="resetOverride('scrapers.local_imports')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
+        <div class="space-y-2">
+          <template x-for="(f, i) in localFolders()" :key="i">
+            <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
+              <input :value="f.name" @input="updateLocalFolder(i, 'name', $event.target.value)" placeholder="name"
+                     class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+              <input :value="f.dir" @input="updateLocalFolder(i, 'dir', $event.target.value)" placeholder="absolute folder path"
+                     class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+              <label class="col-span-2 flex items-center gap-1 text-xs">
+                <input type="checkbox" :checked="f.enabled" @change="updateLocalFolder(i, 'enabled', $event.target.checked)"/> on
+              </label>
+              <button @click="removeLocalFolder(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
+            </div>
+          </template>
+          <button @click="addLocalFolder()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
+        </div>
         </template>
       </div>
     </section>
@@ -6241,6 +6478,23 @@ function dashboard() {
     // so this can never drift from the Python source of truth. Used by the
     // preset editor's enabled-toggles.
     scraperNames: {{ scraper_names_json|safe }},
+    // Full ordered list the priority block covers (SCRAPER_NAMES + YT-DLP);
+    // injected from job_config.PRIORITY_NAMES so this can never drift.
+    priorityNames: {{ priority_names_json|safe }},
+    // Per-scraper descriptions (server-side dict), used by the unified card
+    // list. Falls back to '' when a name isn't in the dict — keeps the header
+    // readable even for an unknown row.
+    scraperDescriptions: {{ scraper_descriptions_json|safe }},
+    // Priority weight bounds mirror job_config.PRIORITY_WEIGHT_* so the UI
+    // clamps to the exact same range the validator enforces.
+    priorityWeightMin: {{ priority_weight_min }},
+    priorityWeightMax: {{ priority_weight_max }},
+    priorityWeightDefault: {{ priority_weight_default }},
+    // Scrapers-tab local state: which cards are expanded + drag/keyboard grab.
+    scraperOpen: {},              // {name: bool} — collapse state
+    scraperGrabbed: null,          // name currently in keyboard grab-mode
+    draggingScraper: null,         // name currently being dragged
+    dragOverScraper: null,         // name currently being dragged OVER (visual)
     providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',
     throttle: 100,
@@ -7271,8 +7525,128 @@ function dashboard() {
       if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
       // Toggles write an override; the active job applies on leave / Apply.
       if (this.currentJob === this.jobsActive) this.je.applyPending = true;
+      // Auto-open the card the first time a scraper is turned on so users
+      // see the settings body without a second click.
+      if (enabled && this.scraperOpen && !this.scraperOpen[name]) {
+        this.scraperOpen = { ...this.scraperOpen, [name]: true };
+      }
       this.refresh(); this.loadJobEditor();
     },
+
+    // ── Scrapers-tab card list: description / enabled map / priority helpers ──
+    scraperDescription(name) {
+      return (this.scraperDescriptions && this.scraperDescriptions[name]) || '';
+    },
+    get scraperEnabledMap() {
+      // Build {name: bool} from the /api/scrapers payload so the header pill
+      // and toggle share ONE source of truth. Unknown names default to true —
+      // consistent with SCRAPER_DISABLED's "absent = enabled" semantics.
+      const out = {};
+      for (const s of (this.scrapers || [])) {
+        if (s && s.name) out[s.name] = !!s.enabled;
+      }
+      for (const n of (this.priorityNames || [])) {
+        if (!(n in out)) out[n] = true;
+      }
+      return out;
+    },
+    // Effective priority (from the job editor's effective config, fall back to
+    // the default order + all-default weights). Every priorityName is covered
+    // deterministically so the UI never renders a partial list.
+    _priorityEff() {
+      const eff = this.effVal('scrapers.priority');
+      const raw = (eff && typeof eff === 'object') ? eff : {};
+      const known = new Set(this.priorityNames || []);
+      const seen = new Set();
+      const order = [];
+      for (const n of (Array.isArray(raw.order) ? raw.order : [])) {
+        if (typeof n === 'string' && known.has(n) && !seen.has(n)) { order.push(n); seen.add(n); }
+      }
+      for (const n of (this.priorityNames || [])) {
+        if (!seen.has(n)) order.push(n);
+      }
+      const rawW = (raw.weights && typeof raw.weights === 'object') ? raw.weights : {};
+      const weights = {};
+      const mn = this.priorityWeightMin, mx = this.priorityWeightMax, def = this.priorityWeightDefault;
+      for (const n of (this.priorityNames || [])) {
+        let w = parseInt(rawW[n], 10);
+        if (!Number.isFinite(w)) w = def;
+        weights[n] = Math.max(mn, Math.min(mx, w));
+      }
+      return { order, weights };
+    },
+    scraperOrder() { return this._priorityEff().order; },
+    scraperWeight(name) { return this._priorityEff().weights[name] ?? this.priorityWeightDefault; },
+    // Auto-derive weight from drag position: top slot = MAX, bottom = MIN,
+    // linear in between. Called from drop/keyboard-reorder but never from the
+    // manual weight input (the user overrides independently).
+    _autoWeightFromIndex(idx, total) {
+      if (total <= 1) return this.priorityWeightDefault;
+      const mn = this.priorityWeightMin, mx = this.priorityWeightMax;
+      const frac = 1 - (idx / (total - 1));
+      return Math.max(mn, Math.min(mx, Math.round(mn + frac * (mx - mn))));
+    },
+    // Persist a whole {order, weights} block as an override (auto-saves).
+    _saveScraperPriority(order, weights) {
+      this.setOverride('scrapers.priority', { order: order.slice(), weights: { ...weights } });
+    },
+    setScraperWeight(name, w) {
+      const clean = Math.max(this.priorityWeightMin, Math.min(this.priorityWeightMax, Math.round(Number(w) || this.priorityWeightDefault)));
+      const eff = this._priorityEff();
+      eff.weights[name] = clean;
+      this._saveScraperPriority(eff.order, eff.weights);
+    },
+    // Reorder helper — moves `name` to index `newIdx` and re-derives weights.
+    _reorderScraper(name, newIdx) {
+      const eff = this._priorityEff();
+      const cur = eff.order.slice();
+      const from = cur.indexOf(name);
+      if (from < 0) return;
+      cur.splice(from, 1);
+      const clampedIdx = Math.max(0, Math.min(cur.length, newIdx));
+      cur.splice(clampedIdx, 0, name);
+      const nextWeights = { ...eff.weights };
+      // Drag also nudges weight: top = 10, bottom = 1. The user can override
+      // any individual weight afterward via the number input.
+      cur.forEach((n, i) => { nextWeights[n] = this._autoWeightFromIndex(i, cur.length); });
+      this._saveScraperPriority(cur, nextWeights);
+    },
+    toggleScraperOpen(name) {
+      this.scraperOpen = { ...this.scraperOpen, [name]: !this.scraperOpen[name] };
+    },
+    // ── HTML5 drag-and-drop (no external lib) ──
+    scraperDragStart(evt, name) {
+      this.draggingScraper = name;
+      try { evt.dataTransfer.setData('text/plain', name); evt.dataTransfer.effectAllowed = 'move'; }
+      catch (_e) { /* older browsers */ }
+    },
+    scraperDragOver(name) { if (this.draggingScraper && this.draggingScraper !== name) this.dragOverScraper = name; },
+    scraperDragLeave(name) { if (this.dragOverScraper === name) this.dragOverScraper = null; },
+    scraperDragEnd() { this.draggingScraper = null; this.dragOverScraper = null; },
+    scraperDrop(targetName) {
+      const src = this.draggingScraper;
+      this.draggingScraper = null; this.dragOverScraper = null;
+      if (!src || src === targetName) return;
+      const order = this.scraperOrder();
+      const targetIdx = order.indexOf(targetName);
+      if (targetIdx < 0) return;
+      this._reorderScraper(src, targetIdx);
+    },
+    // ── Keyboard grab mode: focus a handle, Space toggles grab, arrows move ──
+    toggleScraperGrab(name) {
+      this.scraperGrabbed = (this.scraperGrabbed === name) ? null : name;
+    },
+    moveScraper(name, delta) {
+      const order = this.scraperOrder();
+      const idx = order.indexOf(name);
+      if (idx < 0) return;
+      this._reorderScraper(name, idx + delta);
+    },
+    async resetScraperPriority() {
+      await this.resetOverride('scrapers.priority');
+      this.notify('Scraper priority reset to preset defaults', 'info');
+    },
+
     async scrapersBulk(action) {
       if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
       const r = await fetch('/api/scrapers/bulk' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
@@ -7973,6 +8347,17 @@ def dashboard():
     return render_template_string(
         HTML_TEMPLATE,
         scraper_names_json=json.dumps(list(job_config.SCRAPER_NAMES)),
+        # PRIORITY_NAMES + descriptions + weight bounds power the unified
+        # Scrapers-tab card list. Everything the Alpine template needs to render
+        # a card comes from job_config here — no JS duplication.
+        priority_names_json=json.dumps(list(job_config.PRIORITY_NAMES)),
+        scraper_descriptions_json=json.dumps({
+            **_SCRAPER_DESCRIPTIONS,
+            "YT-DLP": "yt-dlp (YouTube, TikTok, Vimeo, X, Reddit, Twitch clips…). Configure URLs + cookies in the card body.",
+        }),
+        priority_weight_min=job_config.PRIORITY_WEIGHT_MIN,
+        priority_weight_max=job_config.PRIORITY_WEIGHT_MAX,
+        priority_weight_default=job_config.PRIORITY_WEIGHT_DEFAULT,
         export_profiles_json=json.dumps(list(export_profiles.PROFILES)),
         video_bucket_modes_json=json.dumps(list(export_profiles.VIDEO_BUCKET_MODES)),
         caption_styles_json=json.dumps(list(vision_prompt.CAPTION_STYLES)),

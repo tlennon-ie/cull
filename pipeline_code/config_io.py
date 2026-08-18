@@ -307,10 +307,61 @@ def _validate_local_imports(li: Any) -> list[dict]:
     return out
 
 
+def _validate_scraper_priority(p: Any) -> dict:
+    """Strict validator for the ``scrapers.priority`` block (order + weights).
+
+    Shape (both keys optional; missing → sensible default):
+      * ``order``: list of PRIORITY_NAMES entries (unknown names rejected,
+        duplicates rejected).
+      * ``weights``: name → int 1-10 map (unknown names rejected, non-integer
+        or out-of-range values rejected).
+
+    Mirrors ``job_config.clean_scraper_priority``'s coercion — but that helper
+    is deliberately silent about garbage (it's the projection path); this one
+    fails loud at the system boundary so a hostile envelope can't sneak past.
+    """
+    _require_object(p, "scrapers.priority")
+    allowed_names = set(job_config.PRIORITY_NAMES)
+    out: dict[str, Any] = {}
+    for k, v in p.items():
+        if k not in {"order", "weights"}:
+            raise ValidationError(f"unknown scrapers.priority key: {k!r}")
+        if k == "order":
+            if not isinstance(v, list):
+                raise ValidationError("scrapers.priority.order must be a list")
+            if len(v) > len(allowed_names):
+                raise ValidationError("scrapers.priority.order has too many entries")
+            seen: set[str] = set()
+            for name in v:
+                if not isinstance(name, str):
+                    raise ValidationError("scrapers.priority.order entries must be strings")
+                if name not in allowed_names:
+                    raise ValidationError(f"unknown scraper in priority.order: {name!r}")
+                if name in seen:
+                    raise ValidationError(f"duplicate scraper in priority.order: {name!r}")
+                seen.add(name)
+            out["order"] = list(v)
+        else:  # weights
+            if not isinstance(v, dict):
+                raise ValidationError("scrapers.priority.weights must be an object")
+            wmap: dict[str, int] = {}
+            for name, raw in v.items():
+                if name not in allowed_names:
+                    raise ValidationError(f"unknown scraper in priority.weights: {name!r}")
+                iv = _as_int(raw, f"scrapers.priority.weights[{name!r}]")
+                if not (job_config.PRIORITY_WEIGHT_MIN <= iv <= job_config.PRIORITY_WEIGHT_MAX):
+                    raise ValidationError(
+                        f"scrapers.priority.weights[{name!r}] out of range "
+                        f"({job_config.PRIORITY_WEIGHT_MIN}-{job_config.PRIORITY_WEIGHT_MAX})")
+                wmap[name] = iv
+            out["weights"] = wmap
+    return out
+
+
 def _validate_scrapers(s: Any) -> dict:
     _require_object(s, "scrapers")
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports", "priority"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -332,6 +383,8 @@ def _validate_scrapers(s: Any) -> dict:
             out[k] = _validate_gallery_dl(v)
         elif k == "yt_dlp":
             out[k] = _validate_yt_dlp(v)
+        elif k == "priority":
+            out[k] = _validate_scraper_priority(v)
         else:  # local_imports
             out[k] = _validate_local_imports(v)
     return out

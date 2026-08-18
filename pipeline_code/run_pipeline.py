@@ -163,6 +163,40 @@ def vision_worker_list() -> list[str]:
     return [single] if single else []
 
 
+def _scraper_priority() -> dict:
+    """Parse SCRAPER_PRIORITY_JSON into ``{"order": [...], "weights": {...}}``.
+
+    Uses ``job_config.clean_scraper_priority`` so unknown names are dropped,
+    missing weights get PRIORITY_WEIGHT_DEFAULT, and every PRIORITY_NAME is
+    covered — the exact same shape the dashboard writes. Empty / malformed env
+    → the default (PRIORITY_NAMES order, every weight = PRIORITY_WEIGHT_DEFAULT).
+    """
+    raw = (os.environ.get("SCRAPER_PRIORITY_JSON", "") or "").strip()
+    if not raw:
+        return job_config.clean_scraper_priority(None)
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return job_config.clean_scraper_priority(None)
+    return job_config.clean_scraper_priority(data)
+
+
+def _apply_priority(agents: dict[str, "AgentSpec"]) -> dict[str, "AgentSpec"]:
+    """Re-order ``agents`` so the priority-list order wins at spawn time.
+
+    Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic Discord-N shards)
+    keep their relative insertion order behind the priority-ordered head. This
+    preserves the "top = fires first" contract without disturbing labels that
+    the priority block doesn't cover.
+    """
+    if not agents:
+        return agents
+    priority = _scraper_priority()
+    order = [n for n in priority.get("order", []) if n in agents]
+    trailing = [name for name in agents if name not in order]
+    return {name: agents[name] for name in (order + trailing)}
+
+
 def _local_import_folders() -> list[dict]:
     """Parse LOCAL_IMPORTS_JSON into the list of enabled local-folder dicts.
 
@@ -505,7 +539,12 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
         if spec is not None:
             add(spec)
 
-    return agents
+    # Per-job priority: reorder the agents dict so the top-priority scraper
+    # spawns first. Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic
+    # Discord-N > 1) keep their insertion order behind the priority head — see
+    # _apply_priority for the contract. Ordering is decided here so
+    # queue_manager stays untouched.
+    return _apply_priority(agents)
 
 
 # ── Supervisor ────────────────────────────────────────────────────────────────

@@ -298,5 +298,54 @@ def test_save_imported_preset_persists(isolated):
     assert name in jc.list_presets()["presets"]
 
 
+# ── scrapers.priority validator ───────────────────────────────────────────────
+
+def test_priority_block_round_trips_through_validator(isolated):
+    """A full {order, weights} block passes _validate_scrapers and comes back
+    intact — the shape the dashboard exports/imports."""
+    cio, jc, _ = isolated
+    block = {
+        "order": ["Web", "X.com", "Gallery-DL"],
+        "weights": {"Web": 9, "X.com": 3, "Gallery-DL": 5},
+    }
+    validated = cio._validate_scrapers({"priority": block})
+    assert validated["priority"]["order"] == ["Web", "X.com", "Gallery-DL"]
+    assert validated["priority"]["weights"] == {"Web": 9, "X.com": 3, "Gallery-DL": 5}
+
+
+def test_priority_unknown_name_in_order_rejected(isolated):
+    cio, jc, _ = isolated
+    with pytest.raises(cio.ValidationError):
+        cio._validate_scrapers({"priority": {"order": ["nope"]}})
+
+
+def test_priority_duplicate_name_in_order_rejected(isolated):
+    cio, jc, _ = isolated
+    with pytest.raises(cio.ValidationError):
+        cio._validate_scrapers({"priority": {"order": ["Web", "Web"]}})
+
+
+def test_priority_weight_out_of_range_rejected(isolated):
+    cio, jc, _ = isolated
+    with pytest.raises(cio.ValidationError):
+        cio._validate_scrapers({"priority": {"weights": {"Web": 99}}})
+    with pytest.raises(cio.ValidationError):
+        cio._validate_scrapers({"priority": {"weights": {"Web": 0}}})
+
+
+def test_priority_full_cfg_round_trip(isolated):
+    """A whole preset carrying a priority override survives the strict
+    inheritable-config validator (no rejection path introduced)."""
+    cio, jc, _ = isolated
+    preset = jc._deep_merge(jc._default_preset_cfg(), {
+        "scrapers": {"priority": {
+            "order": list(jc.PRIORITY_NAMES),
+            "weights": {n: 6 for n in jc.PRIORITY_NAMES},
+        }},
+    })
+    cleaned = cio.validate_inheritable_cfg(preset, partial=False)
+    assert cleaned["scrapers"]["priority"]["weights"]["Web"] == 6
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
