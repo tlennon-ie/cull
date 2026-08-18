@@ -21,6 +21,16 @@
 
 ![cull dashboard preview — gallery, stats, scrapers](docs/screenshots/gallery.png)
 
+## What's new
+
+- **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg`. Videos play inline in the gallery modal. Toggle with `VIDEO_CLASSIFY_ENABLED` (needs the `[video]` extra).
+- **First-run wizard.** New installs land on a guided flow that creates the first job, picks a preset, and verifies at least one scraper + one vision worker before turning the pipeline on.
+- **Preset marketplace.** Import / export presets as portable JSON; a public gallery of curated starter presets ships with each release.
+- **Kohya + HuggingFace exporters.** ZIP a filtered gallery view directly into a trainer, or push a curated set to a private HuggingFace dataset repo (`hf_export.py`).
+- **Digest webhook + desktop toasts.** Job completion fires a POST to `WEBHOOK_URL` (SSRF-guarded — http/s only, no redirects) and, optionally, a local desktop notification.
+- **Local vision fleet.** Multiple LM Studio / llama.cpp / Ollama endpoints run in parallel, each as its own subprocess, with gated failover and llama.cpp GBNF grammar support.
+- **Security hardening.** CSP + `X-Frame-Options: DENY` + `nosniff` on every response; `safe_inside()` on every user-supplied path; `SECRET_MASK` on every credential leaving the server; `allow_redirects=False` on every outbound HTTP probe. See [`SECURITY.md`](SECURITY.md).
+
 ## What it is
 
 cull is a single-machine curation engine for AI-generated images. It pulls from a handful of dedicated scrapers plus gallery-dl's 340+ supported sites, runs each image through a vision model under a strict 17-field JSON schema, and drops the keepers into category folders next to the prompt that made them. It is plumbing for people building image datasets by hand, with a dashboard so you can see the work. No Redis. No database. Docker optional — run it from the bootstrap scripts, `pip install -e .`, or a container, whichever you prefer.
@@ -267,6 +277,29 @@ gallery-dl scraper:
 - `GALLERY_DL_COOKIES_FILE` — Netscape `cookies.txt` path; required for login-walled sites.
 - `GALLERY_DL_CONFIG_PATH` — optional extra gallery-dl JSON config layered on top of cull's defaults.
 
+## Security posture
+
+cull is a **single-user local admin tool**. The dashboard trusts anyone who can
+reach its port. If that's just you on your own machine, you're fine; if the
+port is exposed to a network you don't trust, put a reverse proxy with auth in
+front of it, or bind loopback-only:
+
+```env
+# .env
+FLASK_HOST=127.0.0.1
+```
+
+The dashboard ships with CSP, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, and a restrictive `Permissions-Policy` on every
+response; every user-supplied path is validated with `safe_inside()`; every set
+credential returns as `********`; every outbound HTTP probe passes
+`allow_redirects=False`. Full threat model in [`SECURITY.md`](SECURITY.md).
+
+**Please scrape politely.** cull's scrapers hit public APIs and pages — respect
+each site's `robots.txt` and Terms of Service, don't burst-scrape, and add
+sensible rate limits via the `RATE_LIMIT_<SOURCE>_*` env vars for the sources
+you push hardest. gallery-dl and yt-dlp inherit the same responsibility.
+
 ## FAQ
 
 **Why no Redis?** Because the filesystem is already a queue. `image.jpg.processing` is the lock; `os.rename` is atomic on every platform that matters; the supervisor's stale-processing sweep recovers from crashes on restart. cull runs on a Raspberry Pi if you want it to.
@@ -289,7 +322,7 @@ gallery-dl scraper:
 
 ## Contributing
 
-Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first.
+Small fixes welcome. For larger changes (new scraper source, new vision provider) please open an issue first. Full guide: [`CONTRIBUTING.md`](CONTRIBUTING.md). By participating you agree to the [`Code of Conduct`](CODE_OF_CONDUCT.md). Security issues: [`SECURITY.md`](SECURITY.md) (please email, don't file a public issue).
 
 ### Working with an AI coding agent
 
