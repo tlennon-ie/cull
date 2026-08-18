@@ -786,7 +786,7 @@ def build_response_format() -> dict[str, Any]:
         "type": "json_schema",
         "json_schema": {
             "name": "VisionClassification",
-            "strict": "true",
+            "strict": True,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
@@ -799,9 +799,17 @@ def build_response_format() -> dict[str, Any]:
                     "OVR_Quality_Score", "REL_Quality_Score", "quality_score",
                     "category", "reason", "caption",
                 ],
+                # NOTE: OpenAI structured-output strict mode (which LM Studio
+                # enforces via a grammar sampler) does NOT support minLength,
+                # maxLength, minimum, maximum, pattern, or format keywords.
+                # See https://platform.openai.com/docs/guides/structured-outputs
+                # Bounds are re-enforced in Python by ``apply_scores`` (clamps
+                # 0-100 / 1-10) and by the prompt's rubric, so removing them
+                # from the schema is behaviourally neutral for the pipeline
+                # and unblocks strict-mode servers.
                 "properties": {
-                    "description":          {"type": "string", "minLength": 10, "maxLength": 1000},
-                    "primary_subject":      {"type": "string", "minLength": 3, "maxLength": 200},
+                    "description":          {"type": "string"},
+                    "primary_subject":      {"type": "string"},
                     "is_screenshot":        {"type": "boolean"},
                     "is_composite_grid":    {"type": "boolean"},
                     "contains_text_overlay": {"type": "boolean"},
@@ -815,15 +823,15 @@ def build_response_format() -> dict[str, Any]:
                     "has_ai_flaws":         {"type": "boolean"},
                     "woman_present":        {"type": "boolean"},
                     "nsfw":                 {"type": "boolean"},
-                    "OVR_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
-                    "REL_Quality_Score":    {"type": "integer", "minimum": 0, "maximum": 100},
-                    "quality_score":        {"type": "integer", "minimum": 1, "maximum": 10},
+                    "OVR_Quality_Score":    {"type": "integer"},
+                    "REL_Quality_Score":    {"type": "integer"},
+                    "quality_score":        {"type": "integer"},
                     "category": {
                         "type": "string",
                         "enum": list(get_schema_categories()),
                     },
-                    "reason": {"type": "string", "minLength": 5, "maxLength": 300},
-                    "caption": {"type": "string", "minLength": 0, "maxLength": 2000},
+                    "reason":  {"type": "string"},
+                    "caption": {"type": "string"},
                 },
             },
         },
