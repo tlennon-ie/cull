@@ -807,6 +807,45 @@ def _iter_gallery_dl_extractor(extr: Any, max_items: int) -> list[str]:
     return urls
 
 
+# gallery-dl config keys that can read/write arbitrary files or invoke shell
+# commands. A dry-run URL check never needs these — they only exist for real
+# download runs and are the classic path-traversal / RCE surface if a hostile
+# config_json is accepted from the dashboard.
+_GALLERY_DL_UNSAFE_KEYS: frozenset[str] = frozenset({
+    "postprocessors",   # can include the "exec" postprocessor for shell exec
+    "exec",
+    "output",
+    "base-directory",
+    "directory",
+    "filename",
+    "archive",          # writes to arbitrary paths
+    "log",              # log-file overrides
+    "logfile",
+    "download-archive",
+    "cache",
+})
+
+
+def _scrub_gallery_dl_config(cfg: dict) -> dict:
+    """Return a copy of ``cfg`` with any file-access / shell-exec keys removed.
+
+    Recursively walks nested dicts because gallery-dl namespaces settings
+    (``{"extractor": {"reddit": {"postprocessors": [...]}}}``). Lists are
+    walked so a postprocessors-inside-a-list is caught too. The dry-run URL
+    check only ever needs metadata / rate-limit / user-agent shaping; the
+    stripped keys have no legitimate role here.
+    """
+    if isinstance(cfg, dict):
+        return {
+            k: _scrub_gallery_dl_config(v)
+            for k, v in cfg.items()
+            if k not in _GALLERY_DL_UNSAFE_KEYS
+        }
+    if isinstance(cfg, list):
+        return [_scrub_gallery_dl_config(item) for item in cfg]
+    return cfg
+
+
 def _check_gallery_dl_url(
     url: str,
     cookies_txt: str | None = None,
@@ -916,6 +955,12 @@ def _check_gallery_dl_url(
                     "error": "config_json must be a JSON object",
                     "message": "config_json must be a JSON object",
                 }
+            # Strip gallery-dl config keys that can read/write arbitrary files
+            # or execute shell commands. Dry-run URL preflight has no legitimate
+            # need for these — but a hostile config_json could otherwise ship
+            # `postprocessors: [{"name": "exec", "command": "..."}]` or point
+            # `base-directory` at a system path.
+            cfg_data = _scrub_gallery_dl_config(cfg_data)
             fd, config_path = tempfile.mkstemp(
                 prefix="cull_gdl_config_", suffix=".json"
             )

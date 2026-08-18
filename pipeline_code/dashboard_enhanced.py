@@ -4373,6 +4373,19 @@ def api_vision_dry_run():
     api_key = (chosen.get("api_key") or "").strip()
     if not base_url:
         return jsonify({"ok": False, "error": "worker has no base_url"}), 400
+    # SSRF gate: the vision fleet is by design a LOCAL / LAN construct —
+    # loopback (127.0.0.1 / ::1) or private RFC1918 ranges. Cloud vision
+    # providers (OpenAI / Anthropic / Groq / OpenRouter / Gemini) go through
+    # their own registered workers, not the fleet's base_url. Rejecting public
+    # URLs here blocks a crafted job config from steering the dry-run at cloud
+    # metadata endpoints or arbitrary internet hosts.
+    if _wave_is_public_http_url(base_url):
+        return jsonify({"ok": False,
+                        "error": (
+                            "vision fleet endpoints must be loopback / LAN "
+                            "(RFC1918 / link-local). Cloud providers are "
+                            "reached via their registered vision workers, "
+                            "not the fleet's base_url.")}), 400
 
     import requests as _requests
     headers = {"Content-Type": "application/json"}
@@ -4461,18 +4474,26 @@ def _b64encode_bytes(data: bytes) -> str:
     return _b64.b64encode(data).decode("ascii")
 
 
+_UPSTREAM_BODY_MAX = 400  # was 800 — smaller cap to keep echoed content minimal
+_UPSTREAM_STRIP_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]")
+
+
 def _format_upstream_error(resp: Any, url: str) -> str:
     """Format a rich diagnostic string from a non-2xx upstream response.
 
     LM Studio / llama.cpp / Ollama frequently return 400 with a JSON body that
     explains WHY (bad model name, unsupported field, schema issue). Surfacing
-    that body — status + url + up to ~800 chars, pretty-printed if JSON — turns
-    "worker call failed: 400 Client Error" into an actually actionable error.
+    that body — status + url + up to ~400 chars, pretty-printed if JSON —
+    turns "worker call failed: 400 Client Error" into an actually actionable
+    error. Control chars are stripped and the body is truncated so that a
+    malicious upstream can't smuggle terminal escapes or unlimited payload
+    text back through the diagnostic surface.
     """
     body_text = ""
     try:
-        # Prefer the parsed JSON body when the upstream sent one, so the
-        # keys the model rejected show up cleanly instead of as escaped text.
+        # Prefer the parsed JSON body when the upstream sent one — safer to
+        # re-serialise than to echo raw response bytes verbatim. Also strips
+        # any control characters via the sanitiser below.
         payload = resp.json()
         body_text = json.dumps(payload, indent=2, ensure_ascii=False)
     except Exception:  # noqa: BLE001 - fall through to raw text
@@ -4480,8 +4501,11 @@ def _format_upstream_error(resp: Any, url: str) -> str:
             body_text = resp.text or ""
         except Exception:  # noqa: BLE001
             body_text = ""
-    if len(body_text) > 800:
-        body_text = body_text[:800] + "…"
+    # Scrub control chars — an attacker upstream could otherwise ship ANSI
+    # escapes or NUL bytes back through the /api/vision/dry-run JSON.
+    body_text = _UPSTREAM_STRIP_RE.sub("", body_text)
+    if len(body_text) > _UPSTREAM_BODY_MAX:
+        body_text = body_text[:_UPSTREAM_BODY_MAX] + "…"
     status = getattr(resp, "status_code", "?")
     return f"upstream {status} from {url}: {body_text}".strip()
 
