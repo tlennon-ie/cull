@@ -32,31 +32,17 @@ from __future__ import annotations
 import copy
 
 __all__ = [
-    "DEFAULT_PRESET", "PRESET_NAMES", "PRESET_DESCRIPTIONS", "PRESET_TAGS",
+    "DEFAULT_PRESET",
+    "PRESET_NAMES",
+    "PRESET_DESCRIPTIONS",
+    "PRESET_TAGS",
     "builtin_library",
+    "get_preset_display_meta",
+    "preset_use_cases",
+    "preset_headline",
 ]
 
 DEFAULT_PRESET = "default"
-
-
-# One-line, use-case-oriented descriptions for the shipped presets. Surfaced
-# in the dashboard's job-create form so users can pick without opening docs.
-# Keep each ≤ 90 chars — they render in a single line inside a card.
-PRESET_DESCRIPTIONS: dict[str, str] = {
-    "default": "General dataset triage — keeps quality wins, sends the maybes to review.",
-    "aerial_drone": "Drone / satellite imagery — rejects ground-level shots, penalises haze.",
-    "underwater_marine": "Below-the-surface scenes — rewards visibility, penalises backscatter.",
-    "wildlife_macro": "Wildlife + macro-nature — rewards eye sharpness, penalises captivity.",
-    "product_ecommerce": "Product / e-commerce photography — clean packshots vs lifestyle.",
-    "anime_illustration": "Anime + illustration only — drops photoreal, keeps clean linework.",
-    "photoreal_portrait": "Original influencer/portrait taxonomy — real humans with strict gates.",
-    "quality_only": "Topic-agnostic quality triage — pure OVR bucketing (Top/Mid/Low).",
-    "video_default": "General video clip triage — rewards intentional motion, drops static.",
-    "video_cinematic": "Cinematic film-look — dolly/crane/tracking, penalises phone/webcam.",
-    "video_anime": "Animated 2D motion — smooth in-betweens, drops live-action footage.",
-    "video_product": "Product turntables / demos — clean orbits and controlled push-ins.",
-    "video_nature": "Nature b-roll — drone, timelapse, slow-mo — rewards coherent motion.",
-}
 
 
 # Category tags for grouping/filtering presets in the UI. Each preset can carry
@@ -76,6 +62,222 @@ PRESET_TAGS: dict[str, tuple[str, ...]] = {
     "video_product": ("video", "product"),
     "video_nature": ("video", "nature"),
 }
+
+
+# ── human-facing metadata for the shipped presets ────────────────────────────
+# Every key in ``PRESET_NAMES`` MUST have a matching ``PRESET_DESCRIPTIONS``
+# entry — the dashboard's preset picker + comparison grid rely on it. Adding a
+# new built-in preset without a metadata entry is a hard failure at import time
+# via the guard at the bottom of this module.
+#
+# Constraints (kept small on purpose so the dashboard card layout stays clean):
+#   - ``headline``   : <= 60 chars, sentence-case, no trailing period
+#   - ``description``: <= 180 chars, one clear sentence
+PRESET_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "default": {
+        "headline": "Broadly usable Keep/Borderline/OffTopic taxonomy",
+        "description": (
+            "Sensible defaults for any subject: quality + relevance gate, no "
+            "person constraints, safe for mixed AI-generated and real content."
+        ),
+    },
+    "aerial_drone": {
+        "headline": "Aerial, drone and satellite imagery curation",
+        "description": (
+            "Keeps elevated / top-down viewpoints, routes ground-level shots "
+            "off-theme, penalises haze and cloud occlusion."
+        ),
+    },
+    "underwater_marine": {
+        "headline": "Underwater, scuba and marine-life curation",
+        "description": (
+            "Keeps beneath-surface scenes with good visibility, routes "
+            "above-water shots off-theme, penalises murk and backscatter."
+        ),
+    },
+    "wildlife_macro": {
+        "headline": "Wildlife and macro-nature photography",
+        "description": (
+            "Rewards eye-sharp animal / macro subjects in natural habitats; "
+            "routes zoo, taxidermy and toy stand-ins to CaptiveStaged."
+        ),
+    },
+    "product_ecommerce": {
+        "headline": "Studio product and e-commerce packshots",
+        "description": (
+            "Rewards seamless backgrounds and even lighting; splits in-context "
+            "lifestyle shots into a separate bucket from clean packshots."
+        ),
+    },
+    "anime_illustration": {
+        "headline": "Anime, manga and drawn illustration datasets",
+        "description": (
+            "Drops photoreal-human gates, penalises jpeg blocking and visible "
+            "signatures, routes photographs off-theme with booru-style captions."
+        ),
+    },
+    "photoreal_portrait": {
+        "headline": "Photoreal portrait curation with subject-lock",
+        "description": (
+            "Person-focused preset with subject and identity checks — retained "
+            "for portrait, influencer and LoRA-training workflows."
+        ),
+    },
+    "quality_only": {
+        "headline": "Topic-agnostic technical-quality triage",
+        "description": (
+            "Routes purely on OVR_Quality_Score: Top / Mid / Low buckets. Ignores "
+            "subject matter, great for de-duplicating a mixed archive."
+        ),
+    },
+    "video_default": {
+        "headline": "General video-clip triage with motion gating",
+        "description": (
+            "Motion-first equivalent of the default preset: rewards coherent "
+            "movement, routes frozen frames to StaticShot."
+        ),
+    },
+    "video_cinematic": {
+        "headline": "Film-look and cinematic camera-move curation",
+        "description": (
+            "Rewards deliberate dolly/tracking/crane moves and motivated grade; "
+            "routes casual handheld and webcam footage to Amateur."
+        ),
+    },
+    "video_anime": {
+        "headline": "Animation and 2D-motion video datasets",
+        "description": (
+            "Reward drawn / cel / rendered motion with smooth in-betweens; "
+            "routes live-action footage off-theme to LiveAction."
+        ),
+    },
+    "video_product": {
+        "headline": "Product turntable and demo-clip curation",
+        "description": (
+            "Rewards clean 360 / orbit / controlled push-in motion on a single "
+            "product; splits in-use lifestyle motion into its own bucket."
+        ),
+    },
+    "video_nature": {
+        "headline": "Wildlife, landscape and drone video curation",
+        "description": (
+            "Rewards subject-sharp nature footage with smooth aerial / tracking "
+            "motion; routes captive / aquarium scenes off-theme."
+        ),
+    },
+}
+
+
+# ── 2–3 example use cases per preset (dashboard comparison card grid) ────────
+# Each string <= 80 chars, imperative or noun-phrase, real-world enough to help
+# a new user pick the right starter without reading the full theme_rules.
+_PRESET_USE_CASES: dict[str, tuple[str, ...]] = {
+    "default": (
+        "Fresh install / first-time triage of a mixed folder",
+        "Prepping a general SD or SDXL fine-tune dataset",
+        "Quick relevance + quality pass before tagging",
+    ),
+    "aerial_drone": (
+        "Drone-photography LoRA training set",
+        "Real-estate and land-survey aerial catalogue",
+        "Mapping / GIS overhead imagery curation",
+    ),
+    "underwater_marine": (
+        "Reef and marine-life photography portfolio",
+        "Dive-log culling from a scuba trip",
+        "Marine-biology reference dataset",
+    ),
+    "wildlife_macro": (
+        "Bird / mammal photography portfolio triage",
+        "Macro-insect LoRA training set",
+        "Nature-magazine submission shortlist",
+    ),
+    "product_ecommerce": (
+        "Shopify / Amazon catalogue packshot QA",
+        "Studio-photography LoRA training set",
+        "Splitting lifestyle vs studio shots for A/B tests",
+    ),
+    "anime_illustration": (
+        "Character-illustration LoRA training set",
+        "Manga / doujin scrape curation",
+        "Digital-art portfolio triage without photos leaking in",
+    ),
+    "photoreal_portrait": (
+        "LoRA training set for a specific face",
+        "Actor or model lookbook curation",
+        "Portrait-shoot delivery shortlist",
+    ),
+    "quality_only": (
+        "De-duping and pruning a legacy stock archive",
+        "Topic-agnostic OVR score sort of a mixed folder",
+        "Backup-drive cleanup by technical quality",
+    ),
+    "video_default": (
+        "General b-roll / stock-clip triage",
+        "Motion-dataset prep for a video model fine-tune",
+        "First-pass cull of a raw scrape of AI video clips",
+    ),
+    "video_cinematic": (
+        "Cinematic LoRA / motion-model training set",
+        "Show-reel shortlist from a director's archive",
+        "Ad-agency mood-reel curation",
+    ),
+    "video_anime": (
+        "Sakuga / key-animation clip dataset",
+        "Anime AMV source-footage triage",
+        "2D-motion model fine-tune dataset prep",
+    ),
+    "video_product": (
+        "Turntable / 360-spin catalogue QA",
+        "Shopify product-video moderation",
+        "Product-demo motion-model training set",
+    ),
+    "video_nature": (
+        "Wildlife documentary rough-cut culling",
+        "Drone-landscape reel curation",
+        "Nature-clip stock-library ingestion",
+    ),
+}
+
+
+def get_preset_display_meta(key: str) -> dict:
+    """Return the dashboard-facing metadata bundle for a built-in preset.
+
+    Shape: ``{"key", "name", "headline", "description"}``. ``name`` is the
+    user-friendly display name (Title Case, spaces), ``headline`` and
+    ``description`` come from :data:`PRESET_DESCRIPTIONS`.
+
+    Raises ``KeyError`` for an unknown key so callers don't silently fall back
+    to a stale entry — the dashboard should only ask for keys it discovered
+    via :data:`PRESET_NAMES`.
+    """
+    meta = PRESET_DESCRIPTIONS[key]  # KeyError intentional on unknown
+    display_name = key.replace("_", " ").title()
+    return {
+        "key": key,
+        "name": display_name,
+        "headline": meta["headline"],
+        "description": meta["description"],
+    }
+
+
+def preset_use_cases(key: str) -> list[str]:
+    """Return 2-3 short (<=80 char) example use cases for a built-in preset.
+
+    Used by the dashboard's preset-comparison card grid to help a user pick a
+    starter without reading the full rules block. Returns an empty list for an
+    unknown key (safer than raising for a purely descriptive helper).
+    """
+    return list(_PRESET_USE_CASES.get(key, ()))
+
+
+def preset_headline(key: str) -> str:
+    """Return the short one-line headline for a preset key, or empty string
+    if unknown. Callers that want just the flat headline (e.g. dashboard
+    picker labels) can use this instead of ``get_preset_display_meta(key)``.
+    """
+    entry = PRESET_DESCRIPTIONS.get(key)
+    return entry["headline"] if isinstance(entry, dict) else ""
 
 
 # ── shared judgement-rule preamble ───────────────────────────────────────────
@@ -748,3 +950,15 @@ PRESET_NAMES: tuple[str, ...] = tuple(_PRESETS.keys())
 def builtin_library() -> dict:
     """Return a fresh {default, presets} library (safe for the caller to mutate)."""
     return {"default": DEFAULT_PRESET, "presets": copy.deepcopy(_PRESETS)}
+
+
+# Import-time guard: every shipped preset MUST carry human-facing metadata so
+# the dashboard preset picker + comparison grid can never render a blank card.
+# Fail loudly here rather than surfacing a KeyError deep inside the UI code.
+_missing_meta = tuple(k for k in PRESET_NAMES if k not in PRESET_DESCRIPTIONS)
+if _missing_meta:  # pragma: no cover - defensive; caught in CI on new presets
+    raise RuntimeError(
+        "PRESET_DESCRIPTIONS is missing entries for: "
+        f"{_missing_meta}. Add a headline + description for each key."
+    )
+del _missing_meta

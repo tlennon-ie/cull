@@ -25,8 +25,11 @@ Timeout is 8 seconds; responses are mapped to clear user-facing messages.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import ipaddress
+import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -81,13 +84,48 @@ def _http_request(
 # ---------------------------------------------------------------------------
 # Result builder helpers
 # ---------------------------------------------------------------------------
+#
+# ``verified`` and ``warning`` are additive fields that the dashboard already
+# renders. ``verified=True`` means the check exchanged a real authenticated
+# round-trip with the target service (not just a structural sanity pass);
+# ``warning`` carries an amber note for "ok but not fully verified" results so
+# a user can see WHY a green tick has an asterisk next to it. Both default to
+# safe values so every legacy caller (and every existing test that only reads
+# ``ok``/``message``/``latency_ms``/``detail``) sees the same behaviour.
 
-def _ok(message: str, latency_ms: int | None = _NO_LATENCY, detail: str = "") -> dict:
-    return {"ok": True, "message": message, "latency_ms": latency_ms, "detail": detail}
+def _ok(
+    message: str,
+    latency_ms: int | None = _NO_LATENCY,
+    detail: str = "",
+    *,
+    verified: bool = True,
+    warning: str = "",
+) -> dict:
+    return {
+        "ok": True,
+        "message": message,
+        "latency_ms": latency_ms,
+        "detail": detail,
+        "verified": verified,
+        "warning": warning,
+    }
 
 
-def _fail(message: str, latency_ms: int | None = _NO_LATENCY, detail: str = "") -> dict:
-    return {"ok": False, "message": message, "latency_ms": latency_ms, "detail": detail}
+def _fail(
+    message: str,
+    latency_ms: int | None = _NO_LATENCY,
+    detail: str = "",
+    *,
+    warning: str = "",
+) -> dict:
+    return {
+        "ok": False,
+        "message": message,
+        "latency_ms": latency_ms,
+        "detail": detail,
+        "verified": False,
+        "warning": warning,
+    }
 
 
 def _unsupported(name: str) -> dict:
@@ -149,17 +187,25 @@ def _status_to_result(
     latency_ms: int,
     *,
     detail: str = "",
+    host: str = "",
 ) -> dict:
+    """Map an HTTP status to a scraper test result.
+
+    ``host`` is included in the error message so a failed check tells the
+    operator WHICH host was hit (invaluable when a scraper has multiple
+    upstreams / a CDN split / a moving API version).
+    """
     if 200 <= status < 300:
         return _ok("authenticated OK", latency_ms=latency_ms, detail=detail)
+    host_suffix = f" [host: {host}]" if host else ""
     if status in (401, 403):
         return _fail(
-            f"auth rejected (HTTP {status}) — check key/cookies/token",
+            f"auth rejected (HTTP {status}) — check key/cookies/token{host_suffix}",
             latency_ms=latency_ms,
             detail=detail,
         )
     return _fail(
-        f"unexpected HTTP {status}",
+        f"unexpected HTTP {status}{host_suffix}",
         latency_ms=latency_ms,
         detail=detail,
     )
@@ -179,28 +225,36 @@ def _live_call(
     """Call _http_request, measure latency, and return a typed result dict.
 
     Exceptions from _http_request are caught so test_scraper never raises.
+    Network errors carry the host name in the user-facing message so a failed
+    live probe tells the operator which upstream is unreachable.
     """
+    host = ""
+    try:
+        host = (urlparse(url).hostname or "")
+    except Exception:  # noqa: BLE001 - never let a URL parse block a probe
+        host = ""
+    host_suffix = f" [host: {host}]" if host else ""
     t0 = time.monotonic()
     try:
         status, body = _http_request(method, url, headers=headers, timeout=_TIMEOUT)
         latency_ms = int((time.monotonic() - t0) * 1000)
         # Never forward the raw response body to the client by default — it could
         # echo token hints or internal error text. Callers pass an explicit detail.
-        return _status_to_result(status, latency_ms, detail=detail or "")
+        return _status_to_result(status, latency_ms, detail=detail or "", host=host)
     except requests.exceptions.Timeout:
         return _fail(
-            "could not connect (timed out)",
+            f"could not connect (timed out){host_suffix}",
             detail=f"GET {url} timed out after {_TIMEOUT}s",
         )
     except requests.exceptions.ConnectionError as exc:
         return _fail(
-            "could not connect (connection error)",
+            f"could not connect (connection error){host_suffix}",
             detail=str(exc)[:200],
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("_live_call unexpected error for %s: %s", url, exc)
         return _fail(
-            f"could not connect (error: {type(exc).__name__})",
+            f"could not connect (error: {type(exc).__name__}){host_suffix}",
             detail=str(exc)[:200],
         )
 
@@ -209,40 +263,61 @@ def _live_call(
 # Per-scraper check functions
 # ---------------------------------------------------------------------------
 
+_CIVITAI_NSFW_HINT = (
+    "NSFW visibility depends on the 'Mature content' toggle in your "
+    "Civitai account settings (civitai.com/user/account) — flip it on "
+    "there if the scraper is only returning SFW results."
+)
+
+
 def _check_civitai_com(config: dict, env: dict | None) -> dict:
     """Civitai.com — requires CIVITAI_API_KEY.
 
     Live call: GET https://civitai.com/api/v1/images?limit=1
-    with Authorization: Bearer <key>.
+    with Authorization: Bearer <key>. A 200 confirms the KEY works; note that
+    NSFW content visibility is a separate per-account toggle on Civitai (see
+    ``_CIVITAI_NSFW_HINT``) that no API probe can flip from here — we surface
+    that fact in the detail string so a puzzled user knows where to look.
     """
     key = _get("CIVITAI_API_KEY", env)
     if key is None:
         return _fail("CIVITAI_API_KEY not set")
     headers = {"Authorization": f"Bearer {key}"}
-    return _live_call(
+    result = _live_call(
         "GET",
         "https://civitai.com/api/v1/images?limit=1",
         headers=headers,
         detail="civitai.com images API",
     )
+    if result.get("ok"):
+        # Preserve caller-facing message; extend detail with the NSFW hint.
+        result = dict(result)
+        base_detail = result.get("detail") or "civitai.com images API"
+        result["detail"] = f"{base_detail} — {_CIVITAI_NSFW_HINT}"
+    return result
 
 
 def _check_civitai_red(config: dict, env: dict | None) -> dict:
     """Civitai.red — prefers CIVITAI_API_RED_KEY, falls back to CIVITAI_API_KEY.
 
     Live call: GET https://civitai.red/api/v1/images?limit=1
-    with Authorization: Bearer <key>.
+    with Authorization: Bearer <key>. Same NSFW-toggle caveat as .com applies.
     """
     key = _get("CIVITAI_API_RED_KEY", env) or _get("CIVITAI_API_KEY", env)
     if key is None:
         return _fail("CIVITAI_API_RED_KEY (or CIVITAI_API_KEY) not set")
     headers = {"Authorization": f"Bearer {key}"}
-    return _live_call(
+    result = _live_call(
         "GET",
         "https://civitai.red/api/v1/images?limit=1",
         headers=headers,
         detail="civitai.red images API",
     )
+    if result.get("ok"):
+        result = dict(result)
+        base_detail = result.get("detail") or "civitai.red images API"
+        result["detail"] = f"{base_detail} — {_CIVITAI_NSFW_HINT}"
+    return result
 
 
 # Public web bearer token embedded in x.com's own JavaScript. NOT a secret — it
@@ -256,7 +331,15 @@ _TWITTER_WEB_BEARER = (
 
 
 def _parse_cookie_pairs(raw: str) -> dict[str, str]:
-    """Parse a raw ``name=value; name2=value2`` Cookie header into a dict."""
+    """Parse a raw ``name=value; name2=value2`` Cookie header into a dict.
+
+    Tolerates a ``Cookie:`` prefix (users often paste the entire request header
+    line, header name and all) so we don't reject a well-formed paste on a
+    trivial format quirk.
+    """
+    raw = (raw or "").strip()
+    if raw[:7].lower() == "cookie:":
+        raw = raw[7:].strip()
     out: dict[str, str] = {}
     for part in raw.split(";"):
         if "=" in part:
@@ -265,21 +348,112 @@ def _parse_cookie_pairs(raw: str) -> dict[str, str]:
     return out
 
 
+def _read_netscape_cookies(path: str) -> tuple[dict[str, str], int | None, str | None]:
+    """Read a Netscape cookies.txt file into (name→value, nearest_expiry, err).
+
+    Never raises. On malformed content, returns whatever we could parse plus an
+    error string so the caller can surface it as a warning (rather than
+    crashing the test). ``nearest_expiry`` is the SMALLEST non-zero ``expires``
+    timestamp across all cookies, or ``None`` if no cookie declared one — used
+    to warn the user when their session is about to lapse.
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        return {}, None, f"cookies file not found: {p}"
+    if not p.is_file():
+        return {}, None, f"cookies path is not a file: {p}"
+
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {}, None, f"could not read cookies file ({exc})"
+
+    first_line = raw.splitlines()[0] if raw else ""
+    header_ok = first_line.strip().lower().startswith("# netscape http cookie file")
+
+    cookies: dict[str, str] = {}
+    nearest: int | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Netscape format: domain \t include_subdomains \t path \t secure \t expires \t name \t value
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        try:
+            expires = int(parts[4])
+        except ValueError:
+            expires = 0
+        name = parts[5].strip()
+        value = parts[6].strip()
+        if not name:
+            continue
+        cookies[name] = value
+        # 0 = session cookie (no persistent expiry); skip it for the "nearest"
+        # bookkeeping so a mix of session + persistent cookies doesn't spam us.
+        if expires > 0 and (nearest is None or expires < nearest):
+            nearest = expires
+
+    err = None if header_ok else (
+        "cookies file present but missing the '# Netscape HTTP Cookie File' "
+        "header — parsed anyway, but re-export from your browser if this fails"
+    )
+    return cookies, nearest, err
+
+
+def _load_x_cookies(env: dict | None) -> tuple[dict[str, str], str, int | None, str | None]:
+    """Resolve X cookies from either an env-string OR an on-disk Netscape file.
+
+    Returns (cookies_map, raw_cookie_header, nearest_expiry_unix, error_or_None).
+    The raw header is what the live HTTP probe will send in the ``Cookie:``
+    header; if the source was a file, we reconstruct it as ``k=v; k2=v2``.
+    """
+    txt_path = _get("X_COOKIES_TXT", env)
+    if txt_path:
+        cookies, nearest, err = _read_netscape_cookies(txt_path)
+        header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        return cookies, header, nearest, err
+
+    raw = _get("TWITTER_COOKIES", env)
+    if raw is None:
+        return {}, "", None, "TWITTER_COOKIES not set"
+
+    stripped = raw.strip()
+    if stripped[:7].lower() == "cookie:":
+        stripped = stripped[7:].strip()
+    return _parse_cookie_pairs(stripped), stripped, None, None
+
+
 def _check_x_com(config: dict, env: dict | None) -> dict:
     """X.com — verify a logged-in cookie string actually authenticates.
 
-    Stage 1 (offline): the cookie string must contain both ``auth_token`` and
-    ``ct0`` (paste the FULL ``Cookie:`` header from a logged-in x.com request).
-    Stage 2 (live): GET v1.1 ``account/verify_credentials.json`` with the public
-    web bearer + ``x-csrf-token: <ct0>`` + the cookies. A cookie-ONLY request
+    Two ways to supply the session:
+      * ``TWITTER_COOKIES`` — raw ``name=value; name2=value2`` header (what most
+        users paste from a browser's Dev Tools). Sessions have no on-disk
+        expiry metadata; only the live probe can tell us if they're stale.
+      * ``X_COOKIES_TXT`` — a Netscape cookies.txt path. Preferred when
+        available because we can also parse the ``expires`` column and warn
+        early ("cookies present but session appears expired — re-export").
+
+    Stage 1 (offline): the cookie set must contain both ``auth_token`` and
+    ``ct0`` (paste the FULL ``Cookie:`` header from a logged-in x.com request,
+    or export a full cookies.txt).
+    Stage 2 (live): GET v1.1 ``account/settings.json`` with the public web
+    bearer + ``x-csrf-token: <ct0>`` + the cookies. A cookie-ONLY request
     always 401s, which is why the old check failed for valid cookies; with the
     bearer + csrf, 200 == the session is live, 401/403 == expired/invalid.
     """
-    raw_cookies = _get("TWITTER_COOKIES", env)
-    if raw_cookies is None:
-        return _fail("TWITTER_COOKIES not set")
+    cookies, raw_cookie_header, nearest_expiry, load_err = _load_x_cookies(env)
 
-    cookies = _parse_cookie_pairs(raw_cookies)
+    # If the operator explicitly pointed us at a cookies.txt file that we could
+    # not read, that's the failure — say so BEFORE the structural check runs.
+    if load_err and _get("X_COOKIES_TXT", env):
+        return _fail(load_err, detail="X_COOKIES_TXT")
+
+    if not cookies and load_err:
+        return _fail(load_err)
+
     if "auth_token" not in cookies:
         return _fail(
             "TWITTER_COOKIES missing 'auth_token' — paste the FULL Cookie header "
@@ -291,10 +465,31 @@ def _check_x_com(config: dict, env: dict | None) -> dict:
             "logged-in x.com request (auth_token=...; ct0=...; ...)"
         )
 
+    # Early expiry warning (only possible when we have persistent expiry data,
+    # i.e. cookies came from a Netscape file). Sub-7-days = amber; already
+    # expired = red — but only when nearest_expiry actually pins auth_token
+    # / ct0. To avoid crying wolf on a session cookie in the mix we required
+    # ``expires > 0`` in the parser.
+    expiry_warning = ""
+    if nearest_expiry is not None:
+        now = int(time.time())
+        remaining = nearest_expiry - now
+        if remaining <= 0:
+            return _fail(
+                "cookies present but session appears expired — re-export from "
+                "browser (cookies.txt)",
+                detail=f"expired {abs(remaining)}s ago",
+            )
+        if remaining < 7 * 86400:
+            days = max(1, remaining // 86400)
+            expiry_warning = (
+                f"cookies expire in ~{days} day(s) — re-export soon from browser"
+            )
+
     headers = {
         "Authorization": _TWITTER_WEB_BEARER,
         "x-csrf-token": cookies["ct0"],
-        "Cookie": raw_cookies,
+        "Cookie": raw_cookie_header,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
@@ -321,8 +516,13 @@ def _check_x_com(config: dict, env: dict | None) -> dict:
         last_status = status
         latency_ms = int((time.monotonic() - t0) * 1000)
         if 200 <= status < 300:
-            return _ok("authenticated — session is live", latency_ms=latency_ms,
-                       detail="x.com account settings")
+            return _ok(
+                "authenticated — session is live",
+                latency_ms=latency_ms,
+                detail="x.com account settings",
+                verified=True,
+                warning=expiry_warning,
+            )
         if status in (401, 403):
             return _fail(
                 f"auth rejected (HTTP {status}) — cookies are invalid or expired; "
@@ -331,11 +531,21 @@ def _check_x_com(config: dict, env: dict | None) -> dict:
         # 404 / other -> endpoint moved; fall through to the next candidate.
     latency_ms = int((time.monotonic() - t0) * 1000)
     note = f"x.com API returned HTTP {last_status}" if last_status else "x.com API unreachable"
+    amber = (
+        "structural only, live not verified — the scraper signs in with a "
+        "real browser (Playwright) so valid cookies should still work"
+    )
+    if expiry_warning:
+        amber = f"{amber} · {expiry_warning}"
     return _ok(
         "cookies look valid (auth_token + ct0 present) — could NOT verify live "
         f"({note}); the scraper signs in with a real browser, so valid cookies "
         "should still work",
-        latency_ms=latency_ms, detail="structural check only")
+        latency_ms=latency_ms,
+        detail="structural check only",
+        verified=False,
+        warning=amber,
+    )
 
 
 def _check_discord(config: dict, env: dict | None) -> dict:
@@ -344,7 +554,10 @@ def _check_discord(config: dict, env: dict | None) -> dict:
     Auth mode (DISCORD_AUTH_MODE): 'bot' -> 'Bot <token>', 'user' -> raw token.
     Default ('auto') starts as 'Bot <token>' per scraper_discord.py behaviour.
 
-    Live call: GET https://discord.com/api/v10/users/@me
+    Live call: GET https://discord.com/api/v10/users/@me — returns the
+    authenticated user object (bot or user). A 401 here means the token is
+    wrong for the current mode; the operator's usual fix is to flip
+    DISCORD_AUTH_MODE between ``bot`` / ``user`` and retry.
     """
     token = _get("DISCORD_BOT_TOKEN", env)
     if token is None:
@@ -358,29 +571,46 @@ def _check_discord(config: dict, env: dict | None) -> dict:
         auth_header = f"Bot {token}"
 
     headers = {"Authorization": auth_header}
-    return _live_call(
+    result = _live_call(
         "GET",
         "https://discord.com/api/v10/users/@me",
         headers=headers,
         detail=f"discord users/@me (mode={auth_mode})",
     )
+    # On a 401 in "bot" or "auto" mode, the token is very likely a personal
+    # user token — surface the actionable fix (flip mode) in the warning so
+    # the operator doesn't need to grep the scraper docs.
+    if not result["ok"] and auth_mode in ("bot", "auto"):
+        msg = result.get("message", "")
+        if "401" in msg or "auth rejected" in msg.lower():
+            result = dict(result)
+            result["warning"] = (
+                "token rejected as a bot — if this is a user account token, "
+                "set DISCORD_AUTH_MODE=user in Global Settings"
+            )
+    return result
 
 
 def _check_reddit(config: dict, env: dict | None) -> dict:
     """Reddit — REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET enable OAuth token fetch.
 
-    If credentials are absent, do a simple public ping of the Reddit JSON API
-    to confirm basic connectivity (scraper_web.py uses unauthenticated requests).
+    If credentials are absent, do a simple public ping of a KNOWN-GOOD listing
+    to confirm both connectivity AND that Reddit isn't 403-ing our default UA.
+    Reddit's anti-bot filter blocks generic UAs — we use a real Chrome UA plus
+    an ``Accept: application/json`` header so the probe mirrors the browser
+    session the scraper actually uses at runtime.
 
     With credentials: POST https://www.reddit.com/api/v1/access_token
-    Without:          GET  https://www.reddit.com/r/all.json?limit=1 (public ping)
-
-    Both paths are routed through _http_request (or _http_request_with_basic_auth)
-    so tests can monkeypatch either helper.
+    Without:          GET  https://www.reddit.com/r/pics/hot.json?limit=1
     """
     client_id = _get("REDDIT_CLIENT_ID", env)
     client_secret = _get("REDDIT_CLIENT_SECRET", env)
-    user_agent = _get("REDDIT_USER_AGENT", env) or "cull/test"
+    user_agent = _get("REDDIT_USER_AGENT", env) or (
+        # Match the real scraper's default UA (scraper_web.py). Reddit 403s the
+        # generic "python-requests/*" and "cull/test" UAs; a Chrome UA passes.
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
 
     if client_id and client_secret:
         # OAuth client-credentials token fetch via the testable helper
@@ -410,16 +640,26 @@ def _check_reddit(config: dict, env: dict | None) -> dict:
         except Exception as exc:  # noqa: BLE001
             return _fail(f"could not connect (error: {type(exc).__name__})", detail=str(exc)[:200])
     else:
-        # No credentials — unauthenticated public ping
+        # No credentials — unauthenticated public ping against a known-good
+        # subreddit (r/pics is huge, public, and not quarantined), with the
+        # ``Accept`` header the scraper actually sends. This catches Reddit's
+        # UA-based 403 filter that a bare ``/r/all.json`` probe would miss.
         result = _live_call(
             "GET",
-            "https://www.reddit.com/r/all.json?limit=1",
-            headers={"User-Agent": user_agent},
+            "https://www.reddit.com/r/pics/hot.json?limit=1",
+            headers={
+                "User-Agent": user_agent,
+                "Accept": "application/json",
+            },
             detail="reddit public JSON API (no credentials)",
         )
         if result["ok"]:
             result = dict(result)
-            result["message"] = "public API reachable (no OAuth credentials configured)"
+            result["message"] = (
+                "public API reachable (no OAuth credentials configured) — "
+                "the scraper uses a real browser (Playwright) at runtime, "
+                "which bypasses Reddit's raw-UA 403s automatically"
+            )
         return result
 
 
@@ -450,38 +690,347 @@ def _check_web(config: dict, env: dict | None) -> dict:
 def _check_gallery_dl(config: dict, env: dict | None) -> dict:
     """Gallery-DL — offline checks only (import + optional file paths).
 
-    1. gallery_dl package must be importable.
-    2. If config['cookies_file'] is set, the file must exist on disk.
-    3. If config['config_path'] is set, the file must exist on disk.
+    1. ``gallery_dl`` package must be importable (and its version resolvable —
+       a truly corrupt install imports but has no ``__version__``).
+    2. If config['cookies_file'] is set, the file must exist AND parse as
+       Netscape format (the format gallery-dl accepts).
+    3. If config['config_path'] is set, the file must exist AND be valid JSON.
 
-    No live HTTP (gallery-dl handles site auth internally).
+    No live HTTP (gallery-dl handles site auth internally). Per-URL live
+    verification is a separate entry point — ``_check_gallery_dl_url`` — used
+    by the dashboard's "Test this URL" button.
     """
     try:
         import gallery_dl  # noqa: F401
-    except Exception:  # noqa: BLE001 - corrupt install / missing transitive dep
+    except ImportError as exc:
         return _fail(
-            "gallery-dl not importable — ensure it is in requirements.txt and "
-            "your virtualenv is active"
+            "gallery-dl not importable — install it via `pip install -r "
+            f"requirements.txt` in your virtualenv (import error: {exc})"
         )
+    except Exception as exc:  # noqa: BLE001 - corrupt install / missing transitive dep
+        return _fail(
+            "gallery-dl import failed unexpectedly — reinstall via "
+            f"`pip install --force-reinstall gallery-dl` ({type(exc).__name__}: {exc})"
+        )
+
+    version = getattr(gallery_dl, "__version__", None) or "unknown"
 
     if isinstance(config, dict):
         cookies_file = config.get("cookies_file")
         if cookies_file and isinstance(cookies_file, str):
-            if not Path(cookies_file).exists():
+            cookies_path = Path(cookies_file).expanduser()
+            if not cookies_path.exists():
                 return _fail(
                     f"cookies_file not found: {cookies_file}",
                     detail="check GALLERY_DL_COOKIES_FILE path",
                 )
+            if not cookies_path.is_file():
+                return _fail(
+                    f"cookies_file is not a regular file: {cookies_file}",
+                    detail="check GALLERY_DL_COOKIES_FILE path",
+                )
+            # Best-effort Netscape header check — non-fatal if the header is
+            # missing (gallery-dl itself is tolerant) but surface as a warning.
+            try:
+                head = cookies_path.read_text(encoding="utf-8", errors="replace")[:512]
+            except OSError as exc:
+                return _fail(
+                    f"cookies_file unreadable: {exc}",
+                    detail=str(cookies_path),
+                )
+            if not head.lstrip().lower().startswith("# netscape http cookie file"):
+                return _ok(
+                    f"gallery-dl v{version} installed; cookies_file present "
+                    "but missing 'Netscape HTTP Cookie File' header",
+                    verified=False,
+                    warning=(
+                        "cookies_file lacks the Netscape header — re-export "
+                        "from your browser as cookies.txt if auth fails"
+                    ),
+                )
 
         config_path = config.get("config_path")
         if config_path and isinstance(config_path, str):
-            if not Path(config_path).exists():
+            cfg = Path(config_path).expanduser()
+            if not cfg.exists():
                 return _fail(
                     f"config_path not found: {config_path}",
                     detail="check GALLERY_DL_CONFIG_PATH",
                 )
+            if not cfg.is_file():
+                return _fail(
+                    f"config_path is not a regular file: {config_path}",
+                    detail="check GALLERY_DL_CONFIG_PATH",
+                )
+            # JSON validation — a syntactically broken config is a very common
+            # failure mode we should catch here rather than at scraper startup.
+            try:
+                json.loads(cfg.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError) as exc:
+                return _fail(
+                    f"config_path is not valid JSON: {exc}",
+                    detail=str(cfg),
+                )
 
-    return _ok("gallery-dl installed and config paths verified")
+    return _ok(f"gallery-dl v{version} installed and config paths verified")
+
+
+_GALLERY_DL_URL_TIMEOUT = 10.0
+
+
+def _iter_gallery_dl_extractor(extr: Any, max_items: int) -> list[str]:
+    """Iterate a gallery-dl extractor, returning up to `max_items` file URLs.
+
+    Filters for ``Message.Url`` entries (skips Directory / Queue messages).
+    """
+    from gallery_dl.extractor.message import Message  # local import
+
+    urls: list[str] = []
+    for msg in extr:
+        if not isinstance(msg, tuple) or len(msg) < 2:
+            continue
+        kind = msg[0]
+        if kind == Message.Url:
+            url_val = msg[1]
+            if isinstance(url_val, str):
+                urls.append(url_val)
+                if len(urls) >= max_items:
+                    break
+        elif kind == Message.Queue:
+            # Sub-gallery link — count the queued URL as a sample too so users
+            # can see a listing page yields links, without descending into it.
+            queued = msg[1]
+            if isinstance(queued, str):
+                urls.append(queued)
+                if len(urls) >= max_items:
+                    break
+    return urls
+
+
+def _check_gallery_dl_url(
+    url: str,
+    cookies_txt: str | None = None,
+    config_json: str | None = None,
+    max_items_estimate: int = 5,
+) -> dict:
+    """Verify a URL via gallery-dl in dry-run mode.
+
+    Runs the URL through gallery-dl's extractor machinery WITHOUT downloading
+    any files. Returns a dict describing which extractor matched, its category,
+    and a small sample of file URLs the extractor would have downloaded.
+
+    Parameters
+    ----------
+    url : str
+        The URL to probe. Must be http(s).
+    cookies_txt : str | None
+        Optional Netscape cookies.txt contents. Written to a temp file for the
+        duration of the probe; the file is deleted in a ``finally`` block so
+        cookie material never leaks past this call.
+    config_json : str | None
+        Optional inline gallery-dl config (JSON object string). Merged over
+        the module defaults for the duration of the probe.
+    max_items_estimate : int
+        Cap the sample of URLs returned. Iteration stops as soon as we have
+        this many.
+
+    Returns
+    -------
+    dict with keys: ok, extractor, category, sample_urls, message, error.
+    """
+    empty: dict = {
+        "ok": False,
+        "extractor": None,
+        "category": None,
+        "sample_urls": [],
+        "message": "",
+        "error": None,
+    }
+
+    # ---- Basic validation --------------------------------------------------
+    if not isinstance(url, str) or not url.strip():
+        return {**empty, "error": "url is required", "message": "url is required"}
+    url = url.strip()
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except Exception:  # noqa: BLE001
+        return {**empty, "error": "invalid url", "message": "invalid url"}
+    if scheme not in ("http", "https"):
+        return {
+            **empty,
+            "error": "only http(s) URLs are allowed",
+            "message": "only http(s) URLs are allowed",
+        }
+
+    # ---- Import gallery-dl -------------------------------------------------
+    try:
+        from gallery_dl import extractor as gdl_extractor
+        from gallery_dl import config as gdl_config
+    except Exception as exc:  # noqa: BLE001 - not installed / corrupt install
+        return {
+            **empty,
+            "error": "gallery-dl not installed",
+            "message": f"gallery-dl not importable ({type(exc).__name__})",
+        }
+
+    # ---- Wire optional cookies + config inside a scoped try/finally --------
+    cookies_path: str | None = None
+    config_path: str | None = None
+    # Snapshot the module config so we can restore it on exit — gallery-dl's
+    # config is process-global, so leaking probe settings into a concurrent
+    # scraper run would misroute downloads.
+    original_config = None
+    try:
+        try:
+            original_config = json.loads(json.dumps(gdl_config._config))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - private attr fallback
+            original_config = None
+
+        if cookies_txt and isinstance(cookies_txt, str) and cookies_txt.strip():
+            fd, cookies_path = tempfile.mkstemp(
+                prefix="cull_gdl_cookies_", suffix=".txt"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(cookies_txt)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            gdl_config.set(("extractor",), "cookies", cookies_path)
+
+        if config_json and isinstance(config_json, str) and config_json.strip():
+            try:
+                cfg_data = json.loads(config_json)
+            except (ValueError, TypeError) as exc:
+                return {
+                    **empty,
+                    "error": f"config_json is not valid JSON: {exc}",
+                    "message": "config_json is not valid JSON",
+                }
+            if not isinstance(cfg_data, dict):
+                return {
+                    **empty,
+                    "error": "config_json must be a JSON object",
+                    "message": "config_json must be a JSON object",
+                }
+            fd, config_path = tempfile.mkstemp(
+                prefix="cull_gdl_config_", suffix=".json"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(cfg_data, fh)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            try:
+                gdl_config.load([config_path])
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    **empty,
+                    "error": f"could not load config_json: {exc}",
+                    "message": "could not apply config_json",
+                }
+
+        # ---- Identify the extractor ---------------------------------------
+        try:
+            extr = gdl_extractor.find(url)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                **empty,
+                "error": f"extractor.find failed: {type(exc).__name__}",
+                "message": "gallery-dl could not process this URL",
+            }
+        if extr is None:
+            return {
+                **empty,
+                "error": "URL not recognised",
+                "message": "no gallery-dl extractor matches this URL",
+            }
+
+        extractor_name = type(extr).__name__.lower()
+        category = getattr(extr, "category", None) or None
+
+        # ---- Iterate under a hard timeout ---------------------------------
+        try:
+            max_items = max(1, int(max_items_estimate))
+        except (TypeError, ValueError):
+            max_items = 5
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_iter_gallery_dl_extractor, extr, max_items)
+                sample_urls = future.result(timeout=_GALLERY_DL_URL_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            return {
+                "ok": False,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched, but the site did "
+                    f"not respond within {int(_GALLERY_DL_URL_TIMEOUT)}s"
+                ),
+                "error": "timed out",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gallery-dl iteration error for %s: %s", url, exc)
+            return {
+                "ok": False,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched but iteration failed"
+                ),
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+
+        if not sample_urls:
+            return {
+                "ok": True,
+                "extractor": extractor_name,
+                "category": category,
+                "sample_urls": [],
+                "message": (
+                    f"extractor '{extractor_name}' matched — no items to preview "
+                    "(gallery may be empty, private, or paginated)"
+                ),
+                "error": None,
+            }
+
+        return {
+            "ok": True,
+            "extractor": extractor_name,
+            "category": category,
+            "sample_urls": sample_urls,
+            "message": (
+                f"extractor '{extractor_name}' matched — "
+                f"{len(sample_urls)} sample item(s) previewed"
+            ),
+            "error": None,
+        }
+    finally:
+        # Restore config so a probe never leaks cookies/config into a live run.
+        try:
+            if original_config is not None:
+                gdl_config._config.clear()  # type: ignore[attr-defined]
+                gdl_config._config.update(original_config)  # type: ignore[attr-defined]
+            else:
+                gdl_config.clear()
+        except Exception:  # noqa: BLE001 - restoration is best-effort
+            pass
+        for path in (cookies_path, config_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def _check_local(config: dict, env: dict | None) -> dict:
@@ -531,6 +1080,24 @@ _CHECKERS = {
 
 
 # ---------------------------------------------------------------------------
+# Per-URL test registry (parallel to _CHECKERS / SUPPORTED)
+# ---------------------------------------------------------------------------
+# Some sources aren't scrapers per se — they're generic URL probes. gallery-dl
+# is the first: any URL a user pastes into the dashboard can be pre-flighted
+# to confirm gallery-dl recognises it and to preview a few items. The registry
+# below carries `kind="per_url"` so dashboards can route these to the right
+# UI (an input field for a URL, not a per-scraper Test button).
+SUPPORTED_URL_TESTS: dict[str, dict[str, Any]] = {
+    "gallery_dl_url": {
+        "label": "gallery-dl URL",
+        "check": _check_gallery_dl_url,
+        "requires": [],
+        "kind": "per_url",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -565,4 +1132,10 @@ def test_scraper(
         )
 
 
-__all__ = ["test_scraper", "SUPPORTED", "_http_request"]
+__all__ = [
+    "test_scraper",
+    "SUPPORTED",
+    "SUPPORTED_URL_TESTS",
+    "_check_gallery_dl_url",
+    "_http_request",
+]
