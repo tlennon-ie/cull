@@ -45,6 +45,7 @@ import job_config
 __all__ = [
     "PRESET_VERSION",
     "MAX_ENVELOPE_BYTES",
+    "SOFT_MAX_CATEGORIES",
     "ValidationError",
     "export_preset",
     "export_preset_bytes",
@@ -86,9 +87,17 @@ except Exception:  # noqa: BLE001 - fallback keeps the validator strict
 _VISION_PROVIDERS: frozenset[str] = frozenset(job_config.VISION_PROVIDERS)
 
 # Caps mirror the dashboard validators (single contract, two call sites).
-# 12 categories is the shipped ceiling — more than that swamps the vision
-# schema's enum + the UI grid becomes unusable.
-_MAX_CATEGORIES = 12
+# 12 categories is the RECOMMENDED ceiling — more than that swamps the vision
+# schema's enum + the UI grid becomes unusable — and the dashboard's own save
+# path (dashboard_enhanced._MAX_CATEGORIES) enforces it for new writes. The
+# import/envelope validator here keeps the older ``40`` ceiling so a preset
+# or job envelope carrying a pre-existing >12 category set from an older cull
+# still loads on upgrade — otherwise ``git pull`` on top of a hand-tuned
+# ``_presets.json`` (or a shared file from a friend) would refuse to import.
+# Callers that surface a soft-warning UI look at ``SOFT_MAX_CATEGORIES``.
+SOFT_MAX_CATEGORIES = 12
+_SOFT_MAX_CATEGORIES = SOFT_MAX_CATEGORIES  # legacy internal alias
+_MAX_CATEGORIES = 40
 _MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
 _MAX_HINT = 2000
@@ -137,13 +146,14 @@ def _require_object(value: Any, what: str) -> dict:
 
 # ── inheritable-config block validators (standalone port of the dashboard) ────
 
-def _validate_categories(cats: Any, *, required: bool) -> list[dict]:
+def _validate_categories(cats: Any, *, required: bool, cap: int | None = None) -> list[dict]:
+    limit = _MAX_CATEGORIES if cap is None else int(cap)
     if cats is None and not required:
         return []
     if not isinstance(cats, list) or (required and not cats):
         raise ValidationError("categories must be a non-empty list")
-    if len(cats) > _MAX_CATEGORIES:
-        raise ValidationError(f"too many categories (max {_MAX_CATEGORIES})")
+    if len(cats) > limit:
+        raise ValidationError(f"too many categories (max {limit})")
     seen: set[str] = set()
     cleaned: list[dict] = []
     for entry in cats:
@@ -461,18 +471,26 @@ def _validate_media(val: Any) -> dict:
     return out
 
 
-def validate_inheritable_cfg(cfg: Any, *, partial: bool) -> dict:
+def validate_inheritable_cfg(cfg: Any, *, partial: bool, category_cap: int | None = None) -> dict:
     """Validate a preset body (``partial=False``) or a job override map
     (``partial=True``); return a cleaned copy. Unknown top-level keys and bad
     block shapes raise :class:`ValidationError`. A full preset must carry
-    categories (they drive the schema enum)."""
+    categories (they drive the schema enum).
+
+    ``category_cap`` overrides the default category ceiling
+    (``_MAX_CATEGORIES``, the generous hard cap for envelope imports). The
+    dashboard's own PUT/POST paths pass ``_SOFT_MAX_CATEGORIES`` here so a
+    new save is refused above 12 while a legacy on-disk file still loads.
+    """
     _require_object(cfg, "config")
     out: dict[str, Any] = {}
     for key, value in cfg.items():
         if key not in _INHERITABLE_KEYS:
             raise ValidationError(f"unknown config key: {key!r}")
         if key == "categories":
-            out["categories"] = _validate_categories(value, required=not partial)
+            out["categories"] = _validate_categories(
+                value, required=not partial, cap=category_cap,
+            )
         elif key == "category_rules":
             if not isinstance(value, str):
                 raise ValidationError("category_rules must be a string")

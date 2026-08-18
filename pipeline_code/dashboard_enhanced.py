@@ -1512,9 +1512,17 @@ def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, 
     dashboard's job & preset save paths can never drift from config_io's
     importer/exporter validation. Adapts its raise-based API to the (clean, err)
     tuple the dashboard callers expect.
+
+    Enforces the SOFT category cap here (12 — mirrors ``_MAX_CATEGORIES``
+    above and the shipped preset ceiling) so a NEW dashboard save can't blow
+    past what the UI grid can comfortably render, while ``config_io``'s
+    envelope importer stays generous enough for a legacy on-disk file to
+    still load on upgrade (see ``config_io._MAX_CATEGORIES`` = 40).
     """
     try:
-        return config_io.validate_inheritable_cfg(cfg, partial=partial), ""
+        return config_io.validate_inheritable_cfg(
+            cfg, partial=partial, category_cap=config_io.SOFT_MAX_CATEGORIES,
+        ), ""
     except config_io.ValidationError as exc:
         return None, str(exc)
 

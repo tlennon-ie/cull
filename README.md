@@ -207,10 +207,38 @@ Each job is a plain JSON file at `data/jobs/<slug>.json` — just `subject`, the
 If you're coming from an older cull where everything lived in a flat `.env`, run the one-shot migration from the repo root (inside the venv):
 
 ```bash
-python tools/migrate_to_jobs.py
+python tools/migrate_to_jobs.py            # apply (default; idempotent)
+python tools/migrate_to_jobs.py --dry-run  # preview only, write nothing
 ```
 
 It seeds a `default` preset, captures your current `.env` as a `default` job (its settings stored as that job's overrides), and adopts any other slug already on disk as its own job — folding any legacy local-folder settings into the new local-folders list. **Your existing `data/queue/<slug>` and `data/sorted/<slug>` folders are not moved or touched** — the migration only writes the new job/preset JSON, so nothing is lost. It's safe to re-run (idempotent); the dashboard and supervisor also auto-create the `default` job on first launch if you skip the script, and old v1 job files auto-upgrade when read. Your old per-job `.env` keys become legacy seeds — once a job is active, its config takes over.
+
+### Upgrading from an older main (the user-acquisition wave)
+
+If you're already on the jobs model and you're just pulling the user-acquisition wave on top of an existing install, run the wave-upgrade audit — it's **read-only by default** and prints exactly what will change before you apply it:
+
+```bash
+python tools/migrate_wave.py             # dry-run: audit only, write nothing
+python tools/migrate_wave.py --check-only # audit + exit 1 on any WARN (CI hook)
+python tools/migrate_wave.py --apply      # run the idempotent migrations
+```
+
+What auto-migrates (no action required):
+
+- **Jobs, presets, index, schedules** load unchanged — every read path is tolerant of the pre-wave shape. A user-edited `_presets.json` with more than the new 12-category dashboard cap still loads (a warning surfaces the mismatch so you can trim it via the dashboard before editing).
+- **Kohya import** (`scrapers.kohya_import`) is added to every preset with `enabled=false` on first read — nothing runs until you point it at a dataset root.
+- **Legacy single-endpoint vision env vars** (`LMSTUDIO_PRIMARY_URL`, `OLLAMA_URL`, `OPENAI_COMPAT_URL`, …) fold into the default preset's `vision.workers` fleet on first supervisor start via `migrate_legacy_vision_to_fleet()` — only while the fleet still carries the shipped localhost default, so a customised fleet is never overwritten.
+- **SQLite index** (`data/cull_index.sqlite3`) is unchanged; the wave broadens the ingested-media set (images + video clips) without a schema change, so pre-existing rows keep working and video containers get discovered on the next scan.
+- **New `data/cost_ledger.json`** is created on first LLM call — nothing to migrate.
+
+What you should check post-upgrade:
+
+1. `python tools/migrate_wave.py` shows all sections `OK` (no `WARN`).
+2. Job list in the dashboard matches your pre-upgrade list.
+3. Queue/sorted counts on the Overview tab match what you had.
+4. If you had `>12` custom categories in a preset, trim the extras (dashboard warns and refuses new saves above the cap; the file still loads).
+
+Nothing is deleted or overwritten by the migration tools — a legacy preset that exceeds the current soft cap is **reported, not truncated**. If you need to preserve the older cap for a shared-file import, `import_preset` / `import_job` keep the hard `40` category ceiling.
 
 ## The dashboard
 
