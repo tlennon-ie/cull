@@ -189,14 +189,27 @@ CORS(app)
 #
 # Applied via after_request so every response, including /api/* JSON and
 # thumbnail bytes, carries the same guard-rails.
+# The dashboard loads Tailwind and Alpine.js from their CDNs, plus a Google
+# Font, all declared in the HTML_TEMPLATE below. The CSP must whitelist those
+# origins or the entire UI fails to style/render. `script-src-elem` and
+# `style-src-elem` are set explicitly so browsers that use those fallbacks
+# (rather than script-src/style-src) also load the assets. If you ever vendor
+# Tailwind + Alpine locally, drop the cdn.tailwindcss.com / unpkg.com origins
+# here and the whole surface tightens automatically.
+_CSP_SCRIPT_SRC = "'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com"
+_CSP_STYLE_SRC = "'self' 'unsafe-inline' https://fonts.googleapis.com"
+_CSP_FONT_SRC = "'self' data: https://fonts.gstatic.com"
+
 _SECURITY_HEADERS: dict[str, str] = {
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-        "style-src 'self' 'unsafe-inline'; "
+        f"script-src {_CSP_SCRIPT_SRC}; "
+        f"script-src-elem {_CSP_SCRIPT_SRC}; "
+        f"style-src {_CSP_STYLE_SRC}; "
+        f"style-src-elem {_CSP_STYLE_SRC}; "
         "img-src 'self' data: blob:; "
         "media-src 'self' blob:; "
-        "font-src 'self' data:; "
+        f"font-src {_CSP_FONT_SRC}; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
         "base-uri 'self'; "
