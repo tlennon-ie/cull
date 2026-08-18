@@ -277,9 +277,21 @@ def test_openai_sends_schema_and_parses(monkeypatch: pytest.MonkeyPatch) -> None
     assert rf["json_schema"]["name"] == "VisionClassification"
     assert "category" in rf["json_schema"]["schema"]["properties"]
     # The image must be sent as a data URL and the model name must be honoured.
+    # Post-perf-pass the OpenAI worker splits into system (long rubric, cached)
+    # + user (image + short reference) so we scan every message for the image
+    # block rather than assuming messages[0] carries it.
     assert kwargs["model"] == "gpt-test-vision"
-    content = kwargs["messages"][0]["content"]
-    image_block = next(b for b in content if b.get("type") == "image_url")
+    image_block = None
+    for msg in kwargs["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "image_url":
+                    image_block = b
+                    break
+        if image_block:
+            break
+    assert image_block is not None
     assert image_block["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 

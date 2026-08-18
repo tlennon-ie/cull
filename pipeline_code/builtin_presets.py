@@ -31,9 +31,269 @@ from __future__ import annotations
 
 import copy
 
-__all__ = ["DEFAULT_PRESET", "PRESET_NAMES", "builtin_library"]
+__all__ = [
+    "DEFAULT_PRESET",
+    "PRESET_NAMES",
+    "PRESET_DESCRIPTIONS",
+    "PRESET_TAGS",
+    "builtin_library",
+    "get_preset_display_meta",
+    "preset_use_cases",
+    "preset_headline",
+]
 
 DEFAULT_PRESET = "default"
+
+
+# Category tags for grouping/filtering presets in the UI. Each preset can carry
+# multiple tags; the dashboard uses these to render tag chips + a quick filter.
+PRESET_TAGS: dict[str, tuple[str, ...]] = {
+    "default": ("general", "photo"),
+    "aerial_drone": ("photo", "landscape"),
+    "underwater_marine": ("photo", "landscape"),
+    "wildlife_macro": ("photo", "nature"),
+    "product_ecommerce": ("photo", "product"),
+    "anime_illustration": ("art", "anime"),
+    "photoreal_portrait": ("photo", "portrait"),
+    "quality_only": ("general", "photo"),
+    "video_default": ("video", "general"),
+    "video_cinematic": ("video", "cinematic"),
+    "video_anime": ("video", "anime"),
+    "video_product": ("video", "product"),
+    "video_nature": ("video", "nature"),
+}
+
+
+# ── human-facing metadata for the shipped presets ────────────────────────────
+# Every key in ``PRESET_NAMES`` MUST have a matching ``PRESET_DESCRIPTIONS``
+# entry — the dashboard's preset picker + comparison grid rely on it. Adding a
+# new built-in preset without a metadata entry is a hard failure at import time
+# via the guard at the bottom of this module.
+#
+# Constraints (kept small on purpose so the dashboard card layout stays clean):
+#   - ``headline``   : <= 60 chars, sentence-case, no trailing period
+#   - ``description``: <= 180 chars, one clear sentence
+PRESET_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "default": {
+        "headline": "Broadly usable Keep/Borderline/OffTopic taxonomy",
+        "description": (
+            "Sensible defaults for any subject: quality + relevance gate, no "
+            "person constraints, safe for mixed AI-generated and real content."
+        ),
+    },
+    "aerial_drone": {
+        "headline": "Aerial, drone and satellite imagery curation",
+        "description": (
+            "Keeps elevated / top-down viewpoints, routes ground-level shots "
+            "off-theme, penalises haze and cloud occlusion."
+        ),
+    },
+    "underwater_marine": {
+        "headline": "Underwater, scuba and marine-life curation",
+        "description": (
+            "Keeps beneath-surface scenes with good visibility, routes "
+            "above-water shots off-theme, penalises murk and backscatter."
+        ),
+    },
+    "wildlife_macro": {
+        "headline": "Wildlife and macro-nature photography",
+        "description": (
+            "Rewards eye-sharp animal / macro subjects in natural habitats; "
+            "routes zoo, taxidermy and toy stand-ins to CaptiveStaged."
+        ),
+    },
+    "product_ecommerce": {
+        "headline": "Studio product and e-commerce packshots",
+        "description": (
+            "Rewards seamless backgrounds and even lighting; splits in-context "
+            "lifestyle shots into a separate bucket from clean packshots."
+        ),
+    },
+    "anime_illustration": {
+        "headline": "Anime, manga and drawn illustration datasets",
+        "description": (
+            "Drops photoreal-human gates, penalises jpeg blocking and visible "
+            "signatures, routes photographs off-theme with booru-style captions."
+        ),
+    },
+    "photoreal_portrait": {
+        "headline": "Photoreal portrait curation with subject-lock",
+        "description": (
+            "Person-focused preset with subject and identity checks — retained "
+            "for portrait, influencer and LoRA-training workflows."
+        ),
+    },
+    "quality_only": {
+        "headline": "Topic-agnostic technical-quality triage",
+        "description": (
+            "Routes purely on OVR_Quality_Score: Top / Mid / Low buckets. Ignores "
+            "subject matter, great for de-duplicating a mixed archive."
+        ),
+    },
+    "video_default": {
+        "headline": "General video-clip triage with motion gating",
+        "description": (
+            "Motion-first equivalent of the default preset: rewards coherent "
+            "movement, routes frozen frames to StaticShot."
+        ),
+    },
+    "video_cinematic": {
+        "headline": "Film-look and cinematic camera-move curation",
+        "description": (
+            "Rewards deliberate dolly/tracking/crane moves and motivated grade; "
+            "routes casual handheld and webcam footage to Amateur."
+        ),
+    },
+    "video_anime": {
+        "headline": "Animation and 2D-motion video datasets",
+        "description": (
+            "Reward drawn / cel / rendered motion with smooth in-betweens; "
+            "routes live-action footage off-theme to LiveAction."
+        ),
+    },
+    "video_product": {
+        "headline": "Product turntable and demo-clip curation",
+        "description": (
+            "Rewards clean 360 / orbit / controlled push-in motion on a single "
+            "product; splits in-use lifestyle motion into its own bucket."
+        ),
+    },
+    "video_nature": {
+        "headline": "Wildlife, landscape and drone video curation",
+        "description": (
+            "Rewards subject-sharp nature footage with smooth aerial / tracking "
+            "motion; routes captive / aquarium scenes off-theme."
+        ),
+    },
+}
+
+
+# ── 2–3 example use cases per preset (dashboard comparison card grid) ────────
+# Each string <= 80 chars, imperative or noun-phrase, real-world enough to help
+# a new user pick the right starter without reading the full theme_rules.
+_PRESET_USE_CASES: dict[str, tuple[str, ...]] = {
+    "default": (
+        "Fresh install / first-time triage of a mixed folder",
+        "Prepping a general SD or SDXL fine-tune dataset",
+        "Quick relevance + quality pass before tagging",
+    ),
+    "aerial_drone": (
+        "Drone-photography LoRA training set",
+        "Real-estate and land-survey aerial catalogue",
+        "Mapping / GIS overhead imagery curation",
+    ),
+    "underwater_marine": (
+        "Reef and marine-life photography portfolio",
+        "Dive-log culling from a scuba trip",
+        "Marine-biology reference dataset",
+    ),
+    "wildlife_macro": (
+        "Bird / mammal photography portfolio triage",
+        "Macro-insect LoRA training set",
+        "Nature-magazine submission shortlist",
+    ),
+    "product_ecommerce": (
+        "Shopify / Amazon catalogue packshot QA",
+        "Studio-photography LoRA training set",
+        "Splitting lifestyle vs studio shots for A/B tests",
+    ),
+    "anime_illustration": (
+        "Character-illustration LoRA training set",
+        "Manga / doujin scrape curation",
+        "Digital-art portfolio triage without photos leaking in",
+    ),
+    "photoreal_portrait": (
+        "LoRA training set for a specific face",
+        "Actor or model lookbook curation",
+        "Portrait-shoot delivery shortlist",
+    ),
+    "quality_only": (
+        "De-duping and pruning a legacy stock archive",
+        "Topic-agnostic OVR score sort of a mixed folder",
+        "Backup-drive cleanup by technical quality",
+    ),
+    "video_default": (
+        "General b-roll / stock-clip triage",
+        "Motion-dataset prep for a video model fine-tune",
+        "First-pass cull of a raw scrape of AI video clips",
+    ),
+    "video_cinematic": (
+        "Cinematic LoRA / motion-model training set",
+        "Show-reel shortlist from a director's archive",
+        "Ad-agency mood-reel curation",
+    ),
+    "video_anime": (
+        "Sakuga / key-animation clip dataset",
+        "Anime AMV source-footage triage",
+        "2D-motion model fine-tune dataset prep",
+    ),
+    "video_product": (
+        "Turntable / 360-spin catalogue QA",
+        "Shopify product-video moderation",
+        "Product-demo motion-model training set",
+    ),
+    "video_nature": (
+        "Wildlife documentary rough-cut culling",
+        "Drone-landscape reel curation",
+        "Nature-clip stock-library ingestion",
+    ),
+}
+
+
+def get_preset_display_meta(key: str) -> dict:
+    """Return the dashboard-facing metadata bundle for a built-in preset.
+
+    Shape: ``{"key", "name", "headline", "description"}``. ``name`` is the
+    user-friendly display name (Title Case, spaces), ``headline`` and
+    ``description`` come from :data:`PRESET_DESCRIPTIONS`.
+
+    Tolerant of the legacy ``dict[str, str]`` shape (an earlier wave commit
+    stored the description as a flat string): a plain-string entry becomes
+    the ``description`` with an empty ``headline`` so downstream renderers
+    never see ``[object Object]``.
+
+    Raises ``KeyError`` for an unknown key so callers don't silently fall back
+    to a stale entry — the dashboard should only ask for keys it discovered
+    via :data:`PRESET_NAMES`.
+    """
+    meta = PRESET_DESCRIPTIONS[key]  # KeyError intentional on unknown
+    display_name = key.replace("_", " ").title()
+    if isinstance(meta, dict):
+        headline = str(meta.get("headline", "") or "")
+        description = str(meta.get("description", "") or "")
+    else:  # legacy flat-string entry
+        headline = ""
+        description = str(meta or "")
+    return {
+        "key": key,
+        "name": display_name,
+        "headline": headline,
+        "description": description,
+    }
+
+
+def preset_use_cases(key: str) -> list[str]:
+    """Return 2-3 short (<=80 char) example use cases for a built-in preset.
+
+    Used by the dashboard's preset-comparison card grid to help a user pick a
+    starter without reading the full rules block. Returns an empty list for an
+    unknown key (safer than raising for a purely descriptive helper).
+    """
+    return list(_PRESET_USE_CASES.get(key, ()))
+
+
+def preset_headline(key: str) -> str:
+    """Return the short one-line headline for a preset key, or empty string
+    if unknown. Callers that want just the flat headline (e.g. dashboard
+    picker labels) can use this instead of ``get_preset_display_meta(key)``.
+
+    Tolerant of the legacy flat-string shape — a plain string has no headline
+    (it was the description) so this returns "" for it.
+    """
+    entry = PRESET_DESCRIPTIONS.get(key)
+    if isinstance(entry, dict):
+        return str(entry.get("headline", "") or "")
+    return ""
 
 
 # ── shared judgement-rule preamble ───────────────────────────────────────────
@@ -575,40 +835,68 @@ def _build_presets() -> dict[str, dict]:
         # the legacy list shape so backward compatibility stays proven.
         "product_ecommerce": _preset(
             require_prompt=False,
+            # Query-string form (see topic_filter.parse_query) — a single
+            # expression covers both the "must include a product vocabulary
+            # hit" AND the "must NOT read as a portrait/selfie" gates that
+            # would otherwise need keywords_extra + banned_keywords together.
+            # banned_keywords stays populated for the broader creature /
+            # fantasy vocabulary that isn't in the AND NOT clause.
             keywords_extra=(
-                "(product OR packshot OR catalog OR "
+                "(product OR packshot OR catalog OR studio OR e-commerce OR "
                 "\"product photography\" OR \"white background\") "
                 "AND NOT (portrait OR selfie)"
             ),
-            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot"),
+            banned_keywords=_SPAM_BANNED + ("nsfw", "selfie", "meme", "screenshot",
+                                            "portrait", "character", "fantasy",
+                                            "creature", "warrior", "orc", "demon"),
             generation_hints=("product photography", "studio lighting",
                               "white background", "commercial shot", "packshot",
                               "catalog photo"),
             reddit_subreddits=("productphotography", "commercialphotography"),
-            ovr_min=50, rel_min=25,
+            ovr_min=55, rel_min=55,
             categories=[
-                ("Keep", "Single clearly-presented product, clean/seamless "
-                 "background, sharp, well-lit, accurate colour, no distracting "
-                 "watermark"),
-                ("Lifestyle", "Product shown in-context / lifestyle scene — "
-                 "useful but a different bucket from clean packshots"),
-                ("Borderline", "Product but cluttered background, soft focus, poor "
-                 "lighting, or a minor watermark -> review"),
-                ("OffTopic", "No clear product, or unrelated to the catalogue "
-                 "subject"),
+                ("Keep", "Single clearly-presented INANIMATE product (bottle, "
+                 "watch, food item, gadget, clothing on a mannequin/hanger, "
+                 "cosmetics, tool, packaging), clean/seamless background, sharp, "
+                 "well-lit, accurate colour, no distracting watermark"),
+                ("Lifestyle", "Product held or worn by a person, or shown in a "
+                 "real-world/lifestyle scene — the PRODUCT is still the subject, "
+                 "just contextualised (e.g. hands holding a phone, a coffee cup "
+                 "on a table). If the person / face is the subject, this is "
+                 "OffTopic, not Lifestyle."),
+                ("Borderline", "A product IS present but the shot is cluttered, "
+                 "soft-focus, poorly-lit, or carries a minor watermark -> review"),
+                ("OffTopic", "No inanimate product is the subject. Includes: any "
+                 "portrait / character / person as the subject (real or AI), "
+                 "fantasy / anime / illustration content, landscapes, animals, "
+                 "screenshots, logos-only, memes, or generic photography of "
+                 "people that happens to include an object."),
             ],
             theme_rules=(
-                "Product / e-commerce dataset. Reward a single clearly-presented "
-                "product, even studio lighting, a seamless or clean background and "
+                "Product / e-commerce dataset. The subject MUST be an inanimate "
+                "product for sale. Reward a single clearly-presented product, "
+                "even studio lighting, a seamless or clean background and "
                 "accurate colour. A product shown within a real-world/lifestyle "
-                "scene goes to Lifestyle. Penalise busy/cluttered backgrounds, "
+                "scene (hands holding a phone, a coffee cup on a table) goes to "
+                "Lifestyle — the product must still be the subject.\n\n"
+                "HARD REJECT (route to OffTopic, do NOT Keep): if primary_subject "
+                "is a person, face, character, warrior, creature, animal, "
+                "landscape, or any non-product entity, the image is OffTopic. "
+                "The rule 'a person wearing clothing' is Lifestyle ONLY when "
+                "the specific garment is clearly the product being sold (e.g. "
+                "a catalogue shot of a jacket on a model); otherwise OffTopic.\n\n"
+                "REL_Quality_Score guidance: a portrait of a person with no "
+                "product = REL <= 15; a fantasy/anime scene = REL <= 10; a "
+                "person holding a phone where the phone is clearly the focus "
+                "= REL 60-80 (Lifestyle). Penalise busy/cluttered backgrounds, "
                 "distracting reflections, and burned-in promotional text or "
                 "watermarks (contains_text_overlay=true -> Borderline at best; "
                 "DISCARD if the overlay dominates)."),
             scoring_notes=(
                 "Reward clean/seamless backgrounds, even lighting, sharpness and "
-                "accurate colour. Penalise clutter, distracting reflections and "
-                "burned-in promo text/watermarks."),
+                "accurate colour on the PRODUCT. Portraits, characters, and "
+                "landscapes get REL <= 15 (OffTopic). Penalise clutter, "
+                "distracting reflections and burned-in promo text/watermarks."),
             caption_style="natural_language",
         ),
 
@@ -723,3 +1011,15 @@ PRESET_NAMES: tuple[str, ...] = tuple(_PRESETS.keys())
 def builtin_library() -> dict:
     """Return a fresh {default, presets} library (safe for the caller to mutate)."""
     return {"default": DEFAULT_PRESET, "presets": copy.deepcopy(_PRESETS)}
+
+
+# Import-time guard: every shipped preset MUST carry human-facing metadata so
+# the dashboard preset picker + comparison grid can never render a blank card.
+# Fail loudly here rather than surfacing a KeyError deep inside the UI code.
+_missing_meta = tuple(k for k in PRESET_NAMES if k not in PRESET_DESCRIPTIONS)
+if _missing_meta:  # pragma: no cover - defensive; caught in CI on new presets
+    raise RuntimeError(
+        "PRESET_DESCRIPTIONS is missing entries for: "
+        f"{_missing_meta}. Add a headline + description for each key."
+    )
+del _missing_meta
