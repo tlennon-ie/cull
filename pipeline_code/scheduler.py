@@ -607,10 +607,51 @@ def notify(
     return delivered
 
 
-def _post_webhook(url: str, body: dict[str, Any]) -> bool:
-    """POST ``body`` as JSON to ``url``. Swallows all network errors → bool."""
+#: Only http(s) is a legitimate webhook scheme. Reject ``file://``, ``gopher://``,
+#: ``ftp://`` and friends so a hostile / typo'd WEBHOOK_URL cannot read local
+#: files or open unexpected protocols through requests / urllib3.
+_ALLOWED_WEBHOOK_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Return True iff ``url`` is a syntactically-valid http(s) URL.
+
+    Basic scheme guard; we deliberately do NOT block private/loopback hosts here
+    because the webhook is user-configured and pointing it at a LAN service
+    (e.g. a home automation hub or a Docker sidecar) is a legitimate use case.
+    """
     try:
-        resp = requests.post(url, json=body, timeout=_WEBHOOK_TIMEOUT)
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except (ValueError, TypeError):
+        return False
+    return parsed.scheme.lower() in _ALLOWED_WEBHOOK_SCHEMES and bool(parsed.netloc)
+
+
+def _post_webhook(url: str, body: dict[str, Any]) -> bool:
+    """POST ``body`` as JSON to ``url``. Swallows all network errors → bool.
+
+    Rejects any URL whose scheme is not http/https (SSRF guard against
+    ``file://`` / ``gopher://`` etc.), and disables redirect-following so a
+    hostile responder cannot 302-bounce the POST at a metadata endpoint.
+    """
+    if not _is_safe_webhook_url(url):
+        # Log only the scheme — the full URL may carry secret query-string
+        # tokens (Slack/Discord webhooks routinely do), and log lines outlive
+        # their SSRF-refusal context.
+        try:
+            scheme = urlparse(url).scheme or "(none)"
+        except Exception:  # noqa: BLE001
+            scheme = "(unparseable)"
+        logger.warning("webhook POST refused: scheme=%r is not http(s)", scheme)
+        return False
+    try:
+        resp = requests.post(
+            url,
+            json=body,
+            timeout=_WEBHOOK_TIMEOUT,
+            allow_redirects=False,
+        )
         resp.raise_for_status()
         return True
     except requests.RequestException as exc:

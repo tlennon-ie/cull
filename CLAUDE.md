@@ -101,6 +101,8 @@ python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; [i
 - Do not bypass `safe_inside()` in dashboard endpoints that accept user-supplied paths. It's the only thing preventing path traversal.
 - Do not touch the atomic `.processing` rename in vision workers. It's the cross-worker lock; replacing it with anything fancier reintroduces races.
 - Do not auto-pip-install dependencies at runtime. The Groq worker used to do this and it broke CI; declare deps in `requirements.txt` instead.
+- Do not remove the `after_request` security-headers hook or the `allow_redirects=False` on outbound probes (`/api/vision/test`, `/api/scrapers/test`, scheduler webhook). Both are load-bearing defenses — see [`SECURITY.md`](SECURITY.md) for the threat model and the regression test suite in `tests/test_dashboard_security.py` for what must keep passing.
+- Do not surface `str(exc)` from a dashboard endpoint. Every error response funnels through `_err()` so the client gets a fixed generic message and the detail lives in the server log. Regressing this reintroduces the py/stack-trace-exposure CodeQL alert.
 
 ## Where the audit / refactor history lives
 

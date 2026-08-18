@@ -168,6 +168,62 @@ except Exception as _exc:  # pragma: no cover - never block dashboard boot
 app = Flask(__name__)
 CORS(app)
 
+
+# ── Security response headers ─────────────────────────────────────────────────
+#
+# cull is a local-only single-user admin tool. Even so, a rogue tab on the same
+# machine can browse to http://localhost:5000 unless we lock the surface down:
+#
+#   * Content-Security-Policy — Alpine.js + inline scripts are inlined into the
+#     HTML template (single-file Flask app, zero build step), so we allow
+#     'unsafe-inline' + 'self'. img-src permits `data:` (thumb URLs) and `blob:`
+#     (video previews). No third-party origins are ever loaded.
+#   * X-Frame-Options: DENY + frame-ancestors 'none' block clickjacking framing
+#     from other tabs.
+#   * X-Content-Type-Options: nosniff — never let a browser MIME-sniff a JSON
+#     payload as HTML.
+#   * Referrer-Policy: no-referrer — nothing outbound; the dashboard never leaks
+#     the page it was reached from to any external origin (e.g. the "Supported
+#     sites" link in the gallery-dl card).
+#   * Permissions-Policy — kill features cull never uses (camera/mic/geo/etc.).
+#
+# Applied via after_request so every response, including /api/* JSON and
+# thumbnail bytes, carries the same guard-rails.
+_SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    ),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+        "accelerometer=(), gyroscope=(), magnetometer=()"
+    ),
+}
+
+
+@app.after_request
+def _apply_security_headers(response):
+    """Attach the fixed security-header set to every response.
+
+    Uses direct assignment (not setdefault) so no future endpoint can weaken
+    this defensive posture by pre-setting a laxer value.
+    """
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
 _pipeline_proc: subprocess.Popen | None = None
 _pipeline_lock = threading.Lock()
 
@@ -11736,4 +11792,9 @@ if __name__ == "__main__":
     print("Pipeline is NOT auto-started. Use the Start button in the UI.", flush=True)
     _start_idle_unload_thread()
     _start_indexer_thread()
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+    # Bind host: default 0.0.0.0 to keep Docker/RunPod/LAN workflows working out
+    # of the box (the README documents this). Set FLASK_HOST=127.0.0.1 for a
+    # loopback-only install on a shared workstation. FLASK_HOST wins when set;
+    # blank/unset falls back to the historical default.
+    _bind_host = (os.environ.get("FLASK_HOST", "") or "0.0.0.0").strip() or "0.0.0.0"
+    app.run(host=_bind_host, port=FLASK_PORT, debug=False, use_reloader=False)
