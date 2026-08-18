@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 
+import cost_tracker
 import vision_model_catalog as catalog
 from pipeline_logging import get_logger
 from vision_worker_base import (
@@ -152,6 +153,20 @@ class GeminiVisionWorker(BaseVisionWorker):
         except Exception as exc:  # noqa: BLE001 - provider raises many error types
             logger.warning("Gemini request failed: %s", str(exc)[:200])
             return None
+
+        # Best-effort spend tracking. Gemini exposes token counts under
+        # ``response.usage_metadata`` when the SDK returns it; missing → 0.
+        try:
+            usage = getattr(response, "usage_metadata", None)
+            in_tok = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+            out_tok = int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
+            if in_tok or out_tok:
+                cost_tracker.record_usage(
+                    provider="gemini", model=self.model_id,
+                    input_tokens=in_tok, output_tokens=out_tok,
+                )
+        except Exception:  # noqa: BLE001 - usage extraction never blocks classify
+            pass
 
         raw = getattr(response, "text", None)
         parsed = _safe_parse_vision_json(raw)

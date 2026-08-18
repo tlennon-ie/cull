@@ -196,6 +196,12 @@ def _default_preset_cfg() -> dict:
                             "cookies_file": "", "config_path": "", "config_json": ""},
             "yt_dlp": {"enabled": False, "urls": [], "limit": 200, "cookies": ""},
             "local_imports": [],
+            # Kohya training-set feeder. One per-job dataset root that follows the
+            # ``<repeats>_<concept>`` subfolder convention. See feed_kohya_folder.py.
+            "kohya_import": {
+                "enabled": False, "dir": "", "name": "kohya",
+                "move": False, "allow_flat": False,
+            },
         },
         "categories": cats,
         "category_rules": rules,
@@ -314,12 +320,47 @@ def _read_presets_raw(path: Path) -> dict | None:
     return None
 
 
+#: Soft-warn ceiling for user-editable UI (mirror of dashboard cap). Presets
+#: above this still load — the dashboard's save path will refuse a new write
+#: above the cap, so the warning surfaces the mismatch on legacy files.
+_SOFT_CATEGORY_LIMIT = 12
+_LOAD_WARN_ONCE: set[str] = set()
+
+
+def _warn_oversized_presets(lib: dict) -> None:
+    """Log once per preset that exceeds the soft UI category cap.
+
+    On upgrade, users who hand-edited ``_presets.json`` before the wave dropped
+    the dashboard save cap to 12 might have >12 categories on disk. The
+    library still loads fine (preserving their data), but new dashboard saves
+    will refuse to persist a change back — surface the mismatch on read so
+    they can prune before hitting a confusing "max 12 categories" error.
+    """
+    for name, cfg in (lib.get("presets") or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        cats = cfg.get("categories") or []
+        if isinstance(cats, list) and len(cats) > _SOFT_CATEGORY_LIMIT:
+            token = f"cats:{name}"
+            if token in _LOAD_WARN_ONCE:
+                continue
+            _LOAD_WARN_ONCE.add(token)
+            logger.warning(
+                "preset %r has %d categories (>%d recommended). It will load, "
+                "but the dashboard editor caps new saves at %d — trim it there "
+                "or edit _presets.json directly before saving via the UI.",
+                name, len(cats), _SOFT_CATEGORY_LIMIT, _SOFT_CATEGORY_LIMIT,
+            )
+
+
 def _read_presets() -> dict:
     data = _read_presets_raw(_presets_path())
     if data is None:
         return _merge_builtin_presets(builtin_presets.builtin_library())
     data.setdefault("default", next(iter(data["presets"])))
-    return _merge_builtin_presets(data)
+    lib = _merge_builtin_presets(data)
+    _warn_oversized_presets(lib)
+    return lib
 
 
 def _write_presets(lib: dict) -> None:
@@ -334,12 +375,14 @@ def list_presets() -> dict:
     if raw is None:
         lib = _merge_builtin_presets(builtin_presets.builtin_library())
         _write_presets(lib)                    # seed + record baselines on first access
+        _warn_oversized_presets(lib)
         return lib
     raw.setdefault("default", next(iter(raw["presets"])))
     before = _preset_signature(raw)            # snapshot pre-merge (content, not just names)
     lib = _merge_builtin_presets(raw)
     if _preset_signature(lib) != before:
         _write_presets(lib)                    # persist refreshed/seeded builtins + baselines
+    _warn_oversized_presets(lib)
     return lib
 
 
@@ -792,6 +835,7 @@ def resolve_env(job: Job) -> dict[str, str]:
     s = _d(eff.get("scrapers"))
     gd = _d(s.get("gallery_dl"))
     yt = _d(s.get("yt_dlp"))
+    ko = _d(s.get("kohya_import"))
     sc = _d(eff.get("scoring"))
     cap = _d(eff.get("captioning"))
     md = _d(eff.get("media"))
@@ -832,6 +876,13 @@ def resolve_env(job: Job) -> dict[str, str]:
         "YT_DLP_URLS": "\n".join(yt.get("urls", []) or []),
         "YT_DLP_LIMIT": str(int(yt.get("limit", 200) or 200)),
         "YT_DLP_COOKIES": str(yt.get("cookies", "") or ""),
+        # Kohya training-set feeder — a single per-job dataset root, projected as
+        # KOHYA_* env vars the (unchanged) feed_kohya_folder.py reads at spawn.
+        "KOHYA_IMPORT_ENABLED": _b(ko.get("enabled", False)),
+        "KOHYA_IMPORT_DIR": str(ko.get("dir", "") or ""),
+        "KOHYA_IMPORT_NAME": str(ko.get("name", "") or "kohya") or "kohya",
+        "KOHYA_MOVE": _b(ko.get("move", False)),
+        "KOHYA_ALLOW_FLAT": _b(ko.get("allow_flat", False)),
         "LOCAL_IMPORTS_JSON": json.dumps(local),
         "VISION_OVR_MIN_SCORE": str(int(sc.get("ovr_min", 0) or 0)),
         "VISION_REL_MIN_SCORE": str(int(sc.get("rel_min", 0) or 0)),
