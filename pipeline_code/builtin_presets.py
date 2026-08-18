@@ -35,12 +35,33 @@ __all__ = [
     "DEFAULT_PRESET",
     "PRESET_NAMES",
     "PRESET_DESCRIPTIONS",
+    "PRESET_TAGS",
     "builtin_library",
     "get_preset_display_meta",
     "preset_use_cases",
+    "preset_headline",
 ]
 
 DEFAULT_PRESET = "default"
+
+
+# Category tags for grouping/filtering presets in the UI. Each preset can carry
+# multiple tags; the dashboard uses these to render tag chips + a quick filter.
+PRESET_TAGS: dict[str, tuple[str, ...]] = {
+    "default": ("general", "photo"),
+    "aerial_drone": ("photo", "landscape"),
+    "underwater_marine": ("photo", "landscape"),
+    "wildlife_macro": ("photo", "nature"),
+    "product_ecommerce": ("photo", "product"),
+    "anime_illustration": ("art", "anime"),
+    "photoreal_portrait": ("photo", "portrait"),
+    "quality_only": ("general", "photo"),
+    "video_default": ("video", "general"),
+    "video_cinematic": ("video", "cinematic"),
+    "video_anime": ("video", "anime"),
+    "video_product": ("video", "product"),
+    "video_nature": ("video", "nature"),
+}
 
 
 # ── human-facing metadata for the shipped presets ────────────────────────────
@@ -248,6 +269,15 @@ def preset_use_cases(key: str) -> list[str]:
     unknown key (safer than raising for a purely descriptive helper).
     """
     return list(_PRESET_USE_CASES.get(key, ()))
+
+
+def preset_headline(key: str) -> str:
+    """Return the short one-line headline for a preset key, or empty string
+    if unknown. Callers that want just the flat headline (e.g. dashboard
+    picker labels) can use this instead of ``get_preset_display_meta(key)``.
+    """
+    entry = PRESET_DESCRIPTIONS.get(key)
+    return entry["headline"] if isinstance(entry, dict) else ""
 
 
 # ── shared judgement-rule preamble ───────────────────────────────────────────
