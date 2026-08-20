@@ -218,8 +218,8 @@ def test_active_slug_cleared_detection(isolated):
 
 
 def test_advance_changes_desired_slug(isolated):
-    """A dashboard-driven advance() (queue → active) is picked up by the same
-    desired_active_slug seam the supervisor polls."""
+    """v2 multi-active: advance ADDS the queue head to the active set — the
+    head stays the same, but ``desired_active_slugs`` grows."""
     run_pipeline, job_config, _ = isolated
     job_config.create_job("Head")
     job_config.create_job("Next")
@@ -229,7 +229,9 @@ def test_advance_changes_desired_slug(isolated):
     assert run_pipeline.desired_active_slug() == "head"
     promoted = job_config.advance()
     assert promoted == "next"
-    assert run_pipeline.desired_active_slug() == "next"
+    # Head unchanged; active set now includes both.
+    assert run_pipeline.desired_active_slug() == "head"
+    assert set(run_pipeline.desired_active_slugs()) == {"head", "next"}
 
 
 # ── migration is invoked safely (idempotent, env-derived) ─────────────────────
@@ -517,6 +519,88 @@ def test_scraper_priority_wired_from_job_override(isolated, monkeypatch):
     agents = run_pipeline.compute_desired_agents(env.get("PIPELINE_TOPIC", ""))
     labels = list(agents.keys())
     assert labels.index("Civitai-Red") < labels.index("X.com")
+
+
+# ── Multi-active: desired_active_slugs + shared vision fleet ────────────────
+
+def test_desired_active_slugs_reflects_multi_activate(isolated):
+    run_pipeline, jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a"); jc.activate("b")           # additive
+    assert run_pipeline.desired_active_slugs() == ["a", "b"]
+    assert run_pipeline.desired_active_slug() == "a"
+
+
+def test_active_job_priorities_defaults_when_unset(isolated):
+    run_pipeline, jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a"); jc.activate("b")
+    prio = run_pipeline.active_job_priorities()
+    assert set(prio.keys()) == {"a", "b"}
+    # Both start at PRIORITY_WEIGHT_DEFAULT (5).
+    assert all(w == jc.PRIORITY_WEIGHT_DEFAULT for w in prio.values())
+    jc.set_job_priority("b", 9)
+    prio = run_pipeline.active_job_priorities()
+    assert prio["b"] == 9
+
+
+def test_compute_desired_agents_multi_prefixes_scrapers_by_slug(isolated, monkeypatch):
+    """Per-slug scrapers are labelled ``slug::label`` so two active jobs' X.com
+    workers don't collide in the supervisor's ``self._active`` map."""
+    run_pipeline, _jc, _ = isolated
+    slug_envs = {
+        "job_a": {"PIPELINE_TOPIC": "a", "PIPELINE_SLUG": "job_a"},
+        "job_b": {"PIPELINE_TOPIC": "b", "PIPELINE_SLUG": "job_b"},
+    }
+    agents = run_pipeline.compute_desired_agents_multi(slug_envs, {"job_a": 5, "job_b": 3})
+    assert "job_a::X.com" in agents
+    assert "job_b::X.com" in agents
+    assert agents["job_a::X.com"].slug == "job_a"
+    assert agents["job_b::X.com"].slug == "job_b"
+
+
+def test_compute_desired_agents_multi_shared_vision_fleet_deduped(isolated):
+    """A vision worker with the same (provider, base_url, model) declared in
+    both jobs' vision.workers becomes ONE shared Vision- agent, and it carries
+    PIPELINE_ACTIVE_SLUGS_JSON = [[slug, weight], …]."""
+    run_pipeline, _jc, _ = isolated
+    fleet_a = [{"id": "a1", "name": "LM Shared", "provider": "lmstudio",
+                "base_url": "http://h:1234", "model": "m", "api_key": ""}]
+    fleet_b = [{"id": "b1", "name": "LM Shared", "provider": "lmstudio",
+                "base_url": "http://h:1234", "model": "m", "api_key": ""},
+               {"id": "b2", "name": "Olla B", "provider": "ollama",
+                "base_url": "http://h:11434", "model": "", "api_key": ""}]
+    slug_envs = {
+        "job_a": {"VISION_WORKERS_JSON": json.dumps(fleet_a),
+                  "PIPELINE_SLUG": "job_a"},
+        "job_b": {"VISION_WORKERS_JSON": json.dumps(fleet_b),
+                  "PIPELINE_SLUG": "job_b"},
+    }
+    agents = run_pipeline.compute_desired_agents_multi(slug_envs, {"job_a": 5, "job_b": 7})
+    vision = {label: spec for label, spec in agents.items() if label.startswith("Vision-")}
+    # LM Shared is deduped across the two jobs; Olla B is job_b only.
+    assert set(vision.keys()) == {"Vision-LM Shared", "Vision-Olla B"}
+    lm = vision["Vision-LM Shared"]
+    assert lm.slug is None                        # shared, not tagged to a slug
+    active_json = json.loads(lm.env["PIPELINE_ACTIVE_SLUGS_JSON"])
+    assert active_json == [["job_a", 5], ["job_b", 7]]
+
+
+def test_compute_desired_agents_multi_shared_fleet_all_have_active_slugs_env(isolated):
+    """Every shared vision spec carries the active-slug projection env so the
+    queue_manager shim can weighted-round-robin regardless of which worker
+    pops first."""
+    run_pipeline, _jc, _ = isolated
+    fleet = [{"id": "x", "name": "X1", "provider": "lmstudio",
+              "base_url": "http://h:1", "model": "m", "api_key": ""},
+             {"id": "y", "name": "Y1", "provider": "ollama",
+              "base_url": "http://h:2", "model": "", "api_key": ""}]
+    slug_envs = {"only": {"VISION_WORKERS_JSON": json.dumps(fleet)}}
+    agents = run_pipeline.compute_desired_agents_multi(slug_envs, {"only": 5})
+    for label, spec in agents.items():
+        if not label.startswith("Vision-"):
+            continue
+        assert "PIPELINE_ACTIVE_SLUGS_JSON" in spec.env
 
 
 if __name__ == "__main__":
