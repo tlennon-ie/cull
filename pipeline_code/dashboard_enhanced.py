@@ -7650,19 +7650,25 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
-      <!-- Find-similar results strip (CLIP embeddings; on-demand). -->
-      <div x-show="sim.open" x-cloak class="card rounded-xl p-4">
+      <!-- Find-similar results strip (CLIP embeddings; on-demand). The panel
+           is scrolled into view + accent-ringed on open so it's obvious the
+           click did something — otherwise it opens above the fold when the
+           user clicked Find similar on a card far down the grid. -->
+      <div x-show="sim.open" x-cloak x-ref="simPanel"
+           class="card rounded-xl p-4 border-2 border-indigo-500 shadow-lg">
         <div class="flex items-center justify-between mb-2">
           <h3 class="font-semibold">Similar to <span class="font-mono text-xs" x-text="sim.sourceName"></span></h3>
           <button @click="sim.open = false" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Close</button>
         </div>
         <div x-show="sim.loading" class="text-xs text-slate-400">Searching…</div>
-        <div x-show="!sim.loading && sim.message" x-cloak class="text-xs text-amber-300" x-text="sim.message"></div>
+        <div x-show="!sim.loading && sim.message" x-cloak
+             class="text-sm text-amber-200 bg-amber-950/40 border border-amber-800 rounded p-3 whitespace-pre-line" x-text="sim.message"></div>
         <div x-show="!sim.loading && !sim.message && sim.results.length === 0" x-cloak class="text-xs text-slate-500">No similar images found.</div>
         <div class="flex flex-wrap gap-3 mt-2">
           <template x-for="m in sim.results" :key="m.path">
             <div class="relative w-32">
-              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700"/>
+              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700 cursor-pointer hover:border-indigo-400 transition"
+                   @click="openModalFromCard(m)"/>
               <div class="text-[11px] text-slate-400 mt-1">score <span x-text="m.score"></span></div>
             </div>
           </template>
@@ -12047,6 +12053,16 @@ function dashboard() {
       // backend degrades gracefully (no ML extra / empty index / un-indexed key)
       // by returning a friendly message instead of an error.
       this.sim = { open: true, loading: true, results: [], message: '', sourceName: card.name || '' };
+      // Scroll the panel into view immediately — it renders above the gallery
+      // grid, so clicking Find similar on a card far down the list previously
+      // opened the panel off-screen and looked like a no-op.
+      await this.$nextTick();
+      try {
+        const el = this.$refs.simPanel;
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      } catch (_) {}
       const q = this.jobQuery();
       const sep = q ? '&' : '?';
       const url = '/api/embeddings/similar' + q + sep
