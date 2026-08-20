@@ -6577,6 +6577,230 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 word-break:break-word; color:#cbd5e1; }
   .log-stream .lvl-error { color:#f87171; }
   .log-stream .lvl-warn { color:#fbbf24; }
+
+  /* ── Universal hover affordances ─────────────────────────────────────────
+     Consolidates the pointer/hover/focus discovery grammar for the whole
+     dashboard so every clickable thing telegraphs its interactivity in all
+     three themes (dark / light / high-contrast). Non-clickable pills (score
+     tiles, resolution tiles) intentionally opt OUT — they never get these
+     classes. */
+  :root {
+    --hover-transition: transform .12s ease, box-shadow .12s ease,
+                        background-color .12s ease, border-color .12s ease,
+                        color .12s ease;
+  }
+  /* Baseline pointer on every interactive control the browser doesn't already
+     make explicit. Disabled controls fall back to `not-allowed` below. */
+  button:not(:disabled), a[href], [role="button"]:not([aria-disabled="true"]),
+  select:not(:disabled), summary, label[for], .link-btn, .chip-click, .click,
+  .hover-card, .drop-zone {
+    cursor: pointer;
+  }
+  button:disabled, [aria-disabled="true"], select:disabled { cursor: not-allowed; }
+  /* Cards + tiles that navigate on click — small lift + accented border. */
+  .hover-card { transition: var(--hover-transition); }
+  .hover-card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+    border-color: var(--color-accent) !important;
+  }
+  /* Clickable images (gallery + global-gallery thumbnails). */
+  img.click { transition: var(--hover-transition); }
+  img.click:hover {
+    box-shadow: 0 0 0 2px var(--color-accent);
+    transform: scale(1.02);
+  }
+  /* Filter/tag chips that toggle a value. Subtle scale + accent border on
+     hover; the active-state colour is still owned by the caller so this
+     doesn't fight per-tab styling. */
+  .chip-click { transition: var(--hover-transition); border-radius: 9999px; }
+  .chip-click:hover { transform: scale(1.05); border-color: var(--color-accent); }
+  /* File-upload / drag-drop zones — dashed border warms to the accent on hover. */
+  .drop-zone { transition: var(--hover-transition); }
+  .drop-zone:hover {
+    border-color: var(--color-accent);
+    background: color-mix(in oklab, var(--color-accent) 8%, transparent);
+  }
+  /* Focus-visible ring — one consistent shape everywhere. */
+  button:focus-visible, a:focus-visible, [role="button"]:focus-visible,
+  select:focus-visible, input:focus-visible, textarea:focus-visible,
+  summary:focus-visible, .chip-click:focus-visible, .hover-card:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  /* High-contrast: swap the subtle indigo for yellow ring + underline so it
+     survives the black/white/yellow palette. */
+  html.theme-hc button:focus-visible, html.theme-hc a:focus-visible,
+  html.theme-hc [role="button"]:focus-visible, html.theme-hc select:focus-visible,
+  html.theme-hc input:focus-visible, html.theme-hc textarea:focus-visible,
+  html.theme-hc .chip-click:focus-visible, html.theme-hc .hover-card:focus-visible {
+    outline: 3px solid #ffe600;
+    outline-offset: 2px;
+  }
+  html.theme-hc a:hover, html.theme-hc .link-btn:hover { text-decoration: underline !important; }
+  html.theme-hc img.click:hover { box-shadow: 0 0 0 3px #ffe600; }
+  html.theme-hc .hover-card:hover { border-color: #ffe600 !important; box-shadow: 0 0 0 2px #ffe600; }
+  html.theme-hc .chip-click:hover { border-color: #ffe600 !important; }
+
+  /* ── Filter modal / popover ──────────────────────────────────────────────
+     Single reusable panel skinned via CSS variables so it flips cleanly
+     across the three themes. The pill triggers it; the panel body carries
+     chip groups, range sliders, and toggles for whichever tab opened it. */
+  .filter-toolbar {
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  }
+  .filter-pill, .sort-pill {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .35rem .8rem; border-radius: 9999px;
+    background: var(--color-surface-alt);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    font-size: .75rem; font-weight: 500;
+    transition: var(--hover-transition);
+    cursor: pointer;
+  }
+  .filter-pill:hover, .sort-pill:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+  .filter-pill[aria-expanded="true"] {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-pill .badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 1.25rem; height: 1.25rem; padding: 0 .35rem; border-radius: 9999px;
+    background: var(--color-accent); color: var(--color-accent-fg);
+    font-size: .65rem; font-weight: 700;
+  }
+  .filter-pill[aria-expanded="true"] .badge {
+    background: var(--color-accent-fg); color: var(--color-accent);
+  }
+  .filter-search {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .3rem .6rem; border-radius: 9999px;
+    background: var(--color-surface-alt);
+    border: 1px solid var(--color-border-strong);
+    transition: var(--hover-transition);
+  }
+  .filter-search:focus-within { border-color: var(--color-accent); }
+  .filter-search input {
+    background: transparent !important; border: 0 !important;
+    padding: 0 !important; font-size: .8rem; width: 12rem; min-width: 6rem;
+    color: var(--color-input-fg);
+  }
+  .filter-search input:focus { outline: none !important; }
+  .filter-backdrop {
+    position: fixed; inset: 0; z-index: 55; background: rgba(0, 0, 0, .35);
+  }
+  .filter-panel {
+    position: absolute; z-index: 60;
+    right: 0; top: calc(100% + .5rem);
+    width: min(28rem, calc(100vw - 2rem));
+    max-height: min(70vh, 640px);
+    background: var(--color-bg-elev);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    border-radius: .75rem;
+    box-shadow: 0 20px 45px rgba(0, 0, 0, .35);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .filter-panel__body {
+    padding: 1rem 1.15rem; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .filter-panel__footer {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: .5rem; padding: .75rem 1.15rem;
+    background: var(--color-surface-alt);
+    border-top: 1px solid var(--color-border);
+  }
+  .filter-section__header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: .5rem;
+  }
+  .filter-section__title {
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--color-fg-muted); font-weight: 600;
+  }
+  .filter-section__reset {
+    font-size: .7rem; color: var(--color-accent);
+    background: none; border: 0; cursor: pointer; padding: 0;
+  }
+  .filter-section__reset:hover { text-decoration: underline; }
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: .3rem;
+    padding: .28rem .65rem; border-radius: 9999px;
+    font-size: .72rem;
+    background: var(--color-surface-alt);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    transition: var(--hover-transition);
+    cursor: pointer;
+  }
+  .filter-chip:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+    transform: scale(1.04);
+  }
+  .filter-chip.is-active {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-chip.is-active:hover { color: var(--color-accent-fg); }
+  .filter-range { display: grid; gap: .35rem; }
+  .filter-range__row { display: flex; align-items: center; gap: .5rem; }
+  .filter-range input[type="range"] {
+    flex: 1; accent-color: var(--color-accent);
+    background: transparent; padding: 0; border: 0;
+  }
+  .filter-range__value {
+    min-width: 2.6rem; text-align: right; font-family: ui-monospace, monospace;
+    font-size: .75rem; color: var(--color-fg);
+  }
+  .filter-date {
+    display: grid; grid-template-columns: 1fr 1fr; gap: .5rem;
+  }
+  .filter-date input {
+    font-size: .75rem; padding: .3rem .5rem;
+    background: var(--color-input-bg); color: var(--color-input-fg);
+    border: 1px solid var(--color-border-strong); border-radius: .35rem;
+  }
+  .filter-footer-btn {
+    padding: .45rem .95rem; border-radius: .5rem; font-size: .78rem; font-weight: 500;
+    transition: var(--hover-transition); cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .filter-footer-btn.is-secondary {
+    background: transparent; color: var(--color-fg-muted);
+    border-color: transparent;
+  }
+  .filter-footer-btn.is-secondary:hover {
+    color: var(--color-fg);
+    background: color-mix(in oklab, var(--color-fg-muted) 15%, transparent);
+  }
+  .filter-footer-btn.is-primary {
+    background: var(--color-accent); color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-footer-btn.is-primary:hover { background: var(--color-accent-hover); }
+  /* Compact "meta row" that shows result count + pagination beside the panel
+     trigger — keeps the header height stable when the panel is closed. */
+  .filter-meta { font-size: .72rem; color: var(--color-fg-muted); }
+
+  /* Mobile: promote the popover to a bottom sheet so it never runs off-screen
+     on narrow viewports. Retains the desktop absolute-positioning on larger
+     displays. */
+  @media (max-width: 640px) {
+    .filter-panel {
+      position: fixed; inset: auto 0 0 0; top: auto; right: 0;
+      width: 100vw; max-height: 82vh;
+      border-radius: 1rem 1rem 0 0;
+    }
+  }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -6994,7 +7218,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <!-- Drop-zone: single source of truth is dryRun.file. Native <input> is
            sr-only so its "No file chosen" text never surfaces; a labelled
            button routes clicks to it. Preview swaps in once a file is set. -->
-      <div class="border-2 border-dashed border-slate-700 rounded p-6 text-center text-xs text-slate-400 mb-3"
+      <div class="drop-zone border-2 border-dashed border-slate-700 rounded p-6 text-center text-xs text-slate-400 mb-3"
            @dragover.prevent="dryRun.dragOver = true" @dragleave.prevent="dryRun.dragOver = false"
            :class="dryRun.dragOver ? 'border-indigo-500' : ''"
            @drop.prevent="handleDryRunDrop($event)">
@@ -7637,70 +7861,112 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          per-job gallery, plus a jobs multi-select filter and a job chip on
          each card. Respects the global NSFW toggle (T2). -->
     <section x-show="view === 'jobs' && active === 'globalGallery'" class="space-y-4">
-      <div class="card rounded-xl p-4">
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Search prompts / descriptions</label>
-            <input x-model="globalGalleryFilters.q" @keydown.enter="loadGlobalGallery(1)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
-              placeholder="e.g. blonde hair, beach, neon"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Sort by</label>
-            <select x-model="globalGalleryFilters.sort" @change.debounce.300ms="loadGlobalGallery(1)"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-              <option value="newest">Newest first</option>
-              <option value="ovr">OVR (craft)</option>
-              <option value="rel">REL (relevance)</option>
-              <option value="quality">quality_score</option>
+      <!-- Compact filter toolbar for the cross-job view. Mirrors the per-job
+           gallery pattern so the two feel like one product; jobs live in the
+           panel here since they're the discriminator for this tab. -->
+      <div class="card rounded-xl p-3">
+        <div class="filter-toolbar justify-between">
+          <div class="filter-toolbar">
+            <label class="filter-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+              </svg>
+              <input type="search" x-model="globalGalleryFilters.q" @keydown.enter="loadGlobalGallery(1)"
+                     placeholder="Search prompts…" aria-label="Search prompts / descriptions"/>
+            </label>
+            <select class="sort-pill" x-model="globalGalleryFilters.sort"
+                    @change.debounce.300ms="loadGlobalGallery(1)" aria-label="Sort by">
+              <option value="newest">Sort · Newest</option>
+              <option value="ovr">Sort · OVR (craft)</option>
+              <option value="rel">Sort · REL (relevance)</option>
+              <option value="quality">Sort · quality_score</option>
             </select>
-          </div>
-          <div class="lg:col-span-6">
-            <label class="text-xs text-slate-400">Jobs<span class="text-slate-500 font-normal ml-1">(none checked = all jobs)</span></label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="jb in jobsList" :key="'gg_jf_'+jb.slug">
-                <button @click="toggleGlobalGalleryJob(jb.slug)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="globalGalleryFilters.jobs.includes(jb.slug) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="jb.name || jb.slug"></button>
-              </template>
-              <template x-if="!jobsList.length">
-                <span class="text-xs text-slate-500 italic">No jobs to filter by yet.</span>
-              </template>
+            <div class="relative" @keydown.escape.window="filterPanel === 'globalGallery' && (filterPanel = null)">
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('globalGallery')"
+                      :aria-expanded="filterPanel === 'globalGallery'" aria-haspopup="dialog"
+                      aria-controls="filter-panel-global-gallery">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 5h18M6 12h12M10 19h4"/>
+                </svg>
+                Filters
+                <span class="badge" x-show="globalGalleryFilterCount() > 0" x-text="globalGalleryFilterCount()"></span>
+              </button>
+              <div x-show="filterPanel === 'globalGallery'" x-cloak class="filter-backdrop"
+                   @click="filterPanel = null" aria-hidden="true"></div>
+              <div x-show="filterPanel === 'globalGallery'" x-cloak
+                   id="filter-panel-global-gallery" class="filter-panel" role="dialog"
+                   aria-label="Global gallery filters">
+                <div class="filter-panel__body">
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Jobs <span class="text-slate-500 lowercase font-normal">(none = all jobs)</span></span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.jobs = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.jobs.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="jb in jobsList" :key="'gg_jf_'+jb.slug">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.jobs.includes(jb.slug) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryJob(jb.slug)"
+                                x-text="jb.name || jb.slug"></button>
+                      </template>
+                      <template x-if="!jobsList.length">
+                        <span class="text-xs text-slate-500 italic">No jobs to filter by yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Sources</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.sources = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.sources.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="src in globalGallery.available?.sources ?? []" :key="'gg_src_'+src">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.sources.includes(src) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryList('sources', src)"
+                                x-text="src"></button>
+                      </template>
+                      <template x-if="(globalGallery.available?.sources?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No sources indexed yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Categories</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.categories = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.categories.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="cat in globalGallery.available?.categories ?? []" :key="'gg_cat_'+cat">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.categories.includes(cat) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryList('categories', cat)"
+                                x-text="cat"></button>
+                      </template>
+                      <template x-if="(globalGallery.available?.categories?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No categories yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                </div>
+                <div class="filter-panel__footer">
+                  <button type="button" class="filter-footer-btn is-secondary"
+                          @click="clearGlobalGalleryFilters()">Reset all</button>
+                  <button type="button" class="filter-footer-btn is-primary"
+                          @click="loadGlobalGallery(1); filterPanel = null">Apply</button>
+                </div>
+              </div>
             </div>
           </div>
-
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Sources</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="src in globalGallery.available?.sources ?? []" :key="'gg_src_'+src">
-                <button @click="toggleGlobalGalleryList('sources', src)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="globalGalleryFilters.sources.includes(src) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="src"></button>
-              </template>
-            </div>
-          </div>
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Categories</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="cat in globalGallery.available?.categories ?? []" :key="'gg_cat_'+cat">
-                <button @click="toggleGlobalGalleryList('categories', cat)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="globalGalleryFilters.categories.includes(cat) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="cat"></button>
-              </template>
-            </div>
-          </div>
-          <div class="lg:col-span-4 flex items-end gap-2 flex-wrap">
-            <button @click="loadGlobalGallery(1)"
-                    class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Apply</button>
-            <button @click="clearGlobalGalleryFilters()"
-                    class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Clear</button>
-            <span class="text-xs text-slate-400 ml-auto">
-              <span x-text="globalGallery.total"></span> / <span x-text="globalGallery.total_unfiltered"></span> match
-            </span>
-          </div>
+          <span class="filter-meta">
+            <span x-text="globalGallery.total"></span> / <span x-text="globalGallery.total_unfiltered"></span> match
+          </span>
         </div>
       </div>
 
@@ -7722,7 +7988,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <template x-for="c in globalGallery.items" :key="'gg_'+c.path">
             <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col relative">
               <span class="nsfw-wrap block">
-                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded click"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }" loading="lazy"
                      @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
                 <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image"
@@ -7947,96 +8213,162 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- GALLERY (job-scoped) -->
     <section x-show="view === 'job' && active === 'gallery'" class="space-y-4">
-      <div class="card rounded-xl p-4">
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Search prompts / descriptions</label>
-            <input x-model="galleryFilters.q" @keydown.enter="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
-              placeholder="e.g. blonde hair, beach, neon"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Sort by</label>
-            <select x-model="galleryFilters.sort" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-              <option value="newest">Newest first</option>
-              <option value="ovr">OVR (craft)</option>
-              <option value="rel">REL (relevance)</option>
-              <option value="quality">quality_score</option>
+      <!-- Compact filter toolbar (T2: replaces the busy inline filter row).
+           Search + Sort stay one-click; every other filter tucks into the
+           Filters popover so the tab body starts at the grid itself. -->
+      <div class="card rounded-xl p-3">
+        <div class="filter-toolbar justify-between">
+          <div class="filter-toolbar">
+            <label class="filter-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+              </svg>
+              <input type="search" x-model="galleryFilters.q" @keydown.enter="galleryReload()"
+                     placeholder="Search prompts…" aria-label="Search prompts / descriptions"/>
+            </label>
+            <select class="sort-pill" x-model="galleryFilters.sort"
+                    @change.debounce.300ms="galleryReload()" aria-label="Sort by">
+              <option value="newest">Sort · Newest</option>
+              <option value="ovr">Sort · OVR (craft)</option>
+              <option value="rel">Sort · REL (relevance)</option>
+              <option value="quality">Sort · quality_score</option>
             </select>
-          </div>
-          <!-- T2: per-gallery NSFW dropdown removed — the sidebar's global
-               "Show NSFW" toggle is the single source of truth for NSFW
-               visibility across every surface. -->
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Date from</label>
-            <input type="date" x-model="galleryFilters.dateFrom" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Date to</label>
-            <input type="date" x-model="galleryFilters.dateTo" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min OVR</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minOvr" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min REL</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minRel" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min quality (1-10)</label>
-            <input type="number" min="0" max="10" x-model.number="galleryFilters.minQuality" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-6 flex items-end gap-2">
-            <button @click="galleryReload()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Apply</button>
-            <button @click="galleryClearFilters()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Clear</button>
-            <button @click="galleryDownload()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm"
-              title="Stream a zip of the current filtered view (image + .txt + .vision.json)">Download view as ZIP</button>
-            <span class="text-xs text-slate-400 ml-auto">
-              <span x-text="gallery.total"></span> / <span x-text="gallery.total_unfiltered"></span> match
-            </span>
-          </div>
-
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Sources</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="src in gallery.available?.sources ?? []" :key="src">
-                <button @click="toggleGalleryFilter('sources', src)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.sources.includes(src) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="src"></button>
-              </template>
+            <div class="relative" @keydown.escape.window="filterPanel === 'gallery' && (filterPanel = null)">
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('gallery')"
+                      :aria-expanded="filterPanel === 'gallery'" aria-haspopup="dialog"
+                      aria-controls="filter-panel-gallery">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 5h18M6 12h12M10 19h4"/>
+                </svg>
+                Filters
+                <span class="badge" x-show="galleryFilterCount() > 0" x-text="galleryFilterCount()"></span>
+              </button>
+              <div x-show="filterPanel === 'gallery'" x-cloak class="filter-backdrop" @click="filterPanel = null" aria-hidden="true"></div>
+              <div x-show="filterPanel === 'gallery'" x-cloak
+                   id="filter-panel-gallery" class="filter-panel" role="dialog" aria-label="Gallery filters">
+                <div class="filter-panel__body">
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Sources</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.sources = []; galleryReload()"
+                              x-show="galleryFilters.sources.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="src in gallery.available?.sources ?? []" :key="'gf_src_'+src">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.sources.includes(src) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('sources', src)"
+                                x-text="src"></button>
+                      </template>
+                      <template x-if="(gallery.available?.sources?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No sources indexed yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Categories</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.categories = []; galleryReload()"
+                              x-show="galleryFilters.categories.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="cat in gallery.available?.categories ?? []" :key="'gf_cat_'+cat">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.categories.includes(cat) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('categories', cat)"
+                                x-text="cat"></button>
+                      </template>
+                      <template x-if="(gallery.available?.categories?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No categories yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Resolution</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.resolutions = []; galleryReload()"
+                              x-show="galleryFilters.resolutions.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="res in gallery.available?.resolutions ?? []" :key="'gf_res_'+res">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.resolutions.includes(res) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('resolutions', res)"
+                                x-text="res"></button>
+                      </template>
+                      <template x-if="(gallery.available?.resolutions?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No resolution buckets yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Score gates</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.minOvr = 0; galleryFilters.minRel = 0; galleryFilters.minQuality = 0; galleryReload()"
+                              x-show="galleryFilters.minOvr || galleryFilters.minRel || galleryFilters.minQuality">Reset</button>
+                    </div>
+                    <div class="filter-range">
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_ovr">Min OVR</label>
+                        <input id="gf_min_ovr" type="range" min="0" max="100" step="1"
+                               x-model.number="galleryFilters.minOvr"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minOvr"></span>
+                      </div>
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_rel">Min REL</label>
+                        <input id="gf_min_rel" type="range" min="0" max="100" step="1"
+                               x-model.number="galleryFilters.minRel"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minRel"></span>
+                      </div>
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_q">Min quality</label>
+                        <input id="gf_min_q" type="range" min="0" max="10" step="1"
+                               x-model.number="galleryFilters.minQuality"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minQuality"></span>
+                      </div>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Date range</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.dateFrom = ''; galleryFilters.dateTo = ''; galleryReload()"
+                              x-show="galleryFilters.dateFrom || galleryFilters.dateTo">Reset</button>
+                    </div>
+                    <div class="filter-date">
+                      <input type="date" aria-label="From date" x-model="galleryFilters.dateFrom"
+                             @change.debounce.300ms="galleryReload()"/>
+                      <input type="date" aria-label="To date" x-model="galleryFilters.dateTo"
+                             @change.debounce.300ms="galleryReload()"/>
+                    </div>
+                  </section>
+                </div>
+                <div class="filter-panel__footer">
+                  <button type="button" class="filter-footer-btn is-secondary"
+                          @click="galleryClearFilters()">Reset all</button>
+                  <button type="button" class="filter-footer-btn is-primary"
+                          @click="galleryReload(); filterPanel = null">Apply</button>
+                </div>
+              </div>
             </div>
+            <button @click="galleryDownload()" class="filter-pill"
+                    title="Stream a zip of the current filtered view (image + .txt + .vision.json)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/>
+              </svg>
+              Download ZIP
+            </button>
           </div>
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Categories</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="cat in gallery.available?.categories ?? []" :key="cat">
-                <button @click="toggleGalleryFilter('categories', cat)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.categories.includes(cat) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="cat"></button>
-              </template>
-            </div>
-          </div>
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Resolution</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="res in gallery.available?.resolutions ?? []" :key="res">
-                <button @click="toggleGalleryFilter('resolutions', res)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.resolutions.includes(res) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="res"></button>
-              </template>
-            </div>
-          </div>
+          <span class="filter-meta">
+            <span x-text="gallery.total"></span> / <span x-text="gallery.total_unfiltered"></span> match
+          </span>
         </div>
       </div>
 
@@ -8094,7 +8426,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                      :checked="bulk.selected.includes(c.path)"
                      @click.stop="bulkToggle(c.path)"/>
               <span class="nsfw-wrap block">
-                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded click"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
                      loading="lazy"
                      @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
@@ -9034,8 +9366,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="flex flex-wrap gap-2">
           <template x-for="jb in jobsList.filter(j => j.is_active || j.queue_position !== null)" :key="'jq_'+jb.slug">
             <button @click="openJob(jb.slug)"
-              class="text-left px-3 py-2 rounded border transition"
-              :class="jb.slug === currentJob ? 'bg-indigo-600/30 border-indigo-400' : 'bg-slate-900/60 border-slate-800 hover:border-slate-600'">
+              class="hover-card text-left px-3 py-2 rounded border"
+              :class="jb.slug === currentJob ? 'bg-indigo-600/30 border-indigo-400' : 'bg-slate-900/60 border-slate-800'">
               <div class="flex items-center gap-2">
                 <span class="pill px-1.5 py-0.5 rounded" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
                 <span class="font-mono text-xs" x-text="jb.slug"></span>
@@ -9091,13 +9423,82 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </template>
 
       <div class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Queue (newest 60) <span class="text-xs font-normal text-slate-500" x-text="'· ' + currentJob"></span></h3>
+      <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
+        <h3 class="font-semibold">Queue (newest 60) <span class="text-xs font-normal text-slate-500" x-text="'· ' + currentJob"></span></h3>
+        <div class="filter-toolbar">
+          <label class="filter-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <input type="search" x-model="queueFilters.q" placeholder="Search name / prompt…" aria-label="Filter queue by text"/>
+          </label>
+          <div class="relative" @keydown.escape.window="filterPanel === 'queue' && (filterPanel = null)">
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('queue')"
+                    :aria-expanded="filterPanel === 'queue'" aria-haspopup="dialog"
+                    aria-controls="filter-panel-queue">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5h18M6 12h12M10 19h4"/>
+              </svg>
+              Filters
+              <span class="badge" x-show="queueFilterCount() > 0" x-text="queueFilterCount()"></span>
+            </button>
+            <div x-show="filterPanel === 'queue'" x-cloak class="filter-backdrop"
+                 @click="filterPanel = null" aria-hidden="true"></div>
+            <div x-show="filterPanel === 'queue'" x-cloak
+                 id="filter-panel-queue" class="filter-panel" role="dialog" aria-label="Queue filters">
+              <div class="filter-panel__body">
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Sources</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="queueFilters.sources = []"
+                            x-show="queueFilters.sources.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="src in queueSources()" :key="'qf_src_'+src">
+                      <button type="button" class="filter-chip"
+                              :class="queueFilters.sources.includes(src) ? 'is-active' : ''"
+                              @click="toggleQueueFilter('sources', src)"
+                              x-text="src"></button>
+                    </template>
+                    <template x-if="queueSources().length === 0">
+                      <span class="text-xs text-slate-500">Queue is empty.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Only show</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="queueFilters.corruptOnly = false"
+                            x-show="queueFilters.corruptOnly">Reset</button>
+                  </div>
+                  <label class="flex items-center gap-3 cursor-pointer text-xs">
+                    <input type="checkbox" x-model="queueFilters.corruptOnly"
+                           class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                    <span>Corrupt / broken files only</span>
+                  </label>
+                </section>
+              </div>
+              <div class="filter-panel__footer">
+                <button type="button" class="filter-footer-btn is-secondary"
+                        @click="clearQueueFilters()">Reset all</button>
+                <button type="button" class="filter-footer-btn is-primary"
+                        @click="filterPanel = null">Apply</button>
+              </div>
+            </div>
+          </div>
+          <span class="filter-meta">
+            <span x-text="filteredQueueFiles().length"></span> / <span x-text="queueFiles.length"></span> match
+          </span>
+        </div>
+      </div>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Name</th><th>Source</th><th>Size</th><th>Prompt</th><th></th></tr></thead>
         <tbody>
-          <template x-for="f in queueFiles" :key="f.path">
+          <template x-for="f in filteredQueueFiles()" :key="f.path">
             <tr :class="f.corrupt ? 'bg-rose-900/25' : ''">
-              <td><img :src="f.thumbnail" :alt="f.name" class="thumb" loading="lazy" @click="openModalFromFile(f)"/></td>
+              <td><img :src="f.thumbnail" :alt="f.name" class="thumb click" loading="lazy" @click="openModalFromFile(f)"/></td>
               <td class="font-mono text-xs" x-text="f.name"></td>
               <td x-text="f.source"></td>
               <td class="font-mono text-xs" x-text="(f.size/1024).toFixed(1) + ' KB'"></td>
@@ -9112,10 +9513,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </td>
             </tr>
           </template>
-          <template x-if="queueFiles.length === 0">
+          <template x-if="filteredQueueFiles().length === 0">
             <tr><td colspan="6" class="text-center text-slate-500 py-8">
-              <div class="opacity-70">Queue is empty.</div>
-              <div class="text-[11px] text-slate-500 mt-1">Scrapers deposit here — the vision workers drain it.</div>
+              <div class="opacity-70" x-text="queueFiles.length === 0 ? 'Queue is empty.' : 'No queue items match these filters.'"></div>
+              <div class="text-[11px] text-slate-500 mt-1" x-show="queueFiles.length === 0">Scrapers deposit here — the vision workers drain it.</div>
             </td></tr>
           </template>
         </tbody>
@@ -9125,20 +9526,109 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- ACTIVITY (job-scoped classification log, newest first) -->
     <section x-show="view === 'job' && active === 'logs'" class="card rounded-xl p-5">
-      <div class="flex items-center justify-between mb-3">
+      <div class="flex items-start justify-between mb-3 gap-2 flex-wrap">
         <div>
           <h3 class="font-semibold">Recent classifications</h3>
           <p class="text-xs text-slate-400">Every image the vision worker has decided about, newest first. Use Gallery to browse and re-cull what you've kept.</p>
+        </div>
+        <div class="filter-toolbar">
+          <label class="filter-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <input type="search" x-model="activityFilters.q" placeholder="Search filename…" aria-label="Filter activity by text"/>
+          </label>
+          <div class="relative" @keydown.escape.window="filterPanel === 'activity' && (filterPanel = null)">
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('activity')"
+                    :aria-expanded="filterPanel === 'activity'" aria-haspopup="dialog"
+                    aria-controls="filter-panel-activity">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5h18M6 12h12M10 19h4"/>
+              </svg>
+              Filters
+              <span class="badge" x-show="activityFilterCount() > 0" x-text="activityFilterCount()"></span>
+            </button>
+            <div x-show="filterPanel === 'activity'" x-cloak class="filter-backdrop"
+                 @click="filterPanel = null" aria-hidden="true"></div>
+            <div x-show="filterPanel === 'activity'" x-cloak
+                 id="filter-panel-activity" class="filter-panel" role="dialog" aria-label="Activity filters">
+              <div class="filter-panel__body">
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Sources</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.sources = []"
+                            x-show="activityFilters.sources.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="src in activitySources()" :key="'af_src_'+src">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.sources.includes(src) ? 'is-active' : ''"
+                              @click="toggleActivityFilter('sources', src)"
+                              x-text="src"></button>
+                    </template>
+                    <template x-if="activitySources().length === 0">
+                      <span class="text-xs text-slate-500">Nothing classified yet.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Categories</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.categories = []"
+                            x-show="activityFilters.categories.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="cat in activityCategories()" :key="'af_cat_'+cat">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.categories.includes(cat) ? 'is-active' : ''"
+                              @click="toggleActivityFilter('categories', cat)"
+                              x-text="cat"></button>
+                    </template>
+                    <template x-if="activityCategories().length === 0">
+                      <span class="text-xs text-slate-500">Nothing classified yet.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Status</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.status = 'any'"
+                            x-show="activityFilters.status !== 'any'">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="opt in [{v:'any',l:'Any'},{v:'kept',l:'Kept'},{v:'discarded',l:'Discarded'}]" :key="'as_'+opt.v">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.status === opt.v ? 'is-active' : ''"
+                              @click="activityFilters.status = opt.v"
+                              x-text="opt.l"></button>
+                    </template>
+                  </div>
+                </section>
+              </div>
+              <div class="filter-panel__footer">
+                <button type="button" class="filter-footer-btn is-secondary"
+                        @click="clearActivityFilters()">Reset all</button>
+                <button type="button" class="filter-footer-btn is-primary"
+                        @click="filterPanel = null">Apply</button>
+              </div>
+            </div>
+          </div>
+          <span class="filter-meta">
+            <span x-text="filteredHistory().length"></span> / <span x-text="history.length"></span> match
+          </span>
         </div>
       </div>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Time</th><th>Image</th><th>Source</th><th>Classification</th></tr></thead>
         <tbody>
-          <template x-for="h in history" :key="(h.image||'') + (h.timestamp||'')">
+          <template x-for="h in filteredHistory()" :key="(h.image||'') + (h.timestamp||'')">
             <tr>
               <td>
                 <span class="nsfw-wrap">
-                  <img :src="h.thumbnail || ''" :alt="h.image" class="thumb" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
+                  <img :src="h.thumbnail || ''" :alt="h.image" class="thumb click" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
                        loading="lazy"
                        onerror="this.style.visibility='hidden'"
                        @click="h.thumbnail && (shouldBlurNsfw(h) ? revealNsfw(h) : openModalFromHistory(h))"/>
@@ -9160,10 +9650,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </td>
             </tr>
           </template>
-          <template x-if="history.length === 0">
+          <template x-if="filteredHistory().length === 0">
             <tr><td colspan="5" class="text-center text-slate-500 py-8">
-              <div class="opacity-70">No classifications yet.</div>
-              <div class="text-[11px] text-slate-500 mt-1">Start the pipeline (top-right) once you've added sources + a vision worker.</div>
+              <div class="opacity-70" x-text="history.length === 0 ? 'No classifications yet.' : 'No history matches these filters.'"></div>
+              <div class="text-[11px] text-slate-500 mt-1" x-show="history.length === 0">Start the pipeline (top-right) once you've added sources + a vision worker.</div>
             </td></tr>
           </template>
         </tbody>
@@ -9597,8 +10087,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               @dragover.prevent="presetThumb.dragOver = true"
               @dragleave.prevent="presetThumb.dragOver = false"
               @drop.prevent="presetThumb.dragOver = false; onPresetThumbDrop($event)"
-              :class="presetThumb.dragOver ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 bg-slate-900/40 hover:border-slate-500'"
-              class="flex flex-col items-center justify-center border-2 border-dashed rounded p-4 cursor-pointer text-center transition-colors">
+              :class="presetThumb.dragOver ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 bg-slate-900/40'"
+              class="drop-zone flex flex-col items-center justify-center border-2 border-dashed rounded p-4 text-center">
               <input type="file" accept="image/gif,image/png,image/jpeg,image/webp"
                      class="hidden" x-ref="presetThumbInput"
                      @change="onPresetThumbPick($event)"/>
@@ -10842,6 +11332,18 @@ function dashboard() {
       nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
+    // ── Filter modal / popover shared state ──────────────────────────────
+    // Only one panel open at a time; assigning a different tab id from a
+    // second trigger auto-closes the first. `null` means closed. Values:
+    // 'gallery' | 'globalGallery' | 'queue' | 'activity'.
+    filterPanel: null,
+    // Queue-tab filters (client-side over `queueFiles`). Search + source
+    // chips + corrupt-only toggle; the API is unfiltered by design.
+    queueFilters: { q: '', sources: [], corruptOnly: false },
+    // Activity-tab filters (client-side over `history`). Search + source +
+    // category chips + kept/discarded status; API returns the newest 200
+    // rows unfiltered.
+    activityFilters: { q: '', sources: [], categories: [], status: 'any' },
     modalReturnFocus: null,
 
     // ── Keyboard-driven culling (§3a) ────────────────────────────────────
@@ -12282,6 +12784,105 @@ function dashboard() {
     clearGlobalGalleryFilters() {
       this.globalGalleryFilters = { q: '', sources: [], categories: [], jobs: [], sort: 'newest' };
       this.loadGlobalGallery(1);
+    },
+
+    // ── Filter modal (T2) — shared popover controller + per-tab helpers ──
+    // One panel open at a time; clicking a different tab's Filters pill just
+    // swaps `filterPanel` and the previous one closes automatically. Passing
+    // the id currently open closes it.
+    toggleFilterPanel(id) {
+      this.filterPanel = (this.filterPanel === id) ? null : id;
+    },
+    // Count of active filters for the badge next to the Filters pill. Sort
+    // + free-text search deliberately don't count — Sort has its own pill and
+    // Search stays visible as a chip beside the pill.
+    galleryFilterCount() {
+      const f = this.galleryFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.resolutions?.length || 0)
+           + (f.minOvr ? 1 : 0) + (f.minRel ? 1 : 0) + (f.minQuality ? 1 : 0)
+           + (f.dateFrom ? 1 : 0) + (f.dateTo ? 1 : 0);
+    },
+    globalGalleryFilterCount() {
+      const f = this.globalGalleryFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.jobs?.length || 0);
+    },
+    // ── Queue tab (client-side over queueFiles) ──
+    queueFilterCount() {
+      const f = this.queueFilters;
+      return (f.sources?.length || 0) + (f.corruptOnly ? 1 : 0);
+    },
+    queueSources() {
+      const set = new Set();
+      for (const f of this.queueFiles || []) if (f && f.source) set.add(f.source);
+      return Array.from(set).sort();
+    },
+    filteredQueueFiles() {
+      const f = this.queueFilters;
+      const q = (f.q || '').trim().toLowerCase();
+      return (this.queueFiles || []).filter(row => {
+        if (f.sources.length && !f.sources.includes(row.source)) return false;
+        if (f.corruptOnly && !row.corrupt) return false;
+        if (q) {
+          const hay = ((row.name || '') + ' ' + (row.prompt || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    },
+    toggleQueueFilter(field, value) {
+      const list = this.queueFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+    },
+    clearQueueFilters() {
+      this.queueFilters = { q: '', sources: [], corruptOnly: false };
+    },
+    // ── Activity tab (client-side over history) ──
+    activityFilterCount() {
+      const f = this.activityFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.status && f.status !== 'any' ? 1 : 0);
+    },
+    activitySources() {
+      const set = new Set();
+      for (const h of this.history || []) if (h && h.source) set.add(h.source);
+      return Array.from(set).sort();
+    },
+    activityCategories() {
+      const set = new Set();
+      for (const h of this.history || []) if (h && h.classification) set.add(h.classification);
+      return Array.from(set).sort();
+    },
+    filteredHistory() {
+      const f = this.activityFilters;
+      const q = (f.q || '').trim().toLowerCase();
+      const terminal = new Set((this.cullTerminal && this.cullTerminal.length)
+                               ? this.cullTerminal.map(s => String(s).toUpperCase())
+                               : ['DISCARD', 'CORRUPT']);
+      return (this.history || []).filter(h => {
+        if (f.sources.length && !f.sources.includes(h.source)) return false;
+        if (f.categories.length && !f.categories.includes(h.classification)) return false;
+        if (f.status === 'kept' && terminal.has(String(h.classification || '').toUpperCase())) return false;
+        if (f.status === 'discarded' && !terminal.has(String(h.classification || '').toUpperCase())) return false;
+        if (q) {
+          const hay = ((h.image || '') + ' ' + (h.source || '') + ' ' + (h.classification || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    },
+    toggleActivityFilter(field, value) {
+      const list = this.activityFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+    },
+    clearActivityFilters() {
+      this.activityFilters = { q: '', sources: [], categories: [], status: 'any' };
     },
 
     // Deterministic hue from a slug — same slug always maps to the same
