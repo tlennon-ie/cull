@@ -55,7 +55,7 @@ from typing import Any
 from PIL import Image
 
 from categories import CATEGORIES
-from paths import sorted_dir
+from paths import queue_root, sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import get_next_image_round_robin
 from vision_prompt import (
@@ -110,10 +110,21 @@ class BaseVisionWorker(ABC):
     request_timeout: int = 600
 
     def __init__(self) -> None:
+        # Multi-active mode (shared vision fleet across jobs): each popped
+        # image comes from ``<queue_root>/<slug>/<source>/…`` and its sorted
+        # destination lives under a per-image-derived ``sorted_dir(slug)``.
+        # In that mode ``self.sorted_dir`` becomes the single-active fallback
+        # only; ``_resolve_sorted_dir`` per-image picks the right slug.
+        self._multi_active: bool = bool(
+            (os.environ.get("PIPELINE_ACTIVE_SLUGS_JSON", "") or "").strip()
+        )
         self.sorted_dir: Path = sorted_dir()
         # Pre-create the active taxonomy's folders so the first write doesn't
         # race against mkdir. _finalise also mkdirs lazily so a category added
-        # while the worker is mid-run still routes correctly.
+        # while the worker is mid-run still routes correctly. In multi-active
+        # mode ``self.sorted_dir`` may point at an unrelated slug (or the head
+        # of the active set) — mkdir is still safe and the per-image resolver
+        # creates the correct dest lazily.
         from categories import get_categories  # lazy: pick up edits made between imports
         for category in get_categories():
             # Constrain each taxonomy-derived folder name to a single safe
@@ -123,6 +134,35 @@ class BaseVisionWorker(ABC):
             )
         # Subclasses can stash backend-specific state here in setup().
         self._processed_count: int = 0
+
+    # ── Sorted-dir routing (single-active + multi-active fleet) ───────────
+
+    def _resolve_sorted_dir(self, image_path: Path) -> Path:
+        """Return the sorted-dir under which ``image_path`` should be filed.
+
+        Single-active mode (the default, and every historic call): returns
+        the worker's own ``self.sorted_dir`` — behaviour is byte-identical.
+
+        Multi-active mode (shared vision fleet spawned by the supervisor
+        with ``PIPELINE_ACTIVE_SLUGS_JSON`` set): derives the slug from the
+        image's path — the queue layout is
+        ``<queue_root>/<slug>/<source>/<file>`` — and returns
+        ``paths.sorted_dir(slug)`` so each classified image lands under its
+        originating job's sorted root. Falls back to ``self.sorted_dir`` if
+        the derivation fails.
+        """
+        if not self._multi_active:
+            return self.sorted_dir
+        try:
+            root = queue_root().resolve()
+            resolved = image_path.resolve()
+            rel = resolved.relative_to(root)
+            slug = rel.parts[0] if rel.parts else ""
+        except (ValueError, OSError):
+            return self.sorted_dir
+        if not slug:
+            return self.sorted_dir
+        return sorted_dir(slug)
 
     # ── Subclass contract ─────────────────────────────────────────────────
 
@@ -378,10 +418,12 @@ class BaseVisionWorker(ABC):
 
         # The category (model output) and source (queue-derived) become directory
         # names — constrain each to a single safe component so a crafted value
-        # can't escape the sorted root (path-injection barrier).
+        # can't escape the sorted root (path-injection barrier). In multi-active
+        # mode the sorted root is per-image (derived from the image's queue slug);
+        # single-active mode preserves the historic ``self.sorted_dir`` path.
         safe_category = _safe_component(final_category, "Unknown")
         safe_source = _safe_component(ctx.source_name, "unknown")
-        dest_dir = self.sorted_dir / safe_category / safe_source
+        dest_dir = self._resolve_sorted_dir(ctx.image_path) / safe_category / safe_source
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         safe_name = (

@@ -652,7 +652,10 @@ def list_jobs() -> list[Job]:
         if job is not None:
             jobs.append(job)
     idx = get_index()
-    order = ([idx["active"]] if idx["active"] else []) + list(idx["queue"])
+    # Multi-active: active jobs come first (in the order they were activated),
+    # then the queue. Legacy readers that expected a single active still see
+    # the head at index 0 because get_active_slug() = active[0].
+    order = list(idx["active"]) + list(idx["queue"])
     pos = {slug: i for i, slug in enumerate(order)}
     jobs.sort(key=lambda j: (pos.get(j.slug, len(order)), j.name.lower()))
     return jobs
@@ -688,49 +691,157 @@ def delete_job(slug: str) -> None:
     # Sanitise before building any path: rejects '/', '\\' and '..' traversal.
     if not JOB_SLUG_RE.fullmatch(slug or ""):
         raise ValueError(f"invalid slug: {slug!r}")
-    if slug == get_active_slug():
+    if slug in get_active_slugs():
         raise ValueError(f"cannot delete the active job: {slug}")
     path = _job_path(slug)
     if path.is_file():
         path.unlink()
     idx = get_index()
-    if slug in idx["queue"]:
-        _save_index({**idx, "queue": [s for s in idx["queue"] if s != slug]})
+    changed = False
+    queue = list(idx["queue"])
+    if slug in queue:
+        queue = [s for s in queue if s != slug]
+        changed = True
+    priority = dict(idx.get("priority") or {})
+    if slug in priority:
+        priority.pop(slug, None)
+        changed = True
+    if changed:
+        _save_index({**idx, "queue": queue, "priority": priority})
 
 
-# ── Index: queue order + active pointer ──────────────────────────────────────
+# ── Index: queue order + active pointer(s) + per-job priority ────────────────
+#
+# Historic shape:  {"active": <slug>|null, "queue": [...]}
+# Multi-active v2: {"active": [<slug>, ...], "queue": [...], "priority": {slug: 1-10}}
+#
+# ``get_index()`` always returns the CANONICAL multi-active shape so the rest
+# of the module stops having to care which on-disk shape a reader landed on.
+# Writes go back through ``_save_index`` in the canonical shape.
+
+def _canonical_active(raw: Any) -> list[str]:
+    """Coerce the on-disk ``active`` field to a canonical list of slugs.
+
+    Accepts the historic single-string form and the new list form; drops
+    duplicates while preserving insertion order.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, list):
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if isinstance(item, str) and item and item not in seen:
+                out.append(item)
+                seen.add(item)
+        return out
+    return []
+
+
+def _canonical_priority(raw: Any) -> dict[str, int]:
+    """Coerce the on-disk ``priority`` field to a canonical clamped map."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for slug, w in raw.items():
+        if not isinstance(slug, str) or not JOB_SLUG_RE.fullmatch(slug):
+            continue
+        try:
+            weight = int(w)
+        except (TypeError, ValueError):
+            weight = PRIORITY_WEIGHT_DEFAULT
+        out[slug] = max(PRIORITY_WEIGHT_MIN, min(PRIORITY_WEIGHT_MAX, weight))
+    return out
+
 
 def get_index() -> dict:
+    """Return the canonical multi-active index shape.
+
+    Migration is on-read: legacy ``{"active": "slug", "queue": [...]}`` files
+    are coerced into ``{"active": ["slug"], "queue": [...], "priority": {}}``
+    without a disk write. The next ``_save_index`` re-persists in the new shape.
+    """
     p = _index_path()
+    empty = {"active": [], "queue": [], "priority": {}}
     if not p.is_file():
-        return {"active": None, "queue": []}
+        return empty
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"active": None, "queue": []}
+        return empty
     if not isinstance(data, dict):
-        return {"active": None, "queue": []}
-    data.setdefault("active", None)
-    data.setdefault("queue", [])
-    if not isinstance(data["queue"], list):
-        data["queue"] = []
-    return data
+        return empty
+    active = _canonical_active(data.get("active"))
+    queue_raw = data.get("queue")
+    queue = [s for s in queue_raw if isinstance(s, str)] if isinstance(queue_raw, list) else []
+    return {
+        "active": active,
+        "queue": queue,
+        "priority": _canonical_priority(data.get("priority")),
+    }
 
 
 def _save_index(idx: dict) -> None:
-    _atomic_write_json(_index_path(), {**idx, "updated_at": _now_iso()})
+    """Persist the canonical multi-active shape (atomic tmpfile+os.replace)."""
+    payload = {
+        "active": list(idx.get("active") or []),
+        "queue": list(idx.get("queue") or []),
+        "priority": dict(idx.get("priority") or {}),
+        "updated_at": _now_iso(),
+    }
+    _atomic_write_json(_index_path(), payload)
+
+
+def get_active_slugs() -> list[str]:
+    """Canonical multi-active reader: every slug currently marked to run."""
+    return list(get_index()["active"])
 
 
 def get_active_slug() -> str | None:
-    return get_index()["active"]
+    """Single-slug view for legacy callers — the head of the active list.
+
+    Returns None when nothing is active. Every existing single-active caller
+    keeps working because a one-slug active list still yields that one slug
+    here.
+    """
+    active = get_active_slugs()
+    return active[0] if active else None
 
 
 def set_active(slug: str | None) -> None:
+    """Replace the active set with ``[slug]`` (or clear it when ``None``).
+
+    Legacy single-active setter kept for callers that own the entire active
+    pointer (tests, ``activate(exclusive=True)``, "stop everything" paths).
+    """
     if slug is not None and get_job(slug) is None:
         raise ValueError(f"unknown job: {slug}")
     idx = get_index()
     queue = [s for s in idx["queue"] if s != slug] if slug is not None else idx["queue"]
-    _save_index({**idx, "active": slug, "queue": queue})
+    new_active = [slug] if slug is not None else []
+    _save_index({**idx, "active": new_active, "queue": queue})
+
+
+def set_active_slugs(slugs: list[str]) -> None:
+    """Replace the entire active set with the given list (order preserved).
+
+    Every slug is validated before any write — an unknown slug raises with the
+    index untouched.
+    """
+    seen: set[str] = set()
+    clean: list[str] = []
+    for s in slugs:
+        if not isinstance(s, str) or s in seen:
+            continue
+        if get_job(s) is None:
+            raise ValueError(f"unknown job: {s}")
+        clean.append(s)
+        seen.add(s)
+    idx = get_index()
+    queue = [s for s in idx["queue"] if s not in seen]
+    _save_index({**idx, "active": clean, "queue": queue})
 
 
 def set_queue(order: list[str]) -> None:
@@ -744,7 +855,7 @@ def enqueue(slug: str) -> None:
     if get_job(slug) is None:
         raise ValueError(f"unknown job: {slug}")
     idx = get_index()
-    if slug != idx["active"] and slug not in idx["queue"]:
+    if slug not in idx["active"] and slug not in idx["queue"]:
         _save_index({**idx, "queue": [*idx["queue"], slug]})
 
 
@@ -755,21 +866,70 @@ def dequeue(slug: str) -> None:
 
 
 def advance() -> str | None:
+    """Pop the queue head and ADD it to the active set.
+
+    Multi-active semantics: advance no longer replaces the active pointer —
+    it augments it. Returns the slug that was promoted, or ``None`` when the
+    queue is empty (or every queued entry was orphaned).
+    """
     idx = get_index()
     queue = list(idx["queue"])
+    active = list(idx["active"])
     new_active: str | None = None
     while queue:
         candidate = queue.pop(0)
-        if get_job(candidate) is not None:
-            new_active = candidate
-            break
-        logger.warning("advance: skipping orphaned queued slug %r", candidate)
-    _save_index({**idx, "active": new_active, "queue": queue})
+        if get_job(candidate) is None:
+            logger.warning("advance: skipping orphaned queued slug %r", candidate)
+            continue
+        if candidate not in active:
+            active.append(candidate)
+        new_active = candidate
+        break
+    _save_index({**idx, "active": active, "queue": queue})
     if new_active is not None:
         job = get_job(new_active)
         if job is not None:
             project_categories(job)
     return new_active
+
+
+# ── Per-job priority (1-10 — drives the queue round-robin weighting) ─────────
+
+def get_job_priority(slug: str) -> int:
+    """Read this job's priority weight. Defaults to ``PRIORITY_WEIGHT_DEFAULT``
+    (5) when unset — every job starts equal-weight so a fresh install just works.
+    """
+    return int(get_index().get("priority", {}).get(slug, PRIORITY_WEIGHT_DEFAULT))
+
+
+def set_job_priority(slug: str, weight: int) -> int:
+    """Clamp ``weight`` to [1, 10] and persist it against ``slug``.
+
+    Returns the clamped weight actually stored so callers (dashboard) can echo
+    it back to the user when they typed something out of range.
+    """
+    if not JOB_SLUG_RE.fullmatch(slug or ""):
+        raise ValueError(f"invalid slug: {slug!r}")
+    if get_job(slug) is None:
+        raise ValueError(f"unknown job: {slug}")
+    try:
+        w = int(weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"weight must be an int: {weight!r}") from exc
+    w = max(PRIORITY_WEIGHT_MIN, min(PRIORITY_WEIGHT_MAX, w))
+    idx = get_index()
+    priority = dict(idx.get("priority") or {})
+    priority[slug] = w
+    _save_index({**idx, "priority": priority})
+    return w
+
+
+def deactivate(slug: str) -> None:
+    """Remove ``slug`` from the active set (no-op if absent). Idempotent."""
+    idx = get_index()
+    active = [s for s in idx["active"] if s != slug]
+    if len(active) != len(idx["active"]):
+        _save_index({**idx, "active": active})
 
 
 # ── Projection: job → runtime contracts ──────────────────────────────────────
@@ -990,11 +1150,36 @@ def project_categories(job: Job) -> None:
     })
 
 
-def activate(slug: str) -> None:
+def activate(slug: str, *, exclusive: bool = False) -> None:
+    """Mark ``slug`` active (additive by default) and project its taxonomy.
+
+    ``exclusive=True`` restores the historic single-active behaviour: the
+    active set is reset to ``[slug]``. The default (``exclusive=False``)
+    APPENDS ``slug`` to the active set so multiple jobs can run in parallel.
+    A slug already in the active set is a no-op on the pointer but still
+    re-projects its taxonomy so a preset edit takes effect.
+
+    Note: ``project_categories`` writes ``cull_categories.json`` from the
+    passed job, so in multi-active mode the LAST activated job "wins" the
+    file. The supervisor's shared vision fleet reads schema per-image from
+    the taxonomy on disk; per-job classification hints stay tight because
+    each per-slug worker fanned out by the supervisor also re-projects its
+    own env before use. See CLAUDE.md Jobs model.
+    """
     job = get_job(slug)
     if job is None:
         raise ValueError(f"unknown job: {slug}")
-    set_active(slug)
+    if exclusive:
+        set_active(slug)
+    else:
+        idx = get_index()
+        active = list(idx["active"])
+        if slug not in active:
+            # Preserve insertion order — re-activating an already-active slug
+            # is a no-op on the pointer (idempotent) so the head stays put.
+            active.append(slug)
+        queue = [s for s in idx["queue"] if s != slug]
+        _save_index({**idx, "active": active, "queue": queue})
     project_categories(job)
 
 
@@ -1195,7 +1380,9 @@ __all__ = [
     "set_default_preset", "default_preset_name",
     "effective_config", "is_overridden", "set_override", "reset_override",
     "get_job", "list_jobs", "save_job", "create_job", "delete_job",
-    "get_index", "get_active_slug", "set_active", "set_queue", "enqueue", "dequeue", "advance",
+    "get_index", "get_active_slug", "get_active_slugs", "set_active", "set_active_slugs",
+    "deactivate", "set_job_priority", "get_job_priority",
+    "set_queue", "enqueue", "dequeue", "advance",
     "resolve_env", "project_categories", "activate", "clean_scraper_priority",
     "migrate_env_to_default_job", "discover_data_slugs", "migrate_existing_data",
     "migrate_legacy_vision_to_fleet", "clean_vision_fleet", "VISION_PROVIDERS",

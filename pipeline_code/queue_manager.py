@@ -353,6 +353,147 @@ class FSQueue:
         return order
 
 
+# ── Cross-slug (multi-active) round-robin ─────────────────────────────────────
+#
+# A shared vision worker consuming from multiple active jobs uses a WEIGHTED
+# round-robin across the slugs' queue subdirs. Weights are per-job priorities
+# (1-10) — weight ``w`` gives that slug ``w`` consecutive turns per cycle.
+# Reuses the per-slug FSQueue caching so the heavy scan work isn't duplicated
+# per call.
+#
+# The queue root (parent of the per-slug subdirs) defaults to the parent of
+# BASE_QUEUE_DIR, so the multi-slug driver doesn't need to redo the .env
+# parsing every call.
+
+_QUEUE_ROOT: Path = BASE_QUEUE_DIR.parent
+
+# Per-slug FSQueue cache. Constructed lazily; reused across pop calls so the
+# in-memory round-robin order cache each FSQueue owns keeps paying off.
+_MULTI_SLUG_QUEUES: dict[str, FSQueue] = {}
+_MULTI_SLUG_LOCK = threading.Lock()
+
+
+def _fsqueue_for_slug(slug: str, root: Path | None = None) -> FSQueue:
+    root = root or _QUEUE_ROOT
+    key = f"{root}::{slug}"
+    with _MULTI_SLUG_LOCK:
+        q = _MULTI_SLUG_QUEUES.get(key)
+        if q is None:
+            q = FSQueue(root / slug)
+            _MULTI_SLUG_QUEUES[key] = q
+        return q
+
+
+def _weighted_round_robin_order(slugs: list[str], weights: dict[str, int]) -> list[str]:
+    """Deterministic weighted round-robin schedule over ``slugs``.
+
+    A slug with weight ``w`` gets ``w`` consecutive turns per cycle, so a
+    priority-10 job pops ~10 images to a priority-1 job's one. Weights <=0
+    are treated as 1 so a mis-typed value can never starve a slug.
+    """
+    order: list[str] = []
+    for slug in slugs:
+        w = max(1, int(weights.get(slug, 1) or 1))
+        order.extend([slug] * w)
+    return order
+
+
+# Module-level round-robin cursor. The schedule ``([slugA]*wA + [slugB]*wB + …)``
+# is stable per (slugs, weights); we walk it advance-by-one per pop so
+# consecutive calls DISTRIBUTE the work across slugs by weight rather than
+# always draining the head slug first.
+_RR_STATE: dict[str, Any] = {"key": None, "schedule": [], "cursor": 0}
+_RR_LOCK = threading.Lock()
+
+
+def _rr_key(slugs: list[str], weights: dict[str, int]) -> str:
+    """Stable key for the (slugs, weights) tuple so a config change resets."""
+    parts = [f"{s}={int(weights.get(s, 1) or 1)}" for s in slugs]
+    return "|".join(parts)
+
+
+def pop_next_across_slugs(
+    slugs: list[str],
+    weights: dict[str, int] | None = None,
+    *,
+    queue_root: Path | None = None,
+) -> tuple[str, str, Path] | tuple[None, None, None]:
+    """Pop the next ``(slug, source, path)`` across multiple active slugs.
+
+    Weighted round-robin — a slug with weight ``w`` gets ``w`` consecutive
+    turns in the schedule, so a priority-10 job pops ~10 images per every
+    ~1 pop a priority-1 job gets. Within a slug, the existing per-slug
+    ``FSQueue`` round-robin over sources applies. The schedule cursor is
+    process-wide state (thread-safe), so consecutive calls DISTRIBUTE work
+    across slugs rather than always finding the head slug's item first and
+    starving the tail.
+
+    Returns ``(None, None, None)`` when every slug's queue is empty.
+    """
+    if not slugs:
+        return None, None, None
+    weights = weights or {}
+    key = _rr_key(slugs, weights)
+    with _RR_LOCK:
+        if _RR_STATE["key"] != key:
+            _RR_STATE["key"] = key
+            _RR_STATE["schedule"] = _weighted_round_robin_order(slugs, weights)
+            _RR_STATE["cursor"] = 0
+        schedule: list[str] = _RR_STATE["schedule"]
+        if not schedule:
+            return None, None, None
+        # Try each slot in the schedule, advancing the cursor. Wrap once so
+        # every slot gets a chance before we declare the multi-slug queue empty.
+        attempts = 0
+        cursor = _RR_STATE["cursor"]
+        result: tuple[str, str, Path] | tuple[None, None, None] = (None, None, None)
+        while attempts < len(schedule):
+            slug = schedule[cursor % len(schedule)]
+            cursor += 1
+            attempts += 1
+            q = _fsqueue_for_slug(slug, queue_root)
+            source, path = q.pop_next()
+            if path is not None:
+                result = (slug, source, path)
+                break
+        _RR_STATE["cursor"] = cursor % len(schedule) if schedule else 0
+        return result
+
+
+def _active_slugs_from_env() -> tuple[list[str], dict[str, int]] | None:
+    """Parse the supervisor-projected multi-active blob (or return ``None``).
+
+    Shape: JSON array of ``[slug, weight]`` pairs, e.g.
+    ``[["job_a", 5], ["job_b", 3]]``. Empty / missing / malformed values yield
+    ``None`` so the module-level pop shim falls back to the historic
+    single-slug ``FSQueue`` behaviour (byte-identical to today).
+    """
+    raw = (os.environ.get("PIPELINE_ACTIVE_SLUGS_JSON", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    slugs: list[str] = []
+    weights: dict[str, int] = {}
+    for entry in data:
+        if isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[0], str):
+            slugs.append(entry[0])
+            try:
+                weights[entry[0]] = max(1, int(entry[1]))
+            except (TypeError, ValueError):
+                weights[entry[0]] = 1
+        elif isinstance(entry, str):
+            slugs.append(entry)
+            weights[entry] = 1
+    if not slugs:
+        return None
+    return slugs, weights
+
+
 # ── Default instance + module-level shims ─────────────────────────────────────
 
 _default_queue: FSQueue = FSQueue(BASE_QUEUE_DIR)
@@ -385,6 +526,26 @@ def list_queue_sources() -> dict[str, int]:
 
 
 def get_next_image_round_robin() -> tuple[str, Path] | tuple[None, None]:
+    """Return ``(source, path)`` for the next queued image.
+
+    When the supervisor is running MULTIPLE active jobs it projects the active
+    set + priority into ``PIPELINE_ACTIVE_SLUGS_JSON``; we detect that here
+    and delegate to ``pop_next_across_slugs`` so a shared vision worker fair-
+    shares across every active slug's queue. The slug is dropped from the
+    return tuple for legacy caller compatibility — the popped path is under
+    ``<queue_root>/<slug>/<source>/…`` so consumers that need the slug can
+    read it from the path.
+
+    In single-active (or standalone) mode the env is absent and we fall back
+    to the historic per-process ``FSQueue`` — behaviour is byte-identical.
+    """
+    multi = _active_slugs_from_env()
+    if multi is not None:
+        slugs, weights = multi
+        _slug, source, path = pop_next_across_slugs(slugs, weights)
+        if path is None:
+            return None, None
+        return source, path
     return _default_queue.pop_next()
 
 
@@ -398,4 +559,5 @@ __all__ = [
     "save_to_queue",
     "list_queue_sources",
     "get_next_image_round_robin",
+    "pop_next_across_slugs",
 ]
