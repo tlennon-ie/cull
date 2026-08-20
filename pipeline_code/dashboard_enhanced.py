@@ -6775,10 +6775,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   }
   .filter-search input:focus { outline: none !important; }
   .filter-backdrop {
-    position: fixed; inset: 0; z-index: 55; background: rgba(0, 0, 0, .35);
+    position: fixed; inset: 0; z-index: 1055; background: rgba(0, 0, 0, .35);
   }
   .filter-panel {
-    position: absolute; z-index: 60;
+    position: absolute; z-index: 1060;
     right: 0; top: calc(100% + .5rem);
     width: min(28rem, calc(100vw - 2rem));
     max-height: min(70vh, 640px);
@@ -6790,6 +6790,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     display: flex; flex-direction: column;
     overflow: hidden;
   }
+  /* Elevate the wrapping .relative anchor so its stacking context floats
+     above the gallery grid — otherwise ancestor transforms/overflow in the
+     grid clip the popover behind the image tiles. */
+  .relative:has(> .filter-panel) { z-index: 1060; }
   .filter-panel__body {
     padding: 1rem 1.15rem; overflow-y: auto;
     display: flex; flex-direction: column; gap: 1rem;
