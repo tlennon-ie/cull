@@ -495,24 +495,40 @@ def _job_status_label(slug: str, job: job_config.Job, *, active: str | None,
     return job.status or "idle"
 
 
-def _job_card(job: job_config.Job, *, active: str | None, queue: list[str]) -> dict[str, Any]:
-    """Compact per-job payload for the jobs grid (list view)."""
+def _job_card(job: job_config.Job, *, active: str | None, queue: list[str],
+              active_slugs: list[str] | None = None,
+              priorities: dict[str, int] | None = None) -> dict[str, Any]:
+    """Compact per-job payload for the jobs grid (list view).
+
+    Multi-active v2 fields:
+      * ``is_active`` — this job is in the active SET (was: head-only match)
+      * ``priority`` — weighted round-robin weight (1-10, default 5)
+    Legacy fields (``queue_position``, ``status``) still key off the HEAD of
+    the active list so existing UI code keeps rendering.
+    """
     counts = _scoped_counts(job.slug)
-    if job.slug == active:
+    active_set = set(active_slugs or ([active] if active else []))
+    is_active_head = job.slug == active
+    is_active = job.slug in active_set
+    if is_active_head:
         position = 0
     elif job.slug in queue:
         position = 1 + queue.index(job.slug)
     else:
         position = None
+    priority_map = priorities or {}
     return {
         "slug": job.slug,
         "name": job.name,
         "status": _job_status_label(job.slug, job, active=active, queue=queue),
-        "is_active": job.slug == active,
+        "is_active": is_active,
+        "is_active_head": is_active_head,
         "queue_position": position,
         "queued": counts["queued"],
         "sorted": counts["sorted"],
         "updated_at": job.updated_at,
+        "priority": int(priority_map.get(
+            job.slug, job_config.PRIORITY_WEIGHT_DEFAULT)),
     }
 
 
@@ -1719,17 +1735,31 @@ def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, 
 
 @app.route("/api/jobs")
 def api_jobs_list():
-    """List jobs with status, queue position, and queued/sorted counts, plus the
-    active slug and queue order from the index."""
+    """List jobs with status + counts, plus the ACTIVE SET, queue order, and
+    per-job priority weights from the index.
+
+    v2 payload additions (backwards compatible — no field was renamed):
+      * ``active_slugs``: list[str] — every currently running job (multi-active)
+      * ``active``: str | None — head of the active list (legacy single-active
+        view; every existing consumer that reads ``active`` keeps working)
+      * ``priority``: {slug: 1-10} — per-job weight (defaults to 5 when unset)
+      * per-card ``is_active`` now reflects membership in ``active_slugs``
+    """
     idx = job_config.get_index()
-    active = idx.get("active")
+    active_slugs = list(idx.get("active") or [])
+    active_head = active_slugs[0] if active_slugs else None
     queue = list(idx.get("queue") or [])
+    priorities = dict(idx.get("priority") or {})
     jobs = job_config.list_jobs()
     return jsonify({
-        "active": active,
+        "active": active_head,
+        "active_slugs": active_slugs,
         "queue": queue,
+        "priority": priorities,
         "pipeline_running": pipeline_running(),
-        "jobs": [_job_card(j, active=active, queue=queue) for j in jobs],
+        "jobs": [_job_card(j, active=active_head, queue=queue,
+                           active_slugs=active_slugs, priorities=priorities)
+                 for j in jobs],
     })
 
 
@@ -1879,12 +1909,65 @@ def api_jobs_clone(slug: str):
 
 @app.route("/api/jobs/<slug>/activate", methods=["POST"])
 def api_jobs_activate(slug: str):
+    """Mark ``slug`` active. Additive by default (multi-active), or exclusive
+    via ``?exclusive=true`` (historic single-active behaviour).
+
+    The default flipped from exclusive to additive in the multi-active wave:
+    every existing caller who wants the OLD reset-then-set semantics must
+    now pass ``?exclusive=true`` (see api_jobs_deactivate for the inverse).
+    """
     if not _valid_slug_or_400(slug):
         return jsonify({"error": "invalid slug"}), 400
     if job_config.get_job(slug) is None:
         return jsonify({"error": "job not found"}), 404
-    job_config.activate(slug)
-    return jsonify({"success": True, "active": slug})
+    exclusive = (request.args.get("exclusive", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
+    job_config.activate(slug, exclusive=exclusive)
+    return jsonify({
+        "success": True,
+        "active": job_config.get_active_slug(),
+        "active_slugs": job_config.get_active_slugs(),
+    })
+
+
+@app.route("/api/jobs/<slug>/deactivate", methods=["POST"])
+def api_jobs_deactivate(slug: str):
+    """Remove ``slug`` from the active set (no-op if it wasn't running).
+
+    Pairs with the additive ``activate`` — the UI's Run slider flips between
+    the two. Does not touch the queue; a deactivated job stays where it was
+    (idle / queued) and can be re-run without going through the wizard.
+    """
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    job_config.deactivate(slug)
+    return jsonify({
+        "success": True,
+        "active": job_config.get_active_slug(),
+        "active_slugs": job_config.get_active_slugs(),
+    })
+
+
+@app.route("/api/jobs/<slug>/priority", methods=["PUT"])
+def api_jobs_priority(slug: str):
+    """Set this job's priority weight (1-10). Out-of-range values are CLAMPED
+    to the bounds rather than rejected — the UI slider stays honest and no
+    silly typed value can starve or hog the vision fleet."""
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    data = request.get_json() or {}
+    if not isinstance(data, dict) or "weight" not in data:
+        return jsonify({"error": "body must be an object with a weight field"}), 400
+    try:
+        weight = int(data["weight"])
+    except (TypeError, ValueError):
+        return jsonify({"error": "weight must be an integer"}), 400
+    stored = job_config.set_job_priority(slug, weight)
+    return jsonify({"success": True, "slug": slug, "weight": stored})
 
 
 @app.route("/api/jobs/queue", methods=["POST"])
@@ -7293,9 +7376,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <span class="pill px-2 py-0.5 rounded shrink-0"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
           x-text="status.pipeline?.running ? 'running' : 'stopped'"></span>
+        <!-- Multi-active: show all running slugs (comma-separated, truncated),
+             with the full list on tooltip so long active sets stay legible. -->
         <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 truncate max-w-full inline-block"
-          x-show="jobsActive" :title="jobsActive"
-          x-text="'active: ' + (jobsActive || '')"></span>
+          x-show="jobsActiveSlugs.length" :title="jobsActiveSlugs.join(', ')"
+          x-text="(jobsActiveSlugs.length === 1 ? 'active: ' : 'running (' + jobsActiveSlugs.length + '): ') + jobsActiveSlugs.join(', ')"></span>
       </div>
     </div>
 
@@ -7534,18 +7619,31 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
       </div>
 
-      <!-- Job queue strip: active job + next queued, with advance control. -->
-      <div class="card rounded-xl p-5" x-show="jobsActive || jobsQueue.length">
+      <!-- Run strip: every currently-running job (multi-active) + queued list.
+           v2: "Active" (singular) becomes "Running" (plural). Each chip shows
+           slug · weight so the operator sees at-a-glance how the shared vision
+           fleet is fair-sharing between concurrent jobs. Advance still exists
+           for the queued tail (Run to lift a queued job into the active set). -->
+      <div class="card rounded-xl p-5" x-show="jobsActiveSlugs.length || jobsQueue.length">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold">Run queue</h3>
           <button @click="advanceQueue()" :disabled="!jobsQueue.length"
             class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"
-            title="Promote the next queued job to active">Advance →</button>
+            title="Promote the next queued job into the active set (adds — does not replace)">Advance →</button>
         </div>
         <div class="flex flex-wrap items-center gap-2 text-sm">
-          <span class="text-xs text-slate-400">Active:</span>
-          <span class="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 font-mono text-xs"
-                x-text="jobsActive || '(none — activate a job)'"></span>
+          <span class="text-xs text-slate-400">Running:</span>
+          <template x-if="!jobsActiveSlugs.length">
+            <span class="px-2 py-1 rounded bg-slate-800 text-slate-400 text-xs">
+              (none — flip a Run switch on a job below)
+            </span>
+          </template>
+          <template x-for="slug in jobsActiveSlugs" :key="'run_'+slug">
+            <span class="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 font-mono text-xs">
+              <span x-text="slug"></span>
+              <span class="opacity-60 ml-1" x-text="'· w' + (jobsPriority[slug] || priorityWeightDefault)"></span>
+            </span>
+          </template>
           <template x-if="jobsQueue.length">
             <span class="text-xs text-slate-400 ml-2">then:</span>
           </template>
@@ -7554,6 +7652,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   x-text="(i+1) + '. ' + slug"></span>
           </template>
         </div>
+        <p x-show="jobsActiveSlugs.length > 3" x-cloak
+           class="text-[11px] text-amber-400 mt-2">
+          Running <span x-text="jobsActiveSlugs.length"></span> jobs in parallel —
+          vision workers are shared and prioritised by weight.
+        </p>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -7573,9 +7676,14 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </template>
         </template>
 
-        <!-- Existing jobs -->
+        <!-- Existing jobs (v2 multi-active): Run toggle + priority stepper
+             replace the old Activate button. Toggling Run ON adds the job to
+             the active set (additive activate); OFF removes it (deactivate).
+             Priority (1-10, default 5) scales the shared vision fleet's
+             weighted round-robin turns per cycle. -->
         <template x-for="jb in jobsList" :key="jb.slug">
-          <div class="card rounded-xl p-5 flex flex-col">
+          <div class="card rounded-xl p-5 flex flex-col"
+               :class="jb.is_active ? 'ring-2 ring-indigo-500/50' : ''">
             <div class="flex items-start justify-between gap-2 mb-2">
               <div class="min-w-0">
                 <div class="font-semibold truncate" x-text="jb.name"></div>
@@ -7583,6 +7691,33 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
               <span class="pill px-2 py-0.5 rounded shrink-0" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
             </div>
+
+            <!-- Run + Priority controls: matches the visual language of the
+                 scraper toggles. Priority is echoed on every priority slider
+                 next to the Run switch so weights are always visible. -->
+            <div class="flex items-center gap-3 mb-3">
+              <label class="flex items-center gap-2 text-xs">
+                <input type="checkbox" :checked="jb.is_active"
+                       @change="toggleJobRun(jb.slug, $event.target.checked)"
+                       class="h-4 w-4 accent-indigo-500 cursor-pointer"
+                       :title="jb.is_active ? 'Running — flip off to remove from active set' : 'Idle — flip on to run in parallel'"/>
+                <span class="uppercase tracking-wide text-slate-400">Run</span>
+              </label>
+              <div class="flex items-center gap-1 ml-auto">
+                <span class="text-[11px] uppercase tracking-wide text-slate-500 mr-1">Priority</span>
+                <button type="button" @click="stepJobPriority(jb.slug, -1)"
+                        class="w-6 h-6 text-xs bg-slate-800 hover:bg-slate-700 rounded"
+                        title="Fewer round-robin turns per cycle">−</button>
+                <input type="number" :min="priorityWeightMin" :max="priorityWeightMax"
+                       :value="jb.priority || priorityWeightDefault"
+                       @change="setJobPriority(jb.slug, $event.target.value)"
+                       class="w-12 h-6 text-center bg-slate-800 border border-slate-700 rounded text-xs" />
+                <button type="button" @click="stepJobPriority(jb.slug, +1)"
+                        class="w-6 h-6 text-xs bg-slate-800 hover:bg-slate-700 rounded"
+                        title="More round-robin turns per cycle">+</button>
+              </div>
+            </div>
+
             <div class="grid grid-cols-2 gap-2 text-center my-2">
               <div class="bg-slate-900/60 border border-slate-800 rounded p-2">
                 <div class="pill text-indigo-300">Queued</div>
@@ -7594,12 +7729,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </div>
             <div class="text-[11px] text-slate-500 mb-3" x-show="jb.queue_position !== null"
-                 x-text="jb.queue_position === 0 ? 'Active' : ('Queue position #' + jb.queue_position)"></div>
+                 x-text="jb.queue_position === 0 ? 'Running (head)' : ('Queue position #' + jb.queue_position)"></div>
             <div class="mt-auto flex flex-wrap gap-1.5">
               <button @click="openJob(jb.slug)" class="px-2.5 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Open</button>
-              <button @click="activateJob(jb.slug)" :disabled="jb.is_active"
-                class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40"
-                x-text="jb.is_active ? 'Active' : 'Activate'"></button>
               <button @click="openJob(jb.slug); active='jobSettings'" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
               <button @click="cloneJob(jb.slug)" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
               <template x-if="!jb.is_active && jb.queue_position === null">
@@ -11041,7 +11173,11 @@ function dashboard() {
     // Jobs landing state. `jobsLoading` starts true so the skeleton grid shows
     // first-paint — otherwise the empty-list branch would flash the welcome
     // hero before the API call resolves.
-    jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: true,
+    // Multi-active state: `jobsActive` is the HEAD of the active set (kept
+    // for existing readers), `jobsActiveSlugs` is the full list, and
+    // `jobsPriority` is the per-slug weight (1-10, default `priorityWeightDefault`).
+    jobsList: [], jobsQueue: [], jobsActive: null, jobsActiveSlugs: [],
+    jobsPriority: {}, jobsLoading: true,
     newJob: { name: '', base_on: '', preset: '', presetFilter: '' },
     presetsList: [], presetsDefault: '', presetsBuiltins: [],
     presetsMeta: { descriptions: {}, tags: {} },
@@ -11469,6 +11605,12 @@ function dashboard() {
       this.jobsList = payload.jobs || [];
       this.jobsQueue = payload.queue || [];
       this.jobsActive = payload.active || null;
+      // Multi-active reader: prefer the new list field; fall back to the
+      // legacy single-slug when the server hasn't been upgraded yet so a
+      // mixed-version deploy keeps rendering.
+      this.jobsActiveSlugs = payload.active_slugs
+        || (payload.active ? [payload.active] : []);
+      this.jobsPriority = payload.priority || {};
     },
     async loadJobs() {
       this.jobsLoading = true;
@@ -11497,11 +11639,51 @@ function dashboard() {
       if (slug) this.openJob(slug);
     },
     async activateJob(slug) {
+      // Additive by default (multi-active). Passing exclusive=true would
+      // reset the active set to just this slug — not what the Run slider
+      // wants (that's what toggleJobRun's off-then-on flow gives you).
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
       if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Activate failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
       await this.refresh();
-      this.notify('Activated "' + slug + '".', 'success');
+      this.notify('Running "' + slug + '".', 'success');
+    },
+    async deactivateJob(slug) {
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/deactivate', {method:'POST'});
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Deactivate failed: ' + (j.error || r.status), 'error'); return; }
+      await this.loadJobs();
+      await this.refresh();
+    },
+    // Run slider on the Jobs card. Toggling ON is additive activate; OFF is
+    // deactivate — mirrors the scraper enable-toggle language so the whole
+    // dashboard feels consistent.
+    async toggleJobRun(slug, wantRunning) {
+      if (wantRunning) { await this.activateJob(slug); }
+      else { await this.deactivateJob(slug); }
+    },
+    // Priority weight (1-10). PUT is fire-and-forget optimistic — we mutate
+    // the local map first so the UI feels instant, then reconcile on reload.
+    async setJobPriority(slug, weight) {
+      const w = Math.max(this.priorityWeightMin,
+                         Math.min(this.priorityWeightMax, parseInt(weight, 10) || this.priorityWeightDefault));
+      this.jobsPriority = { ...this.jobsPriority, [slug]: w };
+      const jb = this.jobsList.find(j => j.slug === slug);
+      if (jb) jb.priority = w;
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/priority', {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({weight: w}),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.notify('Priority update failed: ' + (j.error || r.status), 'error');
+      }
+      await this.loadJobs();
+    },
+    stepJobPriority(slug, delta) {
+      const cur = (this.jobsPriority[slug]
+                   || (this.jobsList.find(j => j.slug === slug) || {}).priority
+                   || this.priorityWeightDefault);
+      this.setJobPriority(slug, cur + delta);
     },
     async cloneJob(slug) {
       const name = await this.askPrompt('Name for the clone of "' + slug + '":', slug + ' copy',
