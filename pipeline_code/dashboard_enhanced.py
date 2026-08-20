@@ -557,6 +557,196 @@ def _job_for_scope(slug: str | None) -> job_config.Job | None:
     return job_config.get_job(slug)
 
 
+# ── T1: SSE event stream (queue + activity + status) ─────────────────────────
+#
+# One long-lived endpoint (`/api/stream/events`) replaces three 5-second polls
+# from the browser. The generator ticks once per second, diffs against the
+# per-client snapshot, and emits `activity`/`queue`/`status` events only when
+# something actually changed. Every 30 s a `:hb` comment line is written so
+# reverse-proxies don't idle-kill the socket. Per-IP concurrency is capped at
+# _SSE_MAX_CONN_PER_IP so a single client can't exhaust the socket budget.
+_SSE_TICK_SECONDS: float = 1.0
+_SSE_HEARTBEAT_SECONDS: float = 30.0
+_SSE_MAX_CONN_PER_IP: int = 5
+_SSE_MAX_STREAM_SECONDS: float = 60 * 60  # cap any one stream at an hour
+_sse_ip_counts: dict[str, int] = {}
+_sse_ip_lock = threading.Lock()
+_sse_event_seq: int = 0
+_sse_seq_lock = threading.Lock()
+
+
+def _sse_next_id() -> int:
+    """Monotonic event id shared across every open stream so `Last-Event-ID`
+    reconnects can carry a stable cursor. The counter never rolls back — a
+    restart resets to 0 which is fine (the browser only compares within a
+    session)."""
+    global _sse_event_seq
+    with _sse_seq_lock:
+        _sse_event_seq += 1
+        return _sse_event_seq
+
+
+def _sse_client_ip() -> str:
+    """Best-effort client IP for the per-IP connection cap. Trusts
+    X-Forwarded-For when set (the dashboard sits behind at most one
+    reverse-proxy in production); falls back to remote_addr."""
+    fwd = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return fwd or (request.remote_addr or "unknown")
+
+
+def _sse_acquire_slot(ip: str) -> bool:
+    with _sse_ip_lock:
+        if _sse_ip_counts.get(ip, 0) >= _SSE_MAX_CONN_PER_IP:
+            return False
+        _sse_ip_counts[ip] = _sse_ip_counts.get(ip, 0) + 1
+        return True
+
+
+def _sse_release_slot(ip: str) -> None:
+    with _sse_ip_lock:
+        n = _sse_ip_counts.get(ip, 0) - 1
+        if n <= 0:
+            _sse_ip_counts.pop(ip, None)
+        else:
+            _sse_ip_counts[ip] = n
+
+
+def _sse_activity_snapshot(slug: str | None, limit: int = 12) -> list[dict[str, Any]]:
+    """Compact activity payload matching /api/activity's shape so the browser
+    can consume both interchangeably."""
+    out: list[dict[str, Any]] = []
+    for item in _list_recent_sorted_scoped(slug, limit):
+        if not Path(item.path).exists():
+            continue
+        vj = item.vision_json or {}
+        ovr = vj.get("OVR_Quality_Score") if isinstance(vj, dict) else None
+        rel = vj.get("REL_Quality_Score") if isinstance(vj, dict) else None
+        reason = vj.get("reason", "") if isinstance(vj, dict) else ""
+        caption = vj.get("caption", "") if isinstance(vj, dict) else ""
+        out.append({
+            "name": Path(item.path).name,
+            "path": item.path,
+            "category": item.category,
+            "source": item.source,
+            "modified": datetime.fromtimestamp(item.mtime).isoformat(),
+            "thumbnail": f"/api/thumbnail?path={item.path}",
+            "prompt_url": f"/api/prompt?path={item.path}",
+            "summary": reason,
+            "quality": item.quality,
+            "reason": reason,
+            "OVR_Quality_Score": ovr,
+            "REL_Quality_Score": rel,
+            "caption": caption,
+        })
+    return out
+
+
+def _sse_queue_snapshot(slug: str | None) -> dict[str, Any]:
+    counts = _scoped_queue_by_source(slug)
+    return {"sources": counts, "total": sum(counts.values())}
+
+
+def _sse_status_snapshot() -> dict[str, Any]:
+    return {
+        "running": pipeline_running(),
+        "pid": _pipeline_proc.pid if pipeline_running() else None,
+        "vision_worker": os.environ.get("PIPELINE_VISION_WORKER", ""),
+        "vision_workers": _active_vision_workers(),
+        "throttle": int(os.environ.get("DASHBOARD_THROTTLE_PERCENT", 100)),
+    }
+
+
+@app.route("/api/stream/events")
+def api_stream_events():
+    """Server-Sent Events feed for the dashboard: activity / queue / status.
+
+    Replaces three 5 s polls with one long-lived stream. The generator ticks
+    at :data:`_SSE_TICK_SECONDS`, diffs against the per-client snapshot, and
+    only writes an event when a slice actually changed — so a quiet pipeline
+    stays cheap. A `:hb` heartbeat comment is written every
+    :data:`_SSE_HEARTBEAT_SECONDS` to keep reverse-proxies from idle-killing
+    the connection.
+
+    Query: ``?job=<slug>`` scopes activity/queue to one job (defaults to the
+    active job). ``Last-Event-ID`` is honoured only informationally; the
+    server always sends fresh snapshots on reconnect.
+    """
+    ip = _sse_client_ip()
+    if not _sse_acquire_slot(ip):
+        # Cap open connections per remote IP so a runaway client can't drain
+        # the worker pool. 429 is retry-after-friendly.
+        return Response(
+            "too many event streams from this IP\n",
+            status=429,
+            mimetype="text/plain",
+            headers={"Retry-After": "10"},
+        )
+    slug = _resolve_job_slug()
+
+    def _stream():
+        try:
+            last: dict[str, Any] = {"activity": None, "queue": None, "status": None}
+            last_heartbeat = _time.time()
+            started = _time.time()
+            # Kick-off with the current snapshot for each slice so the client
+            # doesn't have to wait for the first change.
+            for kind, snap in (
+                ("activity", {"job": slug, "items": _sse_activity_snapshot(slug)}),
+                ("queue",    {"job": slug, **_sse_queue_snapshot(slug)}),
+                ("status",   {"job": slug, **_sse_status_snapshot()}),
+            ):
+                last[kind] = snap
+                payload = json.dumps(snap, default=str)
+                yield f"id: {_sse_next_id()}\nevent: {kind}\ndata: {payload}\n\n"
+            while True:
+                # Long streams get force-recycled so pathological clients can't
+                # hold a socket forever; the browser reconnects seamlessly.
+                if _time.time() - started > _SSE_MAX_STREAM_SECONDS:
+                    return
+                _time.sleep(_SSE_TICK_SECONDS)
+                emitted = False
+                # activity: diff on the top-N path list — cheapest signal that
+                # something classified. Full items only re-sent when the list
+                # actually changed.
+                act = {"job": slug, "items": _sse_activity_snapshot(slug)}
+                if [i.get("path") for i in act["items"]] != [
+                    i.get("path") for i in (last["activity"] or {}).get("items", [])
+                ]:
+                    last["activity"] = act
+                    payload = json.dumps(act, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: activity\ndata: {payload}\n\n"
+                    emitted = True
+                q = {"job": slug, **_sse_queue_snapshot(slug)}
+                if q != last["queue"]:
+                    last["queue"] = q
+                    payload = json.dumps(q, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: queue\ndata: {payload}\n\n"
+                    emitted = True
+                st = {"job": slug, **_sse_status_snapshot()}
+                if st != last["status"]:
+                    last["status"] = st
+                    payload = json.dumps(st, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: status\ndata: {payload}\n\n"
+                    emitted = True
+                # Heartbeat: keep proxies from dropping an idle socket. Any
+                # data write resets the clock so busy streams don't add noise.
+                now = _time.time()
+                if emitted:
+                    last_heartbeat = now
+                elif now - last_heartbeat >= _SSE_HEARTBEAT_SECONDS:
+                    last_heartbeat = now
+                    yield ": hb\n\n"
+        finally:
+            _sse_release_slot(ip)
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",  # disable nginx buffering
+        "Connection": "keep-alive",
+    }
+    return Response(_stream(), mimetype="text/event-stream", headers=headers)
+
+
 def _job_effective_scrapers(job: job_config.Job) -> dict[str, Any]:
     eff = job_config.effective_config(job)
     s = eff.get("scrapers")
@@ -3191,6 +3381,11 @@ def api_stats():
     """Aggregates over every sorted image: keyword frequency, top thumbnails,
     per-source platform analytics. Cached for 60s via _get_sorted_items.
     Scoped to ?job=<slug> (default active).
+
+    When ``?by=job`` is present the payload gains a ``by_job`` map — a compact
+    per-job breakdown ``{slug: {total, kept, discarded}}`` used by the Global
+    Stats donut chart (T4). This is derived from the FULL unscoped set so a
+    single request answers the donut regardless of the primary ``?job=`` filter.
     """
     items = _get_sorted_items_scoped(_resolve_job_slug())
     non_discard = [it for it in items if it.category.upper() != "DISCARD"]
@@ -3270,7 +3465,7 @@ def api_stats():
         })
     sources.sort(key=lambda r: r["total"], reverse=True)
 
-    return jsonify({
+    payload: dict[str, Any] = {
         "totals": {
             "all": len(items),
             "non_discard": len(non_discard),
@@ -3282,7 +3477,24 @@ def api_stats():
         "top_relative": top_relative,
         "sources": sources,
         "cached_age": round(_time.time() - _sorted_cache["ts"], 1),
-    })
+    }
+    # T4: per-job breakdown for the Global Stats donut chart. Derived from the
+    # FULL unscoped set (never the ?job=<slug> filter) so one call powers the
+    # donut regardless of the drill-down. Keys are the job slug ('default' when
+    # a row has no topic_slug set); values are {total, kept, discarded}.
+    if (request.args.get("by") or "").lower() == "job":
+        all_items = _get_sorted_items(force=False)
+        breakdown: dict[str, dict[str, int]] = {}
+        for it in all_items:
+            slug_key = it.topic_slug or "default"
+            bucket = breakdown.setdefault(slug_key, {"total": 0, "kept": 0, "discarded": 0})
+            bucket["total"] += 1
+            if it.category.upper() == "DISCARD":
+                bucket["discarded"] += 1
+            else:
+                bucket["kept"] += 1
+        payload["by_job"] = breakdown
+    return jsonify(payload)
 
 
 # ── API: gallery (paginated + filtered) ───────────────────────────────────────
@@ -3399,6 +3611,64 @@ def api_gallery():
             "sources": sorted({it.source for it in items}),
             "categories": sorted({it.category for it in items}),
             "resolutions": [b[0] for b in _RESOLUTION_BUCKETS] + ["ultra", "unknown"],
+        },
+    })
+
+
+@app.route("/api/gallery/global")
+def api_gallery_global():
+    """T3: cross-job gallery — same shape as ``/api/gallery`` but aggregated
+    over every job. ``?jobs=slug1,slug2`` narrows to the listed slugs (comma-
+    separated); an empty / absent value keeps the aggregate. Each card carries
+    ``topic_slug`` so the client can chip the job name onto the tile.
+
+    Reuses ``_get_sorted_items(None)`` + ``_filter_items`` so gallery filter
+    semantics (source/category/resolution/date/scores/keyword) stay identical
+    to the per-job endpoint — the only differences are scope and the job
+    filter applied here on top.
+    """
+    items = _get_sorted_items_scoped(None)
+    jobs_arg = (request.args.get("jobs") or "").strip()
+    if jobs_arg:
+        wanted = {
+            s.strip() for s in jobs_arg.split(",")
+            if s.strip() and job_config.JOB_SLUG_RE.match(s.strip())
+        }
+        if wanted:
+            items = [it for it in items if (it.topic_slug or "default") in wanted]
+    filtered = _filter_items(items, request.args)
+    sort_key = (request.args.get("sort") or "newest").lower()
+    if sort_key == "ovr":
+        filtered.sort(key=lambda it: float(it.payload.get("OVR_Quality_Score") or 0), reverse=True)
+    elif sort_key == "rel":
+        filtered.sort(key=lambda it: float(it.payload.get("REL_Quality_Score") or 0), reverse=True)
+    elif sort_key == "quality":
+        filtered.sort(key=lambda it: float(it.payload.get("quality_score") or 0), reverse=True)
+    else:
+        filtered.sort(key=lambda it: it.mtime, reverse=True)
+    page = max(1, _parse_int(request.args.get("page"), default=1))
+    page_size = max(1, min(240, _parse_int(request.args.get("page_size"), default=_GALLERY_PAGE_LIMIT)))
+    start = (page - 1) * page_size
+    page_items = filtered[start:start + page_size]
+
+    def _card(it: _SortedItem) -> dict[str, Any]:
+        card = _item_to_card(it)
+        # topic_slug lets the client chip the job name on each tile — the
+        # per-job endpoint doesn't need it, but here it disambiguates the mix.
+        card["topic_slug"] = it.topic_slug or "default"
+        return card
+
+    return jsonify({
+        "page": page,
+        "page_size": page_size,
+        "total": len(filtered),
+        "total_unfiltered": len(items),
+        "items": [_card(it) for it in page_items],
+        "available": {
+            "sources": sorted({it.source for it in items}),
+            "categories": sorted({it.category for it in items}),
+            "resolutions": [b[0] for b in _RESOLUTION_BUCKETS] + ["ultra", "unknown"],
+            "jobs": sorted({(it.topic_slug or "default") for it in items}),
         },
     })
 
@@ -6293,6 +6563,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 border-radius:3px; }
   .bulk-bar { position:sticky; bottom:1rem; z-index:15; }
 
+  /* T1: subtle fade-in for items appended/prepended by the SSE stream so a
+     just-arrived classification/queue entry visibly enters the list without
+     the pop of a hard-swap. Runs once per element. */
+  @keyframes sseFadeIn { from { opacity: 0; transform: translateY(-2px); }
+                         to   { opacity: 1; transform: none; } }
+  .sse-fade { animation: sseFadeIn 220ms ease-out both; }
+
   /* Live-log stream viewer. */
   .log-stream { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.72rem;
                 line-height:1.4; background:#020617; border:1px solid #334155; border-radius:.5rem;
@@ -6844,6 +7121,65 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          class="mt-2 text-[11px] text-slate-500"
          x-text="'Indexed ' + ((indexer.queue_total || 0) + (indexer.sorted_total || 0)).toLocaleString() + ' images'">
     </div>
+
+    <!-- Updates strip (T6) — compact self-update UX pinned to the sidebar so
+         it's reachable from every tab without cluttering Global Settings.
+         The /api/update/check + /api/update/run endpoints are unchanged; only
+         the location + surface have moved. Update failures surface as toasts. -->
+    <div class="mt-4 pt-3 border-t border-slate-800 space-y-1.5 text-[11px]">
+      <div class="flex items-center justify-between gap-1">
+        <span class="font-mono text-slate-400 truncate"
+              :title="'Installed: ' + (update.local_sha || 'unknown')"
+              x-text="'cull @ ' + (update.local_sha ? update.local_sha.slice(0,7) : '…')"></span>
+        <a href="https://github.com/tlennon-ie/cull" target="_blank" rel="noopener"
+           class="text-slate-400 hover:text-slate-200 transition shrink-0"
+           title="Open cull on GitHub" aria-label="Open cull on GitHub">
+          <!-- Octocat glyph (inline SVG). Keeps this dependency-free. -->
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+            <path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 005.47 7.59c.4.07.55-.17.55-.38
+              0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+              -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+              .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
+              -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27
+              .68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12
+              .51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48
+              0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42
+              -3.58-8-8-8z"/>
+          </svg>
+        </a>
+      </div>
+      <div class="flex items-center gap-1 flex-wrap">
+        <template x-if="!update.checked || update.checking">
+          <button @click="checkUpdate(true)" :disabled="update.checking"
+                  class="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-60"
+                  x-text="update.checking ? 'Checking…' : 'Check for updates'"></button>
+        </template>
+        <template x-if="update.checked && !update.checking && update.behind === 0 && !update.error">
+          <span class="px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300 text-[11px]"
+                title="Latest cull is already installed">up to date</span>
+        </template>
+        <template x-if="update.checked && update.behind > 0">
+          <div class="flex flex-col gap-1 w-full">
+            <div class="flex items-center gap-1 text-amber-300">
+              <span>Update available</span>
+              <span class="font-mono text-slate-500 truncate"
+                    x-text="(update.local_sha ? update.local_sha.slice(0,7) : '…') + ' → ' + (update.remote_sha ? update.remote_sha.slice(0,7) : '…')"></span>
+            </div>
+            <button @click="runUpdate()" :disabled="update.running"
+                    class="px-2 py-1 rounded bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold text-[11px] disabled:opacity-60"
+                    x-text="update.running ? 'Updating…' : 'Update to latest &amp; restart'"></button>
+            <button @click="checkUpdate(true)" :disabled="update.checking"
+                    class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] disabled:opacity-60"
+                    x-text="update.checking ? 'Rechecking…' : 'Re-check'"></button>
+          </div>
+        </template>
+        <template x-if="update.checked && update.error && !update.checking">
+          <button @click="checkUpdate(true)"
+                  class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                  title="Last check failed — try again">Re-check</button>
+        </template>
+      </div>
+    </div>
   </aside>
 
   <!-- Backdrop when sidebar is open on mobile. -->
@@ -6858,11 +7194,20 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <span x-show="view === 'jobs' && active === 'jobs'">Each job is a curation target with its own scrapers, taxonomy, and scoring. Activate one to run it.</span>
           <span x-show="view === 'jobs' && active === 'settings'">Global credentials, model endpoints, and storage roots. Per-job settings live inside each job.</span>
           <span x-show="view === 'jobs' && active === 'gstats'">Aggregate analytics across every job — filter to one job to drill in.</span>
+          <span x-show="view === 'jobs' && active === 'globalGallery'">Every job's sorted library in one grid — chip filter by job, plus the standard prompt/source/category filters.</span>
           <span x-show="view === 'job' && active !== 'gallery'" x-text="'Job: ' + currentJob + ' — auto-refresh every 5 s'"></span>
           <span x-show="view === 'job' && active === 'gallery'" x-text="'Filter, browse, edit, and export ' + currentJob + '\'s sorted library'"></span>
         </p>
       </div>
       <div class="flex items-center gap-2">
+        <!-- T2: Global "Show NSFW" toggle. Client-only; persists to
+             localStorage['cull_show_nsfw'] and drives shouldBlurNsfw() so
+             EVERY image surface honours a single switch. Default OFF. -->
+        <label class="flex items-center gap-1.5 text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1.5 cursor-pointer"
+               :title="showNsfw ? 'Hide NSFW imagery (blurs across every surface)' : 'Reveal NSFW imagery on every surface'">
+          <input type="checkbox" class="accent-indigo-500" :checked="showNsfw" @change="setShowNsfw($event.target.checked)"/>
+          <span class="select-none">Show NSFW</span>
+        </label>
         <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>. -->
         <select :value="theme" @change="setTheme($event.target.value)"
                 title="Colour theme"
@@ -7217,6 +7562,48 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-rose-300">Discarded</div><div class="text-2xl font-mono mt-1 text-rose-200" x-text="stats.totals?.discard ?? 0"></div></div>
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Sources</div><div class="text-2xl font-mono mt-1" x-text="(stats.sources?.length ?? 0)"></div></div>
         </div>
+
+        <!-- T4: per-job donut. Derived from ?by=job; one slice per job with a
+             deterministic hsl(hash(slug)) hue so slice/legend colours match
+             across renders. Filtering the picker to one job collapses to a
+             single-slice donut with that job's % of the global total. Inline
+             SVG keeps this dependency-free and theme-aware (all colours are
+             tokens/hsl; the ring hole uses --color-bg-elev). -->
+        <div class="mt-4 grid gap-4 md:grid-cols-[minmax(0,300px)_1fr] items-center"
+             x-show="globalStatsDonutSlices().length">
+          <div style="max-width:300px" class="mx-auto md:mx-0 w-full">
+            <svg viewBox="0 0 200 200" width="100%" height="100%" role="img"
+                 :aria-label="'Per-job classification totals — ' + (globalStatsGrandTotal() || 0) + ' total'">
+              <template x-for="s in globalStatsDonutSlices()" :key="'gd_'+s.slug">
+                <path :d="s.path" :fill="s.fill" stroke="var(--color-bg-elev)" stroke-width="1"
+                      :aria-label="s.slug + ' ' + s.count + ' (' + s.pct + '%)'"><title x-text="s.slug + ' — ' + s.count + ' (' + s.pct + '%)'"></title></path>
+              </template>
+              <!-- Ring hole. Colour follows the surface so the donut stays legible in every theme. -->
+              <circle cx="100" cy="100" r="46" fill="var(--color-bg-elev)"/>
+              <text x="100" y="95" text-anchor="middle" font-size="14"
+                    fill="var(--color-fg-muted)">total</text>
+              <text x="100" y="115" text-anchor="middle" font-size="20" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+                    fill="var(--color-fg)" x-text="globalStatsGrandTotal().toLocaleString()"></text>
+            </svg>
+          </div>
+          <div class="text-xs space-y-1">
+            <div class="font-semibold text-sm mb-1"
+                 x-text="'By job (' + globalStatsDonutSlices().length + ')'"></div>
+            <div class="max-h-[220px] overflow-y-auto pr-1 space-y-1">
+              <template x-for="s in globalStatsDonutSlices()" :key="'gdl_'+s.slug">
+                <div class="flex items-center gap-2">
+                  <span class="inline-block w-3 h-3 rounded-sm shrink-0" :style="'background:'+s.fill"></span>
+                  <span class="font-mono truncate flex-1" x-text="s.slug"></span>
+                  <span class="font-mono text-slate-400" x-text="s.count.toLocaleString()"></span>
+                  <span class="font-mono text-slate-500 w-12 text-right" x-text="s.pct + '%'"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+        <div x-show="!globalStatsDonutSlices().length" class="mt-3 text-xs text-slate-500 italic">
+          No per-job data yet — donut renders once a job classifies its first image.
+        </div>
       </div>
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Per-source platform analytics</h3>
@@ -7242,6 +7629,131 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             </template>
           </tbody>
         </table></div>
+      </div>
+    </section>
+
+    <!-- GLOBAL GALLERY ────────────────────────────────────────────────────
+         T3: every job's sorted library in one grid. Same tile renderer as the
+         per-job gallery, plus a jobs multi-select filter and a job chip on
+         each card. Respects the global NSFW toggle (T2). -->
+    <section x-show="view === 'jobs' && active === 'globalGallery'" class="space-y-4">
+      <div class="card rounded-xl p-4">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Search prompts / descriptions</label>
+            <input x-model="globalGalleryFilters.q" @keydown.enter="loadGlobalGallery(1)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
+              placeholder="e.g. blonde hair, beach, neon"/>
+          </div>
+          <div class="lg:col-span-2">
+            <label class="text-xs text-slate-400">Sort by</label>
+            <select x-model="globalGalleryFilters.sort" @change.debounce.300ms="loadGlobalGallery(1)"
+              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+              <option value="newest">Newest first</option>
+              <option value="ovr">OVR (craft)</option>
+              <option value="rel">REL (relevance)</option>
+              <option value="quality">quality_score</option>
+            </select>
+          </div>
+          <div class="lg:col-span-6">
+            <label class="text-xs text-slate-400">Jobs<span class="text-slate-500 font-normal ml-1">(none checked = all jobs)</span></label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="jb in jobsList" :key="'gg_jf_'+jb.slug">
+                <button @click="toggleGlobalGalleryJob(jb.slug)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="globalGalleryFilters.jobs.includes(jb.slug) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="jb.name || jb.slug"></button>
+              </template>
+              <template x-if="!jobsList.length">
+                <span class="text-xs text-slate-500 italic">No jobs to filter by yet.</span>
+              </template>
+            </div>
+          </div>
+
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Sources</label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="src in globalGallery.available?.sources ?? []" :key="'gg_src_'+src">
+                <button @click="toggleGlobalGalleryList('sources', src)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="globalGalleryFilters.sources.includes(src) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="src"></button>
+              </template>
+            </div>
+          </div>
+          <div class="lg:col-span-4">
+            <label class="text-xs text-slate-400">Categories</label>
+            <div class="flex flex-wrap gap-1 mt-1">
+              <template x-for="cat in globalGallery.available?.categories ?? []" :key="'gg_cat_'+cat">
+                <button @click="toggleGlobalGalleryList('categories', cat)"
+                  class="px-2 py-0.5 text-xs rounded border"
+                  :class="globalGalleryFilters.categories.includes(cat) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
+                  x-text="cat"></button>
+              </template>
+            </div>
+          </div>
+          <div class="lg:col-span-4 flex items-end gap-2 flex-wrap">
+            <button @click="loadGlobalGallery(1)"
+                    class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Apply</button>
+            <button @click="clearGlobalGalleryFilters()"
+                    class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Clear</button>
+            <span class="text-xs text-slate-400 ml-auto">
+              <span x-text="globalGallery.total"></span> / <span x-text="globalGallery.total_unfiltered"></span> match
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Results (all jobs)</h3>
+          <div class="flex items-center gap-2 text-xs">
+            <button @click="loadGlobalGallery(Math.max(1, globalGallery.page - 1))"
+                    :disabled="globalGallery.page <= 1"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">Prev</button>
+            <span>Page <span x-text="globalGallery.page"></span> / <span x-text="Math.max(1, Math.ceil(globalGallery.total / globalGallery.pageSize))"></span></span>
+            <button @click="loadGlobalGallery(globalGallery.page + 1)"
+                    :disabled="globalGallery.page >= Math.max(1, Math.ceil(globalGallery.total / globalGallery.pageSize))"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">Next</button>
+          </div>
+        </div>
+        <div x-show="globalGalleryLoading" class="text-xs text-slate-400">Loading…</div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+          <template x-for="c in globalGallery.items" :key="'gg_'+c.path">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col relative">
+              <span class="nsfw-wrap block">
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
+                     :class="{ 'nsfw-blur': shouldBlurNsfw(c) }" loading="lazy"
+                     @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
+                <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image"
+                      x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                  </svg>
+                </span>
+              </span>
+              <div class="mt-1 flex items-center justify-between gap-1">
+                <span class="pill px-1.5 py-0.5 rounded bg-slate-800" x-text="c.category"></span>
+                <span class="text-slate-400 truncate" :title="c.source" x-text="c.source"></span>
+              </div>
+              <div class="mt-1 flex items-center justify-between gap-1">
+                <span class="pill px-1.5 py-0.5 rounded bg-indigo-950/60 text-indigo-200 font-mono truncate"
+                      :title="'job: ' + c.topic_slug"
+                      x-text="c.topic_slug"></span>
+                <span class="text-slate-500 text-[11px]" x-text="c.resolution_bucket"></span>
+              </div>
+              <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
+              <div class="mt-1 flex items-center gap-3">
+                <span class="link-btn" @click.stop="openModalFromCard(c)">Open</span>
+              </div>
+            </div>
+          </template>
+          <template x-if="!globalGalleryLoading && (globalGallery.items?.length ?? 0) === 0">
+            <div class="col-span-full text-center py-10 text-sm text-slate-500">
+              Nothing matches these filters across any job.
+            </div>
+          </template>
+        </div>
       </div>
     </section>
 
@@ -7453,15 +7965,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <option value="quality">quality_score</option>
             </select>
           </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">NSFW</label>
-            <select x-model="galleryFilters.nsfw" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-              <option value="any">Show all</option>
-              <option value="exclude">Hide NSFW</option>
-              <option value="only">Only NSFW</option>
-            </select>
-          </div>
+          <!-- T2: per-gallery NSFW dropdown removed — the sidebar's global
+               "Show NSFW" toggle is the single source of truth for NSFW
+               visibility across every surface. -->
           <div class="lg:col-span-2">
             <label class="text-xs text-slate-400">Date from</label>
             <input type="date" x-model="galleryFilters.dateFrom" @change.debounce.300ms="galleryReload()"
@@ -9286,7 +9792,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <div class="flex gap-2 shrink-0">
           <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-          <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+          <button @click="saveSettings()" :disabled="!settingsDirty || settingsSaving"
+                  :title="settingsSaving ? 'Saving…' : (settingsDirty ? '' : 'No unsaved changes')"
+                  class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                  x-text="settingsSaving ? 'Saving…' : (settingsDirty ? 'Save' : 'Saved')"></button>
         </div>
       </div>
       <template x-if="settingsBanner">
@@ -9296,40 +9805,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           x-text="settingsBanner"></div>
       </template>
 
-      <!-- Software updates — pull origin/main + restart. Mirrors the update toast. -->
-      <div class="card rounded-xl p-5">
-        <div class="flex items-start justify-between gap-4 mb-2">
-          <div>
-            <h3 class="font-semibold">Software updates</h3>
-            <p class="text-xs text-slate-400">Pull the latest cull from <code>origin/main</code> and restart. Needs a clean git checkout.</p>
-          </div>
-          <div class="flex gap-2 shrink-0">
-            <button @click="checkUpdate(true)" :disabled="!!update.checking"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
-              <span x-text="update.checking ? 'Checking…' : 'Check for updates'"></span>
-            </button>
-            <button @click="runUpdate()" :disabled="!!update.running || update.behind === 0 || !!update.dirty"
-              class="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded text-sm disabled:opacity-50"
-              :title="update.dirty ? 'Commit or stash local changes first' : (update.behind === 0 ? 'Already up to date' : '')">
-              <span x-text="update.running ? 'Updating…' : 'Update to latest &amp; restart'"></span>
-            </button>
-          </div>
-        </div>
-        <div class="text-xs text-slate-400 space-y-1">
-          <div>Installed: <span class="font-mono text-slate-200" x-text="update.local_sha || '—'"></span>
-            <template x-if="update.checked">
-              <span>· latest <span class="font-mono text-slate-200" x-text="update.remote_sha || '—'"></span>
-                <span x-show="update.behind > 0" class="text-amber-300" x-text="'· ' + update.behind + ' behind'"></span>
-                <span x-show="update.checked && update.behind === 0 && !update.error" class="text-emerald-300">· up to date</span>
-              </span>
-            </template>
-          </div>
-          <div x-show="update.remote_subject" class="truncate text-slate-500" x-text="'→ ' + update.remote_subject"></div>
-          <div x-show="update.dirty" class="text-rose-300">Working tree has uncommitted changes — commit or stash before updating.</div>
-          <div x-show="update.error" class="text-rose-300" x-text="'⚠ ' + update.error"></div>
-          <div x-show="update.running" class="text-slate-400">Pulling, reinstalling deps if needed, and relaunching. The dashboard will restart — refresh in a moment.</div>
-        </div>
-      </div>
+      <!-- Software updates now live in the sidebar (T6). -->
 
       <!-- Backup & restore — export/import all jobs + presets, or a single preset/job. -->
       <div class="card rounded-xl p-5">
@@ -10029,6 +10505,16 @@ function dashboard() {
     currentJob: null,         // slug of the job being viewed, when view==='job'
     active: 'jobs',           // active section id within the current view
     sidebarOpen: false,
+    // T2: Global "Show NSFW" — client-only. When false, EVERY image surface
+    // blurs NSFW items (via shouldBlurNsfw). Hydrated from localStorage on
+    // start(); watched below to persist changes. Default OFF.
+    showNsfw: false,
+    // T1: SSE connection state. `_sseSource` holds the EventSource; `_sseOpen`
+    // gates the legacy polls (skipped while streaming); `_sseSlug` remembers
+    // the job scope the current stream was opened with (so job switches
+    // reopen). `_sseLastEventId` is only informational — the server always
+    // sends fresh snapshots on reconnect.
+    _sseSource: null, _sseOpen: false, _sseSlug: null, _sseLastEventId: 0,
     // Job-scoped tabs (shown when view==='job'). Ordered by frequency of use:
     // Overview first (dashboard-of-dashboards), then curation surfaces
     // (Gallery / Queue / Activity / Stats), then config, then troubleshooting.
@@ -10056,6 +10542,7 @@ function dashboard() {
       {id:'presets',   label:'Presets',         hint:'Reusable config bundles jobs inherit from'},
       {id:'schedules', label:'Schedules',       hint:'Run jobs on a cadence (hourly, daily, custom)'},
       {id:'gstats',    label:'Global Stats',    hint:'Aggregate analytics across every job'},
+      {id:'globalGallery', label:'Global Gallery', hint:'Every job\'s sorted images in one grid'},
       {id:'settings',  label:'Global Settings', hint:'Credentials, model endpoints, storage roots'},
       {id:'liveLogs',  label:'Logs',            hint:'Live-tail pipeline logs'},
       {id:'faq',       label:'FAQ',             hint:'Common questions about how cull works'},
@@ -10111,6 +10598,14 @@ function dashboard() {
     _gvTimer: null,
     // Global Stats per-job filter (null = all jobs aggregate).
     globalStatsJob: '__all__',
+    // T3 Global Gallery — aggregate view across every job. Reuses shouldBlurNsfw,
+    // openModalFromCard, revealNsfw etc. Filters are OWN state (no leak into
+    // the per-job gallery form). "jobs" is a slug allowlist; empty = all.
+    globalGallery: { page: 1, pageSize: 60, total: 0, total_unfiltered: 0, items: [], available: {} },
+    globalGalleryLoading: false,
+    globalGalleryFilters: {
+      q: '', sources: [], categories: [], jobs: [], sort: 'newest',
+    },
     // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
     // so this can never drift from the Python source of truth. Used by the
     // preset editor's enabled-toggles.
@@ -10137,7 +10632,12 @@ function dashboard() {
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '', settingsBannerOk: true,
-    settingsDirty: false, settingsErrors: {}, configImporting: false,
+    settingsErrors: {}, configImporting: false,
+    // T5: dirty detection via JSON snapshot. `settingsDirty` is a getter that
+    // compares the live settings object against `_settingsSnapshot` (captured
+    // on every successful fetch/save). Save is disabled when nothing changed.
+    settingsSaving: false, _settingsSnapshot: '',
+    get settingsDirty() { return JSON.stringify(this.settings) !== this._settingsSnapshot; },
     // Cached video-backend probe (used by the Settings VIDEO_CLASSIFY_ENABLED
     // banner). `checked=false` on boot so the banner never flashes before the
     // first probe returns.
@@ -10337,6 +10837,8 @@ function dashboard() {
     galleryFilters: {
       q: '', sources: [], categories: [], resolutions: [],
       minOvr: 0, minRel: 0, minQuality: 0,
+      // T2: 'nsfw' filter retained for API back-compat but no longer surfaced
+      // in the UI — global NSFW toggle governs visibility now.
       nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
@@ -10377,12 +10879,23 @@ function dashboard() {
       // status pill, and skip the job-scoped polls entirely.
       const j = (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status));
       if (this.view === 'jobs') {
-        const [status, jobs] = await Promise.allSettled([j('/api/status'), j('/api/jobs')]);
-        if (status.status === 'fulfilled') this.applyStatus(status.value);
+        // T1: status flows through SSE while the stream is open; only poll
+        // it in a fallback (no-EventSource) session so the pipeline pill
+        // still updates without the stream.
+        const statusPromise = this._sseOpen ? Promise.resolve(null) : j('/api/status');
+        const [status, jobs] = await Promise.allSettled([statusPromise, j('/api/jobs')]);
+        if (status.status === 'fulfilled' && status.value) this.applyStatus(status.value);
         if (jobs.status === 'fulfilled') this.applyJobs(jobs.value);
         if (this.active === 'settings' || this.active === 'gstats') {
           const s = await j('/api/settings').catch(() => null);
-          if (s && !this.settingsDirty && Object.keys(this.settings).length === 0) this.settings = s;
+          // Only seed settings on first load; guard on the object being empty
+          // rather than the (now getter-based) settingsDirty flag so a stale
+          // snapshot can't lock the form empty. Snapshot afterwards so the
+          // getter reports "clean" until the user actually edits a field.
+          if (s && Object.keys(this.settings).length === 0) {
+            this.settings = s;
+            this._settingsSnapshot = JSON.stringify(this.settings);
+          }
         }
         this.lastRefresh = new Date().toLocaleTimeString();
         return;
@@ -10392,14 +10905,19 @@ function dashboard() {
       const sep = q ? '&' : '?';
       const tab = this.active;
       const need = (id) => tab === id || tab === 'overview';
+      // T1: status/queue/activity now flow through /api/stream/events (SSE)
+      // when the browser supports it. Skip them from the 5 s poll iff the
+      // stream is open; otherwise keep the legacy pulls so no-EventSource
+      // browsers still see fresh data.
+      const streamOn = !!this._sseOpen;
       const tasks = {
-        status:    j('/api/status' + q),
+        status:    streamOn ? null : j('/api/status' + q),
         scrapers:  j('/api/scrapers' + q),
         workers:   j('/api/vision/workers'),
         models:    (need('vision') ? j('/api/lmstudio/models') : null),
-        queue:     (need('queue')  ? j('/api/queue/files' + q + sep + 'limit=60') : null),
+        queue:     (need('queue')  ? (streamOn ? null : j('/api/queue/files' + q + sep + 'limit=60')) : null),
         history:   (need('logs')   ? j('/api/logs/history' + q + sep + 'limit=200') : null),
-        activity:  (need('overview') || tab === 'vision' ? j('/api/activity' + q + sep + 'limit=12') : null),
+        activity:  (need('overview') || tab === 'vision' ? (streamOn ? null : j('/api/activity' + q + sep + 'limit=12')) : null),
         // Vision tab also needs GLOBAL settings for the LMStudio knobs.
         settings:  (tab === 'vision' ? j('/api/settings') : null),
       };
@@ -10415,8 +10933,10 @@ function dashboard() {
       if (out.history)   this.history = out.history;
       if (out.activity)  this.activity = out.activity;
       // Only seed settings on first load OR when the user explicitly hits Reload.
-      if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
+      // Snapshot for dirty-detection (T5): the form is clean until the user edits.
+      if (out.settings && Object.keys(this.settings).length === 0) {
         this.settings = out.settings;
+        this._settingsSnapshot = JSON.stringify(this.settings);
       }
       // Probe video-backend availability once (cheap, cached client-side) so
       // the Settings banner has an answer to render when the user opens it.
@@ -10550,6 +11070,9 @@ function dashboard() {
                   savedFlash: '', saving: false, error: '', applyPending: false };
       this.refresh();
       this.loadJobEditor();
+      // T1: reopen the SSE stream scoped to the new job so per-job snapshots
+      // (activity/queue) filter server-side instead of on the client.
+      this.openStream();
     },
     // Flush pending edits + apply once if the (active) job has unapplied changes.
     // Cancels the debounce timer first so it can't fire after we've moved on.
@@ -10569,6 +11092,9 @@ function dashboard() {
       this.sidebarOpen = false;
       this.loadJobs();
       this.refresh();
+      // T1: re-scope the SSE to the active-job (global) stream now that we're
+      // back on the jobs landing.
+      this.openStream();
     },
 
     // ── Job Settings (v2 inherit/override + auto-save) ───────────────────
@@ -11053,9 +11579,11 @@ function dashboard() {
       this.presetEditor.saving = false;
     },
     async saveSettings() {
+      if (!this.settingsDirty || this.settingsSaving) return;
       this.settingsBanner = 'Saving...';
       this.settingsBannerOk = true;
       this.settingsErrors = {};
+      this.settingsSaving = true;
       try {
         const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify(this.settings)});
@@ -11063,7 +11591,10 @@ function dashboard() {
         if (j.success) {
           this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
           this.settingsBannerOk = true;
-          this.settingsDirty = false;
+          // Refresh the snapshot BEFORE clearing settings so the getter reads
+          // "clean" while we wait for the server round-trip; then let refresh()
+          // re-fetch + re-snapshot with the server's canonical values.
+          this._settingsSnapshot = JSON.stringify(this.settings);
           this.settings = {};  // Force reload from server on next refresh
           setTimeout(() => this.settingsBanner = '', 6000);
         } else {
@@ -11078,10 +11609,12 @@ function dashboard() {
       } catch (e) {
         this.settingsBanner = 'Network error - see console.';
         this.settingsBannerOk = false;
+      } finally {
+        this.settingsSaving = false;
       }
       this.refresh();
     },
-    markSettingsDirty() { this.settingsDirty = true; },
+    markSettingsDirty() { /* legacy no-op: dirty is now derived from _settingsSnapshot (T5). */ },
     // Map a vision worker name to the provider its /api/vision/test probe uses.
     workerProvider(name) {
       const n = (name || '').toLowerCase();
@@ -11293,8 +11826,13 @@ function dashboard() {
         const r = await fetch('/api/update/run', { method: 'POST' });
         const j = await r.json();
         if (!j.ok) {
-          this.update.error = j.error || 'Update failed.';
+          // T6: surface the reason as a toast instead of a persistent UI block.
+          // "uncommitted changes present" is the common one — the git checkout
+          // is dirty, so the update is refused until the user commits/stashes.
+          const msg = j.error || 'Update failed.';
+          this.update.error = msg;
           this.update.running = false;
+          this.notify('Update failed: ' + msg, 'error');
         }
         // On success the dashboard process will exit imminently; the update
         // script restarts it. The user just needs to refresh.
@@ -11320,7 +11858,7 @@ function dashboard() {
       if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
                                   { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
-      this.settingsDirty = false;
+      this._settingsSnapshot = '';  // T5: force refresh() to re-seed + snapshot.
       this.settingsErrors = {};
       // Re-probe so a freshly-installed ffmpeg is picked up without a full refresh.
       this.videoBackend = { checked: false, has_any: true, backends: [] };
@@ -11700,15 +12238,132 @@ function dashboard() {
     },
     // Global Stats (jobs view): aggregate across all jobs, or one job when the
     // per-job filter is set. Uses an explicit ?job= rather than currentJob.
+    // Requests ?by=job so the payload carries the per-job breakdown that the
+    // donut chart (T4) renders alongside the aggregate totals.
     async loadGlobalStats() {
       this.statsLoading = true;
       try {
-        // Default the picker to __all__ so backends aggregate across every
-        // job. Empty string used to fall back to the active job server-side.
         const scope = this.globalStatsJob || '__all__';
-        this.stats = await fetch('/api/stats?job=' + encodeURIComponent(scope)).then(r=>r.json());
+        this.stats = await fetch('/api/stats?by=job&job=' + encodeURIComponent(scope)).then(r=>r.json());
       } catch (e) { /* swallow */ }
       this.statsLoading = false;
+    },
+    // ── Global Gallery (T3) ────────────────────────────────────────────────
+    async loadGlobalGallery(page) {
+      if (page) this.globalGallery.page = page;
+      this.globalGalleryLoading = true;
+      try {
+        const f = this.globalGalleryFilters;
+        const params = new URLSearchParams();
+        params.set('page', this.globalGallery.page);
+        params.set('page_size', this.globalGallery.pageSize);
+        if (f.q) params.set('q', f.q);
+        if (f.sources.length) params.set('sources', f.sources.join(','));
+        if (f.categories.length) params.set('categories', f.categories.join(','));
+        if (f.sort) params.set('sort', f.sort);
+        if (f.jobs.length) params.set('jobs', f.jobs.join(','));
+        const j = await fetch('/api/gallery/global?' + params.toString()).then(r => r.json());
+        this.globalGallery = { ...this.globalGallery, ...j };
+      } catch (e) { /* swallow — grid stays as-is */ }
+      this.globalGalleryLoading = false;
+    },
+    toggleGlobalGalleryJob(slug) {
+      const list = this.globalGalleryFilters.jobs;
+      const idx = list.indexOf(slug);
+      if (idx === -1) list.push(slug); else list.splice(idx, 1);
+      this.loadGlobalGallery(1);
+    },
+    toggleGlobalGalleryList(field, value) {
+      const list = this.globalGalleryFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+      this.loadGlobalGallery(1);
+    },
+    clearGlobalGalleryFilters() {
+      this.globalGalleryFilters = { q: '', sources: [], categories: [], jobs: [], sort: 'newest' };
+      this.loadGlobalGallery(1);
+    },
+
+    // Deterministic hue from a slug — same slug always maps to the same
+    // colour across chart + legend, and across renders. Simple 32-bit FNV-1a
+    // fold, then hsl() with fixed saturation/lightness to keep every slice
+    // legible in dark, light, and high-contrast themes.
+    _slugHue(slug) {
+      let h = 2166136261 >>> 0;
+      const s = String(slug || '');
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+      }
+      return h % 360;
+    },
+    globalStatsGrandTotal() {
+      const map = this.stats?.by_job || {};
+      let n = 0;
+      for (const k in map) n += (map[k]?.total || 0);
+      return n;
+    },
+    // Build the donut slices. Slice geometry uses an SVG arc from the ring's
+    // outer radius (90) around cx/cy 100 — so 200x200 viewBox has enough
+    // padding for a 1px stroke without clipping. Under the per-job filter we
+    // still show one slice (that job's share of the global total) so the donut
+    // stays meaningful as the user drills in.
+    globalStatsDonutSlices() {
+      const map = this.stats?.by_job || {};
+      const filter = this.globalStatsJob;
+      const total = this.globalStatsGrandTotal();
+      if (!total) return [];
+      const cx = 100, cy = 100, r = 90;
+      const buildPath = (startPct, endPct, fill) => {
+        // Full circle: two-arc trick keeps the path from collapsing to a point.
+        if (endPct - startPct >= 0.9999) {
+          return `M ${cx} ${cy-r} A ${r} ${r} 0 1 1 ${cx-0.01} ${cy-r} A ${r} ${r} 0 1 1 ${cx} ${cy-r} Z`;
+        }
+        const a0 = 2 * Math.PI * startPct - Math.PI/2;
+        const a1 = 2 * Math.PI * endPct - Math.PI/2;
+        const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+        const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+        const large = (endPct - startPct) > 0.5 ? 1 : 0;
+        return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
+      };
+      // Filter to one job → single slice for its % of grand total; leave a
+      // muted "rest" slice so the donut still communicates "share of total".
+      if (filter && filter !== '__all__' && filter !== 'all' && filter !== '*') {
+        const bucket = map[filter];
+        if (!bucket) return [];
+        const pct = bucket.total / total;
+        const hue = this._slugHue(filter);
+        const slices = [{
+          slug: filter, count: bucket.total, pct: Math.round(pct * 100),
+          fill: `hsl(${hue} 65% 55%)`,
+          path: buildPath(0, pct, `hsl(${hue} 65% 55%)`),
+        }];
+        if (pct < 0.999) {
+          slices.push({
+            slug: 'other jobs', count: total - bucket.total,
+            pct: 100 - Math.round(pct * 100),
+            fill: 'color-mix(in oklab, var(--color-fg-muted) 45%, transparent)',
+            path: buildPath(pct, 1, ''),
+          });
+        }
+        return slices;
+      }
+      const rows = Object.entries(map)
+        .map(([slug, v]) => ({ slug, count: (v && v.total) || 0 }))
+        .filter(r => r.count > 0)
+        .sort((a, b) => b.count - a.count);
+      let cursor = 0;
+      return rows.map(row => {
+        const pct = row.count / total;
+        const hue = this._slugHue(row.slug);
+        const fill = `hsl(${hue} 65% 55%)`;
+        const slice = {
+          slug: row.slug, count: row.count, pct: Math.round(pct * 100),
+          fill, path: buildPath(cursor, cursor + pct, fill),
+        };
+        cursor += pct;
+        return slice;
+      });
     },
 
     // ── Gallery tab ──────────────────────────────────────────────────────
@@ -12201,31 +12856,154 @@ function dashboard() {
       this.galleryReload();
     },
 
-    // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth - callers
-    // pass {category, path}, we decide based on the BLUR_NSFW_THUMBS setting
-    // and whether the user has clicked the eye for this path. revealNsfw()
-    // flips the per-path reveal so a single image is unblurred without
-    // disabling the global setting.
+    // ── T1: SSE stream lifecycle ───────────────────────────────────────────
+    // Opens ONE long-lived /api/stream/events connection when the tab becomes
+    // visible; closes when it hides so hidden tabs don't hold a socket. The
+    // stream carries `activity`, `queue`, and `status` events with a stable
+    // monotonic id. If EventSource isn't in the browser (or the endpoint
+    // errors), we fall back to the legacy 5 s poll (leaving _sseOpen=false).
+    _sseUrl() {
+      const scope = (this.view === 'job' && this.currentJob) ? this.currentJob : '';
+      const qs = scope ? '?job=' + encodeURIComponent(scope) : '';
+      return '/api/stream/events' + qs;
+    },
+    openStream() {
+      if (typeof EventSource === 'undefined') return;      // fall back to polling
+      if (document.visibilityState !== 'visible') return;  // wait for visibility
+      const scope = (this.view === 'job' && this.currentJob) ? this.currentJob : '';
+      // Reuse an open stream if the scope hasn't changed.
+      if (this._sseSource && this._sseSlug === scope) return;
+      this.closeStream();
+      let src;
+      try { src = new EventSource(this._sseUrl()); }
+      catch (e) { this._sseOpen = false; return; }
+      this._sseSource = src;
+      this._sseSlug = scope;
+      src.addEventListener('open',    () => { this._sseOpen = true; });
+      src.addEventListener('error',   () => { this._sseOpen = false; /* EventSource auto-retries */ });
+      src.addEventListener('activity', ev => this._sseOnActivity(ev));
+      src.addEventListener('queue',    ev => this._sseOnQueue(ev));
+      src.addEventListener('status',   ev => this._sseOnStatus(ev));
+    },
+    closeStream() {
+      if (this._sseSource) { try { this._sseSource.close(); } catch (_) {} }
+      this._sseSource = null;
+      this._sseOpen = false;
+      this._sseSlug = null;
+    },
+    // Handlers merge stream payloads into existing state. Path-diff so we
+    // only mark newly-arrived rows with .sse-fade — the animation should fire
+    // per new item, not on every tick.
+    _sseTagFresh(prevPaths, list) {
+      const p = new Set(prevPaths);
+      const fresh = [];
+      for (const r of list) {
+        if (r && r.path && !p.has(r.path)) fresh.push(r.path);
+      }
+      // Alpine reruns :class each tick; storing the set on the instance lets
+      // the template read it without re-tagging existing items.
+      this._sseFreshPaths = new Set(fresh);
+    },
+    _sseOnActivity(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d || !Array.isArray(d.items)) return;
+        // Scope guard: ignore events for a job we're no longer viewing.
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        const prev = (this.activity || []).map(r => r.path);
+        this._sseTagFresh(prev, d.items);
+        this.activity = d.items;
+      } catch (_) {}
+    },
+    _sseOnQueue(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d) return;
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        // Fold the compact queue snapshot into status so existing bindings
+        // (status.queue.total / by_source) keep working without a rewrite.
+        this.status = { ...(this.status || {}), queue: { total: d.total || 0, by_source: d.sources || {} } };
+      } catch (_) {}
+    },
+    _sseOnStatus(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d) return;
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        // Merge into the existing status.pipeline so we don't clobber queue/
+        // sorted/errors from the last /api/status poll.
+        const existing = this.status || {};
+        this.status = {
+          ...existing,
+          pipeline: {
+            ...(existing.pipeline || {}),
+            running: !!d.running,
+            vision_worker: d.vision_worker || '',
+            vision_workers: d.vision_workers || [],
+            throttle: (d.throttle != null ? d.throttle : (existing.pipeline?.throttle ?? 100)),
+            pid: d.pid || null,
+          },
+        };
+        this.provider = d.vision_worker || this.provider;
+        this.throttle = (d.throttle != null ? d.throttle : this.throttle);
+      } catch (_) {}
+    },
+
+    // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth — callers
+    // pass {category, path}. T2 folds in the sidebar's global "Show NSFW"
+    // toggle: when OFF (default) EVERY NSFW surface blurs regardless of the
+    // legacy per-user BLUR_NSFW_THUMBS setting. When ON, blur only if the
+    // legacy setting is on AND the user hasn't clicked the per-path eye.
     shouldBlurNsfw(item) {
       if (!item) return false;
       const cat = String(item.category || item.classification || '').toUpperCase();
-      if (cat !== 'NSFW') return false;
-      if ((this.settings.BLUR_NSFW_THUMBS || 'true') !== 'true') return false;
+      const nsfw = cat === 'NSFW' || !!item.nsfw;
+      if (!nsfw) return false;
       const key = item.path || item.thumbnail || item.image || '';
-      return !this.revealedNsfw[key];
+      // Per-image reveal (eye) always wins.
+      if (this.revealedNsfw[key]) return false;
+      // Global toggle OFF ⇒ always blur.
+      if (!this.showNsfw) return true;
+      // Global toggle ON ⇒ still honour the legacy BLUR_NSFW_THUMBS default
+      // for users who kept the extra guard on. Empty/undefined defaults false
+      // now (showing NSFW is an explicit opt-in via the global toggle).
+      return (this.settings.BLUR_NSFW_THUMBS || 'false') === 'true';
     },
     revealNsfw(item) {
       const key = item?.path || item?.thumbnail || item?.image || '';
       if (key) this.revealedNsfw[key] = true;
+    },
+    setShowNsfw(on) {
+      this.showNsfw = !!on;
+      try { localStorage.setItem('cull_show_nsfw', this.showNsfw ? '1' : '0'); } catch (_) {}
+      // Flipping the global toggle drops per-image reveals so surfaces snap
+      // back to a consistent state — a user hiding NSFW after revealing an
+      // image expects the image to hide again, not linger unblurred.
+      if (!this.showNsfw) this.revealedNsfw = {};
     },
 
     start() {
       // Hydrate sticky-dismissal for the welcome hero BEFORE loading jobs so
       // the first render doesn't flash the banner and then hide it.
       try { this.welcome.dismissed = localStorage.getItem('cull_welcome_dismissed') === '1'; } catch (_) {}
+      // T2: hydrate the global NSFW toggle. Default OFF unless the user
+      // previously flipped it on. Applied before any surface renders so the
+      // first paint doesn't flash unblurred imagery.
+      try { this.showNsfw = localStorage.getItem('cull_show_nsfw') === '1'; } catch (_) {}
       this.loadJobs();
       this.loadPresets();
       this.refresh();
+      // T1: open the SSE stream on visibility, close when the tab hides so
+      // background tabs don't hold sockets. Guarded by openStream() itself so
+      // a re-fire in a visible state is a no-op.
+      this.openStream();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.openStream();
+        else this.closeStream();
+      });
       // Global keyboard-cull listener. Gated entirely by cullHotkeysActive()
       // (gallery tab open, no modal, not typing) so it's inert everywhere else.
       window.addEventListener('keydown', (ev) => this.onCullKeydown(ev));
@@ -12239,6 +13017,11 @@ function dashboard() {
       this.$watch('active', (tab) => {
         if (tab === 'stats') this.loadStats();
         if (tab === 'gstats') this.loadGlobalStats();
+        if (tab === 'globalGallery' && this.globalGallery.items.length === 0 && !this.globalGalleryLoading) {
+          // Ensure jobsList is loaded so the multi-select can render its chips.
+          if (!this.jobsList.length) this.loadJobs();
+          this.loadGlobalGallery();
+        }
         if (tab === 'presets') { this.loadPresets(); this.loadCommunityPresets(); }
         if (tab === 'settings') this.loadGlobalVision();
         if (tab === 'schedules') { this.loadSchedules(); if (!this.jobsList.length) this.loadJobs(); }
