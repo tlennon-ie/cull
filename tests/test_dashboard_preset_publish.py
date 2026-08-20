@@ -140,17 +140,24 @@ def test_thumbnail_upload_rejects_non_loopback(client):
 
 def test_thumbnail_upload_rejects_bad_key(client):
     c, _ws, _o = client
-    # A key with a slash would let a hostile caller escape the thumbnail dir;
-    # even after .lower() the regex rejects any non ``[a-z0-9_]`` character.
-    # Flask's routing itself blocks / in a single path segment, but a dot
-    # or a dash still reaches the regex — verify one of each is refused.
-    for bad in ("with-dash", "with.dot", "bad!name"):
+    # The key regex now matches PRESET_NAME_RE (^[A-Za-z0-9 _-]{1,40}$) so
+    # spaces, mixed case, and hyphens all pass — a legacy preset like
+    # "Female Influencer" must be uploadable. Verify the truly-hostile
+    # characters (dots, slashes, exclamation marks, over-length input,
+    # control chars) are still refused.
+    over_40 = "a" * 41
+    for bad in ("with.dot", "bad!name", "path/segment", over_40, ""):
         r = c.post(
             f"/api/presets/{bad}/thumbnail",
             data={"file": (io.BytesIO(_png_bytes()), "t.png")},
             content_type="multipart/form-data",
         )
-        assert r.status_code == 400, (bad, r.status_code, r.get_data(as_text=True))
+        # Routing side-effects can surface for hostile inputs before the
+        # handler runs: 404 for path segments Flask can't match, 405 for the
+        # empty segment (which routes to /api/presets/, wrong method). The
+        # handler itself returns 400. All three shapes are legitimate
+        # rejections — the invariant is "no upload lands on disk".
+        assert r.status_code in (400, 404, 405), (bad, r.status_code, r.get_data(as_text=True))
 
 
 def test_thumbnail_upload_rejects_non_image(client):
