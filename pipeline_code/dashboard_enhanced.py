@@ -1789,7 +1789,28 @@ def api_presets_list():
     })
 
 
-_PRESET_THUMB_KEY_RE = re.compile(r"^[a-z0-9_]+$")
+# Built-in preset keys are always [a-z0-9_], but a user-created preset name
+# can carry spaces, hyphens, and mixed case (PRESET_NAME_RE = ^[A-Za-z0-9 _-]{1,40}$)
+# — e.g. "Female Influencer". The thumbnail routes must accept any valid preset
+# name; internally we slugify it to a filesystem-safe stem via
+# ``_preset_thumb_key`` so lookups are stable regardless of case / whitespace.
+_PRESET_THUMB_KEY_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}$")
+
+
+def _preset_thumb_key(raw: str) -> str | None:
+    """Normalise a preset-name URL segment into a lookup-safe filesystem stem.
+
+    Returns ``None`` when the input fails the preset-name regex — callers
+    should treat that as a 400 (invalid preset key). Otherwise returns the
+    slugified stem (lowercase, non-alnum → `_`, collapsed) so both the GET
+    thumbnail lookup and the POST upload write/read the same filename.
+    """
+    if not raw or not _PRESET_THUMB_KEY_RE.match(raw):
+        return None
+    try:
+        return job_config.slugify(raw) or None
+    except Exception:  # noqa: BLE001 - never let slugify crash a request
+        return None
 _PRESET_THUMB_EXTS: tuple[tuple[str, str], ...] = (
     (".gif", "image/gif"),
     (".png", "image/png"),
@@ -1880,8 +1901,8 @@ def api_presets_thumbnail():
       3. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
       4. Deterministic gradient-with-letter SVG placeholder (any other key)
     """
-    key = (request.args.get("key") or "").strip().lower()
-    if not _PRESET_THUMB_KEY_RE.match(key):
+    key = _preset_thumb_key(request.args.get("key") or "")
+    if key is None:
         abort(400)
     for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
         hit = _preset_thumb_lookup_in(root, key)
@@ -1962,8 +1983,8 @@ def api_presets_thumbnail_upload(key: str):
     """
     if not _wave_is_loopback_request():
         return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
-    key = (key or "").strip().lower()
-    if not _PRESET_THUMB_KEY_RE.match(key):
+    key = _preset_thumb_key(key)
+    if key is None:
         return jsonify({"ok": False, "error": "invalid preset key"}), 400
     upload = request.files.get("file")
     if upload is None:
@@ -2055,8 +2076,8 @@ def api_presets_thumbnail_status(key: str):
     """
     if not _wave_is_loopback_request():
         return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
-    key = (key or "").strip().lower()
-    if not _PRESET_THUMB_KEY_RE.match(key):
+    key = _preset_thumb_key(key)
+    if key is None:
         return jsonify({"ok": False, "error": "invalid preset key"}), 400
     path = None
     for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
@@ -2079,8 +2100,8 @@ def api_presets_thumbnail_delete(key: str):
     """
     if not _wave_is_loopback_request():
         return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
-    key = (key or "").strip().lower()
-    if not _PRESET_THUMB_KEY_RE.match(key):
+    key = _preset_thumb_key(key)
+    if key is None:
         return jsonify({"ok": False, "error": "invalid preset key"}), 400
     removed: list[str] = []
     for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
@@ -5702,11 +5723,13 @@ def api_presets_publish(key: str):
         return jsonify({"ok": False, "error": "invalid preset name"}), 400
     if not _preset_exists(key):
         return jsonify({"ok": False, "error": "preset not found"}), 404
-    # We also lock the key against the thumbnail regex so nothing sneaks a
-    # dodgy value into a subprocess path.
-    if not _PRESET_THUMB_KEY_RE.match(key.lower()):
-        return jsonify({"ok": False, "error": "preset key must be lowercase [a-z0-9_]"}), 400
-    key_lower = key.lower()
+    # Publish is a subprocess path — slugify the preset name to a
+    # filesystem-safe stem for the committed filename. Any character the
+    # preset-name regex allows (spaces, mixed case, hyphens) becomes
+    # lowercase [a-z0-9_].
+    key_lower = _preset_thumb_key(key)
+    if key_lower is None:
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
 
     git_bin = shutil.which("git")
     if not git_bin:
@@ -11339,6 +11362,18 @@ function dashboard() {
       // Cancel any pending job-editor auto-save so its (pre-toggle) overrides
       // can't clobber the toggle we're about to write server-side.
       if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      // YT-DLP lives outside the canonical scrapers.enabled map (its state is
+      // scrapers.yt_dlp.enabled — a separate boolean field). Toggling it via
+      // /api/scrapers/toggle would hit the "unknown scraper" reject branch
+      // and surface a misleading "local folders" error. Route it through the
+      // standard setOverride path instead.
+      if (name === 'YT-DLP') {
+        this.setOverride('scrapers.yt_dlp.enabled', enabled);
+        if (enabled && this.scraperOpen && !this.scraperOpen[name]) {
+          this.scraperOpen = { ...this.scraperOpen, [name]: true };
+        }
+        return;
+      }
       const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})});
       const j = await r.json().catch(()=>({}));
@@ -11370,6 +11405,14 @@ function dashboard() {
       }
       for (const n of (this.priorityNames || [])) {
         if (!(n in out)) out[n] = true;
+      }
+      // YT-DLP's live state is scrapers.yt_dlp.enabled (its own field, not
+      // the canonical scrapers.enabled map). Read it from the effective cfg
+      // so the slider reflects reality — otherwise it always renders "on"
+      // regardless of what the user configured.
+      if (this.je && this.je.loaded) {
+        const yt = this.effVal('scrapers.yt_dlp.enabled');
+        if (yt !== undefined && yt !== null) out['YT-DLP'] = !!yt;
       }
       return out;
     },
