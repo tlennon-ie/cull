@@ -11339,6 +11339,18 @@ function dashboard() {
       // Cancel any pending job-editor auto-save so its (pre-toggle) overrides
       // can't clobber the toggle we're about to write server-side.
       if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      // YT-DLP lives outside the canonical scrapers.enabled map (its state is
+      // scrapers.yt_dlp.enabled — a separate boolean field). Toggling it via
+      // /api/scrapers/toggle would hit the "unknown scraper" reject branch
+      // and surface a misleading "local folders" error. Route it through the
+      // standard setOverride path instead.
+      if (name === 'YT-DLP') {
+        this.setOverride('scrapers.yt_dlp.enabled', enabled);
+        if (enabled && this.scraperOpen && !this.scraperOpen[name]) {
+          this.scraperOpen = { ...this.scraperOpen, [name]: true };
+        }
+        return;
+      }
       const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})});
       const j = await r.json().catch(()=>({}));
@@ -11370,6 +11382,14 @@ function dashboard() {
       }
       for (const n of (this.priorityNames || [])) {
         if (!(n in out)) out[n] = true;
+      }
+      // YT-DLP's live state is scrapers.yt_dlp.enabled (its own field, not
+      // the canonical scrapers.enabled map). Read it from the effective cfg
+      // so the slider reflects reality — otherwise it always renders "on"
+      // regardless of what the user configured.
+      if (this.je && this.je.loaded) {
+        const yt = this.effVal('scrapers.yt_dlp.enabled');
+        if (yt !== undefined && yt !== null) out['YT-DLP'] = !!yt;
       }
       return out;
     },
