@@ -36,7 +36,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -6005,18 +6007,41 @@ def api_vision_worker_info():
                     **hints})
 
 
-# ── Community publish via git add / commit / push ─────────────────────────────
+# ── Community publish via git worktree + PR ───────────────────────────────────
 #
-# Replaces the earlier gist-based sharing flow. The dashboard already lives in
-# the operator's git checkout, so the natural way to share a preset is to
-# commit it to presets/community/ and push. This keeps the commit path-scoped
-# (git commit -o) so the user's OTHER working-tree edits are NEVER swept into
-# the publish commit — that's a hard product requirement.
+# Community contributions never land directly on main. The publish flow spins
+# up a throwaway git WORKTREE at origin/main HEAD, drops the contribution
+# files into it, commits + pushes a fresh `contrib/*` branch, and opens a PR
+# via `gh` if the CLI is available (falling back to a compare URL the caller
+# can click). The worktree is torn down at the end. This never touches the
+# user's current branch or their working-tree WIP — the whole operation is
+# isolated in a scratch directory.
+#
+# Why a worktree instead of branch-swap-in-place?
+#   Branch-swap risked entangling other uncommitted user changes on the
+#   original branch. A dedicated worktree side-steps the risk entirely and
+#   matches what a well-behaved CI job would do.
 
 # Subprocess timeout for every git call this endpoint drives. 30 s matches the
 # task spec; a slow push (large repo, poor network) will fail loudly instead
 # of hanging the dashboard's Flask worker.
 _PRESET_PUBLISH_GIT_TIMEOUT: float = 30.0
+
+_PR_BASE_BRANCH_DEFAULT: str = "main"
+_PR_BRANCH_PREFIX: str = "contrib/preset"
+
+
+def _github_compare_url(remote_url: str, base: str, head: str) -> str | None:
+    """Build a GitHub compare URL for owner/repo derived from ``remote_url``.
+
+    Returns None for non-GitHub remotes; the caller falls back to a plain
+    "branch pushed" message so the flow still succeeds without gh CLI.
+    """
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", remote_url or "")
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://github.com/{owner}/{repo}/compare/{base}...{head}?expand=1"
 
 
 def _git_run(args: list[str], cwd: Path) -> tuple[int, str, str]:
@@ -6055,19 +6080,21 @@ def _clean_git_error(stderr: str, cap: int = 400) -> str:
 
 @app.route("/api/presets/<key>/publish", methods=["POST"])
 def api_presets_publish(key: str):
-    """Publish preset ``key`` (+ thumbnail if any) via git add / commit / push.
+    """Publish preset ``key`` (+ thumbnail if any) as a PR to origin.
 
-    Loopback-only. Empty body. Writes ``presets/community/<key>.preset.json``
-    from ``config_io.export_preset_bytes(key)`` and copies the user's
-    thumbnail (from either ``presets/thumbnails/<key>.<ext>`` or the community
-    slot) to ``presets/community/thumbnails/<key>.<ext>``. Commits ONLY those
-    files (``git commit -o``) so unrelated working-tree changes stay
-    uncommitted, then pushes to ``origin HEAD``.
+    Loopback-only. Empty body. Spins up a throwaway git worktree at
+    ``origin/main``, writes ``presets/community/<key>.preset.json`` from
+    ``config_io.export_preset_bytes(key)`` and the user's thumbnail (from
+    ``presets/thumbnails/<key>.<ext>`` or the community slot) into it,
+    commits a fresh ``contrib/preset-<slug>-<epoch>`` branch, pushes to
+    origin, and opens a PR via ``gh pr create`` when the CLI is available.
+    Falls back to a github.com compare URL when ``gh`` is missing.
 
-    Returns ``{ok, commit, pushed_to, files}`` on success, ``{ok:false, error, hint}``
-    on any failure — with human-actionable hints for the common "git isn't set
-    up" cases (missing git, not a repo, no origin) so users don't need to read
-    stderr.
+    The user's current branch and working-tree WIP are never touched —
+    all mutations happen inside the scratch worktree, which is removed
+    at the end of the request regardless of outcome.
+
+    Returns ``{ok, pr_url, branch, base, commit, files, gh_used}``.
     """
     if not _wave_is_loopback_request():
         return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
@@ -6076,10 +6103,6 @@ def api_presets_publish(key: str):
         return jsonify({"ok": False, "error": "invalid preset name"}), 400
     if not _preset_exists(key):
         return jsonify({"ok": False, "error": "preset not found"}), 404
-    # Publish is a subprocess path — slugify the preset name to a
-    # filesystem-safe stem for the committed filename. Any character the
-    # preset-name regex allows (spaces, mixed case, hyphens) becomes
-    # lowercase [a-z0-9_].
     key_lower = _preset_thumb_key(key)
     if key_lower is None:
         return jsonify({"ok": False, "error": "invalid preset key"}), 400
@@ -6098,7 +6121,6 @@ def api_presets_publish(key: str):
             "hint": "cull was likely downloaded as a zip. Clone the repo instead: git clone https://github.com/tlennon-ie/cull",
         }), 400
 
-    # Verify origin exists.
     rc, out, err = _git_run([git_bin, "remote", "get-url", "origin"], WORKSPACE_ROOT)
     if rc != 0 or not out.strip():
         return jsonify({
@@ -6108,110 +6130,149 @@ def api_presets_publish(key: str):
         }), 400
     remote_url = out.strip().splitlines()[0]
 
-    # Serialize the preset envelope to disk.
+    # Serialize the preset payload in-memory FIRST — nothing on disk in the
+    # user's tree changes if this fails.
     try:
         envelope_bytes = config_io.export_preset_bytes(key)
-    except Exception as exc:  # noqa: BLE001 - export failures surface as user-facing error
+    except Exception as exc:  # noqa: BLE001
         return _err("failed to export preset", exc, 500)
-    community_dir = _community_preset_dir()
-    community_dir.mkdir(parents=True, exist_ok=True)
-    preset_path = community_dir / f"{key_lower}.preset.json"
-    try:
-        preset_path.write_bytes(envelope_bytes)
-    except OSError as exc:
-        return _err("could not write community preset file", exc, 500)
 
-    files_to_commit: list[Path] = [preset_path]
-
-    # Copy a user thumbnail (if any) into the community slot so publish ships
-    # both files atomically. We look in the user-override slot AND the
-    # community slot itself (user may have uploaded straight there via the
-    # thumbnail endpoint) so a re-publish never drops a colocated image.
+    # Locate an existing thumbnail (user or community slot) to include.
     thumb_source: Path | None = None
     for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
         hit = _preset_thumb_lookup_in(root, key_lower)
         if hit is not None:
             thumb_source = hit[0]
             break
-    if thumb_source is not None:
-        _preset_community_thumbnail_dir().mkdir(parents=True, exist_ok=True)
-        thumb_dest = _preset_community_thumbnail_dir() / f"{key_lower}{thumb_source.suffix.lower()}"
-        try:
-            # If source and destination are the same file this is a no-op copy.
-            if os.path.realpath(str(thumb_source)) != os.path.realpath(str(thumb_dest)):
-                shutil.copyfile(str(thumb_source), str(thumb_dest))
-        except OSError as exc:
-            return _err("could not copy thumbnail into community dir", exc, 500)
-        files_to_commit.append(thumb_dest)
 
-    # Build repo-relative paths for git subcommands. We pass paths WITHOUT a
-    # leading ./ so git output stays clean; the -o (only) flag ensures nothing
-    # else in the working tree is committed.
-    rel_paths = [str(p.relative_to(WORKSPACE_ROOT)).replace("\\", "/") for p in files_to_commit]
-
-    # Stage the files (add is a no-op for already-tracked files whose contents
-    # have not changed, but harmless).
-    rc, _out, err = _git_run([git_bin, "add", "--", *rel_paths], WORKSPACE_ROOT)
+    # Fetch latest origin/main so the branch is cut from an up-to-date base.
+    base_branch = _PR_BASE_BRANCH_DEFAULT
+    rc, _out, err = _git_run([git_bin, "fetch", "origin", base_branch, "--quiet"], WORKSPACE_ROOT)
     if rc != 0:
         return jsonify({
             "ok": False,
-            "error": f"git add failed: {_clean_git_error(err)}",
+            "error": f"git fetch origin {base_branch} failed: {_clean_git_error(err)}",
+            "hint": "check your network + credentials for origin.",
         }), 500
 
-    # Path-only commit. The -o flag makes git ignore everything else in the
-    # index for this commit — the user's OTHER WIP stays uncommitted.
-    commit_msg = f"community preset: {key_lower}"
-    rc, _out, err = _git_run(
-        [git_bin, "commit", "-o", *rel_paths, "-m", commit_msg],
-        WORKSPACE_ROOT,
-    )
-    if rc != 0:
-        cleaned = _clean_git_error(err)
-        # An empty commit ("nothing to commit") is not an error from the
-        # user's perspective — the preset is already on this branch as-is.
-        if "nothing to commit" in cleaned.lower() or "no changes added to commit" in cleaned.lower():
-            # Grab the HEAD sha so the response still points at the commit
-            # that already carries this preset.
-            _rc, sha, _e = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    branch = f"{_PR_BRANCH_PREFIX}-{key_lower}-{int(time.time())}"
+    worktree_dir = Path(tempfile.mkdtemp(prefix="cull-publish-"))
+    try:
+        # Create a fresh worktree that CHECKS OUT a new branch off origin/main.
+        rc, _out, err = _git_run(
+            [git_bin, "worktree", "add", "-b", branch, str(worktree_dir), f"origin/{base_branch}"],
+            WORKSPACE_ROOT,
+        )
+        if rc != 0:
             return jsonify({
-                "ok": True,
-                "commit": sha.strip(),
-                "pushed_to": None,
+                "ok": False,
+                "error": f"git worktree add failed: {_clean_git_error(err)}",
+            }), 500
+
+        preset_rel = f"presets/community/{key_lower}.preset.json"
+        preset_path = worktree_dir / preset_rel
+        preset_path.parent.mkdir(parents=True, exist_ok=True)
+        preset_path.write_bytes(envelope_bytes)
+        rel_paths: list[str] = [preset_rel]
+
+        if thumb_source is not None:
+            thumb_rel = f"presets/community/thumbnails/{key_lower}{thumb_source.suffix.lower()}"
+            thumb_dest = worktree_dir / thumb_rel
+            thumb_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(thumb_source), str(thumb_dest))
+            rel_paths.append(thumb_rel)
+
+        rc, _out, err = _git_run([git_bin, "add", "--", *rel_paths], worktree_dir)
+        if rc != 0:
+            return jsonify({"ok": False, "error": f"git add failed: {_clean_git_error(err)}"}), 500
+
+        commit_msg = f"community preset: {key_lower}"
+        rc, _out, err = _git_run(
+            [git_bin, "commit", "-m", commit_msg], worktree_dir,
+        )
+        if rc != 0:
+            cleaned = _clean_git_error(err)
+            if "nothing to commit" in cleaned.lower():
+                return jsonify({
+                    "ok": True,
+                    "pr_url": None,
+                    "branch": None,
+                    "base": base_branch,
+                    "files": rel_paths,
+                    "message": "no changes — preset is already at origin/main as-is",
+                    "gh_used": False,
+                })
+            return jsonify({"ok": False, "error": f"git commit failed: {cleaned}"}), 500
+
+        _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], worktree_dir)
+        new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+
+        rc, _out, err = _git_run(
+            [git_bin, "push", "-u", "origin", branch], worktree_dir,
+        )
+        if rc != 0:
+            return jsonify({
+                "ok": False,
+                "error": f"git push failed: {_clean_git_error(err)}",
+                "commit": new_sha,
+                "branch": branch,
                 "files": rel_paths,
-                "message": "no changes — preset already committed as-is",
-            })
-        return jsonify({
-            "ok": False,
-            "error": f"git commit failed: {cleaned}",
-        }), 500
+                "hint": "the commit exists on the local branch — push it manually: git push -u origin " + branch,
+            }), 500
 
-    # Capture the new commit sha.
-    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
-    new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+        # Try `gh pr create`. Falls back to a compare URL if gh isn't
+        # installed or isn't authenticated.
+        pr_url: str | None = None
+        gh_used = False
+        gh_bin = shutil.which("gh")
+        if gh_bin:
+            pr_title = f"community preset: {key_lower}"
+            pr_body = (
+                f"Adds `{key_lower}` to `presets/community/`.\n\n"
+                "Published via the cull dashboard's community-share flow. "
+                "Review the preset envelope + thumbnail then squash-merge."
+            )
+            rc, gh_out, gh_err = _git_run(
+                [gh_bin, "pr", "create", "--base", base_branch, "--head", branch,
+                 "--title", pr_title, "--body", pr_body],
+                worktree_dir,
+            )
+            if rc == 0:
+                # gh prints the PR URL on stdout.
+                for line in (gh_out or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("https://"):
+                        pr_url = line
+                        break
+                gh_used = True
+            # If gh failed (e.g. not authenticated) we silently fall through
+            # to the compare URL — the branch is already pushed either way.
 
-    # Push the current HEAD to origin.
-    rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
-    if rc != 0:
+        if not pr_url:
+            pr_url = _github_compare_url(remote_url, base_branch, branch)
+
         return jsonify({
-            "ok": False,
-            "error": f"git push failed: {_clean_git_error(err)}",
+            "ok": True,
+            "pr_url": pr_url,
+            "branch": branch,
+            "base": base_branch,
             "commit": new_sha,
+            "remote": remote_url,
             "files": rel_paths,
-            "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
-        }), 500
-
-    # Best-effort branch name for the friendly response line.
-    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
-    branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
-
-    return jsonify({
-        "ok": True,
-        "commit": new_sha,
-        "pushed_to": f"{remote_url} ({branch})",
-        "remote": remote_url,
-        "branch": branch,
-        "files": rel_paths,
-    })
+            "gh_used": gh_used,
+            "hint": None if pr_url else "branch pushed; open the compare page on your git host to raise the PR",
+        })
+    finally:
+        # Always tear the worktree down so a stray directory can't accumulate
+        # across many publishes. --force covers the case where the branch was
+        # partially initialised before an error.
+        try:
+            _git_run(
+                [git_bin, "worktree", "remove", "--force", str(worktree_dir)],
+                WORKSPACE_ROOT,
+            )
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            shutil.rmtree(str(worktree_dir), ignore_errors=True)
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -10283,7 +10344,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
                 <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
                 <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
-                <button @click="publishPresetViaGit(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this preset to presets/community/ and push to origin">Publish</button>
+                <button @click="publishPresetViaGit(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Open a PR that adds this preset to presets/community/ (never lands on main directly)">Publish</button>
                 <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
                         title="Restore this shipped preset to its built-in defaults"
                         class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
@@ -14265,22 +14326,22 @@ function dashboard() {
         this._highlightPresetCard(j.name || name);
       } catch (e) { this.notify('Install failed: ' + e, 'error'); }
     },
-    // Publish a preset to presets/community/ via a local git add/commit/push.
-    // Uses the same styled askConfirm dialog the rest of the dashboard uses
-    // instead of a bespoke modal — the request is essentially "confirm this
-    // will touch git and push". Displays a clear success line (SHA + remote)
-    // or the server's friendly error hint if git is not set up.
+    // Publish a preset by opening a PR against origin/main. The server
+    // cuts a fresh `contrib/preset-<slug>-<epoch>` branch inside a
+    // throwaway git worktree — the user's current branch + WIP are never
+    // touched. Uses `gh pr create` when available; falls back to a
+    // github compare URL the user can click to open the PR manually.
     async publishPresetViaGit(name) {
       const key = String(name || '').trim();
       if (!key) return;
-      const bodyText = 'This will export "' + key + '" and its thumbnail (if any) to presets/community/, commit those files, and push to origin. Your other local changes stay uncommitted.';
+      const bodyText = 'This will branch off origin/main in a scratch worktree, commit "' + key + '" + its thumbnail, push a contrib/* branch, and open a PR. Nothing lands on main directly. Your current branch and working-tree edits are untouched.';
       const ok = await this.askConfirm(bodyText, {
-        title: 'Publish preset to community?',
-        confirmLabel: 'Publish',
+        title: 'Publish preset as a PR?',
+        confirmLabel: 'Open PR',
         cancelLabel: 'Cancel',
       });
       if (!ok) return;
-      const toastId = this.notify('Publishing ' + key + '…', 'info', 0);
+      const toastId = this.notify('Opening PR for ' + key + '…', 'info', 0);
       try {
         const r = await fetch('/api/presets/' + encodeURIComponent(key) + '/publish', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
@@ -14293,9 +14354,18 @@ function dashboard() {
           this.notify('Publish failed — ' + parts.join(' · '), 'error', 9000);
           return;
         }
-        const sha = (j.commit || '').slice(0, 8);
-        const suffix = j.pushed_to ? (' → pushed to ' + j.pushed_to) : '';
-        this.notify('Published ' + key + ' (' + (sha || 'no change') + ')' + suffix, 'success', 6500);
+        // "No changes" short-circuit — preset is already on origin/main.
+        if (!j.branch) {
+          this.notify(j.message || ('No changes for ' + key), 'info', 6000);
+          return;
+        }
+        if (j.pr_url) {
+          const verb = j.gh_used ? 'PR opened' : 'branch pushed — click to open PR';
+          this.notify(verb + ': ' + j.pr_url, 'success', 12000);
+          try { window.open(j.pr_url, '_blank', 'noopener'); } catch (_) {}
+        } else {
+          this.notify('Branch pushed: ' + j.branch + ' — open the PR from your git host', 'info', 9000);
+        }
       } catch (e) {
         this.dismissToast(toastId);
         this.notify('Publish failed: ' + e, 'error', 6000);
