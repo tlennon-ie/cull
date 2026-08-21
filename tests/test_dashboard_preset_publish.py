@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,11 @@ def client(tmp_path, monkeypatch):
                    check=True, capture_output=True)
     # Make sure HEAD is called 'main' so the branch label in the response is stable.
     subprocess.run(["git", "-C", str(workspace), "branch", "-M", "main"],
+                   check=True, capture_output=True)
+    # Publish flow branches off origin/main, so seed the remote with the
+    # initial commit — mirrors a real user setup where the repo has been
+    # cloned from origin.
+    subprocess.run(["git", "-C", str(workspace), "push", "-u", "origin", "main"],
                    check=True, capture_output=True)
 
     monkeypatch.setenv("PIPELINE_BASE_DIR", str(workspace / "data"))
@@ -270,7 +276,7 @@ def test_publish_rejects_missing_preset(client):
     assert r.status_code == 404
 
 
-def test_publish_commits_and_pushes_preset(client):
+def test_publish_opens_pr_branch_off_main(client):
     c, ws, origin = client
 
     r = c.post("/api/presets/default/publish", json={})
@@ -278,27 +284,41 @@ def test_publish_commits_and_pushes_preset(client):
     j = r.get_json()
     assert j["ok"] is True
     assert j["commit"], "commit sha should be non-empty"
+    assert j["base"] == "main"
+    assert j["branch"].startswith("contrib/preset-default-"), j["branch"]
     assert "presets/community/default.preset.json" in j["files"]
-    assert (ws / "presets" / "community" / "default.preset.json").is_file()
 
-    # The commit must be visible on origin/main (the bare repo we pointed at).
-    out = subprocess.run(
+    # The contrib branch must exist on origin — but origin/main must NOT
+    # advance. This is the "never lands on main directly" guarantee.
+    branches = subprocess.run(
+        ["git", "-C", str(origin), "for-each-ref", "--format=%(refname:short)",
+         "refs/heads/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert any(b == j["branch"] for b in branches), branches
+    main_log = subprocess.run(
         ["git", "-C", str(origin), "log", "--format=%s", "main"],
         capture_output=True, text=True, check=True,
     )
-    assert "community preset: default" in out.stdout
+    assert "community preset: default" not in main_log.stdout, main_log.stdout
+
+    # And the contrib branch's tip DOES carry the preset file.
+    contrib_log = subprocess.run(
+        ["git", "-C", str(origin), "log", "--format=%s", j["branch"]],
+        capture_output=True, text=True, check=True,
+    )
+    assert "community preset: default" in contrib_log.stdout
 
 
 def test_publish_never_sweeps_operator_wip_into_commit(client):
-    """The core safety invariant: git commit -o is path-scoped.
+    """The core safety invariant: the throwaway worktree isolates the commit.
 
-    Simulate the operator having other unstaged work in the tree before
+    Simulate the operator having other unstaged work in the main tree before
     hitting Publish. That work MUST stay uncommitted — otherwise the button
     would silently ship a user's private edits with the shared preset.
     """
     c, ws, _o = client
-    # Simulate operator WIP: an existing tracked file with a dirty edit
-    # and a brand-new untracked file. Neither should land in the publish commit.
+    # Simulate operator WIP in the main working tree.
     tracked = ws / "README.md"
     tracked.write_text("seed\nDIRTY WIP\n", encoding="utf-8")
     untracked = ws / "notes.txt"
@@ -308,7 +328,7 @@ def test_publish_never_sweeps_operator_wip_into_commit(client):
     assert r.status_code == 200, r.get_data(as_text=True)
     sha = r.get_json()["commit"]
 
-    # Inspect the commit's file list — should be JUST the preset file.
+    # Inspect the contribution commit — should be JUST the preset file.
     out = subprocess.run(
         ["git", "-C", str(ws), "show", "--name-only", "--format=", sha],
         capture_output=True, text=True, check=True,
@@ -316,12 +336,11 @@ def test_publish_never_sweeps_operator_wip_into_commit(client):
     committed_files = {p.strip() for p in out.stdout.splitlines() if p.strip()}
     assert committed_files == {"presets/community/default.preset.json"}
 
-    # And the operator's WIP is still visible in git status as unstaged.
+    # And the operator's WIP is still visible in git status of the main tree.
     status = subprocess.run(
         ["git", "-C", str(ws), "status", "--porcelain"],
         capture_output=True, text=True, check=True,
     )
-    # ' M README.md' and '?? notes.txt' should both still be present.
     lines = set(status.stdout.splitlines())
     assert any("README.md" in ln for ln in lines), lines
     assert any("notes.txt" in ln for ln in lines), lines
@@ -340,7 +359,34 @@ def test_publish_ships_thumbnail_when_present(client):
     assert r.status_code == 200, r.get_data(as_text=True)
     j = r.get_json()
     assert "presets/community/thumbnails/default.png" in j["files"]
-    assert (ws / "presets" / "community" / "thumbnails" / "default.png").is_file()
+    # The thumbnail lives on the contribution branch (not the main tree).
+    # Confirm by inspecting the commit.
+    sha = j["commit"]
+    show = subprocess.run(
+        ["git", "-C", str(ws), "show", "--name-only", "--format=", sha],
+        capture_output=True, text=True, check=True,
+    )
+    committed = {p.strip() for p in show.stdout.splitlines() if p.strip()}
+    assert "presets/community/thumbnails/default.png" in committed
+
+
+def test_publish_uses_fresh_branch_per_call(client):
+    """Successive publishes each get their own contrib branch — no collisions."""
+    c, _ws, origin = client
+
+    first = c.post("/api/presets/default/publish", json={}).get_json()
+    # Sleep 1s so the epoch suffix differs between calls.
+    time.sleep(1.1)
+    second = c.post("/api/presets/default/publish", json={}).get_json()
+
+    assert first["branch"] != second["branch"], (first["branch"], second["branch"])
+    branches = subprocess.run(
+        ["git", "-C", str(origin), "for-each-ref", "--format=%(refname:short)",
+         "refs/heads/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert first["branch"] in branches
+    assert second["branch"] in branches
 
 
 def test_publish_reports_missing_origin(client, tmp_path, monkeypatch):

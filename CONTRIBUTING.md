@@ -112,6 +112,19 @@ Examples from the log:
 - `fix(security): scrub fleet keys, SSRF guards, mask sentinel, video-discard`
 - `refactor(dashboard): delegate inheritable-config validation to config_io`
 
+## Branch protection
+
+`main` is protected. All changes land through a PR — direct pushes to `main` are refused. The dashboard's community-share button (Publish preset / theme) reflects this: it cuts a fresh `contrib/*` branch inside a throwaway git worktree, pushes it, and opens a PR via `gh` (falling back to a compare URL if `gh` is not installed). Your own working branch stays untouched.
+
+If you're a maintainer setting up a fork, apply these rules to `main` in GitHub → Settings → Branches:
+
+- Require a pull request before merging (1 approval)
+- Require status checks: CI must pass (`Tests`, `pip-audit`, `CodeQL (python)`)
+- Require branches to be up to date before merging
+- Do not allow bypassing the above (uncheck admin bypass unless you're solo)
+
+For solo development it's still worth enabling the "require PR" rule so you get the same review checklist for every change.
+
 ## Pull request checklist
 
 Copy this into your PR description and check what applies:
