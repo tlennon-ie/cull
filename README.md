@@ -19,20 +19,70 @@
 ![cull — job-based curation](assets/cull-jobs-demo.svg)
 <p align="center"><em>Spin up a job per dataset, queue them, and let cull work down the list.</em></p>
 
-![cull dashboard preview — gallery, stats, scrapers](docs/screenshots/gallery.png)
+![cull dashboard — jobs grid with the multi-job Run toggle and per-job priority](docs/screenshots/01-jobs.png)
+
+## Screenshots
+
+Every shot below comes from a seeded demo dataset (`python tools/seed_demo_data.py`) — no real credentials, no real people, no real scraper traffic.
+
+### Jobs & orchestration
+
+|  |  |
+|---|---|
+| ![Jobs grid](docs/screenshots/01-jobs.png) | ![Global Stats](docs/screenshots/02-global-stats.png) |
+| **Jobs** — each job is a curation target with its own scrapers, taxonomy, and scoring. Multi-job parallelism ships as a per-card Run toggle + a 1-10 priority slider, and the sidebar surfaces which jobs are running now. | **Global Stats** — aggregate donut across every job, per-source composition bars (kept / discarded / NSFW share), click a slice to filter. Powered by SSE so numbers update live. |
+
+### Curation surfaces
+
+|  |  |
+|---|---|
+| ![Global Gallery](docs/screenshots/03-global-gallery.png) | ![Gallery filters](docs/screenshots/04-gallery-filters.png) |
+| **Global Gallery** — every sorted image from every job in one grid, chip-filterable by job, source, category, score, resolution. | **Filter popover** — the same filter surface ships on the per-job Gallery, on Global Gallery, on Queue, and on Activity. Teleported to `<body>` so it renders above the tile grid on every theme. |
+
+### Extensibility
+
+|  |  |
+|---|---|
+| ![Preset marketplace](docs/screenshots/05-preset-marketplace.png) | ![Scrapers](docs/screenshots/08-scrapers.png) |
+| **Presets** — built-in starters (aerial, underwater, wildlife, product, anime, portrait, quality-only, general) side-by-side with a community strip. Publish sends a preset + its thumbnail to `presets/community/` and opens a PR against `main` — no PAT, no Gist. | **Scrapers** — Civitai, X, Reddit, Discord, gallery-dl (340+ sites), yt-dlp, Kohya import, and any number of local folders on one tab. Per-source enable / URL / cookies / priority weight. |
+
+### Themes & vision workers
+
+|  |  |
+|---|---|
+| ![Themes picker](docs/screenshots/06-themes-picker.png) | ![Theme editor](docs/screenshots/07-theme-editor.png) |
+| **Themes** — eight shipped looks (`dark`, `light`, `hc`, `ai-slop`, `beige`, `wood`, `cyberpunk`, `forest`) plus any custom theme under `data/themes/`. Clone → edit → Publish opens a PR against `themes/community/`. | **Theme editor** — every CSS token has a native color picker with a live preview panel that renders real dashboard chrome using the theme you're editing. Save auto-persists; Publish sends the JSON upstream via the same git-based flow the preset publish uses. |
+
+|  |
+|---|
+| ![Vision fleet](docs/screenshots/09-vision.png) |
+| **Vision** — configure any number of local LM Studio / llama.cpp / Ollama endpoints as a per-job fleet, alongside cloud workers (Groq / Claude / OpenAI / Gemini / OpenRouter). Each worker fans out into its own subprocess; failures gate over cleanly. |
+
+### Theme gallery
+
+Every shipped theme, one canonical view — click through and pick the one your eyes tolerate best:
+
+|  |  |  |  |
+|---|---|---|---|
+| ![dark](docs/screenshots/themes/dark.png) | ![light](docs/screenshots/themes/light.png) | ![hc](docs/screenshots/themes/hc.png) | ![ai-slop](docs/screenshots/themes/ai-slop.png) |
+| **dark** — CSS core | **light** — CSS core | **hc** — high-contrast core | **ai-slop** — the meta joke |
+| ![beige](docs/screenshots/themes/beige.png) | ![wood](docs/screenshots/themes/wood.png) | ![cyberpunk](docs/screenshots/themes/cyberpunk.png) | ![forest](docs/screenshots/themes/forest.png) |
+| **beige** — warm paper | **wood** — earthy stain | **cyberpunk** — neon dark | **forest** — muted green |
 
 ## What's new
 
-The **user-acquisition wave** landed a first-run wizard, a demo mode, a
-publishable preset marketplace, video-as-first-class-media, and a cost-aware
-cloud-vision fleet. Highlights:
-
-- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/seed_demo_data.py` seeds synthetic queue/sorted rows so the dashboard shows real numbers before you configure anything.
-- **Preset marketplace + community presets + editable thumbnails + git-based Publish.** The Presets tab now has a dedicated editor detail view, a comparison grid of built-in starters, a community strip that browses `presets/community/*.preset.json`, and drag-and-drop thumbnail upload per preset. Publish sends the preset (+ its thumbnail) to `presets/community/` and commits+pushes to `origin` with `git commit -o` — your other working-tree edits stay uncommitted. Cleaner than the old Gist flow: no GitHub PAT required.
+- **Multi-job parallelism + per-job priority.** Multi-active is now a first-class Run toggle on every job card, backed by `job_config.set_active_slugs`. Each job carries a 1-10 priority weight that fans out into the scraper round-robin, so a hot job pulls harder without starving the queue.
+- **Global Gallery + Global Stats + click-to-filter donut.** Every job's sorted library rolls up into one cross-job grid; a Global Stats donut charts the split (with a source-composition bar strip below) and a slice click drills to the matching filtered gallery.
+- **SSE real-time streaming.** The dashboard now streams `activity`, `queue`, and `status` over a `/api/stream` SSE channel — the 5-second poll fallback is still there, but the moment SSE opens, polls stop.
+- **Global NSFW toggle.** A sidebar switch controls the blur on every surface (gallery, activity, thumbnails) and persists in `localStorage`. NSFW-bucketed items stay in the index; only the visual affordance flips.
+- **Filter popovers everywhere.** Gallery / Global Gallery / Queue / Activity all share one filter popover component — sources, categories, score gates, date range, NSFW mode. Teleported to `<body>` so it lands above the tile grid on every theme.
+- **Five new built-in themes + custom theme editor + community themes marketplace.** `ai-slop`, `beige`, `wood`, `cyberpunk`, and `forest` join the existing `dark` / `light` / `hc` cores. A Settings → Themes tab has color pickers for every CSS token with a live preview panel, and a Publish button that opens a PR against `themes/community/` (no direct push to `main`).
+- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/seed_demo_data.py` seeds synthetic queue/sorted rows for two demo jobs (`car_ads` + `realistic_female_influencer`) so the dashboard shows real numbers before you configure anything. `--reset` wipes and rebuilds.
+- **Preset marketplace + community presets + editable thumbnails + git-based Publish.** The Presets tab now has a dedicated editor detail view, a comparison grid of built-in starters, a community strip that browses `presets/community/*.preset.json`, and drag-and-drop thumbnail upload per preset. Publish sends the preset (+ its thumbnail) to `presets/community/` and opens a PR against `main`.
 - **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg` (via `imageio-ffmpeg`, no OS install needed). Videos play inline in the gallery modal. When the video backend is missing the pipeline **holds unclassifiable videos** (does NOT auto-DISCARD) so nothing is lost while you install the `[video]` extra.
 - **LM Studio strict-schema + a registry of cloud workers.** LM Studio's grammar backend now accepts our response schema (strict-mode-forbidden keywords stripped). Groq / Anthropic Claude / OpenAI / OpenRouter / Google Gemini all ship as first-class registered workers alongside the local fleet, with prompt caching + a per-provider **cost tracker** (`data/cost_ledger.json`) so a runaway cloud pass can't sneak up on you.
 - **Query-language keywords.** `topic_filter` now accepts `AND` / `OR` / `NOT`, parens, and `"quoted phrases"` — a keyword filter like `(portrait OR headshot) AND NOT anime` does what it says.
-- **Unified scraper cards + draggable priority.** Every scraper (Civitai, X, Reddit, Discord, gallery-dl, yt-dlp, Kohya import, local folders) lives on ONE Scrapers tab with per-source URL/target editors, per-URL Test buttons, and draggable priority (order + weight). No more hunting through Settings for the right toggle.
+- **Unified scraper cards + draggable priority.** Every scraper (Civitai, X, Reddit, Discord, gallery-dl, yt-dlp, Kohya import, local folders) lives on ONE Scrapers tab with per-source URL/target editors, per-URL Test buttons, and draggable priority (order + weight).
 - **Kohya + gallery-dl + yt-dlp scrapers.** Kohya-format LoRA training folders re-import through the same pipeline; gallery-dl covers 340+ sites out of the box; yt-dlp is now a first-class per-job scraper with cookies + custom args.
 - **Security hardening.** CSP + `X-Frame-Options: DENY` + `nosniff` on every response; `safe_inside()` on every user-supplied path; `SECRET_MASK` on every credential leaving the server; `allow_redirects=False` on every outbound HTTP probe. Full policy in [`SECURITY.md`](SECURITY.md), how-to-contribute in [`CONTRIBUTING.md`](CONTRIBUTING.md), community norms in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and every PR uses the [PR template](.github/pull_request_template.md).
 - **Kohya + HuggingFace exporters.** ZIP a filtered gallery view directly into a trainer, or push a curated set to a private HuggingFace dataset repo (`hf_export.py`).
@@ -89,12 +139,12 @@ FLASK_PORT=5000 ./launch.sh
 Want to see the dashboard with mock data before configuring scrapers?
 
 ```bash
-python tools/seed_demo_data.py
-PIPELINE_TOPIC="Artistic Showcase" PIPELINE_SLUG=artistic_showcase \
-  PIPELINE_BASE_DIR="$(pwd)/data" FLASK_PORT=5050 \
-  python pipeline_code/dashboard_enhanced.py
-# open http://localhost:5050
+python tools/seed_demo_data.py             # seeds two demo jobs (car_ads + realistic_female_influencer)
+python tools/seed_demo_data.py --reset     # wipe + reseed for a clean state
+python pipeline_code/dashboard_enhanced.py # open http://localhost:5000
 ```
+
+The seeder is deterministic and self-contained — no network, no external images, no NSFW content. Every image is a Pillow gradient tile stamped with its bucket, wrapped in a real `.txt` prompt + `.vision.json` audit sidecar so the indexer / gallery / stats / donut / source-bars all populate for the demo the same way they would for a real run. Every README screenshot above is captured against this dataset via `python tools/capture_screenshots.py`.
 
 ## Run with Docker
 
@@ -252,16 +302,9 @@ Nothing is deleted or overwritten by the migration tools — a legacy preset tha
 
 ## The dashboard
 
-Single-file Flask + Alpine.js, zero build step. The jobs grid is the landing surface; open a job for its scoped tabs. Auto-refreshes every 5 seconds.
+Single-file Flask + Alpine.js, zero build step. The jobs grid is the landing surface; open a job for its scoped tabs. Real-time updates land via SSE (`/api/stream`) with a 5-second poll fallback.
 
-| | |
-|---|---|
-| ![Overview](docs/screenshots/overview.png) | ![Stats](docs/screenshots/stats.png) |
-| **Overview** — queue and sorted totals, recent classifications, queue-by-source | **Stats** — top keywords, three top-10 leaderboards, per-source DISCARD / NSFW / quality |
-| ![Gallery](docs/screenshots/gallery.png) | ![Scrapers](docs/screenshots/scrapers.png) |
-| **Gallery** — filterable grid, score / date / source / resolution / NSFW filters, ZIP export of the current view, n-gram insights, click-to-edit prompts | **Scrapers** — per-source on/off toggles, scoped to the open job |
-| ![About](docs/screenshots/about.png) | ![FAQ](docs/screenshots/faq.png) |
-| **About** — what cull is, repo + license, live counters, brand palette swatches | **FAQ** — pre-empts the GitHub issues (Why no Redis · Why force a JSON schema · What is "Watermarked" · How to add a scraper · How to switch LM Studio · Where data lives · Why "cull") |
+The primary surfaces are captured in the [Screenshots](#screenshots) section above: **Jobs** (multi-job Run toggle + priority slider) · **Global Stats** (donut with click-to-filter + source composition bars) · **Global Gallery** (every job's sorted library in one grid) · **Gallery filter popover** (chip-driven filters for source / category / score gates / NSFW / date) · **Presets** (built-in + community + editable thumbnails) · **Scrapers** (all sources on one tab, per-source URL + priority) · **Vision** (local LLM fleet + cloud workers, per-worker Test) · **Themes** (eight built-ins + a full color-picker editor).
 
 The Gallery detail modal lets you edit the prompt and save. The save overwrites the `.txt` next to the image with no backup, by design — versioning belongs in git, not in a thousand `.txt.bak` files.
 
