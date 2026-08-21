@@ -1,0 +1,176 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "wildlife_macro",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "wildlife",
+        "macro",
+        "insect",
+        "bird",
+        "animal",
+        "nature",
+        "butterfly",
+        "close-up"
+      ],
+      "banned_keywords": [
+        "link in bio",
+        "dm me",
+        "onlyfans",
+        "patreon",
+        "subscribe",
+        "follow me",
+        "promo code",
+        "for sale",
+        "commission",
+        "check my",
+        "zoo",
+        "captive",
+        "taxidermy",
+        "plush toy",
+        "anime"
+      ],
+      "generation_hints": [
+        "wildlife photography",
+        "macro shot",
+        "telephoto",
+        "natural habitat",
+        "nature photography",
+        "in the wild"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "enabled": {
+        "X.com": true,
+        "Discord-1": true,
+        "Civitai-Com": true,
+        "Civitai-Red": true,
+        "Web": true,
+        "Gallery-DL": true
+      },
+      "x_accounts": [
+        "NatGeoPhotos"
+      ],
+      "reddit_subreddits": [
+        "macro",
+        "wildlifephotography",
+        "macrophotography",
+        "naturephotography",
+        "birdphotography",
+        "insects"
+      ],
+      "discord_channels_json": "",
+      "civitai_domains": [
+        "civitai.com",
+        "civitai.red"
+      ],
+      "gallery_dl": {
+        "enabled": false,
+        "urls": [],
+        "limit_per_url": 200,
+        "cookies_file": "",
+        "config_path": "",
+        "config_json": ""
+      },
+      "yt_dlp": {
+        "enabled": false,
+        "urls": [],
+        "limit": 200,
+        "cookies": ""
+      },
+      "local_imports": [],
+      "kohya_import": {
+        "enabled": false,
+        "dir": "",
+        "name": "kohya",
+        "move": false,
+        "allow_flat": false
+      },
+      "priority": {
+        "order": [
+          "X.com",
+          "Discord-1",
+          "Civitai-Com",
+          "Civitai-Red",
+          "Web",
+          "Gallery-DL",
+          "YT-DLP"
+        ],
+        "weights": {
+          "X.com": 5,
+          "Discord-1": 5,
+          "Civitai-Com": 5,
+          "Civitai-Red": 5,
+          "Web": 5,
+          "Gallery-DL": 5,
+          "YT-DLP": 5
+        }
+      }
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Sharp wildlife or macro-nature subject with the eye/key plane in focus, natural habitat, clean subject separation, on-topic"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Soft focus, subject small/distant in frame, busy background, or average quality -> review"
+      },
+      {
+        "name": "CaptiveStaged",
+        "hint": "Obvious zoo bars/enclosure, taxidermy mount, plush toy or sculpture standing in for a real wild animal -> off-theme"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Unrelated to the wildlife/nature subject"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image. Anime, illustration, 3D render, digital painting, or a photo of a statue/figurine -> the matching label, NEVER `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (malformed face/hands, wrong finger count, melted limbs, warped text, impossible geometry).\n- A SCREENSHOT is the WHOLE frame being a screen capture (UI chrome / browser bars). A photo that merely contains a phone or monitor as a scene object is NOT a screenshot.\n- A COMPOSITE/GRID is 2+ separate images stitched together -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in watermarks, captions, logos, or infographic text.\n- nsfw = TRUE only for explicit nudity or sexual content.\n- The curation topic only informs REL_Quality_Score; do NOT invent details that aren't in the pixels.\nWildlife & macro-nature dataset. Reward critical sharpness on the animal's eye (or the macro subject's key plane), natural habitat and clean separation from the background. Penalise visible cages/bars, heavy crops that destroy detail and motion blur on the subject. A taxidermy mount, plush toy or sculpture is NOT a real animal — real-subject = false and route CaptiveStaged.",
+    "scoring": {
+      "ovr_min": 50,
+      "rel_min": 25,
+      "notes": "Reward eye-level sharpness on the subject, natural habitat and clean background separation. Penalise soft focus, tiny-in-frame subjects, cage bars and motion blur."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    },
+    "media": {
+      "types": [
+        "image"
+      ],
+      "image_exts": [
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".gif"
+      ],
+      "video_exts": [
+        ".mp4",
+        ".mov",
+        ".webm",
+        ".mkv",
+        ".avi",
+        ".m4v"
+      ]
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}
