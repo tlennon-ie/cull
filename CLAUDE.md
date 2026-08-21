@@ -65,6 +65,7 @@ These are load-bearing — breaking them will silently misroute images.
 | Change classification taxonomy | [`categories.py`](pipeline_code/categories.py) — affects JSON schema + worker mkdir + dashboard automatically |
 | Tune classification quality | [`vision_prompt.py`](pipeline_code/vision_prompt.py) — `build_classification_prompt` for the model-side instruction, `apply_scores` for post-hoc validation gates |
 | Add a dashboard endpoint | [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) — single-file Flask + giant `HTML_TEMPLATE` Alpine.js string |
+| Add a new UI theme | [`theme_config.py`](pipeline_code/theme_config.py) is the registry + validation; shipped themes live in [`themes/builtin/*.theme.json`](themes/builtin/), community-contributed themes land in [`themes/community/`](themes/community/), user customs go to `data/themes/`. The CSS token schema (`THEME_VAR_KEYS`) must stay in lockstep with the `:root` block in `dashboard_enhanced.py`. Dashboard editor lives in Settings → Themes; publish goes through the same `_git_run` helpers the preset publish flow uses. |
 | Swap the queue backend | Implement the `Queue` Protocol from [`queue_manager.py`](pipeline_code/queue_manager.py); change `_default_queue` factory |
 | Configure a setting via UI | Add the env var name to `SETTINGS_KEYS` in [`dashboard_enhanced.py`](pipeline_code/dashboard_enhanced.py) and add inputs in the Settings tab template |
 
@@ -86,7 +87,7 @@ python tools/seed_demo_data.py                        # synthetic demo data for 
 python -c "import sys; sys.path.insert(0, 'pipeline_code'); import importlib; [importlib.import_module(m) for m in (
   'paths','pipeline_logging','categories','job_config','builtin_presets','vision_workers','vision_prompt',
   'queue_manager','topic_filter','seen_store','credentials','scraper_test',
-  'feed_local_folder',
+  'feed_local_folder','theme_config',
   'scraper_civitai','scraper_civitai_search','scraper_x','scraper_discord','scraper_web',
   'scraper_gallery_dl',
   'vision_worker_base','vision_worker_balanced_lm','vision_worker_balanced_groq',
