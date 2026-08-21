@@ -6275,6 +6275,240 @@ def api_presets_publish(key: str):
             shutil.rmtree(str(worktree_dir), ignore_errors=True)
 
 
+# ── Themes: registry + editor + community publish ─────────────────────────────
+#
+# Mirrors the presets marketplace. The three layers are:
+#   * builtin   — themes/builtin/<slug>.theme.json (checked in)
+#   * community — themes/community/<slug>.theme.json (contributed, publishable)
+#   * user      — data/themes/<slug>.json (per install)
+#
+# theme_config.py owns the on-disk shape + validation; this module wires that
+# to Flask routes and re-uses the git helpers (_git_run, _clean_git_error) that
+# the preset publish flow already ships. No new subprocess plumbing is added.
+
+import theme_config as _theme_config  # noqa: E402
+
+
+def _valid_theme_name(name: str) -> bool:
+    """Boundary validator for every theme route."""
+    return bool(_theme_config.is_valid_name(name))
+
+
+@app.route("/api/themes")
+def api_themes_list():
+    """List every theme visible to the dashboard.
+
+    Returns ``{themes: [...], core: [...]}``. Core names are the CSS-only
+    themes (dark / light / hc) so the client can flag them as read-only.
+    """
+    try:
+        items = _theme_config.list_themes()
+    except Exception as exc:  # noqa: BLE001 — never let a bad file crash listing
+        return _err("failed to list themes", exc, 500)
+    return jsonify({
+        "themes": items,
+        "core": list(_theme_config.CORE_THEMES),
+        "var_keys": list(_theme_config.THEME_VAR_KEYS),
+    })
+
+
+@app.route("/api/themes/<name>")
+def api_themes_get(name: str):
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+    return jsonify({"ok": True, "theme": theme})
+
+
+@app.route("/api/themes/<name>", methods=["PUT"])
+def api_themes_put(name: str):
+    """Save a user theme (creates or overwrites the ``data/themes/<slug>.json``).
+
+    Body: ``{font_family, vars}``. Unknown vars keys are dropped; unsafe values
+    are dropped; sanitisation happens in theme_config._sanitize_theme.
+    """
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "body must be a JSON object"}), 400
+    try:
+        path = _theme_config.write_theme(name, body)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        return _err("failed to write theme", exc, 500)
+    return jsonify({"ok": True, "name": name, "path": str(path)})
+
+
+@app.route("/api/themes/<name>", methods=["DELETE"])
+def api_themes_delete(name: str):
+    """Remove a user theme override. Builtin + community files are never touched."""
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    if _theme_config.is_builtin(name):
+        return jsonify({"ok": False, "error": "cannot delete a built-in theme"}), 400
+    ok = _theme_config.delete_theme(name)
+    if not ok:
+        return jsonify({"ok": False, "error": "no user theme to delete"}), 404
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/themes/<name>/install", methods=["POST"])
+def api_themes_install(name: str):
+    """Copy a builtin or community theme into ``data/themes/`` for local editing.
+
+    Loopback-only. Mirrors the preset "install from URL" flow (SAVE the shipped
+    payload as a user copy so subsequent edits don't touch the shipped file).
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+    # Force a user-layer copy — read_theme picked whichever layer wins today,
+    # but installing means "give me my own editable copy".
+    try:
+        path = _theme_config.write_theme(name, {
+            "font_family": theme.get("font_family", ""),
+            "vars": theme.get("vars", {}),
+        })
+    except (ValueError, OSError) as exc:
+        return _err("failed to install theme", exc, 500)
+    return jsonify({"ok": True, "name": name, "path": str(path)})
+
+
+@app.route("/api/themes/<name>/publish", methods=["POST"])
+def api_themes_publish(name: str):
+    """Publish a user theme to ``themes/community/`` via git add / commit / push.
+
+    Loopback-only. Empty body. Copies ``data/themes/<slug>.json`` (or the
+    effective theme when the user hasn't saved a local copy — a user might
+    want to re-publish a builtin's tweaked variables straight from the JSON
+    that ships) to ``themes/community/<slug>.theme.json`` and commits ONLY
+    that file (``git commit -o``) so unrelated working-tree changes stay
+    uncommitted, then pushes to ``origin HEAD``. Uses the same helpers the
+    preset publish route uses (never touches _api_presets_publish which is
+    being refactored in a parallel PR).
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return jsonify({
+            "ok": False,
+            "error": "git not installed",
+            "hint": "Install git and clone the cull repo (see README).",
+        }), 400
+    if not (WORKSPACE_ROOT / ".git").exists():
+        return jsonify({
+            "ok": False,
+            "error": "not a git repository",
+            "hint": "cull was likely downloaded as a zip. Clone the repo instead: git clone https://github.com/tlennon-ie/cull",
+        }), 400
+
+    # Verify origin exists.
+    rc, out, err = _git_run([git_bin, "remote", "get-url", "origin"], WORKSPACE_ROOT)
+    if rc != 0 or not out.strip():
+        return jsonify({
+            "ok": False,
+            "error": "no 'origin' remote configured",
+            "hint": "git remote add origin <url> (see README).",
+        }), 400
+    remote_url = out.strip().splitlines()[0]
+
+    # Serialise the community envelope. We deliberately DROP the transient
+    # ``source`` / ``path`` fields the list endpoint adds — the published file
+    # is a portable theme, not a listing row.
+    community_dir = _theme_config.community_themes_dir()
+    community_dir.mkdir(parents=True, exist_ok=True)
+    dest = _theme_config.community_file_for(name)
+    envelope = {
+        "name": theme["name"],
+        "font_family": theme.get("font_family", ""),
+        "vars": theme.get("vars", {}),
+    }
+    try:
+        # Containment check — dest MUST live under community_themes_dir so no
+        # crafted slug can escape (theme name regex already prevents it, but
+        # defence in depth matches how the preset publish route validates).
+        if safe_inside(str(dest), [community_dir]) is None and not dest.exists():
+            # dest doesn't exist yet — check parent instead.
+            if safe_inside(str(dest.parent), [community_dir]) is None:
+                return jsonify({"ok": False, "error": "invalid destination path"}), 400
+        dest.write_text(
+            json.dumps(envelope, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return _err("could not write community theme file", exc, 500)
+
+    rel_path = str(dest.relative_to(WORKSPACE_ROOT)).replace("\\", "/")
+
+    rc, _out, err = _git_run([git_bin, "add", "--", rel_path], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git add failed: {_clean_git_error(err)}",
+        }), 500
+
+    commit_msg = f"community theme: {name}"
+    rc, _out, err = _git_run(
+        [git_bin, "commit", "-o", rel_path, "-m", commit_msg],
+        WORKSPACE_ROOT,
+    )
+    if rc != 0:
+        cleaned = _clean_git_error(err)
+        if "nothing to commit" in cleaned.lower() or "no changes added to commit" in cleaned.lower():
+            _rc, sha, _e = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+            return jsonify({
+                "ok": True,
+                "commit": sha.strip(),
+                "pushed_to": None,
+                "files": [rel_path],
+                "message": "no changes — theme already committed as-is",
+            })
+        return jsonify({
+            "ok": False,
+            "error": f"git commit failed: {cleaned}",
+        }), 500
+
+    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+
+    rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git push failed: {_clean_git_error(err)}",
+            "commit": new_sha,
+            "files": [rel_path],
+            "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
+        }), 500
+
+    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
+    branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
+
+    return jsonify({
+        "ok": True,
+        "commit": new_sha,
+        "pushed_to": f"{remote_url} ({branch})",
+        "remote": remote_url,
+        "branch": branch,
+        "files": [rel_path],
+    })
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
@@ -6681,6 +6915,292 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     background: #ffe600 !important; color: #000 !important; border: 2px solid #fff !important;
   }
   html.theme-hc thead, html.theme-hc th { background: #000 !important; color: #ffe600 !important; border-color: #fff !important; }
+
+  /* ── NEW BUILT-IN THEMES (T3 #22 batch 2) ─────────────────────────────────
+     Each theme is a set of CSS variable overrides on html.theme-<slug>. The
+     ``:root`` block above defines the dark defaults; every override slot only
+     needs to redefine the tokens that differ. The Tailwind-utility class
+     blanket overrides used by html.theme-light also apply to these when the
+     theme registry ships the same tokens (see the light-theme block above for
+     the pattern the JS side reuses). */
+  html.theme-ai-slop {
+    --color-bg: #0a0014;
+    --color-bg-elev: #12001f;
+    --color-fg: #f2e6ff;
+    --color-fg-muted: #a78bfa;
+    --color-surface: rgba(24,0,40,0.85);
+    --color-surface-alt: #1a0033;
+    --color-border: rgba(139,92,246,0.35);
+    --color-border-strong: #8b5cf6;
+    --color-accent: #e879f9;
+    --color-accent-hover: #d946ef;
+    --color-accent-fg: #0a0014;
+    --color-success: #22d3ee;
+    --color-success-fg: #0a0014;
+    --color-warn: #fde047;
+    --color-warn-fg: #0a0014;
+    --color-danger: #ff2d95;
+    --color-danger-fg: #0a0014;
+    --color-input-bg: #1a0033;
+    --color-input-fg: #f2e6ff;
+    --color-input-placeholder: #a78bfa;
+    --color-pill-bg: rgba(232,121,249,0.15);
+    --color-pill-fg: #f0abfc;
+  }
+  html.theme-beige {
+    --color-bg: #f5efe4;
+    --color-bg-elev: #faf5ec;
+    --color-fg: #1a1613;
+    --color-fg-muted: #6b5f52;
+    --color-surface: #faf5ec;
+    --color-surface-alt: #ede4d3;
+    --color-border: #d9cdb8;
+    --color-border-strong: #a89680;
+    --color-accent: #b8543a;
+    --color-accent-hover: #9c4530;
+    --color-accent-fg: #faf5ec;
+    --color-success: #5c7a3f;
+    --color-success-fg: #faf5ec;
+    --color-warn: #b8873a;
+    --color-warn-fg: #faf5ec;
+    --color-danger: #992a1a;
+    --color-danger-fg: #faf5ec;
+    --color-input-bg: #faf5ec;
+    --color-input-fg: #1a1613;
+    --color-input-placeholder: #a89680;
+    --color-pill-bg: #ede4d3;
+    --color-pill-fg: #5c483a;
+  }
+  html.theme-wood {
+    --color-bg: #241611;
+    --color-bg-elev: #2f1c14;
+    --color-fg: #f4e8d8;
+    --color-fg-muted: #c4a880;
+    --color-surface: rgba(58,34,22,0.9);
+    --color-surface-alt: #3a2216;
+    --color-border: rgba(139,94,60,0.4);
+    --color-border-strong: #8b5e3c;
+    --color-accent: #d4a04a;
+    --color-accent-hover: #c08a35;
+    --color-accent-fg: #241611;
+    --color-success: #8fa860;
+    --color-success-fg: #241611;
+    --color-warn: #e0a850;
+    --color-warn-fg: #241611;
+    --color-danger: #c8553d;
+    --color-danger-fg: #f4e8d8;
+    --color-input-bg: #2f1c14;
+    --color-input-fg: #f4e8d8;
+    --color-input-placeholder: #a08560;
+    --color-pill-bg: rgba(212,160,74,0.15);
+    --color-pill-fg: #e8c88a;
+  }
+  html.theme-cyberpunk {
+    --color-bg: #000000;
+    --color-bg-elev: #0a0010;
+    --color-fg: #e0f7ff;
+    --color-fg-muted: #78d0e8;
+    --color-surface: rgba(10,0,16,0.92);
+    --color-surface-alt: #12001a;
+    --color-border: rgba(255,46,147,0.4);
+    --color-border-strong: #ff2e93;
+    --color-accent: #00e5ff;
+    --color-accent-hover: #00b8d4;
+    --color-accent-fg: #000000;
+    --color-success: #00ff88;
+    --color-success-fg: #000000;
+    --color-warn: #ffd60a;
+    --color-warn-fg: #000000;
+    --color-danger: #ff2e93;
+    --color-danger-fg: #000000;
+    --color-input-bg: #12001a;
+    --color-input-fg: #e0f7ff;
+    --color-input-placeholder: #78d0e8;
+    --color-pill-bg: rgba(0,229,255,0.12);
+    --color-pill-fg: #00e5ff;
+  }
+  html.theme-forest {
+    --color-bg: #0e1f18;
+    --color-bg-elev: #132a20;
+    --color-fg: #f0ead6;
+    --color-fg-muted: #a3b8a5;
+    --color-surface: rgba(19,42,32,0.9);
+    --color-surface-alt: #1a3a2a;
+    --color-border: rgba(122,158,108,0.35);
+    --color-border-strong: #5c8a4a;
+    --color-accent: #e8a54a;
+    --color-accent-hover: #d4903a;
+    --color-accent-fg: #0e1f18;
+    --color-success: #7fbf5c;
+    --color-success-fg: #0e1f18;
+    --color-warn: #e8a54a;
+    --color-warn-fg: #0e1f18;
+    --color-danger: #c85a3f;
+    --color-danger-fg: #f0ead6;
+    --color-input-bg: #132a20;
+    --color-input-fg: #f0ead6;
+    --color-input-placeholder: #7a8e7c;
+    --color-pill-bg: rgba(232,165,74,0.15);
+    --color-pill-fg: #f0c07a;
+  }
+  /* ── Shared "non-dark" blanket overrides for the JSON-backed themes ───────
+     The Tailwind-utility overrides html.theme-light uses (bg-slate-*, text-*,
+     border-*) work equally well for every theme once its token set is
+     defined — a light theme (beige) and dark themes (ai-slop / wood /
+     cyberpunk / forest) all just need those Tailwind classes to resolve to
+     `var(--color-*)` instead of the hard-coded slate/indigo/emerald values.
+     Rather than duplicate a huge selector list per theme, we opt every named
+     theme (except dark, which the utilities already match) into the same
+     blanket via the `[data-theme]` selector the JS sets in tandem with the
+     class name (see applyTheme()). */
+  html[data-theme]:not([data-theme="dark"]) body { background: var(--color-bg) !important; color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) aside,
+  html[data-theme]:not([data-theme="dark"]) aside.bg-slate-900\/70,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/70 {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .card {
+    background: var(--color-surface) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/50,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/40,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/50,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/40,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/30,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-950,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-950\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-700,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-700:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-800:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-900:hover {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-slate-100,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-200,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-300,
+  html[data-theme]:not([data-theme="dark"]) .text-white { color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) .text-slate-400,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-500,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-600 { color: var(--color-fg-muted) !important; }
+  html[data-theme]:not([data-theme="dark"]) .border-slate-600,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-700,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-800,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-900 { border-color: var(--color-border) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-indigo-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-indigo-600,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-600:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-700:hover {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-300,
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-400,
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-500 { color: var(--color-accent) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-800,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-800\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-emerald-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-emerald-600:hover {
+    background: var(--color-success) !important;
+    color: var(--color-success-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-100,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-200,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-300,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-400 { color: var(--color-success) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-amber-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-amber-600,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-amber-400:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-amber-500:hover {
+    background: var(--color-warn) !important;
+    color: var(--color-warn-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-amber-300,
+  html[data-theme]:not([data-theme="dark"]) .text-amber-400 { color: var(--color-warn) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-red-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-red-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-950\/60,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-rose-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-rose-800:hover {
+    background: var(--color-danger) !important;
+    color: var(--color-danger-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-rose-100,
+  html[data-theme]:not([data-theme="dark"]) .text-rose-200 { color: var(--color-danger-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) .text-rose-300,
+  html[data-theme]:not([data-theme="dark"]) .text-rose-400,
+  html[data-theme]:not([data-theme="dark"]) .text-red-400 { color: var(--color-danger) !important; }
+  html[data-theme]:not([data-theme="dark"]) input,
+  html[data-theme]:not([data-theme="dark"]) select,
+  html[data-theme]:not([data-theme="dark"]) textarea {
+    background: var(--color-input-bg) !important;
+    color: var(--color-input-fg) !important;
+    border-color: var(--color-border-strong) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) input::placeholder,
+  html[data-theme]:not([data-theme="dark"]) textarea::placeholder { color: var(--color-input-placeholder) !important; }
+  html[data-theme]:not([data-theme="dark"]) .pill { background: var(--color-pill-bg) !important; color: var(--color-pill-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) thead,
+  html[data-theme]:not([data-theme="dark"]) thead tr,
+  html[data-theme]:not([data-theme="dark"]) th { background: var(--color-surface-alt) !important; color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) code {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-accent) !important;
+    border-color: var(--color-border) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) a,
+  html[data-theme]:not([data-theme="dark"]) .link-btn { color: var(--color-accent) !important; }
+
+  /* Live theme preview mini-mock used inside the theme editor. Scoped to a
+     .theme-preview root so its palette can override the outer theme without
+     affecting siblings. Every element pulls from the same CSS variables the
+     real dashboard consumes, so the preview mirrors reality. */
+  .theme-preview { border:1px solid var(--color-border); border-radius:.6rem; padding:1rem;
+                   background: var(--color-bg); color: var(--color-fg); }
+  .theme-preview .tp-card { background: var(--color-bg-elev); border:1px solid var(--color-border);
+                             border-radius:.5rem; padding:.9rem; }
+  .theme-preview .tp-btn { background: var(--color-accent); color: var(--color-accent-fg);
+                            border:none; border-radius:.35rem; padding:.4rem .9rem; font-weight:600;
+                            cursor:pointer; }
+  .theme-preview .tp-btn:hover { background: var(--color-accent-hover); }
+  .theme-preview .tp-btn-secondary { background: var(--color-surface-alt); color: var(--color-fg);
+                                      border:1px solid var(--color-border-strong); }
+  .theme-preview .tp-chip { display:inline-block; background: var(--color-pill-bg);
+                             color: var(--color-pill-fg); border-radius:9999px;
+                             padding:.15rem .55rem; font-size:.7rem; letter-spacing:.03em; }
+  .theme-preview .tp-input { background: var(--color-input-bg); color: var(--color-input-fg);
+                              border:1px solid var(--color-border); border-radius:.35rem;
+                              padding:.35rem .6rem; }
+  .theme-preview .tp-input::placeholder { color: var(--color-input-placeholder); }
+  .theme-preview .tp-heading { color: var(--color-fg); font-weight:600; margin:0 0 .4rem; }
+  .theme-preview .tp-muted { color: var(--color-fg-muted); font-size:.75rem; }
+  .theme-preview .tp-success { background: var(--color-success); color: var(--color-success-fg);
+                                border-radius:.25rem; padding:.1rem .5rem; font-size:.7rem; font-weight:500; }
+  .theme-preview .tp-danger { background: var(--color-danger); color: var(--color-danger-fg);
+                               border-radius:.25rem; padding:.1rem .5rem; font-size:.7rem; font-weight:500; }
+
+  /* Theme editor swatch — reusable colour tile next to each colour picker. */
+  .swatch { display:inline-block; width:1.25rem; height:1.25rem; border-radius:.25rem;
+            border:1px solid var(--color-border-strong); vertical-align:middle; }
 
   /* Preset marketplace + wizard shared card styling. */
   .preset-card { transition: transform .12s, border-color .12s; }
@@ -7581,7 +8101,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   x-text="update.checking ? 'Checking…' : 'Check for updates'"></button>
         </template>
         <template x-if="update.checked && !update.checking && update.behind === 0 && !update.error">
-          <span class="px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300 text-[11px]"
+          <!-- Theme-token pill: previously bg-emerald-900/60 + text-emerald-300 which the
+               light-theme mapping only partially caught (bg fell through, text turned
+               green on white ≈ invisible). Now uses --color-success / --color-success-fg
+               explicitly so every theme lands a legible pill. -->
+          <span class="px-2 py-0.5 rounded text-[11px] font-medium"
+                style="background: var(--color-success); color: var(--color-success-fg);"
                 title="Latest cull is already installed">up to date</span>
         </template>
         <template x-if="update.checked && update.behind > 0">
@@ -7637,13 +8162,17 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </span>
           <span>Show NSFW</span>
         </label>
-        <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>. -->
+        <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>.
+             Driven from availableThemes() so shipped + community + user themes
+             show up automatically. The visible label capitalises the slug so
+             `ai-slop` renders as `Ai-slop` etc.; users see the slug they saved. -->
         <select :value="theme" @change="setTheme($event.target.value)"
                 title="Colour theme"
                 class="text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1.5 mr-1">
-          <option value="dark">Theme: Dark</option>
-          <option value="light">Theme: Light</option>
-          <option value="hc">Theme: High-contrast</option>
+          <template x-for="t in availableThemes()" :key="'th_' + t.name">
+            <option :value="t.name"
+                    x-text="'Theme: ' + (t.name.charAt(0).toUpperCase() + t.name.slice(1))"></option>
+          </template>
         </select>
         <template x-if="view === 'job'">
           <div class="flex gap-2">
@@ -10700,6 +11229,166 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <button @click="gAddFleet()" x-show="globalVision.loaded" class="mt-2 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
         <div x-show="!globalVision.loaded" class="text-xs text-slate-500 italic mt-2">Loading…</div>
+      </div>
+
+      <!-- Themes: registry (built-in + community + user) + inline editor. Two
+           views like the presets tab: 'grid' shows every theme as a card,
+           'detail' hosts the colour-picker editor for one custom theme. Saves
+           via /api/themes; publish shares the git helpers the preset publish
+           route uses. Stop-propagates change/input so tweaks here don't mark
+           the .env form dirty. -->
+      <div class="card rounded-xl p-5" @change.stop @input.stop
+           x-show="themeEditor.view === 'grid'">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <h3 class="font-semibold">Themes</h3>
+            <p class="text-xs text-slate-400">Pick from shipped themes, install a community theme, or design a fully custom one. Custom themes save to <code>data/themes/</code>.</p>
+          </div>
+          <button @click="loadThemes()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded shrink-0">Reload</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <!-- New / clone card. Same style as the presets 'New preset' card. -->
+          <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
+            <div class="text-sm font-semibold mb-2">New theme</div>
+            <input x-model="themeEditor.newName" placeholder="theme-slug (lowercase)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2 font-mono"/>
+            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
+            <select x-model="themeEditor.newBase" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
+              <template x-for="t in availableThemes()" :key="'nb_'+t.name">
+                <option :value="t.name" x-text="t.name"></option>
+              </template>
+            </select>
+            <button @click="createTheme()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
+          </div>
+          <template x-for="t in (themes.list || [])" :key="'tc_'+t.name">
+            <div class="bg-slate-900/60 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <!-- Mini swatch strip: 6 tokens at a glance. -->
+              <div class="flex h-14 border-b border-slate-800">
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-bg']||'#0f172a')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-surface-alt']||'#1e293b')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-accent']||'#6366f1')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-success']||'#10b981')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-warn']||'#f59e0b')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-danger']||'#e11d48')"></div>
+              </div>
+              <div class="p-3 flex flex-col gap-2">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="font-mono text-sm truncate" x-text="t.name"></div>
+                    <div class="text-[11px] text-slate-500" x-text="t.source"></div>
+                  </div>
+                  <span x-show="theme === t.name" class="pill px-1.5 py-0.5 rounded" style="background: var(--color-accent); color: var(--color-accent-fg);">Active</span>
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <button @click="setTheme(t.name)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Apply</button>
+                  <button @click="openThemeEditor(t.name)" x-show="t.source === 'user'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+                  <button @click="cloneTheme(t.name)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+                  <button @click="installTheme(t.name)" x-show="t.source !== 'user'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Copy to data/themes/ so you can edit it">Customize</button>
+                  <button @click="publishTheme(t.name)" x-show="t.source === 'user' || t.source === 'community'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this theme to themes/community/ and push to origin">Publish</button>
+                  <button @click="deleteTheme(t.name)" x-show="t.source === 'user'" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Delete</button>
+                </div>
+              </div>
+            </div>
+          </template>
+          <template x-if="!themes.loaded">
+            <div class="col-span-full text-xs text-slate-500 italic">Loading themes…</div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Theme editor detail view — reveals only when a custom theme is being
+           edited. Keeps the isolated deeper level pattern the preset editor
+           uses (Back button, sticky header, dedicated card). Colour pickers
+           use native <input type=color>; the live preview mirrors the actual
+           dashboard tokens so a change is instantly visible. -->
+      <div class="card rounded-xl p-5" @change.stop @input.stop
+           x-show="themeEditor.view === 'detail' && themeEditor.editing">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-center justify-between backdrop-blur">
+          <div class="flex items-center gap-3 min-w-0">
+            <button @click="closeThemeEditor()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1 shrink-0" title="Back to themes">
+              <span aria-hidden="true">←</span> Back
+            </button>
+            <h3 class="font-semibold truncate">Editing theme: <span class="font-mono" x-text="themeEditor.editing"></span></h3>
+          </div>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-emerald-300" x-text="themeEditor.savedFlash"></span>
+            <button @click="saveTheme()" :disabled="themeEditor.saving"
+                    class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-40">
+              <span x-text="themeEditor.saving ? 'Saving…' : 'Save'"></span>
+            </button>
+            <button @click="publishTheme(themeEditor.editing)" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Publish</button>
+          </div>
+        </div>
+        <div x-show="themeEditor.error" class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="themeEditor.error"></div>
+
+        <div class="grid lg:grid-cols-2 gap-5">
+          <!-- Left: pickers -->
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Font family</label>
+              <div class="flex gap-2">
+                <input x-model="themeEditor.draft.font_family" placeholder="Inter, system-ui, sans-serif"
+                       class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"/>
+                <select @change="themeEditor.draft.font_family = $event.target.value"
+                        class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
+                  <option value="">(preset stacks)</option>
+                  <template x-for="f in themeEditor.fontStacks" :key="'fp_'+f.label">
+                    <option :value="f.value" x-text="f.label"></option>
+                  </template>
+                </select>
+              </div>
+              <p class="text-[11px] text-slate-500 mt-1">Web-safe stacks apply immediately. Google Fonts (Inter, Space Grotesk, IBM Plex Sans, Playfair Display) load from fonts.googleapis.com — the CSP allowlists that origin.</p>
+            </div>
+
+            <div>
+              <h4 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Colours</h4>
+              <div class="grid grid-cols-1 gap-1.5">
+                <template x-for="k in themeEditor.varKeys" :key="'tv_'+k">
+                  <div class="flex items-center gap-2">
+                    <input type="color" :value="themeEditor.hexOf(k)"
+                           @input="themeEditor.setVar(k, $event.target.value)"
+                           class="w-9 h-8 rounded border border-slate-700 bg-transparent cursor-pointer p-0.5 shrink-0"
+                           :title="k"/>
+                    <input :value="themeEditor.draft.vars[k] || ''"
+                           @input="themeEditor.setVar(k, $event.target.value)"
+                           :placeholder="k"
+                           class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono"/>
+                    <span class="text-[10px] text-slate-500 font-mono w-40 truncate shrink-0" x-text="k"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: live preview -->
+          <div>
+            <h4 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Live preview</h4>
+            <div class="theme-preview" :style="themeEditor.previewStyle()">
+              <div class="tp-card mb-3">
+                <h5 class="tp-heading">cull dashboard</h5>
+                <p class="tp-muted">Automating taste, one thumbnail at a time.</p>
+              </div>
+              <div class="flex gap-2 mb-3">
+                <button class="tp-btn">Primary action</button>
+                <button class="tp-btn tp-btn-secondary">Secondary</button>
+              </div>
+              <div class="flex gap-2 mb-3 flex-wrap">
+                <span class="tp-chip">portrait</span>
+                <span class="tp-chip">anime</span>
+                <span class="tp-chip">product</span>
+              </div>
+              <div class="mb-3">
+                <input class="tp-input w-full" placeholder="Search prompts…"/>
+              </div>
+              <div class="flex gap-2 flex-wrap">
+                <span class="tp-success">up to date</span>
+                <span class="tp-danger">discard</span>
+              </div>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Preview uses the same CSS variables as the real dashboard, so anything readable here reads everywhere.</p>
+          </div>
+        </div>
       </div>
 
       <!-- LM Studio runtime — part of Local vision: VRAM unload policy + per-endpoint
@@ -14070,23 +14759,322 @@ function dashboard() {
       setInterval(() => this.checkUpdate(), 30 * 60 * 1000);
       // Wave-2 UI bootstrap: apply persisted theme, poll demo status,
       // and preload preset metadata for wizard + comparison grid.
+      // Themes are loaded before the first paint so a custom user theme
+      // saved in a previous session takes effect on reload.
       this.applyTheme();
+      this.loadThemes();
       this.loadDemoStatus();
       this.loadPresetsMeta();
     },
 
     // ── T3 #22: theme selector ────────────────────────────────────────────
+    // Now backed by a registry of themes (core CSS ones + JSON-shipped
+    // themes.list + user-created themes). The core three (dark/light/hc)
+    // live entirely in the CSS above; anything else is projected into a
+    // dedicated <style id="theme-custom"> tag with a `html.theme-<slug>{...}`
+    // rule so the same token-based selectors apply.
     theme: (typeof localStorage !== 'undefined' && localStorage.getItem('cull.theme')) || 'dark',
+    themes: { loaded: false, list: [] },   // filled by loadThemes()
+    // Set of theme slugs the CSS ships with — for these applyTheme() knows
+    // the class already exists and skips the <style> injection.
+    _coreThemeSlugs: ['dark','light','hc','ai-slop','beige','wood','cyberpunk','forest'],
+    availableThemes() {
+      // Deduped list of {name, source} for the header dropdown.
+      const seen = new Set();
+      const out = [];
+      const push = (name, source) => {
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+        out.push({ name, source });
+      };
+      // Anchor CSS-only themes first so the dropdown starts with the trio
+      // most users recognise. The forest/wood/etc themes come from
+      // themes.list and slot in in the same order as list_themes() returns.
+      ['dark','light','hc'].forEach(n => push(n, 'core'));
+      (this.themes.list || []).forEach(t => push(t.name, t.source));
+      return out;
+    },
+    // Sanitise a CSS variable value coming from a theme JSON before we
+    // splice it into a <style> tag. Mirrors theme_config._is_safe_value
+    // so the client-side injector can't be tricked into breaking out of
+    // the rule body even if the server response were compromised.
+    _safeCssVal(v) {
+      if (typeof v !== 'string') return '';
+      if (v.length > 128) return '';
+      if (/[<>;`]|url\s*\(|javascript:|expression\s*\(/i.test(v)) return '';
+      return v;
+    },
+    _safeCssKey(k) {
+      // Only allow --color-<segment> tokens we actually ship.
+      return typeof k === 'string' && /^--color-[a-z-]{1,40}$/.test(k);
+    },
+    _buildCustomThemeCss() {
+      // Rebuild the whole custom-theme stylesheet. Called on every load /
+      // save so a mid-edit theme becomes visible immediately.
+      const parts = [];
+      (this.themes.list || []).forEach(t => {
+        if (this._coreThemeSlugs.includes(t.name)) return;   // CSS already ships this
+        const vars = t.vars || {};
+        const rules = [];
+        Object.keys(vars).forEach(k => {
+          if (!this._safeCssKey(k)) return;
+          const v = this._safeCssVal(vars[k]);
+          if (v) rules.push('  ' + k + ': ' + v + ';');
+        });
+        if (t.font_family && typeof t.font_family === 'string' && !/[<>;`]/.test(t.font_family)) {
+          // Font is applied via `body` so `.font-brand` (JetBrains Mono) can
+          // still override for the header/mono callouts.
+          parts.push('html.theme-' + t.name + ' body { font-family: ' + t.font_family.replace(/"/g,'\'') + '; }');
+        }
+        if (rules.length) {
+          parts.push('html.theme-' + t.name + ' {\n' + rules.join('\n') + '\n}');
+        }
+      });
+      let tag = document.getElementById('theme-custom');
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = 'theme-custom';
+        document.head.appendChild(tag);
+      }
+      tag.textContent = parts.join('\n\n');
+    },
+    async loadThemes() {
+      // Called on init + after any theme save / delete so the header dropdown
+      // and the settings editor always show the current library.
+      try {
+        const j = await fetch('/api/themes').then(r => r.json());
+        this.themes.list = Array.isArray(j.themes) ? j.themes : [];
+        this.themes.loaded = true;
+      } catch (e) {
+        this.themes.list = [];
+        this.themes.loaded = true;
+      }
+      this._buildCustomThemeCss();
+      // Re-apply the theme so a just-loaded custom theme takes effect
+      // without the user having to reselect it.
+      this.applyTheme();
+    },
     applyTheme() {
-      const t = ['dark','light','hc'].includes(this.theme) ? this.theme : 'dark';
-      document.documentElement.classList.remove('theme-dark','theme-light','theme-hc');
-      document.documentElement.classList.add('theme-' + t);
+      const known = this.availableThemes().map(t => t.name);
+      const t = known.includes(this.theme) ? this.theme : 'dark';
+      // Remove every `theme-*` class so switching from ai-slop → dark
+      // doesn't leave the previous class stuck on <html>.
+      const html = document.documentElement;
+      const classes = Array.from(html.classList);
+      classes.filter(c => c.indexOf('theme-') === 0).forEach(c => html.classList.remove(c));
+      html.classList.add('theme-' + t);
+      html.setAttribute('data-theme', t);
     },
     setTheme(t) {
-      if (!['dark','light','hc'].includes(t)) t = 'dark';
+      const known = this.availableThemes().map(x => x.name);
+      if (!known.includes(t)) t = 'dark';
       this.theme = t;
       try { localStorage.setItem('cull.theme', t); } catch (e) {}
       this.applyTheme();
+    },
+
+    // ── Theme editor state ────────────────────────────────────────────────
+    // Two views: 'grid' (registry cards) and 'detail' (colour-picker editor).
+    // The editor works on a `draft` copy of a user theme so a mid-edit change
+    // isn't lost if the user Back-buttons out without saving; Save writes
+    // `draft` to the server via PUT /api/themes/<name>.
+    themeEditor: {
+      view: 'grid',
+      editing: '',       // slug of the theme being edited
+      draft: { font_family: '', vars: {} },
+      newName: '',
+      newBase: 'dark',
+      saving: false,
+      savedFlash: '',
+      error: '',
+      // The canonical variable list — mirrors theme_config.THEME_VAR_KEYS.
+      // Filled from /api/themes response (var_keys) on first load; fallback
+      // list keeps the picker functional if the response is late.
+      varKeys: [
+        '--color-bg','--color-bg-elev','--color-fg','--color-fg-muted',
+        '--color-surface','--color-surface-alt','--color-border','--color-border-strong',
+        '--color-accent','--color-accent-hover','--color-accent-fg',
+        '--color-success','--color-success-fg','--color-warn','--color-warn-fg',
+        '--color-danger','--color-danger-fg',
+        '--color-input-bg','--color-input-fg','--color-input-placeholder',
+        '--color-pill-bg','--color-pill-fg',
+      ],
+      // Curated web-safe stacks + a handful of Google Fonts. Kept small so
+      // users don't have to scroll through a font dictionary; anyone who
+      // wants a fancier stack can type it into the free-form input.
+      fontStacks: [
+        { label: 'System UI (sans)', value: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif' },
+        { label: 'Inter', value: 'Inter, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'IBM Plex Sans', value: 'IBM Plex Sans, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'Space Grotesk', value: 'Space Grotesk, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'Playfair Display (serif)', value: 'Playfair Display, Georgia, ui-serif, serif' },
+        { label: 'JetBrains Mono', value: 'JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace' },
+      ],
+      // Convert a colour token to a hex string for <input type=color>. The
+      // native picker only accepts #rrggbb — rgba() etc. is not accepted so
+      // we fall back to black when the token isn't a hex.
+      hexOf(k) {
+        const v = (this.draft.vars || {})[k] || '';
+        const m = /^#([0-9a-f]{6})$/i.exec(v);
+        if (m) return '#' + m[1].toLowerCase();
+        // Attempt a rough conversion for rgb(x,y,z) so the picker at least
+        // renders a swatch; anything unrecognised → black default.
+        const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(v);
+        if (rgb) {
+          const h = n => ('0' + Math.max(0,Math.min(255, parseInt(n,10))).toString(16)).slice(-2);
+          return '#' + h(rgb[1]) + h(rgb[2]) + h(rgb[3]);
+        }
+        return '#000000';
+      },
+      setVar(k, v) {
+        // Store exactly what the input holds so a user typing an rgba()
+        // preserves the alpha channel. Sanitisation runs server-side too.
+        if (!this.draft.vars) this.draft.vars = {};
+        this.draft.vars[k] = v;
+      },
+      previewStyle() {
+        // Build an inline `style=` block so the mini-mock overrides the
+        // page's outer theme with the draft in progress. All variables are
+        // scoped to the .theme-preview element only.
+        const parts = [];
+        Object.keys(this.draft.vars || {}).forEach(k => {
+          const v = this.draft.vars[k];
+          if (typeof v === 'string' && v.length && !/[<>;`]/.test(v)) {
+            parts.push(k + ':' + v);
+          }
+        });
+        if (this.draft.font_family && !/[<>;`]/.test(this.draft.font_family)) {
+          parts.push('font-family:' + this.draft.font_family.replace(/"/g,'\''));
+        }
+        return parts.join(';');
+      },
+    },
+    openThemeEditor(name) {
+      // Pre-populate `draft` with the effective theme so the pickers start
+      // on the current colours. A theme that isn't in the user layer yet
+      // still opens (read-only preview) but Save will fail — the UI
+      // encourages "Customize" first, which install-copies it.
+      const t = (this.themes.list || []).find(x => x.name === name);
+      if (!t) { this.notify('Theme not found', 'error'); return; }
+      this.themeEditor.editing = name;
+      this.themeEditor.draft = {
+        font_family: t.font_family || '',
+        vars: { ...(t.vars || {}) },
+      };
+      this.themeEditor.view = 'detail';
+      this.themeEditor.error = '';
+      this.themeEditor.savedFlash = '';
+    },
+    closeThemeEditor() {
+      this.themeEditor.view = 'grid';
+      this.themeEditor.editing = '';
+      this.themeEditor.error = '';
+    },
+    async createTheme() {
+      const slug = (this.themeEditor.newName || '').trim().toLowerCase();
+      if (!/^[a-z0-9_-]{1,40}$/.test(slug)) {
+        this.notify('Theme slug must be 1-40 chars of a-z 0-9 _ -', 'error');
+        return;
+      }
+      // Copy the chosen base into a new user theme.
+      const base = (this.themes.list || []).find(x => x.name === this.themeEditor.newBase);
+      if (!base) { this.notify('Base theme not found', 'error'); return; }
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(slug), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: base.font_family || '',
+            vars: base.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Save failed', 'error'); return; }
+        this.themeEditor.newName = '';
+        await this.loadThemes();
+        this.openThemeEditor(slug);
+      } catch (e) {
+        this.notify('Create failed', 'error');
+      }
+    },
+    async cloneTheme(name) {
+      const suggested = name + '-copy';
+      const slug = (window.prompt('Clone theme "' + name + '" as (slug):', suggested) || '').trim().toLowerCase();
+      if (!slug) return;
+      if (!/^[a-z0-9_-]{1,40}$/.test(slug)) {
+        this.notify('Theme slug must be 1-40 chars of a-z 0-9 _ -', 'error');
+        return;
+      }
+      const src = (this.themes.list || []).find(x => x.name === name);
+      if (!src) { this.notify('Source not found', 'error'); return; }
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(slug), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: src.font_family || '',
+            vars: src.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Clone failed', 'error'); return; }
+        await this.loadThemes();
+        this.openThemeEditor(slug);
+      } catch (e) { this.notify('Clone failed', 'error'); }
+    },
+    async installTheme(name) {
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name) + '/install', {
+          method: 'POST',
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Install failed', 'error'); return; }
+        this.notify('Copied ' + name + ' to your themes — you can edit it now', 'success');
+        await this.loadThemes();
+        this.openThemeEditor(name);
+      } catch (e) { this.notify('Install failed', 'error'); }
+    },
+    async saveTheme() {
+      const name = this.themeEditor.editing;
+      if (!name) return;
+      this.themeEditor.saving = true;
+      this.themeEditor.error = '';
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: this.themeEditor.draft.font_family || '',
+            vars: this.themeEditor.draft.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.themeEditor.error = resp.error || 'Save failed'; return; }
+        this.themeEditor.savedFlash = 'Saved';
+        setTimeout(() => { this.themeEditor.savedFlash = ''; }, 1500);
+        await this.loadThemes();
+      } catch (e) {
+        this.themeEditor.error = 'Save failed';
+      } finally {
+        this.themeEditor.saving = false;
+      }
+    },
+    async deleteTheme(name) {
+      if (!window.confirm('Delete custom theme "' + name + '"? (Built-in themes are never removed.)')) return;
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name), { method: 'DELETE' }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Delete failed', 'error'); return; }
+        if (this.theme === name) this.setTheme('dark');
+        await this.loadThemes();
+      } catch (e) { this.notify('Delete failed', 'error'); }
+    },
+    async publishTheme(name) {
+      if (!window.confirm('Publish theme "' + name + '" — commit to themes/community/ and push to origin. Continue?')) return;
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name) + '/publish', { method: 'POST' }).then(r => r.json());
+        if (!resp.ok) {
+          this.notify((resp.error || 'Publish failed') + (resp.hint ? ' — ' + resp.hint : ''), 'error');
+          return;
+        }
+        this.notify('Published ' + name + (resp.pushed_to ? ' → ' + resp.pushed_to : ''), 'success');
+        await this.loadThemes();
+      } catch (e) { this.notify('Publish failed', 'error'); }
     },
 
     // ── T1 #1: demo seed / unseed ─────────────────────────────────────────

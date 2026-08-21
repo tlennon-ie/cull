@@ -1,0 +1,28 @@
+{
+  "name": "beige",
+  "font_family": "Inter, ui-sans-serif, system-ui, sans-serif",
+  "vars": {
+    "--color-bg": "#f5efe4",
+    "--color-bg-elev": "#faf5ec",
+    "--color-fg": "#1a1613",
+    "--color-fg-muted": "#6b5f52",
+    "--color-surface": "#faf5ec",
+    "--color-surface-alt": "#ede4d3",
+    "--color-border": "#d9cdb8",
+    "--color-border-strong": "#a89680",
+    "--color-accent": "#b8543a",
+    "--color-accent-hover": "#9c4530",
+    "--color-accent-fg": "#faf5ec",
+    "--color-success": "#5c7a3f",
+    "--color-success-fg": "#faf5ec",
+    "--color-warn": "#b8873a",
+    "--color-warn-fg": "#faf5ec",
+    "--color-danger": "#992a1a",
+    "--color-danger-fg": "#faf5ec",
+    "--color-input-bg": "#faf5ec",
+    "--color-input-fg": "#1a1613",
+    "--color-input-placeholder": "#a89680",
+    "--color-pill-bg": "#ede4d3",
+    "--color-pill-fg": "#5c483a"
+  }
+}

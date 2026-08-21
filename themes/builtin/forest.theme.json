@@ -1,0 +1,28 @@
+{
+  "name": "forest",
+  "font_family": "IBM Plex Sans, ui-sans-serif, system-ui, sans-serif",
+  "vars": {
+    "--color-bg": "#0e1f18",
+    "--color-bg-elev": "#132a20",
+    "--color-fg": "#f0ead6",
+    "--color-fg-muted": "#a3b8a5",
+    "--color-surface": "rgba(19, 42, 32, 0.9)",
+    "--color-surface-alt": "#1a3a2a",
+    "--color-border": "rgba(122, 158, 108, 0.35)",
+    "--color-border-strong": "#5c8a4a",
+    "--color-accent": "#e8a54a",
+    "--color-accent-hover": "#d4903a",
+    "--color-accent-fg": "#0e1f18",
+    "--color-success": "#7fbf5c",
+    "--color-success-fg": "#0e1f18",
+    "--color-warn": "#e8a54a",
+    "--color-warn-fg": "#0e1f18",
+    "--color-danger": "#c85a3f",
+    "--color-danger-fg": "#f0ead6",
+    "--color-input-bg": "#132a20",
+    "--color-input-fg": "#f0ead6",
+    "--color-input-placeholder": "#7a8e7c",
+    "--color-pill-bg": "rgba(232, 165, 74, 0.15)",
+    "--color-pill-fg": "#f0c07a"
+  }
+}
