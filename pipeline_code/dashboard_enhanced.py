@@ -6693,6 +6693,59 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     box-shadow: 0 0 0 2px var(--color-accent);
     transform: scale(1.02);
   }
+  /* iOS-style toggle switch — reusable for boolean settings (Show NSFW,
+     Jobs Run, scraper enable). Multi-select checkboxes for images/rows
+     stay as native <input type=checkbox>, this class ONLY applies to
+     high-level yes/no settings. Wraps a hidden native checkbox so form
+     semantics + keyboard focus stay intact. */
+  .toggle-switch {
+    position: relative; display: inline-block;
+    width: 2.25rem; height: 1.25rem;
+    flex-shrink: 0;
+  }
+  .toggle-switch input {
+    opacity: 0; width: 0; height: 0;
+    position: absolute; inset: 0;
+  }
+  .toggle-switch__track {
+    position: absolute; inset: 0;
+    background: var(--color-surface-alt);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 9999px;
+    transition: background .18s ease, border-color .18s ease;
+    cursor: pointer;
+  }
+  .toggle-switch__thumb {
+    position: absolute; top: 2px; left: 2px;
+    width: calc(1.25rem - 6px); height: calc(1.25rem - 6px);
+    background: var(--color-fg);
+    border-radius: 9999px;
+    transition: transform .18s ease, background .18s ease;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+    pointer-events: none;
+  }
+  .toggle-switch input:checked ~ .toggle-switch__track {
+    background: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+  .toggle-switch input:checked ~ .toggle-switch__track .toggle-switch__thumb {
+    transform: translateX(1rem);
+    background: var(--color-accent-fg);
+  }
+  .toggle-switch input:focus-visible ~ .toggle-switch__track {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  .toggle-switch input:disabled ~ .toggle-switch__track {
+    opacity: .5; cursor: not-allowed;
+  }
+  .toggle-label {
+    display: inline-flex; align-items: center; gap: .5rem;
+    cursor: pointer; user-select: none;
+    font-size: .8rem;
+  }
+  .toggle-label:hover .toggle-switch__track { border-color: var(--color-accent); }
+
   /* Filter/tag chips that toggle a value. Subtle scale + accent border on
      hover; the active-state colour is still owned by the caller so this
      doesn't fight per-tab styling. */
@@ -6777,9 +6830,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .filter-backdrop {
     position: fixed; inset: 0; z-index: 1055; background: rgba(0, 0, 0, .35);
   }
+  /* position: fixed portals the panel out of the .card's backdrop-filter
+     stacking context — that context otherwise traps the popover behind
+     sibling cards regardless of z-index. Anchor coords set inline via JS. */
   .filter-panel {
-    position: absolute; z-index: 1060;
-    right: 0; top: calc(100% + .5rem);
+    position: fixed; z-index: 1060;
+    top: 4rem; right: 1rem;
     width: min(28rem, calc(100vw - 2rem));
     max-height: min(70vh, 640px);
     background: var(--color-bg-elev);
@@ -6790,10 +6846,6 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     display: flex; flex-direction: column;
     overflow: hidden;
   }
-  /* Elevate the wrapping .relative anchor so its stacking context floats
-     above the gallery grid — otherwise ancestor transforms/overflow in the
-     grid clip the popover behind the image tiles. */
-  .relative:has(> .filter-panel) { z-index: 1060; }
   .filter-panel__body {
     padding: 1rem 1.15rem; overflow-y: auto;
     display: flex; flex-direction: column; gap: 1rem;
@@ -7516,10 +7568,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <!-- T2: Global "Show NSFW" toggle. Client-only; persists to
              localStorage['cull_show_nsfw'] and drives shouldBlurNsfw() so
              EVERY image surface honours a single switch. Default OFF. -->
-        <label class="flex items-center gap-1.5 text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1.5 cursor-pointer"
+        <label class="toggle-label bg-slate-800 border border-slate-700 rounded px-2 py-1.5"
                :title="showNsfw ? 'Hide NSFW imagery (blurs across every surface)' : 'Reveal NSFW imagery on every surface'">
-          <input type="checkbox" class="accent-indigo-500" :checked="showNsfw" @change="setShowNsfw($event.target.checked)"/>
-          <span class="select-none">Show NSFW</span>
+          <span class="toggle-switch">
+            <input type="checkbox" :checked="showNsfw" @change="setShowNsfw($event.target.checked)" aria-label="Show NSFW imagery"/>
+            <span class="toggle-switch__track"><span class="toggle-switch__thumb"></span></span>
+          </span>
+          <span>Show NSFW</span>
         </label>
         <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>. -->
         <select :value="theme" @change="setTheme($event.target.value)"
@@ -7700,12 +7755,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                  scraper toggles. Priority is echoed on every priority slider
                  next to the Run switch so weights are always visible. -->
             <div class="flex items-center gap-3 mb-3">
-              <label class="flex items-center gap-2 text-xs">
-                <input type="checkbox" :checked="jb.is_active"
-                       @change="toggleJobRun(jb.slug, $event.target.checked)"
-                       class="h-4 w-4 accent-indigo-500 cursor-pointer"
-                       :title="jb.is_active ? 'Running — flip off to remove from active set' : 'Idle — flip on to run in parallel'"/>
-                <span class="uppercase tracking-wide text-slate-400">Run</span>
+              <label class="toggle-label"
+                     :title="jb.is_active ? 'Running — flip off to remove from active set' : 'Idle — flip on to run in parallel'">
+                <span class="toggle-switch">
+                  <input type="checkbox" :checked="jb.is_active"
+                         @change="toggleJobRun(jb.slug, $event.target.checked)"
+                         :aria-label="'Run ' + jb.name"/>
+                  <span class="toggle-switch__track"><span class="toggle-switch__thumb"></span></span>
+                </span>
+                <span class="uppercase tracking-wide text-slate-400 text-[11px]">Run</span>
               </label>
               <div class="flex items-center gap-1 ml-auto">
                 <span class="text-[11px] uppercase tracking-wide text-slate-500 mr-1">Priority</span>
@@ -7923,39 +7981,56 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Sources</div><div class="text-2xl font-mono mt-1" x-text="(stats.sources?.length ?? 0)"></div></div>
         </div>
 
-        <!-- T4: per-job donut. Derived from ?by=job; one slice per job with a
-             deterministic hsl(hash(slug)) hue so slice/legend colours match
-             across renders. Filtering the picker to one job collapses to a
-             single-slice donut with that job's % of the global total. Inline
-             SVG keeps this dependency-free and theme-aware (all colours are
-             tokens/hsl; the ring hole uses --color-bg-elev). -->
-        <div class="mt-4 grid gap-4 md:grid-cols-[minmax(0,300px)_1fr] items-center"
+        <!-- T4: per-job donut. Hover a slice or legend row to lift the paired
+             element; keeps donut + legend visually linked for large legends. -->
+        <div class="mt-6 grid gap-6 md:grid-cols-[280px_1fr] items-center"
              x-show="globalStatsDonutSlices().length">
-          <div style="max-width:300px" class="mx-auto md:mx-0 w-full">
-            <svg viewBox="0 0 200 200" width="100%" height="100%" role="img"
+          <div class="mx-auto md:mx-0 w-full max-w-[280px]">
+            <svg viewBox="0 0 220 220" width="100%" height="100%" role="img"
                  :aria-label="'Per-job classification totals — ' + (globalStatsGrandTotal() || 0) + ' total'">
               <template x-for="s in globalStatsDonutSlices()" :key="'gd_'+s.slug">
-                <path :d="s.path" :fill="s.fill" stroke="var(--color-bg-elev)" stroke-width="1"
-                      :aria-label="s.slug + ' ' + s.count + ' (' + s.pct + '%)'"><title x-text="s.slug + ' — ' + s.count + ' (' + s.pct + '%)'"></title></path>
+                <path :d="s.pathOffset(110, 110, statsHoverSlug === s.slug ? 96 : 90)"
+                      :fill="s.fill"
+                      stroke="var(--color-bg-elev)"
+                      :stroke-width="statsHoverSlug === s.slug ? 2 : 1"
+                      :opacity="statsHoverSlug && statsHoverSlug !== s.slug ? 0.35 : 1"
+                      style="cursor: pointer; transition: opacity .15s, stroke-width .15s;"
+                      @mouseenter="statsHoverSlug = s.slug" @mouseleave="statsHoverSlug = null"
+                      @click="globalStatsJob = s.slug; loadGlobalStats()"
+                      :aria-label="s.slug + ' ' + s.count + ' (' + s.pct + '%)'">
+                  <title x-text="s.slug + ' — ' + s.count.toLocaleString() + ' (' + s.pct + '%) — click to filter'"></title>
+                </path>
               </template>
-              <!-- Ring hole. Colour follows the surface so the donut stays legible in every theme. -->
-              <circle cx="100" cy="100" r="46" fill="var(--color-bg-elev)"/>
-              <text x="100" y="95" text-anchor="middle" font-size="14"
-                    fill="var(--color-fg-muted)">total</text>
-              <text x="100" y="115" text-anchor="middle" font-size="20" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
-                    fill="var(--color-fg)" x-text="globalStatsGrandTotal().toLocaleString()"></text>
+              <circle cx="110" cy="110" r="52" fill="var(--color-bg-elev)"/>
+              <text x="110" y="102" text-anchor="middle" font-size="11"
+                    fill="var(--color-fg-muted)" letter-spacing="0.08em"
+                    x-text="(statsHoverSlug || 'total').toUpperCase()"></text>
+              <text x="110" y="124" text-anchor="middle" font-size="22" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+                    fill="var(--color-fg)"
+                    x-text="(statsHoverSlug ? (stats.by_job?.[statsHoverSlug]?.total || 0) : globalStatsGrandTotal()).toLocaleString()"></text>
+              <text x="110" y="140" text-anchor="middle" font-size="10"
+                    fill="var(--color-fg-muted)"
+                    x-text="statsHoverSlug ? (Math.round(((stats.by_job?.[statsHoverSlug]?.total || 0) / (globalStatsGrandTotal() || 1)) * 100) + '%') : ''"></text>
             </svg>
           </div>
-          <div class="text-xs space-y-1">
-            <div class="font-semibold text-sm mb-1"
-                 x-text="'By job (' + globalStatsDonutSlices().length + ')'"></div>
-            <div class="max-h-[220px] overflow-y-auto pr-1 space-y-1">
+          <div class="text-xs">
+            <div class="flex items-center justify-between mb-2">
+              <div class="font-semibold text-sm" x-text="'By job (' + globalStatsDonutSlices().length + ')'"></div>
+              <div class="text-[11px] text-slate-500">click a slice to filter</div>
+            </div>
+            <div class="max-h-[240px] overflow-y-auto pr-1 space-y-1.5">
               <template x-for="s in globalStatsDonutSlices()" :key="'gdl_'+s.slug">
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 rounded px-1.5 py-1 cursor-pointer transition"
+                     :style="statsHoverSlug === s.slug ? 'background: color-mix(in oklab, ' + s.fill + ' 12%, transparent);' : ''"
+                     @mouseenter="statsHoverSlug = s.slug" @mouseleave="statsHoverSlug = null"
+                     @click="globalStatsJob = s.slug; loadGlobalStats()">
                   <span class="inline-block w-3 h-3 rounded-sm shrink-0" :style="'background:'+s.fill"></span>
                   <span class="font-mono truncate flex-1" x-text="s.slug"></span>
-                  <span class="font-mono text-slate-400" x-text="s.count.toLocaleString()"></span>
-                  <span class="font-mono text-slate-500 w-12 text-right" x-text="s.pct + '%'"></span>
+                  <div class="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
+                    <div class="h-full rounded-full" :style="'width: ' + s.pct + '%; background: ' + s.fill"></div>
+                  </div>
+                  <span class="font-mono text-slate-300 w-16 text-right" x-text="s.count.toLocaleString()"></span>
+                  <span class="font-mono text-slate-500 w-10 text-right" x-text="s.pct + '%'"></span>
                 </div>
               </template>
             </div>
@@ -7965,6 +8040,37 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           No per-job data yet — donut renders once a job classifies its first image.
         </div>
       </div>
+
+      <!-- Per-source stacked bar chart: shows KEPT vs DISCARDED per source
+           with volume + NSFW meter. Replaces the flat percentage-only table
+           with something eyeball-scannable. -->
+      <div class="card rounded-xl p-5" x-show="statsSourceBars().length">
+        <h3 class="font-semibold mb-1">Source composition</h3>
+        <p class="text-xs text-slate-400 mb-4">Kept vs discarded volume per source, with NSFW share below.</p>
+        <div class="space-y-3">
+          <template x-for="s in statsSourceBars()" :key="'ssb_'+s.source">
+            <div>
+              <div class="flex items-center justify-between text-xs mb-1">
+                <span class="font-mono" x-text="s.source"></span>
+                <span class="text-slate-400 font-mono" x-text="s.total.toLocaleString() + ' · ' + s.discard_pct + '% discarded · ' + s.nsfw_pct + '% NSFW'"></span>
+              </div>
+              <div class="h-3 rounded-full overflow-hidden bg-slate-800 flex" :title="s.source + ': ' + s.kept.toLocaleString() + ' kept + ' + s.discarded.toLocaleString() + ' discarded of ' + s.total.toLocaleString() + ' (bar length = share of largest source)'">
+                <div class="h-full bg-emerald-500 transition-all" :style="'width: ' + (s.keptShare * 100) + '%'"></div>
+                <div class="h-full bg-rose-500 transition-all" :style="'width: ' + (s.discardShare * 100) + '%'"></div>
+              </div>
+              <div class="h-1 mt-1 rounded-full bg-slate-800 overflow-hidden" x-show="s.nsfw_pct > 0">
+                <div class="h-full bg-amber-500" :style="'width: ' + s.nsfw_pct + '%'" :title="s.nsfw_pct + '% NSFW'"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="flex items-center gap-4 mt-4 text-[11px] text-slate-400">
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span>Kept</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-rose-500"></span>Discarded</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-amber-500"></span>NSFW share</span>
+        </div>
+      </div>
+
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Per-source platform analytics</h3>
         <div class="scroll-box"><table>
@@ -8018,7 +8124,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <option value="quality">Sort · quality_score</option>
             </select>
             <div class="relative" @keydown.escape.window="filterPanel === 'globalGallery' && (filterPanel = null)">
-              <button type="button" class="filter-pill" @click="toggleFilterPanel('globalGallery')"
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('globalGallery', $event)"
                       :aria-expanded="filterPanel === 'globalGallery'" aria-haspopup="dialog"
                       aria-controls="filter-panel-global-gallery">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -8370,7 +8476,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <option value="quality">Sort · quality_score</option>
             </select>
             <div class="relative" @keydown.escape.window="filterPanel === 'gallery' && (filterPanel = null)">
-              <button type="button" class="filter-pill" @click="toggleFilterPanel('gallery')"
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('gallery', $event)"
                       :aria-expanded="filterPanel === 'gallery'" aria-haspopup="dialog"
                       aria-controls="filter-panel-gallery">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -9569,7 +9675,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <input type="search" x-model="queueFilters.q" placeholder="Search name / prompt…" aria-label="Filter queue by text"/>
           </label>
           <div class="relative" @keydown.escape.window="filterPanel === 'queue' && (filterPanel = null)">
-            <button type="button" class="filter-pill" @click="toggleFilterPanel('queue')"
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('queue', $event)"
                     :aria-expanded="filterPanel === 'queue'" aria-haspopup="dialog"
                     aria-controls="filter-panel-queue">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -9634,7 +9740,19 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <tbody>
           <template x-for="f in filteredQueueFiles()" :key="f.path">
             <tr :class="f.corrupt ? 'bg-rose-900/25' : ''">
-              <td><img :src="f.thumbnail" :alt="f.name" class="thumb click" loading="lazy" @click="openModalFromFile(f)"/></td>
+              <td>
+                <span class="nsfw-wrap">
+                  <img :src="f.thumbnail" :alt="f.name" class="thumb click"
+                       :class="{ 'nsfw-blur': !showNsfw && !revealedNsfw[f.path] }"
+                       loading="lazy"
+                       @click="(!showNsfw && !revealedNsfw[f.path]) ? revealNsfw(f) : openModalFromFile(f)"/>
+                  <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal thumbnail"
+                        x-show="!showNsfw && !revealedNsfw[f.path]"
+                        @click.stop="revealNsfw(f)" title="Reveal thumbnail">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-8 10-8 10 8 10 8-4 8-10 8S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </span>
+                </span>
+              </td>
               <td class="font-mono text-xs" x-text="f.name"></td>
               <td x-text="f.source"></td>
               <td class="font-mono text-xs" x-text="(f.size/1024).toFixed(1) + ' KB'"></td>
@@ -9675,7 +9793,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <input type="search" x-model="activityFilters.q" placeholder="Search filename…" aria-label="Filter activity by text"/>
           </label>
           <div class="relative" @keydown.escape.window="filterPanel === 'activity' && (filterPanel = null)">
-            <button type="button" class="filter-pill" @click="toggleFilterPanel('activity')"
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('activity', $event)"
                     :aria-expanded="filterPanel === 'activity'" aria-haspopup="dialog"
                     aria-controls="filter-panel-activity">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -11228,6 +11346,9 @@ function dashboard() {
     _gvTimer: null,
     // Global Stats per-job filter (null = all jobs aggregate).
     globalStatsJob: '__all__',
+    // Hover-linked donut ↔ legend: slug of the currently hovered slice
+    // (null = no hover). Drives the "explode" radius bump and legend row tint.
+    statsHoverSlug: null,
     // T3 Global Gallery — aggregate view across every job. Reuses shouldBlurNsfw,
     // openModalFromCard, revealNsfw etc. Filters are OWN state (no leak into
     // the per-job gallery form). "jobs" is a slug allowlist; empty = all.
@@ -12976,8 +13097,23 @@ function dashboard() {
     // One panel open at a time; clicking a different tab's Filters pill just
     // swaps `filterPanel` and the previous one closes automatically. Passing
     // the id currently open closes it.
-    toggleFilterPanel(id) {
-      this.filterPanel = (this.filterPanel === id) ? null : id;
+    toggleFilterPanel(id, ev) {
+      if (this.filterPanel === id) { this.filterPanel = null; return; }
+      this.filterPanel = id;
+      const btn = ev?.currentTarget;
+      if (!btn || typeof btn.getBoundingClientRect !== 'function') return;
+      const domId = 'filter-panel-' + id.replace(/([A-Z])/g, '-$1').toLowerCase();
+      this.$nextTick(() => {
+        const panel = document.getElementById(domId);
+        if (!panel) return;
+        const rect = btn.getBoundingClientRect();
+        const panelW = Math.min(28 * 16, window.innerWidth - 32);
+        let right = Math.max(8, window.innerWidth - rect.right);
+        if (right + panelW > window.innerWidth - 8) right = 8;
+        panel.style.top = (rect.bottom + 8) + 'px';
+        panel.style.right = right + 'px';
+        panel.style.left = 'auto';
+      });
     },
     // Count of active filters for the badge next to the Filters pill. Sort
     // + free-text search deliberately don't count — Sort has its own pill and
@@ -13100,19 +13236,23 @@ function dashboard() {
       const filter = this.globalStatsJob;
       const total = this.globalStatsGrandTotal();
       if (!total) return [];
-      const cx = 100, cy = 100, r = 90;
-      const buildPath = (startPct, endPct, fill) => {
-        // Full circle: two-arc trick keeps the path from collapsing to a point.
-        if (endPct - startPct >= 0.9999) {
-          return `M ${cx} ${cy-r} A ${r} ${r} 0 1 1 ${cx-0.01} ${cy-r} A ${r} ${r} 0 1 1 ${cx} ${cy-r} Z`;
-        }
-        const a0 = 2 * Math.PI * startPct - Math.PI/2;
-        const a1 = 2 * Math.PI * endPct - Math.PI/2;
-        const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
-        const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
-        const large = (endPct - startPct) > 0.5 ? 1 : 0;
-        return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
-      };
+      // Slice with per-instance pathOffset(cx, cy, r) so the SVG can bump the
+      // radius on hover for an "explode" effect — cheaper than transforming
+      // the whole slice, and keeps donut proportions exact.
+      const buildSlice = (slug, count, startPct, endPct, fill) => ({
+        slug, count, pct: Math.round((endPct - startPct) * 100), fill,
+        pathOffset(cx, cy, r) {
+          if (endPct - startPct >= 0.9999) {
+            return `M ${cx} ${cy-r} A ${r} ${r} 0 1 1 ${cx-0.01} ${cy-r} A ${r} ${r} 0 1 1 ${cx} ${cy-r} Z`;
+          }
+          const a0 = 2 * Math.PI * startPct - Math.PI/2;
+          const a1 = 2 * Math.PI * endPct - Math.PI/2;
+          const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+          const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+          const large = (endPct - startPct) > 0.5 ? 1 : 0;
+          return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
+        },
+      });
       // Filter to one job → single slice for its % of grand total; leave a
       // muted "rest" slice so the donut still communicates "share of total".
       if (filter && filter !== '__all__' && filter !== 'all' && filter !== '*') {
@@ -13120,18 +13260,12 @@ function dashboard() {
         if (!bucket) return [];
         const pct = bucket.total / total;
         const hue = this._slugHue(filter);
-        const slices = [{
-          slug: filter, count: bucket.total, pct: Math.round(pct * 100),
-          fill: `hsl(${hue} 65% 55%)`,
-          path: buildPath(0, pct, `hsl(${hue} 65% 55%)`),
-        }];
+        const slices = [buildSlice(filter, bucket.total, 0, pct, `hsl(${hue} 65% 55%)`)];
         if (pct < 0.999) {
-          slices.push({
-            slug: 'other jobs', count: total - bucket.total,
-            pct: 100 - Math.round(pct * 100),
-            fill: 'color-mix(in oklab, var(--color-fg-muted) 45%, transparent)',
-            path: buildPath(pct, 1, ''),
-          });
+          slices.push(buildSlice(
+            'other jobs', total - bucket.total, pct, 1,
+            'color-mix(in oklab, var(--color-fg-muted) 45%, transparent)'
+          ));
         }
         return slices;
       }
@@ -13143,14 +13277,34 @@ function dashboard() {
       return rows.map(row => {
         const pct = row.count / total;
         const hue = this._slugHue(row.slug);
-        const fill = `hsl(${hue} 65% 55%)`;
-        const slice = {
-          slug: row.slug, count: row.count, pct: Math.round(pct * 100),
-          fill, path: buildPath(cursor, cursor + pct, fill),
-        };
+        const slice = buildSlice(row.slug, row.count, cursor, cursor + pct, `hsl(${hue} 65% 55%)`);
         cursor += pct;
         return slice;
       });
+    },
+    // Per-source bars: derives kept / discarded shares relative to the largest
+    // source so bar length is comparable at a glance. Percentages inside a
+    // single source still add to 100 (kept + discarded of that source).
+    statsSourceBars() {
+      const rows = this.stats?.sources || [];
+      if (!rows.length) return [];
+      const maxTotal = rows.reduce((m, r) => Math.max(m, r.total || 0), 0) || 1;
+      return rows.map(r => {
+        const total = r.total || 0;
+        const discardPct = Number(r.discard_pct) || 0;
+        const discarded = Math.round(total * discardPct / 100);
+        const kept = Math.max(0, total - discarded);
+        const scale = total / maxTotal;
+        // Split the (share of largest) bar length between kept and discarded.
+        const keptShare = scale * (total > 0 ? kept / total : 0);
+        const discardShare = scale * (total > 0 ? discarded / total : 0);
+        return {
+          source: r.source, total, kept, discarded,
+          discard_pct: Math.round(discardPct * 10) / 10,
+          nsfw_pct: Number(r.nsfw_pct) || 0,
+          keptShare, discardShare,
+        };
+      }).sort((a, b) => b.total - a.total);
     },
 
     // ── Gallery tab ──────────────────────────────────────────────────────
@@ -13749,15 +13903,16 @@ function dashboard() {
       const cat = String(item.category || item.classification || '').toUpperCase();
       const nsfw = cat === 'NSFW' || !!item.nsfw;
       if (!nsfw) return false;
+      // Global toggle wins outright — Show NSFW ON ⇒ never blur, no matter
+      // what the legacy BLUR_NSFW_THUMBS setting says. Users expect the
+      // header switch to be the single source of truth across every surface
+      // (gallery, global gallery, queue, activity, modal).
+      if (this.showNsfw) return false;
       const key = item.path || item.thumbnail || item.image || '';
-      // Per-image reveal (eye) always wins.
+      // Per-image reveal (eye) still wins when the global toggle is OFF —
+      // lets a curator peek one image without unhiding the whole set.
       if (this.revealedNsfw[key]) return false;
-      // Global toggle OFF ⇒ always blur.
-      if (!this.showNsfw) return true;
-      // Global toggle ON ⇒ still honour the legacy BLUR_NSFW_THUMBS default
-      // for users who kept the extra guard on. Empty/undefined defaults false
-      // now (showing NSFW is an explicit opt-in via the global toggle).
-      return (this.settings.BLUR_NSFW_THUMBS || 'false') === 'true';
+      return true;
     },
     revealNsfw(item) {
       const key = item?.path || item?.thumbnail || item?.image || '';

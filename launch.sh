@@ -99,6 +99,21 @@ else
   echo "[launch] requirements already installed (hash unchanged)"
 fi
 
+# ── ML extras (torch + open_clip_torch) — enables Find similar / embeddings.
+# Heavy (~800MB torch wheel) so install is one-shot + flag-guarded. Opt out
+# with CULL_SKIP_ML=1 if you never need semantic image search.
+ML_FLAG="$FLAG_DIR/.ml_installed"
+if [ "${CULL_SKIP_ML:-0}" != "1" ] && [ ! -f "$ML_FLAG" ]; then
+  echo "[launch] installing ML extras (torch, open_clip_torch — one-time, ~800MB)"
+  if "$PY" -m pip install -e "$SCRIPT_DIR"[ml]; then
+    : > "$ML_FLAG"
+  else
+    echo "WARN: ML extras install failed. 'Find similar' will show an install hint." >&2
+    echo "      Retry with: $PY -m pip install -e '$SCRIPT_DIR'[ml]" >&2
+    echo "      Or opt out permanently: CULL_SKIP_ML=1 ./launch.sh" >&2
+  fi
+fi
+
 # ── Playwright Chromium (one-time) ──────────────────────────────────────────
 # Only needed for the X/Twitter + web scrapers. Skip with
 # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1. A failure here is non-fatal.
