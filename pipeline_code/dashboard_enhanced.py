@@ -8133,8 +8133,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 Filters
                 <span class="badge" x-show="globalGalleryFilterCount() > 0" x-text="globalGalleryFilterCount()"></span>
               </button>
-              <div x-show="filterPanel === 'globalGallery'" x-cloak class="filter-backdrop"
-                   @click="filterPanel = null" aria-hidden="true"></div>
+              <!-- Teleport panel to <body> so it escapes ancestor .card's
+                   backdrop-filter (which otherwise makes position: fixed
+                   containing-block-relative to the card, trapping the popover
+                   behind sibling cards). -->
+              <template x-teleport="body">
+                <div x-show="filterPanel === 'globalGallery'" x-cloak class="filter-backdrop"
+                     @click="filterPanel = null" aria-hidden="true"></div>
+              </template>
+              <template x-teleport="body">
               <div x-show="filterPanel === 'globalGallery'" x-cloak
                    id="filter-panel-global-gallery" class="filter-panel" role="dialog"
                    aria-label="Global gallery filters">
@@ -8204,6 +8211,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                           @click="loadGlobalGallery(1); filterPanel = null">Apply</button>
                 </div>
               </div>
+              </template>
             </div>
           </div>
           <span class="filter-meta">
@@ -8485,7 +8493,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                 Filters
                 <span class="badge" x-show="galleryFilterCount() > 0" x-text="galleryFilterCount()"></span>
               </button>
-              <div x-show="filterPanel === 'gallery'" x-cloak class="filter-backdrop" @click="filterPanel = null" aria-hidden="true"></div>
+              <template x-teleport="body">
+                <div x-show="filterPanel === 'gallery'" x-cloak class="filter-backdrop" @click="filterPanel = null" aria-hidden="true"></div>
+              </template>
+              <template x-teleport="body">
               <div x-show="filterPanel === 'gallery'" x-cloak
                    id="filter-panel-gallery" class="filter-panel" role="dialog" aria-label="Gallery filters">
                 <div class="filter-panel__body">
@@ -8599,6 +8610,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                           @click="galleryReload(); filterPanel = null">Apply</button>
                 </div>
               </div>
+              </template>
             </div>
             <button @click="galleryDownload()" class="filter-pill"
                     title="Stream a zip of the current filtered view (image + .txt + .vision.json)">
@@ -9684,8 +9696,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               Filters
               <span class="badge" x-show="queueFilterCount() > 0" x-text="queueFilterCount()"></span>
             </button>
-            <div x-show="filterPanel === 'queue'" x-cloak class="filter-backdrop"
-                 @click="filterPanel = null" aria-hidden="true"></div>
+            <template x-teleport="body">
+              <div x-show="filterPanel === 'queue'" x-cloak class="filter-backdrop"
+                   @click="filterPanel = null" aria-hidden="true"></div>
+            </template>
+            <template x-teleport="body">
             <div x-show="filterPanel === 'queue'" x-cloak
                  id="filter-panel-queue" class="filter-panel" role="dialog" aria-label="Queue filters">
               <div class="filter-panel__body">
@@ -9729,6 +9744,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                         @click="filterPanel = null">Apply</button>
               </div>
             </div>
+            </template>
           </div>
           <span class="filter-meta">
             <span x-text="filteredQueueFiles().length"></span> / <span x-text="queueFiles.length"></span> match
@@ -9802,8 +9818,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               Filters
               <span class="badge" x-show="activityFilterCount() > 0" x-text="activityFilterCount()"></span>
             </button>
-            <div x-show="filterPanel === 'activity'" x-cloak class="filter-backdrop"
-                 @click="filterPanel = null" aria-hidden="true"></div>
+            <template x-teleport="body">
+              <div x-show="filterPanel === 'activity'" x-cloak class="filter-backdrop"
+                   @click="filterPanel = null" aria-hidden="true"></div>
+            </template>
+            <template x-teleport="body">
             <div x-show="filterPanel === 'activity'" x-cloak
                  id="filter-panel-activity" class="filter-panel" role="dialog" aria-label="Activity filters">
               <div class="filter-panel__body">
@@ -9869,6 +9888,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                         @click="filterPanel = null">Apply</button>
               </div>
             </div>
+            </template>
           </div>
           <span class="filter-meta">
             <span x-text="filteredHistory().length"></span> / <span x-text="history.length"></span> match
