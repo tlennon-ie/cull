@@ -1,0 +1,28 @@
+{
+  "name": "cyberpunk",
+  "font_family": "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace",
+  "vars": {
+    "--color-bg": "#000000",
+    "--color-bg-elev": "#0a0010",
+    "--color-fg": "#e0f7ff",
+    "--color-fg-muted": "#78d0e8",
+    "--color-surface": "rgba(10, 0, 16, 0.92)",
+    "--color-surface-alt": "#12001a",
+    "--color-border": "rgba(255, 46, 147, 0.4)",
+    "--color-border-strong": "#ff2e93",
+    "--color-accent": "#00e5ff",
+    "--color-accent-hover": "#00b8d4",
+    "--color-accent-fg": "#000000",
+    "--color-success": "#00ff88",
+    "--color-success-fg": "#000000",
+    "--color-warn": "#ffd60a",
+    "--color-warn-fg": "#000000",
+    "--color-danger": "#ff2e93",
+    "--color-danger-fg": "#000000",
+    "--color-input-bg": "#12001a",
+    "--color-input-fg": "#e0f7ff",
+    "--color-input-placeholder": "#78d0e8",
+    "--color-pill-bg": "rgba(0, 229, 255, 0.12)",
+    "--color-pill-fg": "#00e5ff"
+  }
+}
