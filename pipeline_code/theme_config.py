@@ -76,6 +76,86 @@ THEME_VAR_KEYS: tuple[str, ...] = (
 # the theme picker; users can clone them but cannot delete or overwrite.
 CORE_THEMES: tuple[str, ...] = ("dark", "light", "hc")
 
+# JSON snapshot of the CSS-only core themes so cloning them (as a base for a
+# new custom theme) works without a JSON file on disk. Values MUST stay in
+# sync with the ``:root`` / ``html.theme-light`` / ``html.theme-hc`` blocks
+# in ``dashboard_enhanced.py``. When adding a new variable to
+# :data:`THEME_VAR_KEYS`, extend all three dicts here too.
+CORE_THEME_VARS: dict[str, dict[str, str]] = {
+    "dark": {
+        "--color-bg": "#020617",
+        "--color-bg-elev": "#0f172a",
+        "--color-fg": "#f1f5f9",
+        "--color-fg-muted": "#94a3b8",
+        "--color-surface": "rgba(15,23,42,0.78)",
+        "--color-surface-alt": "#1e293b",
+        "--color-border": "rgba(51,65,85,0.5)",
+        "--color-border-strong": "#334155",
+        "--color-accent": "#6366f1",
+        "--color-accent-hover": "#4f46e5",
+        "--color-accent-fg": "#ffffff",
+        "--color-success": "#10b981",
+        "--color-success-fg": "#ffffff",
+        "--color-warn": "#f59e0b",
+        "--color-warn-fg": "#0f172a",
+        "--color-danger": "#e11d48",
+        "--color-danger-fg": "#ffffff",
+        "--color-input-bg": "#0f172a",
+        "--color-input-fg": "#f1f5f9",
+        "--color-input-placeholder": "#64748b",
+        "--color-pill-bg": "rgba(30,41,59,0.6)",
+        "--color-pill-fg": "#cbd5e1",
+    },
+    "light": {
+        "--color-bg": "#f5f2ec",
+        "--color-bg-elev": "#ffffff",
+        "--color-fg": "#0f172a",
+        "--color-fg-muted": "#475569",
+        "--color-surface": "#ffffff",
+        "--color-surface-alt": "#f1f5f9",
+        "--color-border": "#e2e8f0",
+        "--color-border-strong": "#cbd5e1",
+        "--color-accent": "#4f46e5",
+        "--color-accent-hover": "#4338ca",
+        "--color-accent-fg": "#ffffff",
+        "--color-success": "#059669",
+        "--color-success-fg": "#ffffff",
+        "--color-warn": "#d97706",
+        "--color-warn-fg": "#ffffff",
+        "--color-danger": "#dc2626",
+        "--color-danger-fg": "#ffffff",
+        "--color-input-bg": "#ffffff",
+        "--color-input-fg": "#0f172a",
+        "--color-input-placeholder": "#94a3b8",
+        "--color-pill-bg": "#eef2ff",
+        "--color-pill-fg": "#3730a3",
+    },
+    "hc": {
+        "--color-bg": "#000000",
+        "--color-bg-elev": "#000000",
+        "--color-fg": "#ffffff",
+        "--color-fg-muted": "#ffffff",
+        "--color-surface": "#000000",
+        "--color-surface-alt": "#000000",
+        "--color-border": "#ffffff",
+        "--color-border-strong": "#ffffff",
+        "--color-accent": "#ffe600",
+        "--color-accent-hover": "#ffd400",
+        "--color-accent-fg": "#000000",
+        "--color-success": "#00ff88",
+        "--color-success-fg": "#000000",
+        "--color-warn": "#ffe600",
+        "--color-warn-fg": "#000000",
+        "--color-danger": "#ff5c5c",
+        "--color-danger-fg": "#000000",
+        "--color-input-bg": "#000000",
+        "--color-input-fg": "#ffffff",
+        "--color-input-placeholder": "#cccccc",
+        "--color-pill-bg": "#000000",
+        "--color-pill-fg": "#ffe600",
+    },
+}
+
 # Font family is a free-form string, but we cap it and forbid characters that
 # would allow CSS injection.
 _MAX_VALUE_LEN = 128
@@ -225,6 +305,20 @@ def list_themes() -> list[dict[str, Any]]:
     Never fails — a missing / unreadable directory contributes nothing.
     """
     merged: dict[str, dict[str, Any]] = {}
+    # Seed the CSS-only core themes first so cloning them works even without
+    # JSON files on disk. Higher-precedence layers below can still overwrite
+    # (e.g. a user could ship a builtin/dark.theme.json to tweak the values).
+    for core_name in CORE_THEMES:
+        core_vars = CORE_THEME_VARS.get(core_name)
+        if not core_vars:
+            continue
+        merged[core_name] = {
+            "name": core_name,
+            "source": "builtin",
+            "path": "",  # CSS-only, no on-disk file
+            "font_family": "",
+            "vars": dict(core_vars),
+        }
     # Walk lowest precedence first so higher-precedence layers overwrite.
     for source, folder in (
         ("builtin", builtin_themes_dir()),
@@ -283,6 +377,18 @@ def read_theme(name: str) -> dict[str, Any] | None:
             "path": str(path),
             "font_family": theme.font_family,
             "vars": theme.vars,
+        }
+    # Last-resort fallback: the CSS-only core themes have no on-disk file.
+    # Return a synthesised envelope so cloning / reading them from the theme
+    # editor works uniformly with the JSON-backed themes.
+    core_vars = CORE_THEME_VARS.get(name)
+    if core_vars is not None:
+        return {
+            "name": name,
+            "source": "builtin",
+            "path": "",
+            "font_family": "",
+            "vars": dict(core_vars),
         }
     return None
 
