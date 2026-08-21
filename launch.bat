@@ -65,6 +65,23 @@ if "!REQ_HASH!" neq "!PREV_HASH!" (
   echo [launch] requirements already installed ^(hash unchanged^)
 )
 
+REM -- ML extras (torch + open_clip_torch) -- enables Find similar / embeddings.
+REM Heavy (~800MB torch wheel) so install is one-shot + flag-guarded. Opt out
+REM with set CULL_SKIP_ML=1 if you never need semantic image search.
+if /i "%CULL_SKIP_ML%" neq "1" (
+  if not exist ".venv\.ml_installed" (
+    echo [launch] installing ML extras ^(torch, open_clip_torch -- one-time, ~800MB^)
+    python -m pip install -e .[ml]
+    if not errorlevel 1 (
+      type nul > ".venv\.ml_installed"
+    ) else (
+      echo WARN: ML extras install failed. 'Find similar' will show an install hint.
+      echo       Retry with: python -m pip install -e .[ml]
+      echo       Or opt out permanently: set CULL_SKIP_ML=1 ^& launch.bat
+    )
+  )
+)
+
 REM -- Playwright Chromium (one-time) ----------------------------------------
 if /i "%PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD%" neq "1" (
   if not exist ".venv\.playwright_chromium_installed" (
