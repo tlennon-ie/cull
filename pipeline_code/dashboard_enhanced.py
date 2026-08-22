@@ -3957,7 +3957,7 @@ def api_gallery_download():
                 try:
                     zf.writestr(f"{stem}.txt", it.txt_path.read_text(encoding="utf-8", errors="replace"))
                 except OSError:
-                    pass
+                    pass  # prompt sidecar is optional — ship the image without it
     buffer.seek(0)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return send_file(
