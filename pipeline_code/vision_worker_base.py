@@ -612,7 +612,7 @@ class BaseVisionWorker(ABC):
         try:
             processing_path.rename(image_path)
         except OSError:
-            pass
+            pass  # another worker already reclaimed it, or the file is gone
 
 
 # Convenience for `python vision_worker_x.py` — subclasses just call

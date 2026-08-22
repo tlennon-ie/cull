@@ -102,9 +102,16 @@ print("="*65)
 config_checks = {}
 
 
-# Credential checks log only a present/missing STATUS (a literal chosen by a
-# condition), never the secret value or anything derived from it (not even its
-# length) — so no sensitive data reaches a logging sink.
+# Credential checks log only a present/missing STATUS, never the secret value
+# or anything derived from it (not even its length). The bool() hop below is
+# deliberate: the status literal is chosen from a plain boolean, so no value
+# that touched a credential can reach a print/log sink.
+
+
+def _configured(present: bool) -> str:
+    """Status literal for a credential. Takes a BOOL, never the secret."""
+    return "✅ Configured" if present else "❌ Missing"
+
 
 # Discord
 discord_token = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -113,7 +120,7 @@ try:
     channels_json = json.loads(discord_channels)
     channel_count = len(channels_json.get("channels", []))
     config_checks["discord"] = {
-        "bot_token": "✅ Configured" if discord_token and discord_token != "your_" else "❌ Missing",
+        "bot_token": _configured(bool(discord_token) and discord_token != "your_"),
         "channels": f"✅ {channel_count} configured" if channel_count > 0 else "❌ None"
     }
     print("Discord:")
@@ -126,7 +133,7 @@ except Exception as e:
 civitai_key = os.getenv("CIVITAI_API_KEY", "")
 civitai_domain = os.getenv("CIVITAI_DOMAIN", "civitai.com")
 config_checks["civitai"] = {
-    "api_key": "✅ Configured" if civitai_key and civitai_key != "your_" else "❌ Missing",
+    "api_key": _configured(bool(civitai_key) and civitai_key != "your_"),
     "domain": f"✅ {civitai_domain}"
 }
 print("Civitai:")
@@ -136,7 +143,7 @@ print(f"  Domain: {config_checks['civitai']['domain']}")
 # Twitter
 twitter_cookies = os.getenv("TWITTER_COOKIES", "")
 config_checks["twitter"] = {
-    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing"
+    "cookies": _configured(bool(twitter_cookies))
 }
 print("Twitter/X:")
 print(f"  Cookies: {config_checks['twitter']['cookies']}")

@@ -337,7 +337,7 @@ def process_channel(ch):
                 if _w >= 2048 and _h >= 2048:
                     continue  # grid
             except Exception:
-                pass
+                pass  # undecodable bytes — let the prompt checks below judge it
 
             # Try PNG metadata if no yaml prompt
             pt = prompt_text

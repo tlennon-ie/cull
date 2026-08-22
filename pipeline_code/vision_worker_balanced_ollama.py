@@ -74,7 +74,7 @@ class BalancedOllamaWorker(BaseVisionWorker):
                 os.environ.get("OLLAMA_TIMEOUT", str(self.request_timeout))
             )
         except ValueError:
-            pass
+            pass  # non-numeric override — keep the class default
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}

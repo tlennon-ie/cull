@@ -1233,7 +1233,7 @@ def api_update_run():
         try:
             script.chmod(script.stat().st_mode | stat.S_IXUSR)
         except OSError:
-            pass
+            pass  # already executable, or a read-only mount — try the spawn anyway
         subprocess.Popen(
             ["/bin/bash", str(script)],
             cwd=str(REPO_ROOT),
@@ -2041,7 +2041,9 @@ def api_presets_list():
     # form doesn't have to guess what each preset is for. Names not shipped
     # by cull (user-created / imported presets) return empty entries.
     try:
-        from builtin_presets import PRESET_DESCRIPTIONS, PRESET_TAGS
+        import builtin_presets as _bp
+        PRESET_DESCRIPTIONS = _bp.PRESET_DESCRIPTIONS
+        PRESET_TAGS = _bp.PRESET_TAGS
     except Exception:  # pragma: no cover - defensive
         PRESET_DESCRIPTIONS, PRESET_TAGS = {}, {}
     names = sorted(lib.get("presets", {}).keys())
@@ -2273,7 +2275,7 @@ def api_presets_thumbnail_upload(key: str):
     try:
         stream.seek(0)
     except (OSError, AttributeError):
-        pass
+        pass  # non-seekable stream: it is already at the head, so read on
     head = stream.read(32)
     declared_ext = ("." + (upload.filename or "").rsplit(".", 1)[-1].lower()) if "." in (upload.filename or "") else ""
     detected = _detect_upload_ext(head, declared_ext, upload.mimetype or "")
@@ -2407,14 +2409,14 @@ def api_presets_descriptions():
     it never drifts from the shipped preset library.
     """
     try:
-        import builtin_presets  # local import — cheap and keeps the top clean
+        import builtin_presets as _bp  # local import — cheap and keeps the top clean
     except Exception as exc:
         return _err("builtin preset library unavailable", exc, 500)
     out: list[dict] = []
-    for key in builtin_presets.PRESET_NAMES:
+    for key in _bp.PRESET_NAMES:
         try:
-            meta = builtin_presets.get_preset_display_meta(key)
-            meta["use_cases"] = builtin_presets.preset_use_cases(key)
+            meta = _bp.get_preset_display_meta(key)
+            meta["use_cases"] = _bp.preset_use_cases(key)
             out.append(meta)
         except Exception:
             continue
@@ -2788,7 +2790,7 @@ def _read_vision_prediction(image_path: Path) -> tuple[str, dict[str, Any]]:
                 if cat:
                     predicted = cat
     except (OSError, json.JSONDecodeError, ValueError):
-        pass
+        pass  # no / unreadable audit record — fall through to the defaults
     return predicted, scores
 
 
@@ -2965,7 +2967,7 @@ def brand_asset(filename: str):
     """
     if filename not in _BRAND_ASSETS:
         abort(404)
-    from paths import REPO_ROOT
+    REPO_ROOT = _paths.REPO_ROOT
     asset_path = REPO_ROOT / "assets" / filename
     if not asset_path.exists():
         abort(404)
@@ -3016,7 +3018,7 @@ def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
         try:
             os.utime(poster, None)
         except OSError:
-            pass
+            pass  # atime bump is only a GC hint; serving the poster still works
         return poster
     try:
         import ffmpeg  # type: ignore
@@ -3038,7 +3040,7 @@ def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
         try:
             tmp.unlink()
         except OSError:
-            pass
+            pass  # temp frame never landed, or is already gone
         return None
     if not tmp.exists() or tmp.stat().st_size == 0:
         return None
@@ -3538,7 +3540,7 @@ def api_stats():
                     bucket["rel_sum"] += float(rel)
                     bucket["rel_n"] += 1
             except (TypeError, ValueError):
-                pass
+                pass  # non-numeric score in the record — leave it out of the mean
 
     sources = []
     for name, b in by_source.items():
@@ -3950,7 +3952,7 @@ def api_gallery_download():
                 zf.writestr(f"{stem}.vision.json",
                             it.meta_path.read_text(encoding="utf-8"))
             except OSError:
-                pass
+                pass  # audit record is optional — ship the image without it
             if it.txt_path is not None:
                 try:
                     zf.writestr(f"{stem}.txt", it.txt_path.read_text(encoding="utf-8", errors="replace"))
@@ -4465,7 +4467,9 @@ from urllib.parse import urlparse as _wave_urlparse
 
 # SSRF guard: reuse the one that ships with scheduler. Keeps the invariant that
 # there's exactly ONE public/private classifier for the whole codebase.
-from scheduler import _is_public_http_url as _wave_is_public_http_url
+# Same SSRF guard the scheduler applies to webhook URLs — reused verbatim so
+# the preset-fetch lane can never diverge from it.
+_wave_is_public_http_url = scheduler._is_public_http_url
 
 # 15s cap on every remote fetch (presets, gists, LM Studio model info).
 _WAVE_HTTP_TIMEOUT: float = 15.0
@@ -4621,7 +4625,7 @@ try:
     try:
         root.destroy()
     except Exception:
-        pass
+        pass  # Tk teardown is noisy on some platforms; the path is already picked
     # Empty string = user cancelled.
     if path:
         sys.stdout.write(path)
@@ -5321,7 +5325,7 @@ def api_export_preview():
                     with Image.open(sample.image_path) as img:
                         width, height = img.size
                 except (OSError, ValueError):
-                    pass
+                    pass  # undecodable image — it just reports 0x0 in the stats
             longest = max(width, height)
             if longest <= 0:
                 pass
@@ -6490,7 +6494,7 @@ def api_themes_publish(name: str):
             "error": f"git commit failed: {cleaned}",
         }), 500
 
-    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    _rc, sha_out, _sha_err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
     new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
 
     rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
@@ -6503,7 +6507,7 @@ def api_themes_publish(name: str):
             "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
         }), 500
 
-    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
+    _rc, br_out, _br_err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
     branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
 
     return jsonify({

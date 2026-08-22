@@ -983,7 +983,7 @@ class Supervisor:
             try:
                 proc.kill()
             except Exception:
-                pass
+                pass  # already reaped — nothing left to stop
 
     def _sweep_stale_processing(self) -> None:
         """Revert `.processing` files back to their original name before respawning.
@@ -1003,7 +1003,7 @@ class Supervisor:
                     proc_file.rename(original)
                     reverted += 1
             except OSError:
-                pass
+                pass  # another worker won the rename; its claim stands
         if reverted:
             print(f"  [env-reload] restored {reverted} in-flight image(s) to the queue", flush=True)
 

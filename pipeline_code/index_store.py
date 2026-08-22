@@ -681,7 +681,7 @@ def scan(
             try:
                 progress_callback(files_seen, files_added)
             except Exception:
-                pass
+                pass  # a caller's progress hook must never abort the scan
         if log_progress and files_seen - last_log >= _PROGRESS_LOG_INTERVAL:
             print(
                 f"[indexer] scanned {files_seen:>7} files, "

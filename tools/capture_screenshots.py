@@ -112,7 +112,7 @@ def _pick_free_port(preferred: int) -> int:
             s.bind(("127.0.0.1", preferred))
             return preferred
         except OSError:
-            pass
+            pass  # port taken — fall through to the random-port bind below
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
@@ -168,7 +168,7 @@ def _terminate_dashboard(proc: subprocess.Popen) -> None:
             proc.terminate()
         proc.wait(timeout=5)
     except Exception:
-        pass
+        pass  # graceful stop failed; the kill below is the backstop
     if proc.poll() is None:
         proc.kill()
 
