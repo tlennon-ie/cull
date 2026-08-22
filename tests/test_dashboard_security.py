@@ -366,3 +366,29 @@ def test_get_root_still_200(client):
     c, dash, _ = client
     r = c.get("/")
     assert r.status_code == 200
+
+
+# ── C. gallery-dl test-url: cookies_file reads an arbitrary local path ────────
+# (CodeQL py/path-injection) so the route must be loopback-only, mirroring the
+# cookies-converter and preset-publish routes.
+
+def test_gallery_dl_test_url_rejects_non_loopback(client):
+    c, _dash, _ = client
+    r = c.post(
+        "/api/scrapers/gallery-dl/test-url",
+        json={"url": "https://example.com/x", "cookies_file": "C:/whatever.txt"},
+        environ_base={"REMOTE_ADDR": "10.0.0.5"},
+    )
+    assert r.status_code == 403
+    assert r.get_json()["ok"] is False
+
+
+def test_gallery_dl_test_url_allows_loopback(client):
+    c, _dash, _ = client
+    r = c.post(
+        "/api/scrapers/gallery-dl/test-url",
+        json={"url": "not a url"},
+    )
+    # Loopback is let through the gate; the malformed URL fails downstream
+    # instead of a 403 from the guard.
+    assert r.status_code != 403
