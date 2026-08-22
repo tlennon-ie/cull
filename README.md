@@ -23,7 +23,13 @@
 
 ## Screenshots
 
-Every shot below comes from a seeded demo dataset (`python tools/seed_demo_data.py`) — no real credentials, no real people, no real scraper traffic.
+Every shot below comes from a seeded demo dataset — **real public-domain photos** (cached under `docs/mock-data/samples/` on first run) distributed across five generic demo jobs (**TikToker**, **Car spotting**, **Landscapes**, **Street photography**, **Pet gallery**). No real credentials, no real scraper traffic, no user-specific data.
+
+```bash
+python tools/fetch_demo_samples.py    # one-time: ~40 SFW photos from picsum.photos
+python tools/seed_demo_data.py        # seed the 5 demo jobs (idempotent)
+python tools/seed_demo_data.py --reset  # wipe + reseed (also purges legacy demo slugs)
+```
 
 ### Jobs & orchestration
 
@@ -77,7 +83,7 @@ Every shipped theme, one canonical view — click through and pick the one your 
 - **Global NSFW toggle.** A sidebar switch controls the blur on every surface (gallery, activity, thumbnails) and persists in `localStorage`. NSFW-bucketed items stay in the index; only the visual affordance flips.
 - **Filter popovers everywhere.** Gallery / Global Gallery / Queue / Activity all share one filter popover component — sources, categories, score gates, date range, NSFW mode. Teleported to `<body>` so it lands above the tile grid on every theme.
 - **Five new built-in themes + custom theme editor + community themes marketplace.** `ai-slop`, `beige`, `wood`, `cyberpunk`, and `forest` join the existing `dark` / `light` / `hc` cores. A Settings → Themes tab has color pickers for every CSS token with a live preview panel, and a Publish button that opens a PR against `themes/community/` (no direct push to `main`).
-- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/seed_demo_data.py` seeds synthetic queue/sorted rows for two demo jobs (`car_ads` + `realistic_female_influencer`) so the dashboard shows real numbers before you configure anything. `--reset` wipes and rebuilds.
+- **First-run wizard + demo mode.** A fresh install lands on a guided flow that names the first job, picks a preset, and verifies at least one scraper + one vision worker before the pipeline turns on. Not ready to hook up scrapers? `python tools/fetch_demo_samples.py` caches ~40 SFW public-domain photos from picsum.photos, then `python tools/seed_demo_data.py` distributes them across five demo jobs (**TikToker**, **Car spotting**, **Landscapes**, **Street photography**, **Pet gallery**) so the dashboard shows real numbers with real-looking imagery before you configure anything. `--reset` wipes, rebuilds, and purges any legacy demo slugs from prior versions.
 - **Preset marketplace + community presets + editable thumbnails + git-based Publish.** The Presets tab now has a dedicated editor detail view, a comparison grid of built-in starters, a community strip that browses `presets/community/*.preset.json`, and drag-and-drop thumbnail upload per preset. Publish sends the preset (+ its thumbnail) to `presets/community/` and opens a PR against `main`.
 - **Video lane.** yt-dlp scraper (YouTube, TikTok, X video, Reddit video, Vimeo, Bilibili) with per-job cookies + frame-level curation via a bundled `ffmpeg` (via `imageio-ffmpeg`, no OS install needed). Videos play inline in the gallery modal. When the video backend is missing the pipeline **holds unclassifiable videos** (does NOT auto-DISCARD) so nothing is lost while you install the `[video]` extra.
 - **LM Studio strict-schema + a registry of cloud workers.** LM Studio's grammar backend now accepts our response schema (strict-mode-forbidden keywords stripped). Groq / Anthropic Claude / OpenAI / OpenRouter / Google Gemini all ship as first-class registered workers alongside the local fleet, with prompt caching + a per-provider **cost tracker** (`data/cost_ledger.json`) so a runaway cloud pass can't sneak up on you.
@@ -139,12 +145,13 @@ FLASK_PORT=5000 ./launch.sh
 Want to see the dashboard with mock data before configuring scrapers?
 
 ```bash
-python tools/seed_demo_data.py             # seeds two demo jobs (car_ads + realistic_female_influencer)
-python tools/seed_demo_data.py --reset     # wipe + reseed for a clean state
+python tools/fetch_demo_samples.py         # one-time: cache ~40 SFW photos (picsum.photos)
+python tools/seed_demo_data.py             # seeds 5 demo jobs (tiktoker, car_spotting, landscapes, street_photography, pet_gallery)
+python tools/seed_demo_data.py --reset     # wipe + reseed for a clean state (also purges legacy demo slugs)
 python pipeline_code/dashboard_enhanced.py # open http://localhost:5000
 ```
 
-The seeder is deterministic and self-contained — no network, no external images, no NSFW content. Every image is a Pillow gradient tile stamped with its bucket, wrapped in a real `.txt` prompt + `.vision.json` audit sidecar so the indexer / gallery / stats / donut / source-bars all populate for the demo the same way they would for a real run. Every README screenshot above is captured against this dataset via `python tools/capture_screenshots.py`.
+The seeder is deterministic and idempotent. Sample photos come from picsum.photos (public-domain / CC0, backed by Unsplash) and are cached under `docs/mock-data/samples/` — the seeder itself never hits the network. Each demo item lands with a real `.txt` prompt + a `.vision.json` audit sidecar carrying a fake `worker_instance` (mock private IPs like `10.0.0.42:1234`) so the indexer / gallery / stats / donut / source-bars / activity feed all populate the way they would for a real run. Every README screenshot above is captured against this dataset via `python tools/capture_screenshots.py`.
 
 ## Run with Docker
 

@@ -511,7 +511,7 @@ def _run(only: set[str] | None, scratch: Path, keep_data: bool, port_hint: int) 
                 page.evaluate(_js_set_theme(shot.theme))
                 # For the 'job' scope, aim at the first demo slug so the URL
                 # / sidebar shows real content.
-                slug = "car_ads" if shot.view == "job" else None
+                slug = "car_spotting" if shot.view == "job" else None
                 page.evaluate(_js_go_to(shot.view, shot.active, slug))
                 # Kick a fresh themes load whenever we head into Settings so
                 # the Themes card is populated before the shot's setup fires.
