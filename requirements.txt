@@ -13,7 +13,7 @@ Flask-Cors>=6.0                   # 4.x/5.x carried CORS CVEs; 6.x is the secure
 Pillow>=11.0
 
 # ── Environment loading ──────────────────────────────────────────────────
-python-dotenv>=1.0.1
+python-dotenv>=1.2.2
 
 # ── HTTP clients ─────────────────────────────────────────────────────────
 requests>=2.32                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.32
