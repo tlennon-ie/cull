@@ -23,6 +23,24 @@ if str(PIPELINE_CODE) not in sys.path:
     sys.path.insert(0, str(PIPELINE_CODE))
 
 
+# Local copy of the multi-JSON-doc parser (previously imported from
+# `tests.test_cli_json`, which fails because `tests/` is not a package under
+# pytest's default config). Duplicating a 15-line helper is cheaper than
+# adding a conftest.py + a shared-helpers module for one caller.
+def _local_iter_json_docs(text: str):
+    decoder = json.JSONDecoder()
+    idx = 0
+    text = text.lstrip()
+    while idx < len(text):
+        while idx < len(text) and text[idx] in " \t\r\n":
+            idx += 1
+        if idx >= len(text):
+            break
+        obj, end = decoder.raw_decode(text[idx:])
+        yield obj
+        idx += end
+
+
 @pytest.fixture()
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_BASE_DIR", str(tmp_path))
@@ -112,7 +130,7 @@ def test_watch_condition_met_immediately(isolated, capsys, tmp_path):
     ])
     assert rc == 0
     # Parse the final JSON document
-    from tests.test_cli_json import _iter_json_docs  # reuse robust parser
+    _iter_json_docs = _local_iter_json_docs  # noqa: F841 — see helper below  # reuse robust parser
     docs = list(_iter_json_docs(capsys.readouterr().out))
     payload = docs[-1]
     assert payload["ok"] is True
@@ -128,7 +146,7 @@ def test_watch_times_out_returns_3(isolated, capsys):
         "--interval", "0.05", "--timeout", "0.2", "--json",
     ])
     assert rc == 3
-    from tests.test_cli_json import _iter_json_docs
+    _iter_json_docs = _local_iter_json_docs  # noqa: F841 — see helper below
     docs = list(_iter_json_docs(capsys.readouterr().out))
     payload = docs[-1]
     assert payload["ok"] is False
@@ -142,7 +160,7 @@ def test_watch_snapshot_mode_no_until_no_timeout(isolated, capsys):
     jc.create_job("snap", subject="s")
     rc = cli.main(["jobs", "watch", "--slug", "snap", "--json"])
     assert rc == 0
-    from tests.test_cli_json import _iter_json_docs
+    _iter_json_docs = _local_iter_json_docs  # noqa: F841 — see helper below
     docs = list(_iter_json_docs(capsys.readouterr().out))
     payload = docs[-1]
     assert payload["condition_met"] is None
