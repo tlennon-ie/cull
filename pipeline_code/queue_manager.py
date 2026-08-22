@@ -59,13 +59,17 @@ SOURCES: dict[str, str] = {
 }
 
 _SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
-_QUEUE_IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif")
+_QUEUE_IMAGE_EXTS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+# Legacy glob-form aliases — tests + a couple of external callers still import
+# these under the *_GLOBS names. Derived once so the two views can't drift.
+_QUEUE_IMAGE_GLOBS: tuple[str, ...] = tuple(f"*{e}" for e in _QUEUE_IMAGE_EXTS)
 # Video containers the round-robin pop will surface ONLY when the video-
 # classification lane is enabled (VIDEO_CLASSIFY_ENABLED). Off by default so an
 # image-only pipeline never starts popping clips it can't classify — behaviour
 # stays byte-identical unless the flag is set. Mirrors video_frames.VIDEO_EXT /
 # export_profiles.VIDEO_EXT.
-_QUEUE_VIDEO_GLOBS = ("*.mp4", "*.mov", "*.webm", "*.mkv", "*.avi", "*.m4v")
+_QUEUE_VIDEO_EXTS: tuple[str, ...] = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
+_QUEUE_VIDEO_GLOBS: tuple[str, ...] = tuple(f"*{e}" for e in _QUEUE_VIDEO_EXTS)
 _DEFAULT_CACHE_TTL = 5.0  # seconds; see FSQueue docstring
 
 
@@ -77,26 +81,57 @@ def _video_classify_enabled() -> bool:
     )
 
 
-def _queue_globs() -> tuple[str, ...]:
-    """The media globs the queue pops, derived from the active media policy:
-    image extensions when the job accepts images, plus video extensions when it
-    accepts video AND the video-classification lane is enabled. Defaults mirror
-    the historical image/video globs, so an unconfigured pipeline is unchanged."""
+def _queue_exts() -> frozenset[str]:
+    """The media extensions the queue pops, derived from the active media policy.
+
+    Returns a lowercase-suffix ``frozenset`` (``.jpg`` etc). One
+    ``os.scandir`` + suffix-in-set check per source dir replaces the previous
+    N-glob-per-source scan — measurable win on directories with 10k+ items.
+    Defaults mirror the historical image/video set, so an unconfigured
+    pipeline is byte-identical unless VIDEO_CLASSIFY_ENABLED is set (which
+    always widens the set to include the standard video containers so the
+    env gate alone is enough to surface clips)."""
+    include_video = _video_classify_enabled()
     try:
         import media_policy
-        globs: tuple[str, ...] = ()
+        exts: list[str] = []
         if media_policy.wants_image():
-            globs += tuple(f"*{e}" for e in media_policy.image_exts())
-        if media_policy.wants_video() and _video_classify_enabled():
-            globs += tuple(f"*{e}" for e in media_policy.video_exts())
-        if globs:
-            return globs
+            exts.extend(media_policy.image_exts())
+        if media_policy.wants_video() and include_video:
+            exts.extend(media_policy.video_exts())
+        if exts:
+            lowered = frozenset(e.lower() for e in exts)
+            # env-gate override: if video is on but policy didn't emit video
+            # exts (image-only default policy), append the standard video set.
+            if include_video and not (lowered & frozenset(_QUEUE_VIDEO_EXTS)):
+                return frozenset(lowered | frozenset(_QUEUE_VIDEO_EXTS))
+            return lowered
     except Exception:  # noqa: BLE001 - never let policy parsing break the queue
         pass
     # Fallback to the historical fixed set.
-    if _video_classify_enabled():
-        return _QUEUE_IMAGE_GLOBS + _QUEUE_VIDEO_GLOBS
-    return _QUEUE_IMAGE_GLOBS
+    if include_video:
+        return frozenset(_QUEUE_IMAGE_EXTS + _QUEUE_VIDEO_EXTS)
+    return frozenset(_QUEUE_IMAGE_EXTS)
+
+
+def _queue_globs() -> tuple[str, ...]:
+    """Legacy glob view of the queue extensions — used by tests and by
+    callers that still consume the ``('*.jpg', ...)`` shape. Thin adapter
+    over :func:`_queue_exts` that preserves the canonical source order
+    (image globs then video globs) so callers can identity-compare against
+    :data:`_QUEUE_IMAGE_GLOBS` / :data:`_QUEUE_VIDEO_GLOBS`."""
+    exts = _queue_exts()
+    # Preserve the canonical source order (images before videos) instead of
+    # returning a sorted-alpha tuple that would break identity comparisons.
+    ordered: list[str] = []
+    for e in _QUEUE_IMAGE_EXTS + _QUEUE_VIDEO_EXTS:
+        if e in exts:
+            ordered.append(f"*{e}")
+    # Any extra exts from a custom media_policy land at the end, sorted.
+    known = set(_QUEUE_IMAGE_EXTS) | set(_QUEUE_VIDEO_EXTS)
+    for e in sorted(exts - known):
+        ordered.append(f"*{e}")
+    return tuple(ordered)
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────────
@@ -267,10 +302,39 @@ class FSQueue:
 
     @staticmethod
     def _images_in(source_dir: Path) -> list[Path]:
-        images: list[Path] = []
-        for pattern in _queue_globs():
-            images.extend(source_dir.glob(pattern))
-        return sorted(images)
+        """One scandir pass per source dir; suffix-filter against a frozenset.
+
+        Old code ran ``source_dir.glob(pattern)`` for each of 5-11 extension
+        globs — for a source with 10k queued items that meant 5-11 full directory
+        walks. ``os.scandir`` walks the dir once and returns ``DirEntry`` objects
+        whose ``.name`` is a fast attribute; the ``in`` check against a
+        ``frozenset`` is O(1). Sorted by name to keep the round-robin order
+        deterministic (mirrors the prior sorted-glob behaviour)."""
+        exts = _queue_exts()
+        try:
+            entries = os.scandir(source_dir)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            return []
+        matches: list[Path] = []
+        try:
+            for entry in entries:
+                # Fast-reject: suffix check on the raw name string (no Path alloc
+                # yet). ``entry.is_file()`` may stat, but only for candidates
+                # that already passed the suffix filter — the common case is
+                # cheap.
+                name = entry.name
+                dot = name.rfind(".")
+                if dot < 0 or name[dot:].lower() not in exts:
+                    continue
+                try:
+                    if entry.is_file():
+                        matches.append(Path(entry.path))
+                except OSError:
+                    continue
+        finally:
+            entries.close()
+        matches.sort(key=lambda p: p.name)
+        return matches
 
     def _build_round_robin_order(self) -> list[tuple[str, Path]]:
         source_images: dict[str, list[Path]] = {}
@@ -287,6 +351,147 @@ class FSQueue:
                 if i < len(source_images[source]):
                     order.append((source, source_images[source][i]))
         return order
+
+
+# ── Cross-slug (multi-active) round-robin ─────────────────────────────────────
+#
+# A shared vision worker consuming from multiple active jobs uses a WEIGHTED
+# round-robin across the slugs' queue subdirs. Weights are per-job priorities
+# (1-10) — weight ``w`` gives that slug ``w`` consecutive turns per cycle.
+# Reuses the per-slug FSQueue caching so the heavy scan work isn't duplicated
+# per call.
+#
+# The queue root (parent of the per-slug subdirs) defaults to the parent of
+# BASE_QUEUE_DIR, so the multi-slug driver doesn't need to redo the .env
+# parsing every call.
+
+_QUEUE_ROOT: Path = BASE_QUEUE_DIR.parent
+
+# Per-slug FSQueue cache. Constructed lazily; reused across pop calls so the
+# in-memory round-robin order cache each FSQueue owns keeps paying off.
+_MULTI_SLUG_QUEUES: dict[str, FSQueue] = {}
+_MULTI_SLUG_LOCK = threading.Lock()
+
+
+def _fsqueue_for_slug(slug: str, root: Path | None = None) -> FSQueue:
+    root = root or _QUEUE_ROOT
+    key = f"{root}::{slug}"
+    with _MULTI_SLUG_LOCK:
+        q = _MULTI_SLUG_QUEUES.get(key)
+        if q is None:
+            q = FSQueue(root / slug)
+            _MULTI_SLUG_QUEUES[key] = q
+        return q
+
+
+def _weighted_round_robin_order(slugs: list[str], weights: dict[str, int]) -> list[str]:
+    """Deterministic weighted round-robin schedule over ``slugs``.
+
+    A slug with weight ``w`` gets ``w`` consecutive turns per cycle, so a
+    priority-10 job pops ~10 images to a priority-1 job's one. Weights <=0
+    are treated as 1 so a mis-typed value can never starve a slug.
+    """
+    order: list[str] = []
+    for slug in slugs:
+        w = max(1, int(weights.get(slug, 1) or 1))
+        order.extend([slug] * w)
+    return order
+
+
+# Module-level round-robin cursor. The schedule ``([slugA]*wA + [slugB]*wB + …)``
+# is stable per (slugs, weights); we walk it advance-by-one per pop so
+# consecutive calls DISTRIBUTE the work across slugs by weight rather than
+# always draining the head slug first.
+_RR_STATE: dict[str, Any] = {"key": None, "schedule": [], "cursor": 0}
+_RR_LOCK = threading.Lock()
+
+
+def _rr_key(slugs: list[str], weights: dict[str, int]) -> str:
+    """Stable key for the (slugs, weights) tuple so a config change resets."""
+    parts = [f"{s}={int(weights.get(s, 1) or 1)}" for s in slugs]
+    return "|".join(parts)
+
+
+def pop_next_across_slugs(
+    slugs: list[str],
+    weights: dict[str, int] | None = None,
+    *,
+    queue_root: Path | None = None,
+) -> tuple[str, str, Path] | tuple[None, None, None]:
+    """Pop the next ``(slug, source, path)`` across multiple active slugs.
+
+    Weighted round-robin — a slug with weight ``w`` gets ``w`` consecutive
+    turns in the schedule, so a priority-10 job pops ~10 images per every
+    ~1 pop a priority-1 job gets. Within a slug, the existing per-slug
+    ``FSQueue`` round-robin over sources applies. The schedule cursor is
+    process-wide state (thread-safe), so consecutive calls DISTRIBUTE work
+    across slugs rather than always finding the head slug's item first and
+    starving the tail.
+
+    Returns ``(None, None, None)`` when every slug's queue is empty.
+    """
+    if not slugs:
+        return None, None, None
+    weights = weights or {}
+    key = _rr_key(slugs, weights)
+    with _RR_LOCK:
+        if _RR_STATE["key"] != key:
+            _RR_STATE["key"] = key
+            _RR_STATE["schedule"] = _weighted_round_robin_order(slugs, weights)
+            _RR_STATE["cursor"] = 0
+        schedule: list[str] = _RR_STATE["schedule"]
+        if not schedule:
+            return None, None, None
+        # Try each slot in the schedule, advancing the cursor. Wrap once so
+        # every slot gets a chance before we declare the multi-slug queue empty.
+        attempts = 0
+        cursor = _RR_STATE["cursor"]
+        result: tuple[str, str, Path] | tuple[None, None, None] = (None, None, None)
+        while attempts < len(schedule):
+            slug = schedule[cursor % len(schedule)]
+            cursor += 1
+            attempts += 1
+            q = _fsqueue_for_slug(slug, queue_root)
+            source, path = q.pop_next()
+            if path is not None:
+                result = (slug, source, path)
+                break
+        _RR_STATE["cursor"] = cursor % len(schedule) if schedule else 0
+        return result
+
+
+def _active_slugs_from_env() -> tuple[list[str], dict[str, int]] | None:
+    """Parse the supervisor-projected multi-active blob (or return ``None``).
+
+    Shape: JSON array of ``[slug, weight]`` pairs, e.g.
+    ``[["job_a", 5], ["job_b", 3]]``. Empty / missing / malformed values yield
+    ``None`` so the module-level pop shim falls back to the historic
+    single-slug ``FSQueue`` behaviour (byte-identical to today).
+    """
+    raw = (os.environ.get("PIPELINE_ACTIVE_SLUGS_JSON", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    slugs: list[str] = []
+    weights: dict[str, int] = {}
+    for entry in data:
+        if isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[0], str):
+            slugs.append(entry[0])
+            try:
+                weights[entry[0]] = max(1, int(entry[1]))
+            except (TypeError, ValueError):
+                weights[entry[0]] = 1
+        elif isinstance(entry, str):
+            slugs.append(entry)
+            weights[entry] = 1
+    if not slugs:
+        return None
+    return slugs, weights
 
 
 # ── Default instance + module-level shims ─────────────────────────────────────
@@ -321,6 +526,26 @@ def list_queue_sources() -> dict[str, int]:
 
 
 def get_next_image_round_robin() -> tuple[str, Path] | tuple[None, None]:
+    """Return ``(source, path)`` for the next queued image.
+
+    When the supervisor is running MULTIPLE active jobs it projects the active
+    set + priority into ``PIPELINE_ACTIVE_SLUGS_JSON``; we detect that here
+    and delegate to ``pop_next_across_slugs`` so a shared vision worker fair-
+    shares across every active slug's queue. The slug is dropped from the
+    return tuple for legacy caller compatibility — the popped path is under
+    ``<queue_root>/<slug>/<source>/…`` so consumers that need the slug can
+    read it from the path.
+
+    In single-active (or standalone) mode the env is absent and we fall back
+    to the historic per-process ``FSQueue`` — behaviour is byte-identical.
+    """
+    multi = _active_slugs_from_env()
+    if multi is not None:
+        slugs, weights = multi
+        _slug, source, path = pop_next_across_slugs(slugs, weights)
+        if path is None:
+            return None, None
+        return source, path
     return _default_queue.pop_next()
 
 
@@ -334,4 +559,5 @@ __all__ = [
     "save_to_queue",
     "list_queue_sources",
     "get_next_image_round_robin",
+    "pop_next_across_slugs",
 ]
