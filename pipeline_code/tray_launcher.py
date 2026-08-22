@@ -23,7 +23,6 @@ The "Pause / Resume" menu items therefore fall back to stop and start, and
 """
 from __future__ import annotations
 
-import io
 import logging
 import os
 import platform

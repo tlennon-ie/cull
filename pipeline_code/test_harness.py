@@ -10,12 +10,8 @@ Tests:
 """
 
 import os
-import sys
 import json
-import time
-import subprocess
 from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
 
 # Load .env
@@ -39,7 +35,7 @@ print("""
 ╚═══════════════════════════════════════════════════════════════╝
 """)
 
-print(f"\n📊 Configuration:")
+print("\n📊 Configuration:")
 print(f"   Queue: {PIPELINE_QUEUE}")
 print(f"   Sorted: {PIPELINE_SORTED}")
 print(f"   Topic: {os.getenv('PIPELINE_TOPIC', 'unknown')}")
@@ -120,7 +116,7 @@ try:
         "bot_token": "✅ Configured" if discord_token and discord_token != "your_" else "❌ Missing",
         "channels": f"✅ {channel_count} configured" if channel_count > 0 else "❌ None"
     }
-    print(f"Discord:")
+    print("Discord:")
     print(f"  Bot Token: {config_checks['discord']['bot_token']}")
     print(f"  Channels: {config_checks['discord']['channels']}")
 except Exception as e:
@@ -133,7 +129,7 @@ config_checks["civitai"] = {
     "api_key": "✅ Configured" if civitai_key and civitai_key != "your_" else "❌ Missing",
     "domain": f"✅ {civitai_domain}"
 }
-print(f"Civitai:")
+print("Civitai:")
 print(f"  API Key: {config_checks['civitai']['api_key']}")
 print(f"  Domain: {config_checks['civitai']['domain']}")
 
@@ -142,7 +138,7 @@ twitter_cookies = os.getenv("TWITTER_COOKIES", "")
 config_checks["twitter"] = {
     "cookies": "✅ Configured" if twitter_cookies else "❌ Missing"
 }
-print(f"Twitter/X:")
+print("Twitter/X:")
 print(f"  Cookies: {config_checks['twitter']['cookies']}")
 
 # ============================================================================
@@ -189,12 +185,12 @@ print(f"\n✅ LMStudio Ready: {lmstudio_ok}")
 print(f"   Primary: {test_results['primary']['status']}")
 print(f"   Secondary: {test_results['secondary']['status']}")
 
-print(f"\n📱 Scrapers:")
+print("\n📱 Scrapers:")
 print(f"   Discord: {config_checks['discord']['bot_token']} ({config_checks['discord']['channels']})")
 print(f"   Civitai: {config_checks['civitai']['api_key']}")
 print(f"   Twitter: {config_checks['twitter']['cookies']}")
 
-print(f"\n✅ Queue Structure: Ready")
+print("\n✅ Queue Structure: Ready")
 print(f"   Path: {PIPELINE_QUEUE}")
 print(f"   Sources: {len(SOURCES)} configured")
 

@@ -169,20 +169,23 @@ def test_set_default_preset(client):
 
 def test_delete_default_preset_is_409(client):
     c, _jc, _tmp = client
-    assert c.delete("/api/presets/default").status_code == 409
+    resp = c.delete("/api/presets/default")
+    assert resp.status_code == 409
 
 
 def test_delete_referenced_preset_is_409(client):
     c, _jc, _tmp = client
     c.post("/api/presets", json={"name": "Used"})
     c.post("/api/jobs", json={"name": "Job On Used", "preset": "Used"})
-    assert c.delete("/api/presets/Used").status_code == 409
+    resp = c.delete("/api/presets/Used")
+    assert resp.status_code == 409
 
 
 def test_delete_unreferenced_preset_ok(client):
     c, _jc, _tmp = client
     c.post("/api/presets", json={"name": "Orphan"})
-    assert c.delete("/api/presets/Orphan").status_code == 200
+    resp = c.delete("/api/presets/Orphan")
+    assert resp.status_code == 200
 
 
 # ── jobs v2 CRUD + override round-trip ───────────────────────────────────────
@@ -312,7 +315,8 @@ def test_delete_refuses_active_409(client):
     c, jc, _tmp = client
     c.post("/api/jobs", json={"name": "Keep"})
     c.post("/api/jobs/keep/activate")
-    assert c.delete("/api/jobs/keep").status_code == 409
+    resp = c.delete("/api/jobs/keep")
+    assert resp.status_code == 409
     assert jc.get_job("keep") is not None
 
 

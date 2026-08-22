@@ -54,7 +54,6 @@ from typing import Any
 
 from PIL import Image
 
-from categories import CATEGORIES
 from paths import queue_root, sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import get_next_image_round_robin

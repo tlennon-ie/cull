@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -1140,7 +1140,7 @@ class Supervisor:
                 until = self._cooldown_until.get(label, 0.0)
                 if until > now:
                     continue  # still in cooldown
-                if until and until <= now:
+                if until:
                     self._cooldown_until.pop(label, None)
                 self._spawn(spec)
 

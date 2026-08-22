@@ -40,7 +40,7 @@ import paths as _paths
 
 # Slug validation. Superset of JOB_SLUG_RE because ``ai-slop`` and similar
 # hyphenated names are natural for theme identifiers.
-THEME_NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
+THEME_NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}\Z")
 
 # The complete set of CSS custom properties a theme MAY set. Any key not in
 # this tuple is silently dropped on write — this is the schema. Keep in
@@ -160,7 +160,7 @@ CORE_THEME_VARS: dict[str, dict[str, str]] = {
 # would allow CSS injection.
 _MAX_VALUE_LEN = 128
 _MAX_FONT_LEN = 200
-_FONT_FAMILY_RE = re.compile(r"^[A-Za-z0-9 ,\"'\-_.()/]{0,200}$")
+_FONT_FAMILY_RE = re.compile(r"^[A-Za-z0-9 ,\"'\-_.()/]{0,200}\Z")
 
 # CSS value guard — a colour value is expected to be a hex code, rgb/rgba,
 # hsl/hsla, oklch(), or a keyword. We accept anything short of characters
