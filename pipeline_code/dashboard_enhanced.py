@@ -5531,9 +5531,17 @@ def api_scrapers_gallery_dl_test_url():
     ``cookies_file`` (a filesystem PATH to a cookies file). When both are
     present the PATH wins — the field is unambiguous, and this matches how
     the scraper config already stores it. When ``cookies_file`` is supplied
-    we read the file server-side (bound to 127.0.0.1) and pass the content
-    down as ``cookies_txt`` so the underlying probe sees exactly one shape.
+    we read the file server-side and pass the content down as ``cookies_txt``
+    so the underlying probe sees exactly one shape.
+
+    Loopback-only (mirrors the cookies-converter and preset-publish routes):
+    ``cookies_file`` accepts an arbitrary local filesystem path with no
+    ``safe_inside`` containment (by design — the caller is meant to point at
+    any cookies export on their own machine), so this route must never be
+    reachable from a non-loopback caller.
     """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
     data = request.get_json() or {}
     url = (data.get("url") or "").strip()
     cookies_txt = data.get("cookies_txt")
