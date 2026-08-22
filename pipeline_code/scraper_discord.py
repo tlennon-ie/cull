@@ -4,7 +4,7 @@ Fetches images + prompts from Discord channels, drops to queue/ folder.
 Does NOT do vision — just download + prompt extract + basic prompt validation.
 Saves to source-based queue using queue_manager.
 """
-import os, re, json, time, struct, requests, sys, tempfile
+import os, json, time, struct, requests, sys, tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -18,7 +18,7 @@ load_dotenv()
 #             can't be added to private servers).
 #   "auto"  - try `Bot <token>` first, fall back to raw on 401. Default.
 # DISCORD_AUTH_PREFIX (legacy) still works as a manual override.
-from credentials import get_optional, warn_if_missing  # noqa: E402
+from credentials import get_optional  # noqa: E402
 
 USER_TOKEN = get_optional("DISCORD_BOT_TOKEN") or ""
 if not USER_TOKEN:
@@ -181,7 +181,9 @@ def download_bytes(url):
             _LIMITER.note_success()
             return r.content
         return None
-    except: return None
+    except Exception:
+        # Any transport/decode failure is a miss — the caller retries the next tick.
+        return None
 
 def extract_prompt_from_png(data):
     if not data or len(data) < 8 or data[:8] != b'\x89PNG\r\n\x1a\n':
@@ -197,12 +199,14 @@ def extract_prompt_from_png(data):
             try:
                 k, v = cdata.split(b'\x00', 1)
                 texts[k.decode()] = v.decode("latin-1")
-            except: pass
+            except Exception:
+                pass  # malformed tEXt chunk — skip it, keep scanning the rest
         elif ctype == "iTXt":
             try:
                 parts = cdata.split(b'\x00', 4)
                 texts[parts[0].decode()] = parts[4].decode("utf-8", errors="replace")
-            except: pass
+            except Exception:
+                pass  # malformed iTXt chunk — skip it, keep scanning the rest
         elif ctype == "IEND": break
 
     for key in ("workflow", "prompt", "parameters", "Parameters"):
@@ -221,7 +225,7 @@ def extract_prompt_from_png(data):
                             if "positive" in title or ("negative" not in title and "neg" not in title):
                                 pos_texts.append(txt.strip())
                 if pos_texts: return pos_texts[0]
-        except:
+        except Exception:
             clean = val.split("Negative prompt:")[0].split("Steps:")[0].strip()
             if len(clean) > MIN_PROMPT_LENGTH: return clean
     return None
@@ -249,7 +253,9 @@ def extract_prompt_from_yaml(yaml_bytes):
                     if "positive" in title: pos_texts.insert(0, txt.strip())
                     elif "negative" not in title and "neg" not in title: pos_texts.append(txt.strip())
         return pos_texts[0] if pos_texts else None
-    except: return None
+    except Exception:
+        # Not a ComfyUI workflow blob — the caller falls back to other sources.
+        return None
 
 def process_channel(ch):
     print(f"\n-> {ch['name']} ({ch['guild']})", flush=True)
@@ -330,8 +336,8 @@ def process_channel(ch):
                 _w, _h = _im.size
                 if _w >= 2048 and _h >= 2048:
                     continue  # grid
-            except: pass
-            if not img_bytes: continue
+            except Exception:
+                pass  # undecodable bytes — let the prompt checks below judge it
 
             # Try PNG metadata if no yaml prompt
             pt = prompt_text
@@ -356,7 +362,6 @@ def process_channel(ch):
             # (so a .mp4 clip stays a clip); otherwise fall back to jpg.
             ext = img_url.split("?")[0].split(".")[-1].lower()
             if not media_policy.accepts("." + ext): ext = "jpg"
-            qid = f"{msg['id']}_{queued}"
             
             # Create temp file for queue_manager
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:

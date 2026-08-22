@@ -10,12 +10,8 @@ Tests:
 """
 
 import os
-import sys
 import json
-import time
-import subprocess
 from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
 
 # Load .env
@@ -39,7 +35,7 @@ print("""
 ╚═══════════════════════════════════════════════════════════════╝
 """)
 
-print(f"\n📊 Configuration:")
+print("\n📊 Configuration:")
 print(f"   Queue: {PIPELINE_QUEUE}")
 print(f"   Sorted: {PIPELINE_SORTED}")
 print(f"   Topic: {os.getenv('PIPELINE_TOPIC', 'unknown')}")
@@ -106,9 +102,16 @@ print("="*65)
 config_checks = {}
 
 
-# Credential checks log only a present/missing STATUS (a literal chosen by a
-# condition), never the secret value or anything derived from it (not even its
-# length) — so no sensitive data reaches a logging sink.
+# Credential checks log only a present/missing STATUS, never the secret value
+# or anything derived from it (not even its length). The bool() hop below is
+# deliberate: the status literal is chosen from a plain boolean, so no value
+# that touched a credential can reach a print/log sink.
+
+
+def _configured(present: bool) -> str:
+    """Status literal for a credential. Takes a BOOL, never the secret."""
+    return "✅ Configured" if present else "❌ Missing"
+
 
 # Discord
 discord_token = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -117,10 +120,10 @@ try:
     channels_json = json.loads(discord_channels)
     channel_count = len(channels_json.get("channels", []))
     config_checks["discord"] = {
-        "bot_token": "✅ Configured" if discord_token and discord_token != "your_" else "❌ Missing",
+        "bot_token": _configured(bool(discord_token) and discord_token != "your_"),
         "channels": f"✅ {channel_count} configured" if channel_count > 0 else "❌ None"
     }
-    print(f"Discord:")
+    print("Discord:")
     print(f"  Bot Token: {config_checks['discord']['bot_token']}")
     print(f"  Channels: {config_checks['discord']['channels']}")
 except Exception as e:
@@ -130,19 +133,19 @@ except Exception as e:
 civitai_key = os.getenv("CIVITAI_API_KEY", "")
 civitai_domain = os.getenv("CIVITAI_DOMAIN", "civitai.com")
 config_checks["civitai"] = {
-    "api_key": "✅ Configured" if civitai_key and civitai_key != "your_" else "❌ Missing",
+    "api_key": _configured(bool(civitai_key) and civitai_key != "your_"),
     "domain": f"✅ {civitai_domain}"
 }
-print(f"Civitai:")
+print("Civitai:")
 print(f"  API Key: {config_checks['civitai']['api_key']}")
 print(f"  Domain: {config_checks['civitai']['domain']}")
 
 # Twitter
 twitter_cookies = os.getenv("TWITTER_COOKIES", "")
 config_checks["twitter"] = {
-    "cookies": "✅ Configured" if twitter_cookies else "❌ Missing"
+    "cookies": _configured(bool(twitter_cookies))
 }
-print(f"Twitter/X:")
+print("Twitter/X:")
 print(f"  Cookies: {config_checks['twitter']['cookies']}")
 
 # ============================================================================
@@ -189,12 +192,12 @@ print(f"\n✅ LMStudio Ready: {lmstudio_ok}")
 print(f"   Primary: {test_results['primary']['status']}")
 print(f"   Secondary: {test_results['secondary']['status']}")
 
-print(f"\n📱 Scrapers:")
+print("\n📱 Scrapers:")
 print(f"   Discord: {config_checks['discord']['bot_token']} ({config_checks['discord']['channels']})")
 print(f"   Civitai: {config_checks['civitai']['api_key']}")
 print(f"   Twitter: {config_checks['twitter']['cookies']}")
 
-print(f"\n✅ Queue Structure: Ready")
+print("\n✅ Queue Structure: Ready")
 print(f"   Path: {PIPELINE_QUEUE}")
 print(f"   Sources: {len(SOURCES)} configured")
 

@@ -388,7 +388,7 @@ def _write_triple(
         try:
             _os.utime(p, (ts, ts))
         except OSError:
-            pass
+            pass  # cosmetic staggering only — a real mtime works fine too
 
 
 def _seed_queue(job: _JobPlan, samples: list[Path]) -> int:
@@ -513,7 +513,7 @@ def _drop_job(slug: str) -> None:
                 job_config.dequeue(slug)
                 job_config.delete_job(slug)
             except Exception:
-                pass
+                pass  # demo job wouldn't dequeue; the reseed below overwrites it
 
 
 def _reset_job(job: _JobPlan) -> None:

@@ -101,7 +101,7 @@ class BalancedOpenAICompatWorker(BaseVisionWorker):
                 os.environ.get("OPENAI_COMPAT_TIMEOUT", str(self.request_timeout))
             )
         except ValueError:
-            pass
+            pass  # non-numeric override — keep the class default
 
     def setup(self) -> None:
         if not self.model:

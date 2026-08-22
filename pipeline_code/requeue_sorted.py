@@ -43,7 +43,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from paths import base_dir, queue_dir, sorted_dir  # noqa: E402
+from paths import queue_dir, sorted_dir  # noqa: E402
 
 SLUG: str = os.environ.get("PIPELINE_SLUG", "default")
 SORTED_ROOT: Path = sorted_dir(SLUG)

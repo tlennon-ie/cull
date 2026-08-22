@@ -3,7 +3,7 @@ scraper_civitai_search.py - Scrape Civitai via Meilisearch API (search-new.civit
 Uses specific search queries (e.g. "female influencer") + filters for high relevance.
 Saves to source-based queue using queue_manager for balanced processing.
 """
-import json, os, time, requests, re, tempfile
+import os, time, requests, re, tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,7 +41,7 @@ if CIVITAI_DOMAIN not in {"civitai.com", "civitai.red"}:
     CIVITAI_DOMAIN = "civitai.com"
 SOURCE_KEY = "civitai_red" if CIVITAI_DOMAIN == "civitai.red" else "civitai"
 
-from credentials import get_optional, get_required, MissingCredentialError  # noqa: E402
+from credentials import get_optional, MissingCredentialError  # noqa: E402
 from seen_store import MigrationSpec, SeenStore  # noqa: E402
 from topic_filter import prompt_optional  # noqa: E402
 import media_policy  # noqa: E402
@@ -206,7 +206,7 @@ def scrape_civitai_search(seen: set):
     query_terms = TOPIC.lower().replace("realistic", "").replace("prompt", "").split()
     query = " ".join(query_terms).strip() or "female influencer"
     
-    print(f"=== Civitai Meilisearch Scraper ===")
+    print("=== Civitai Meilisearch Scraper ===")
     print(f"Query: '{query}'")
     print(f"Models: {len(BASE_MODELS)} allowed")
     
@@ -221,7 +221,7 @@ def scrape_civitai_search(seen: set):
             r = requests.post(SEARCH_URL, headers=HEADERS, json=payload, timeout=20, **_LIMITER.requests_kwargs())
             if r.status_code == 429:
                 _LIMITER.note_429(retry_after=_retry_after_seconds(r))
-                print(f"  [429] Rate limited, backing off...")
+                print("  [429] Rate limited, backing off...")
                 continue
             if not r.ok:
                 print(f"  [Error] {r.status_code}: {r.text[:200]}")

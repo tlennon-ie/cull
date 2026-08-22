@@ -936,7 +936,7 @@ def _check_gallery_dl_url(
                 try:
                     os.close(fd)
                 except OSError:
-                    pass
+                    pass  # fdopen already consumed the fd
                 raise
             gdl_config.set(("extractor",), "cookies", cookies_path)
 
@@ -971,7 +971,7 @@ def _check_gallery_dl_url(
                 try:
                     os.close(fd)
                 except OSError:
-                    pass
+                    pass  # fdopen already consumed the fd
                 raise
             try:
                 gdl_config.load([config_path])
@@ -1075,7 +1075,7 @@ def _check_gallery_dl_url(
                 try:
                     os.unlink(path)
                 except OSError:
-                    pass
+                    pass  # temp file already gone
 
 
 def _check_local(config: dict, env: dict | None) -> dict:

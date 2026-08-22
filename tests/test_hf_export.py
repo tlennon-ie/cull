@@ -305,7 +305,7 @@ def test_missing_token_raises_clear_error(env) -> None:
     """No token anywhere => MissingCredentialError (a SystemExit subclass)."""
     from credentials import MissingCredentialError
 
-    _install_fake_hf  # not installed here on purpose; token check happens first
+    # _install_fake_hf is deliberately NOT called: the token check runs first.
     mod = _import_fresh()
     kept = mod._kept_categories(None)
     _write_sample(
@@ -340,7 +340,7 @@ def test_explicit_token_argument_is_used(env, monkeypatch: pytest.MonkeyPatch) -
 
 def test_token_read_from_env(env, monkeypatch: pytest.MonkeyPatch) -> None:
     """HF_TOKEN in the environment is picked up when no token arg is given."""
-    capture = _install_fake_hf(monkeypatch)
+    _install_fake_hf(monkeypatch)
     monkeypatch.setenv("HF_TOKEN", "hf_env_token")
     mod = _import_fresh()
     kept = mod._kept_categories(None)

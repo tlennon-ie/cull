@@ -42,8 +42,8 @@ logger = get_logger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-JOB_SLUG_RE = re.compile(r"^[a-z0-9_]+$")
-PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}$")
+JOB_SLUG_RE = re.compile(r"^[a-z0-9_]+\Z")
+PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}\Z")
 JOB_STATUSES: tuple[str, ...] = ("idle", "queued", "running", "paused", "done")
 
 # Canonical scraper names (single source of truth shared with the dashboard).
