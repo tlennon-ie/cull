@@ -132,6 +132,9 @@ import credentials
 import demo_seed
 import digest as _digest_mod
 import requeue_sorted as _requeue_mod
+import api_auth
+import openapi_schema
+import webhook_dispatcher
 
 # Now that job_config is importable, derive the canonical scraper toggle list
 # from its SCRAPER_NAMES (single source of truth) annotated with UI descriptions.
@@ -2017,10 +2020,25 @@ def api_jobs_dequeue(slug: str):
 @app.route("/api/jobs/<slug>/advance", methods=["POST"])
 def api_jobs_advance(slug: str | None = None):
     """Promote the next queued job to active. The optional <slug> is accepted
-    for symmetry but advance() always pops the queue head (sequential model)."""
+    for symmetry but advance() always pops the queue head (sequential model).
+
+    Fires ``job.completed`` webhooks for the job that just came off the active
+    slot (best-effort, never blocks the response).
+    """
     if slug is not None and not _valid_slug_or_400(slug):
         return jsonify({"error": "invalid slug"}), 400
+    previous_active = job_config.get_active_slug()
     new_active = job_config.advance()
+    # A slug that was active before and isn't the new head has just finished.
+    if previous_active and previous_active != new_active:
+        try:
+            webhook_dispatcher.dispatch(
+                webhook_dispatcher.EVENT_JOB_COMPLETED,
+                previous_active,
+                {"reason": "advanced", "next_active": new_active},
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort observability
+            logger.warning("webhook dispatch on advance failed: %s", exc)
     return jsonify({"success": True, "active": new_active})
 
 
@@ -4513,6 +4531,25 @@ def _wave_is_loopback_request() -> bool:
     if addr.startswith("::ffff:127."):
         return True
     return False
+
+
+# ── API-key auth middleware install ──────────────────────────────────────────
+#
+# Reads ``CULL_API_KEYS`` at import time. Empty / unset → the middleware is
+# still installed but every request is passed through (backward compat: 995+
+# existing tests must keep passing with no env change). Once tokens are set,
+# non-loopback callers need a valid ``Authorization: Bearer <token>`` or
+# ``X-Cull-API-Key`` header, and admin-tier URLs require the ``admin`` scope.
+# The loopback classifier is injected so a single source of truth stays in
+# ``_wave_is_loopback_request``.
+try:
+    _API_AUTH_LIMITER = api_auth.install(
+        app,
+        is_loopback=_wave_is_loopback_request,
+    )
+except Exception as _exc:  # pragma: no cover - never block dashboard boot
+    logger.warning("api_auth install failed: %s", _exc)
+    _API_AUTH_LIMITER = None
 
 
 def _wave_fetch_preset_body(url: str) -> tuple[bool, str, dict | None]:
@@ -15909,6 +15946,25 @@ def _start_idle_unload_thread() -> None:
     thread.start()
 
 
+def _sorted_root_for_slug(slug: str) -> Path:
+    """Resolve ``data/sorted/<slug>`` for the threshold watcher."""
+    return _paths.sorted_dir(slug)
+
+
+_THRESHOLD_WATCHER: webhook_dispatcher.ThresholdWatcher | None = None
+
+
+def _start_threshold_watcher() -> None:
+    """Spin up the per-job sorted-threshold poller (30s cadence)."""
+    global _THRESHOLD_WATCHER
+    if _THRESHOLD_WATCHER is not None:
+        return
+    _THRESHOLD_WATCHER = webhook_dispatcher.ThresholdWatcher(
+        sorted_root_fn=_sorted_root_for_slug,
+    )
+    _THRESHOLD_WATCHER.start()
+
+
 def _start_indexer_thread() -> None:
     """Spawn the background SQLite indexer. First scan can take a while
     on a 100k-image dataset; subsequent ticks are incremental."""
@@ -15953,12 +16009,110 @@ def api_index_status():
     return jsonify(_index_status_payload())
 
 
+# ── OpenAPI 3.1 spec + Swagger UI ────────────────────────────────────────────
+#
+# ``/api/openapi.json`` introspects the current URL map — no build step, no
+# hand-maintained spec file. Docstrings become ``summary`` / ``description``,
+# path params (``<slug>``) become ``{slug}`` OpenAPI parameters. Swagger UI at
+# ``/api/docs`` loads its assets from jsdelivr (already whitelisted in the CSP
+# for Tailwind); the page itself is fully static.
+
+@app.route("/api/openapi.json")
+def api_openapi_spec():
+    """Return the OpenAPI 3.1 spec describing every ``/api/*`` route.
+
+    Regenerated on every call — the URL map is small, and this keeps the spec
+    in sync with hot-reloaded routes without any invalidation logic.
+    """
+    try:
+        spec = openapi_schema.build_spec(app)
+    except Exception as exc:  # noqa: BLE001 - never 500 the spec endpoint
+        return _err("could not build OpenAPI spec", exc, 500)
+    return jsonify(spec)
+
+
+@app.route("/api/docs")
+def api_docs():
+    """Serve the Swagger UI viewer for the ``/api/openapi.json`` spec."""
+    return Response(openapi_schema.SWAGGER_UI_HTML, mimetype="text/html; charset=utf-8")
+
+
+# ── Per-job lifecycle webhooks ───────────────────────────────────────────────
+#
+# CRUD endpoints for the ``webhooks`` override on each job. URLs are validated
+# with ``scheduler._is_public_http_url`` at save time so a private URL never
+# lands in the store; the dispatcher re-validates just before POSTing.
+
+def _webhook_from_payload(payload: Any) -> webhook_dispatcher.Webhook:
+    return webhook_dispatcher.Webhook.from_dict(payload)
+
+
+@app.route("/api/jobs/<slug>/webhooks", methods=["GET"])
+def api_jobs_webhooks_list(slug: str):
+    """List webhook subscriptions on ``<slug>``."""
+    if not _valid_slug_or_400(slug):
+        return _err("invalid slug", None, 400)
+    if job_config.get_job(slug) is None:
+        return _err("job not found", None, 404)
+    hooks = webhook_dispatcher.list_webhooks(slug)
+    return jsonify({"ok": True, "slug": slug, "webhooks": [h.to_dict() for h in hooks]})
+
+
+@app.route("/api/jobs/<slug>/webhooks", methods=["POST"])
+def api_jobs_webhooks_replace(slug: str):
+    """Replace the webhook list on ``<slug>``.
+
+    Body: ``{"webhooks": [{event, url, secret?, threshold_category?, threshold_count?}, ...]}``
+    """
+    if not _valid_slug_or_400(slug):
+        return _err("invalid slug", None, 400)
+    if job_config.get_job(slug) is None:
+        return _err("job not found", None, 404)
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return _err("body must be a JSON object", None, 400)
+    entries = payload.get("webhooks", [])
+    if not isinstance(entries, list):
+        return _err("'webhooks' must be a list", None, 400)
+    try:
+        hooks = [_webhook_from_payload(e) for e in entries]
+    except (TypeError, ValueError) as exc:
+        return _err("invalid webhook entry", exc, 400)
+    try:
+        saved = webhook_dispatcher.save_webhooks(slug, hooks)
+    except ValueError as exc:
+        return _err("could not save webhooks", exc, 400)
+    return jsonify({"ok": True, "slug": slug, "webhooks": [h.to_dict() for h in saved]})
+
+
+@app.route("/api/jobs/<slug>/webhooks/test", methods=["POST"])
+def api_jobs_webhooks_test(slug: str):
+    """Dispatch a synthetic event to every subscription on ``<slug>``.
+
+    Body: ``{"event": "job.completed"}`` — must be a supported event.
+    """
+    if not _valid_slug_or_400(slug):
+        return _err("invalid slug", None, 400)
+    if job_config.get_job(slug) is None:
+        return _err("job not found", None, 404)
+    body = request.get_json(silent=True) or {}
+    event = str(body.get("event") or webhook_dispatcher.EVENT_JOB_COMPLETED)
+    if event not in webhook_dispatcher.SUPPORTED_EVENTS:
+        return _err("unsupported event", None, 400)
+    try:
+        count = webhook_dispatcher.dispatch(event, slug, {"test": True})
+    except Exception as exc:  # noqa: BLE001
+        return _err("dispatch failed", exc, 500)
+    return jsonify({"ok": True, "slug": slug, "event": event, "dispatched": count})
+
+
 if __name__ == "__main__":
     print(f"Dashboard: http://localhost:{FLASK_PORT}", flush=True)
     print(f"Settings: {ENV_PATH}", flush=True)
     print("Pipeline is NOT auto-started. Use the Start button in the UI.", flush=True)
     _start_idle_unload_thread()
     _start_indexer_thread()
+    _start_threshold_watcher()
     # Bind host: default 0.0.0.0 to keep Docker/RunPod/LAN workflows working out
     # of the box (the README documents this). Set FLASK_HOST=127.0.0.1 for a
     # loopback-only install on a shared workstation. FLASK_HOST wins when set;
