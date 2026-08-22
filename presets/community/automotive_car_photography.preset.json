@@ -1,0 +1,80 @@
+{
+  "cull_preset_version": 1,
+  "kind": "cull.preset",
+  "name": "Automotive Photography",
+  "preset": {
+    "topic_filters": {
+      "keywords_extra": [
+        "car photography", "automotive photography", "supercar", "sports car",
+        "vintage car", "classic car", "roll shot", "rig shot", "panning shot",
+        "3/4 hero", "car show", "track day", "concept car", "car interior",
+        "wheel detail"
+      ],
+      "banned_keywords": [
+        "link in bio", "dm me", "onlyfans", "patreon", "subscribe",
+        "follow me", "promo code", "for sale", "commission", "check my",
+        "used car listing", "carfax", "anime", "cartoon"
+      ],
+      "generation_hints": [
+        "automotive photography", "car photograph", "3/4 hero shot",
+        "panning shot", "rolling shot", "golden hour car", "studio car shot",
+        "shallow depth of field"
+      ],
+      "min_prompt_length": 0,
+      "require_prompt": false
+    },
+    "scrapers": {
+      "reddit_subreddits": [
+        "carporn", "AutoPhotography", "carphotography", "spotted",
+        "classiccars", "supercars", "F1Porn", "MotorsportPorn"
+      ],
+      "civitai_domains": ["civitai.com", "civitai.red"]
+    },
+    "categories": [
+      {
+        "name": "Keep",
+        "hint": "Deliberate automotive hero — clean 3/4, side profile, low-angle wide, panning shot with motion streak, or detail (headlight, wheel, badge) with intent. Sharp on the primary panel, motivated light, clean/uncluttered background, on-topic. OVR_Quality_Score >= 60 AND REL_Quality_Score >= 60"
+      },
+      {
+        "name": "Interior",
+        "hint": "Cockpit / dashboard / seating-area shot of a car — useful but a different bucket from exterior hero shots"
+      },
+      {
+        "name": "Borderline",
+        "hint": "Car in frame but skewed 3/4 angle, cluttered dealer-lot background, dull flat lighting, distracting reflections in paint, or only-average quality -> human review"
+      },
+      {
+        "name": "Snapshot",
+        "hint": "Casual phone snap in a parking lot / driveway with no compositional intent — no clear hero angle, no light shaping -> off-theme for a photography dataset"
+      },
+      {
+        "name": "OffTopic",
+        "hint": "Not a car / motor-vehicle image at all"
+      }
+    ],
+    "category_rules": "STRICT JUDGEMENT RULES (no exceptions):\n- Fill `description` and `primary_subject` FIRST, from the pixels only. Then make every label agree with that description.\n- art_medium = `photograph` ONLY for a camera-captured (or AI photoreal) image; an automotive render or concept illustration is the matching label, never `photograph`.\n- has_ai_flaws = TRUE only for SEVERE artefacts (melted/impossible body panels, warped wheels or spokes, mismatched left/right badges, floating door handles, warped licence plates, wrong number of wheels).\n- A COMPOSITE/GRID is 2+ separate images stitched together (before/after mods, angle grid) -> is_composite_grid=true and DISCARD.\n- contains_text_overlay = TRUE for burned-in dealer branding, price tags, watermarks, spec-sheet stats, or forum handles.\n- nsfw = TRUE only for explicit nudity or sexual content.\nAutomotive photography dataset. Reward deliberate hero angles (clean 3/4, low wide, high-line drone, panning motion streak), sharpness on the primary panel or the eye of the wheel, motivated light (golden hour, motivated studio softbox) and a clean/uncomplicated background. A cockpit / interior shot goes to Interior. A dealer-lot phone snap with no intent is Snapshot. Penalise distracting parking-lot clutter, dull grey overcast with no shape on the panel, and burned-in dealer / forum branding. The curation topic only informs REL_Quality_Score.",
+    "scoring": {
+      "ovr_min": 55,
+      "rel_min": 25,
+      "notes": "Reward deliberate angles, sharpness on the primary panel, motivated light shaping the bodywork and a clean background. Penalise skewed angles, parking-lot clutter, flat overcast light and dealer/forum watermarks."
+    },
+    "captioning": {
+      "enabled": false,
+      "style": "natural_language",
+      "overwrite": false
+    },
+    "vision": {
+      "workers": [
+        {
+          "id": "local-lm",
+          "name": "LM Studio",
+          "provider": "lmstudio",
+          "base_url": "http://127.0.0.1:1234",
+          "model": "",
+          "api_key": "",
+          "enabled": true
+        }
+      ]
+    }
+  }
+}
