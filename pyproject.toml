@@ -105,6 +105,14 @@ dev = [
     "ruff>=0.15.20",
     "pip-audit>=2.7",
 ]
+# Model Context Protocol server — exposes cull's job / preset / stats / export
+# surface as stdio tools so an agent (Claude Desktop, Cursor, Codex) can drive
+# it end-to-end. The server module (pipeline_code/mcp_server.py) imports
+# cleanly WITHOUT this extra; the `cull-mcp` console script only fails with a
+# friendly install hint when the SDK is missing.
+mcp = [
+    "mcp>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/tlennon-ie/cull"
@@ -114,6 +122,10 @@ Issues = "https://github.com/tlennon-ie/cull/issues"
 [project.scripts]
 # Installed `cull` command → headless CLI entry point (pipeline_code/cull_cli.py).
 cull = "cull_cli:main"
+# Installed `cull-mcp` command → MCP server entry point
+# (pipeline_code/mcp_server.py). Requires the `[mcp]` extra; the script prints
+# a friendly install hint if the SDK is missing.
+cull-mcp = "mcp_server:main"
 
 # ── setuptools: flat-module layout ───────────────────────────────────────────
 # Map the (implicit, root) package to pipeline_code/ and install each loose
@@ -140,6 +152,7 @@ py-modules = [
     "job_config",
     "lmstudio_admin",
     "lmstudio_models",
+    "mcp_server",
     "paths",
     "phash_dedup",
     "pipeline_logging",
