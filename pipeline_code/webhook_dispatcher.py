@@ -90,9 +90,22 @@ class Webhook:
     threshold_category: str = ""
     threshold_count: int = 0
 
-    def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"event": self.event, "url": self.url}
-        if self.secret:
+    def to_dict(self, *, include_secret: bool = False) -> dict[str, Any]:
+        """Serialise this webhook.
+
+        Default omits the HMAC ``secret`` entirely and reports only
+        ``has_secret: bool``. Callers that need to persist or re-sign a
+        payload MUST opt in with ``include_secret=True`` — a mistake here
+        exposes the shared secret to anyone who can read the webhooks
+        endpoint, which would let them forge signed payloads. See the
+        internal `_to_dict_persist` helper used by :func:`save_webhooks`.
+        """
+        out: dict[str, Any] = {
+            "event": self.event,
+            "url": self.url,
+            "has_secret": bool(self.secret),
+        }
+        if include_secret and self.secret:
             out["secret"] = self.secret
         if self.threshold_category:
             out["threshold_category"] = self.threshold_category
@@ -172,8 +185,11 @@ def save_webhooks(slug: str, hooks: Iterable[Webhook]) -> list[Webhook]:
         seen.add(key)
         cleaned.append(hook)
 
+    # Persistence needs the secret so signatures still verify on the next
+    # dispatch. The API-facing to_dict() strips it — those are the two
+    # distinct call sites for this helper.
     updated = job_config.set_override(
-        job, _WEBHOOKS_PATH, [h.to_dict() for h in cleaned]
+        job, _WEBHOOKS_PATH, [h.to_dict(include_secret=True) for h in cleaned]
     )
     job_config.save_job(updated)
     return cleaned
