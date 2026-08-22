@@ -258,6 +258,55 @@ def test_scraper_names_has_no_local_folder_entry(isolated):
     assert all("local" not in n.lower() for n in jc.SCRAPER_NAMES)
 
 
+def test_priority_names_extends_scraper_names_with_yt_dlp(isolated):
+    """PRIORITY_NAMES is the reorderable set (SCRAPER_NAMES + YT-DLP). The extra
+    name is intentionally OUT of SCRAPER_NAMES so the on/off contract stays
+    exactly what scrapers/UI already read."""
+    jc, _ = isolated
+    assert set(jc.SCRAPER_NAMES).issubset(set(jc.PRIORITY_NAMES))
+    assert "YT-DLP" in jc.PRIORITY_NAMES
+    assert "YT-DLP" not in jc.SCRAPER_NAMES
+
+
+def test_clean_scraper_priority_defaults_and_clamps(isolated):
+    """The projection helper is defensive: unknown names dropped, missing
+    weights back-filled with the default, out-of-range values clamped."""
+    jc, _ = isolated
+    # None → full-default block (deterministic PRIORITY_NAMES order, all default weight).
+    p = jc.clean_scraper_priority(None)
+    assert p["order"] == list(jc.PRIORITY_NAMES)
+    assert all(w == jc.PRIORITY_WEIGHT_DEFAULT for w in p["weights"].values())
+    # Partial user order → prefix wins, missing names appended in PRIORITY_NAMES order.
+    p = jc.clean_scraper_priority({"order": ["Web", "X.com", "not-a-scraper"],
+                                   "weights": {"Web": 99, "X.com": -3, "junk": 5}})
+    assert p["order"][0] == "Web" and p["order"][1] == "X.com"
+    assert set(p["order"]) == set(jc.PRIORITY_NAMES)
+    assert p["weights"]["Web"] == jc.PRIORITY_WEIGHT_MAX          # clamped up from 99
+    assert p["weights"]["X.com"] == jc.PRIORITY_WEIGHT_MIN        # clamped up from -3
+    assert "junk" not in p["weights"]                              # unknown dropped
+
+
+def test_resolve_env_emits_scraper_priority_json(isolated):
+    """A user-set override projects into SCRAPER_PRIORITY_JSON — the string the
+    supervisor consumes at spawn to decide agent order + weights."""
+    jc, _ = isolated
+    job = jc.create_job("P", subject="s")
+    job = jc.set_override(job, "scrapers.priority", {
+        "order": ["Web", "Gallery-DL", "X.com"],
+        "weights": {"Web": 9, "Gallery-DL": 4},
+    })
+    env = jc.resolve_env(job)
+    payload = json.loads(env["SCRAPER_PRIORITY_JSON"])
+    assert payload["order"][0] == "Web"
+    assert payload["order"][1] == "Gallery-DL"
+    assert payload["order"][2] == "X.com"
+    # Every PRIORITY_NAME is covered (including untouched ones defaulted).
+    assert set(payload["order"]) == set(jc.PRIORITY_NAMES)
+    assert payload["weights"]["Web"] == 9
+    assert payload["weights"]["Gallery-DL"] == 4
+    assert payload["weights"]["Civitai-Com"] == jc.PRIORITY_WEIGHT_DEFAULT
+
+
 # ── projection ───────────────────────────────────────────────────────────────
 
 def test_project_categories_uses_effective(isolated):
@@ -304,13 +353,18 @@ def test_enqueue_dequeue_and_order(isolated):
 
 
 def test_advance_promotes_head(isolated):
+    """v2: advance() ADDS the queue head to the active set (multi-active) —
+    the previous active job stays running. ``get_active_slug()`` still
+    returns the HEAD (first slug), so 'first' remains at the head after we
+    add 'second' as a second active job."""
     jc, _ = isolated
     for n in ("First", "Second"):
         jc.create_job(n)
     jc.set_active("first")
     jc.enqueue("second")
     assert jc.advance() == "second"
-    assert jc.get_active_slug() == "second"
+    assert jc.get_active_slug() == "first"                 # head unchanged
+    assert set(jc.get_active_slugs()) == {"first", "second"}
     assert jc.advance() is None
 
 
@@ -321,7 +375,9 @@ def test_advance_skips_orphaned_slug(isolated):
     jc.set_active("first")
     jc.enqueue("second"); jc.enqueue("third")
     (jc.jobs_dir() / "second.json").unlink()
+    # Advance skips the orphaned 'second' and adds 'third' to the active set.
     assert jc.advance() == "third"
+    assert set(jc.get_active_slugs()) == {"first", "third"}
 
 
 def test_delete_refuses_active_and_removes_from_queue(isolated):
@@ -485,6 +541,138 @@ def test_delete_unknown_preset_raises(isolated):
     jc, _ = isolated
     with pytest.raises(ValueError):
         jc.delete_preset("never_saved")
+
+
+# ── multi-active + per-job priority (v2) ─────────────────────────────────────
+
+def test_get_active_slugs_returns_head_and_full_list(isolated):
+    jc, _ = isolated
+    for n in ("A", "B"):
+        jc.create_job(n)
+    assert jc.get_active_slugs() == []
+    assert jc.get_active_slug() is None
+    jc.set_active("a")
+    assert jc.get_active_slugs() == ["a"]
+    assert jc.get_active_slug() == "a"
+
+
+def test_activate_additive_by_default(isolated):
+    jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a")
+    jc.activate("b")                     # additive
+    assert jc.get_active_slugs() == ["a", "b"]
+    assert jc.get_active_slug() == "a"   # head unchanged
+    # Re-activating an already-active slug is idempotent — no duplicate.
+    jc.activate("a")
+    assert jc.get_active_slugs() == ["a", "b"]
+
+
+def test_activate_exclusive_resets_active_set(isolated):
+    jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a")
+    jc.activate("b", exclusive=True)     # resets to [b]
+    assert jc.get_active_slugs() == ["b"]
+
+
+def test_deactivate_removes_from_active_set(isolated):
+    jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a"); jc.activate("b")
+    jc.deactivate("a")
+    assert jc.get_active_slugs() == ["b"]
+    jc.deactivate("a")                   # idempotent no-op
+    assert jc.get_active_slugs() == ["b"]
+
+
+def test_set_active_slugs_replaces_wholesale(isolated):
+    jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B"); jc.create_job("C")
+    jc.set_active_slugs(["a", "b", "c"])
+    assert jc.get_active_slugs() == ["a", "b", "c"]
+    jc.set_active_slugs(["c"])
+    assert jc.get_active_slugs() == ["c"]
+
+
+def test_set_active_slugs_rejects_unknown(isolated):
+    jc, _ = isolated
+    jc.create_job("A")
+    with pytest.raises(ValueError):
+        jc.set_active_slugs(["a", "ghost"])
+    # Active set must be untouched on rejection.
+    assert jc.get_active_slugs() == []
+
+
+def test_priority_default_and_clamp(isolated):
+    jc, _ = isolated
+    jc.create_job("A")
+    assert jc.get_job_priority("a") == jc.PRIORITY_WEIGHT_DEFAULT
+    assert jc.set_job_priority("a", 20) == jc.PRIORITY_WEIGHT_MAX
+    assert jc.set_job_priority("a", -3) == jc.PRIORITY_WEIGHT_MIN
+    assert jc.set_job_priority("a", 7) == 7
+    assert jc.get_job_priority("a") == 7
+
+
+def test_priority_rejects_unknown_slug(isolated):
+    jc, _ = isolated
+    with pytest.raises(ValueError):
+        jc.set_job_priority("ghost", 5)
+
+
+def test_index_migration_from_legacy_single_string(isolated, tmp_path):
+    """A legacy _index.json with string ``active`` must upgrade on read."""
+    jc, _ = isolated
+    jc.create_job("A")
+    jc.jobs_dir().mkdir(parents=True, exist_ok=True)
+    (jc.jobs_dir() / "_index.json").write_text(
+        json.dumps({"active": "a", "queue": ["b"]}), encoding="utf-8"
+    )
+    idx = jc.get_index()
+    assert idx["active"] == ["a"]                # coerced to list
+    assert idx["queue"] == ["b"]
+    assert idx["priority"] == {}
+
+
+def test_index_migration_priority_absent_defaults(isolated):
+    jc, _ = isolated
+    jc.create_job("A")
+    # No priority on disk → get_job_priority returns default.
+    assert jc.get_job_priority("a") == jc.PRIORITY_WEIGHT_DEFAULT
+
+
+def test_delete_refuses_any_active_slug(isolated):
+    """A job in the active SET (not just at the head) can't be deleted."""
+    jc, _ = isolated
+    jc.create_job("A"); jc.create_job("B")
+    jc.activate("a"); jc.activate("b")
+    with pytest.raises(ValueError):
+        jc.delete_job("b")                       # b is in the active set
+    jc.deactivate("b")
+    jc.delete_job("b")                           # now allowed
+
+
+def test_delete_removes_priority_entry(isolated):
+    jc, _ = isolated
+    jc.create_job("A")
+    jc.set_job_priority("a", 8)
+    jc.delete_job("a")
+    # Fresh get for a non-existent slug returns the DEFAULT weight (5).
+    assert jc.get_job_priority("a") == jc.PRIORITY_WEIGHT_DEFAULT
+
+
+def test_advance_adds_to_active_set(isolated):
+    """v2: advance is ADDITIVE — the queue head joins the active set rather
+    than replacing it."""
+    jc, _ = isolated
+    for n in ("A", "B", "C"):
+        jc.create_job(n)
+    jc.activate("a")
+    jc.enqueue("b"); jc.enqueue("c")
+    assert jc.advance() == "b"
+    assert set(jc.get_active_slugs()) == {"a", "b"}
+    assert jc.advance() == "c"
+    assert set(jc.get_active_slugs()) == {"a", "b", "c"}
 
 
 if __name__ == "__main__":
