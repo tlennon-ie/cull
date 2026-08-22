@@ -176,6 +176,51 @@ def test_signature_empty_secret_returns_empty_string(wd_env):
     assert wd.sign_body("", b"whatever") == ""
 
 
+# ── Secret exposure regression ───────────────────────────────────────────────
+
+def test_to_dict_default_omits_secret(wd_env):
+    """API surface must NEVER round-trip the signing secret.
+
+    A HIGH finding from an automated security review: `to_dict()` used to
+    include the secret verbatim, so anyone with GET access to the webhooks
+    endpoint could read it and forge signed payloads. Regression guard.
+    """
+    wd, _, _ = wd_env
+    h = wd.Webhook(event=wd.EVENT_JOB_COMPLETED, url="https://example.com/x", secret="topsecret")
+    api_view = h.to_dict()  # default = API-facing
+    assert "secret" not in api_view
+    assert api_view["has_secret"] is True
+    # No-secret hook flags has_secret False.
+    h2 = wd.Webhook(event=wd.EVENT_JOB_COMPLETED, url="https://example.com/y")
+    assert h2.to_dict()["has_secret"] is False
+
+
+def test_to_dict_include_secret_opt_in(wd_env):
+    """Internal callers (persistence, dispatch signing) can opt in."""
+    wd, _, _ = wd_env
+    h = wd.Webhook(event=wd.EVENT_JOB_COMPLETED, url="https://example.com/x", secret="topsecret")
+    persist_view = h.to_dict(include_secret=True)
+    assert persist_view.get("secret") == "topsecret"
+    assert persist_view["has_secret"] is True
+
+
+def test_save_webhooks_persists_secret_but_api_hides_it(wd_env):
+    """End-to-end: save persists the secret to disk so signing keeps working,
+    but list_webhooks + to_dict (the two paths behind GET) never surface it."""
+    wd, jc, _ = wd_env
+    _make_job(jc)
+    wd.save_webhooks("wt1", [
+        wd.Webhook(event=wd.EVENT_JOB_COMPLETED, url="https://example.com/z", secret="s3cr3t!"),
+    ])
+    # In-memory list still carries the secret (needed for signing on dispatch).
+    loaded = wd.list_webhooks("wt1")
+    assert loaded[0].secret == "s3cr3t!"
+    # But the API-facing view strips it — matches what the GET endpoint returns.
+    api_view = [h.to_dict() for h in loaded]
+    assert "secret" not in api_view[0]
+    assert api_view[0]["has_secret"] is True
+
+
 # ── Dispatch + retries ───────────────────────────────────────────────────────
 
 def test_dispatch_sends_signature_when_secret_set(wd_env):
