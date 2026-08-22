@@ -68,6 +68,7 @@ class OpenRouterVisionWorker(BaseVisionWorker):
             base_url=self.base_url,
             model=self.model_id,
             timeout=_resolve_timeout("OPENROUTER_TIMEOUT"),
+            provider="openrouter",
         )
 
     def banner(self) -> None:

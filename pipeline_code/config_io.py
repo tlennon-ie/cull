@@ -45,6 +45,7 @@ import job_config
 __all__ = [
     "PRESET_VERSION",
     "MAX_ENVELOPE_BYTES",
+    "SOFT_MAX_CATEGORIES",
     "ValidationError",
     "export_preset",
     "export_preset_bytes",
@@ -74,11 +75,28 @@ _INHERITABLE_KEYS: frozenset[str] = frozenset({
 })
 _MEDIA_TYPES: frozenset[str] = frozenset({"image", "video"})
 _MAX_MEDIA_EXTS: int = 40
-_CAPTION_STYLES: frozenset[str] = frozenset(
-    {"sd_prompt", "booru_tags", "natural_language"})
+# Source of truth for caption styles is vision_prompt so adding a new style
+# there (e.g. "motion" for video LoRA trainers) doesn't require a parallel
+# edit here.
+try:
+    import vision_prompt as _vp
+    _CAPTION_STYLES: frozenset[str] = frozenset(_vp.CAPTION_STYLES)
+except Exception:  # noqa: BLE001 - fallback keeps the validator strict
+    _CAPTION_STYLES = frozenset(
+        {"sd_prompt", "booru_tags", "natural_language", "motion"})
 _VISION_PROVIDERS: frozenset[str] = frozenset(job_config.VISION_PROVIDERS)
 
 # Caps mirror the dashboard validators (single contract, two call sites).
+# 12 categories is the RECOMMENDED ceiling — more than that swamps the vision
+# schema's enum + the UI grid becomes unusable — and the dashboard's own save
+# path (dashboard_enhanced._MAX_CATEGORIES) enforces it for new writes. The
+# import/envelope validator here keeps the older ``40`` ceiling so a preset
+# or job envelope carrying a pre-existing >12 category set from an older cull
+# still loads on upgrade — otherwise ``git pull`` on top of a hand-tuned
+# ``_presets.json`` (or a shared file from a friend) would refuse to import.
+# Callers that surface a soft-warning UI look at ``SOFT_MAX_CATEGORIES``.
+SOFT_MAX_CATEGORIES = 12
+_SOFT_MAX_CATEGORIES = SOFT_MAX_CATEGORIES  # legacy internal alias
 _MAX_CATEGORIES = 40
 _MAX_VISION_WORKERS = 64
 _MAX_LOCAL_FOLDERS = 32
@@ -128,13 +146,14 @@ def _require_object(value: Any, what: str) -> dict:
 
 # ── inheritable-config block validators (standalone port of the dashboard) ────
 
-def _validate_categories(cats: Any, *, required: bool) -> list[dict]:
+def _validate_categories(cats: Any, *, required: bool, cap: int | None = None) -> list[dict]:
+    limit = _MAX_CATEGORIES if cap is None else int(cap)
     if cats is None and not required:
         return []
     if not isinstance(cats, list) or (required and not cats):
         raise ValidationError("categories must be a non-empty list")
-    if len(cats) > _MAX_CATEGORIES:
-        raise ValidationError(f"too many categories (max {_MAX_CATEGORIES})")
+    if len(cats) > limit:
+        raise ValidationError(f"too many categories (max {limit})")
     seen: set[str] = set()
     cleaned: list[dict] = []
     for entry in cats:
@@ -166,9 +185,21 @@ def _validate_topic_filters(tf: Any) -> dict:
         if k not in allowed:
             raise ValidationError(f"unknown topic_filters key: {k!r}")
         if k in ("keywords_extra", "banned_keywords", "generation_hints"):
-            if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
-                raise ValidationError(f"topic_filters.{k} must be a list of strings")
-            out[k] = list(v)
+            # Each keyword field accepts EITHER the legacy list-of-strings
+            # (implicit OR of substring matches) OR a single query-expression
+            # string using AND/OR/NOT/parens (see topic_filter.parse_query).
+            # Both round-trip through _csv(): a list joins with commas, a
+            # string passes through verbatim.
+            if isinstance(v, str):
+                if len(v) > _MAX_RULES:
+                    raise ValidationError(
+                        f"topic_filters.{k} query too long (max {_MAX_RULES} chars)")
+                out[k] = v
+            elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+                out[k] = list(v)
+            else:
+                raise ValidationError(
+                    f"topic_filters.{k} must be a list of strings or a query string")
         elif k == "min_prompt_length":
             iv = _as_int(v, "topic_filters.min_prompt_length")
             if iv < 0 or iv > _MAX_PROMPT_LEN:
@@ -307,10 +338,86 @@ def _validate_local_imports(li: Any) -> list[dict]:
     return out
 
 
+def _validate_scraper_priority(p: Any) -> dict:
+    """Strict validator for the ``scrapers.priority`` block (order + weights).
+
+    Shape (both keys optional; missing → sensible default):
+      * ``order``: list of PRIORITY_NAMES entries (unknown names rejected,
+        duplicates rejected).
+      * ``weights``: name → int 1-10 map (unknown names rejected, non-integer
+        or out-of-range values rejected).
+
+    Mirrors ``job_config.clean_scraper_priority``'s coercion — but that helper
+    is deliberately silent about garbage (it's the projection path); this one
+    fails loud at the system boundary so a hostile envelope can't sneak past.
+    """
+    _require_object(p, "scrapers.priority")
+    allowed_names = set(job_config.PRIORITY_NAMES)
+    out: dict[str, Any] = {}
+    for k, v in p.items():
+        if k not in {"order", "weights"}:
+            raise ValidationError(f"unknown scrapers.priority key: {k!r}")
+        if k == "order":
+            if not isinstance(v, list):
+                raise ValidationError("scrapers.priority.order must be a list")
+            if len(v) > len(allowed_names):
+                raise ValidationError("scrapers.priority.order has too many entries")
+            seen: set[str] = set()
+            for name in v:
+                if not isinstance(name, str):
+                    raise ValidationError("scrapers.priority.order entries must be strings")
+                if name not in allowed_names:
+                    raise ValidationError(f"unknown scraper in priority.order: {name!r}")
+                if name in seen:
+                    raise ValidationError(f"duplicate scraper in priority.order: {name!r}")
+                seen.add(name)
+            out["order"] = list(v)
+        else:  # weights
+            if not isinstance(v, dict):
+                raise ValidationError("scrapers.priority.weights must be an object")
+            wmap: dict[str, int] = {}
+            for name, raw in v.items():
+                if name not in allowed_names:
+                    raise ValidationError(f"unknown scraper in priority.weights: {name!r}")
+                iv = _as_int(raw, f"scrapers.priority.weights[{name!r}]")
+                if not (job_config.PRIORITY_WEIGHT_MIN <= iv <= job_config.PRIORITY_WEIGHT_MAX):
+                    raise ValidationError(
+                        f"scrapers.priority.weights[{name!r}] out of range "
+                        f"({job_config.PRIORITY_WEIGHT_MIN}-{job_config.PRIORITY_WEIGHT_MAX})")
+                wmap[name] = iv
+            out["weights"] = wmap
+    return out
+
+
+def _validate_kohya_import(ki: Any) -> dict:
+    """Validate scrapers.kohya_import — a single per-job Kohya dataset root.
+
+    Shape mirrors the default preset in job_config._default_preset_cfg
+    (fields: enabled, dir, name, move, allow_flat). Same defensive path check
+    as local_imports; ``name`` reuses _LOCAL_NAME_RE so it can safely become a
+    filesystem component downstream.
+    """
+    _require_object(ki, "scrapers.kohya_import")
+    if _bad_path_str(ki.get("dir", "")):
+        raise ValidationError("scrapers.kohya_import.dir is not a valid path string")
+    name = ki.get("name", "kohya") or "kohya"
+    if not isinstance(name, str) or not _LOCAL_NAME_RE.match(name):
+        raise ValidationError(
+            "scrapers.kohya_import.name must match [A-Za-z0-9_-] (1-40 chars)")
+    return {
+        "enabled": bool(ki.get("enabled", False)),
+        "dir": str(ki.get("dir", "") or ""),
+        "name": name,
+        "move": bool(ki.get("move", False)),
+        "allow_flat": bool(ki.get("allow_flat", False)),
+    }
+
+
 def _validate_scrapers(s: Any) -> dict:
     _require_object(s, "scrapers")
     allowed = {"enabled", "x_accounts", "reddit_subreddits", "discord_channels_json",
-               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports"}
+               "civitai_domains", "gallery_dl", "yt_dlp", "local_imports",
+               "kohya_import", "priority"}
     out: dict[str, Any] = {}
     for k, v in s.items():
         if k not in allowed:
@@ -332,6 +439,10 @@ def _validate_scrapers(s: Any) -> dict:
             out[k] = _validate_gallery_dl(v)
         elif k == "yt_dlp":
             out[k] = _validate_yt_dlp(v)
+        elif k == "priority":
+            out[k] = _validate_scraper_priority(v)
+        elif k == "kohya_import":
+            out[k] = _validate_kohya_import(v)
         else:  # local_imports
             out[k] = _validate_local_imports(v)
     return out
@@ -425,18 +536,26 @@ def _validate_media(val: Any) -> dict:
     return out
 
 
-def validate_inheritable_cfg(cfg: Any, *, partial: bool) -> dict:
+def validate_inheritable_cfg(cfg: Any, *, partial: bool, category_cap: int | None = None) -> dict:
     """Validate a preset body (``partial=False``) or a job override map
     (``partial=True``); return a cleaned copy. Unknown top-level keys and bad
     block shapes raise :class:`ValidationError`. A full preset must carry
-    categories (they drive the schema enum)."""
+    categories (they drive the schema enum).
+
+    ``category_cap`` overrides the default category ceiling
+    (``_MAX_CATEGORIES``, the generous hard cap for envelope imports). The
+    dashboard's own PUT/POST paths pass ``_SOFT_MAX_CATEGORIES`` here so a
+    new save is refused above 12 while a legacy on-disk file still loads.
+    """
     _require_object(cfg, "config")
     out: dict[str, Any] = {}
     for key, value in cfg.items():
         if key not in _INHERITABLE_KEYS:
             raise ValidationError(f"unknown config key: {key!r}")
         if key == "categories":
-            out["categories"] = _validate_categories(value, required=not partial)
+            out["categories"] = _validate_categories(
+                value, required=not partial, cap=category_cap,
+            )
         elif key == "category_rules":
             if not isinstance(value, str):
                 raise ValidationError("category_rules must be a string")
