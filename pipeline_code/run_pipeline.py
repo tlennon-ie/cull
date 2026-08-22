@@ -100,6 +100,11 @@ STRUCTURAL_ENV_KEYS: tuple[str, ...] = (
     "GALLERY_DL_URLS", "GALLERY_DL_COOKIES_FILE", "GALLERY_DL_CONFIG_PATH",
     "GALLERY_DL_LIMIT_PER_URL",
     "YT_DLP_URLS", "YT_DLP_COOKIES", "YT_DLP_LIMIT",
+    # Kohya training-set feeder — a change to root/name/toggles/mode must restart
+    # the feeder so the new dataset path takes effect. KOHYA_POLL_INTERVAL is
+    # read live inside the feeder loop, so it's not structural.
+    "KOHYA_IMPORT_ENABLED", "KOHYA_IMPORT_DIR", "KOHYA_IMPORT_NAME",
+    "KOHYA_MOVE", "KOHYA_ALLOW_FLAT",
     "REQUIRE_PROMPT",
     "AUTO_CAPTION_ENABLED", "AUTO_CAPTION_STYLE", "AUTO_CAPTION_OVERWRITE",
 )
@@ -130,12 +135,18 @@ class AgentSpec:
     launched, so each agent can carry per-agent overrides (e.g. a civitai
     domain, a vision-worker's keepalive flag, or a local folder's
     LOCAL_IMPORT_DIR/NAME fanned out from LOCAL_IMPORTS_JSON).
+
+    In multi-active mode, ``slug`` names which per-slug base env this agent's
+    spawn should use as its base. ``None`` (the default) means "use the
+    supervisor's shared base env" — that's the shared vision fleet and every
+    single-active spawn.
     """
     label: str
     script: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     loop_sleep: int = 300  # seconds between respawns if the child exits on its own
+    slug: str | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -161,6 +172,40 @@ def vision_worker_list() -> list[str]:
         return [w.strip() for w in raw.split(",") if w.strip()]
     single = os.environ.get("PIPELINE_VISION_WORKER", "").strip()
     return [single] if single else []
+
+
+def _scraper_priority() -> dict:
+    """Parse SCRAPER_PRIORITY_JSON into ``{"order": [...], "weights": {...}}``.
+
+    Uses ``job_config.clean_scraper_priority`` so unknown names are dropped,
+    missing weights get PRIORITY_WEIGHT_DEFAULT, and every PRIORITY_NAME is
+    covered — the exact same shape the dashboard writes. Empty / malformed env
+    → the default (PRIORITY_NAMES order, every weight = PRIORITY_WEIGHT_DEFAULT).
+    """
+    raw = (os.environ.get("SCRAPER_PRIORITY_JSON", "") or "").strip()
+    if not raw:
+        return job_config.clean_scraper_priority(None)
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return job_config.clean_scraper_priority(None)
+    return job_config.clean_scraper_priority(data)
+
+
+def _apply_priority(agents: dict[str, "AgentSpec"]) -> dict[str, "AgentSpec"]:
+    """Re-order ``agents`` so the priority-list order wins at spawn time.
+
+    Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic Discord-N shards)
+    keep their relative insertion order behind the priority-ordered head. This
+    preserves the "top = fires first" contract without disturbing labels that
+    the priority block doesn't cover.
+    """
+    if not agents:
+        return agents
+    priority = _scraper_priority()
+    order = [n for n in priority.get("order", []) if n in agents]
+    trailing = [name for name in agents if name not in order]
+    return {name: agents[name] for name in (order + trailing)}
 
 
 def _local_import_folders() -> list[dict]:
@@ -197,9 +242,32 @@ def desired_active_slug() -> str | None:
     """The slug of the job the supervisor SHOULD be running, or None to idle.
 
     Thin wrapper over ``job_config.get_active_slug`` so the supervisor's
-    active-slug change detection has one named seam to test/mock.
+    active-slug change detection has one named seam to test/mock. Multi-active
+    callers should use :func:`desired_active_slugs` instead.
     """
     return job_config.get_active_slug()
+
+
+def desired_active_slugs() -> list[str]:
+    """Every slug the supervisor should be running (may be empty).
+
+    Multi-active reader — the supervisor iterates this to spawn per-slug
+    scrapers and to compute the shared vision fleet's active-slug env.
+    """
+    return job_config.get_active_slugs()
+
+
+def active_job_priorities() -> dict[str, int]:
+    """The per-slug priority map (defaults filled in for absent entries).
+
+    Returned map covers every currently-active slug — never missing, never
+    empty when there is at least one active slug — so the shared vision
+    fleet's round-robin schedule is deterministic.
+    """
+    priorities: dict[str, int] = {}
+    for slug in desired_active_slugs():
+        priorities[slug] = job_config.get_job_priority(slug)
+    return priorities
 
 
 def active_job_env(slug: str | None = None) -> dict[str, str] | None:
@@ -472,6 +540,22 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
             },
         ))
 
+    # Kohya-style training-set feeder. Gated identically to gallery-dl: only
+    # desired when both the toggle is on AND a dataset root is configured, so an
+    # empty config never respawns a broken agent every loop_sleep. The feeder
+    # walks ``<repeats>_<concept>`` subdirs and (optionally) flat Danbooru-style
+    # folders — see feed_kohya_folder.py.
+    if (
+        os.environ.get("KOHYA_IMPORT_ENABLED", "false").lower() == "true"
+        and (os.environ.get("KOHYA_IMPORT_DIR", "") or "").strip()
+    ):
+        _kohya_name = (os.environ.get("KOHYA_IMPORT_NAME", "") or "kohya").strip() or "kohya"
+        add(AgentSpec(
+            label=f"Kohya-{_kohya_name}",
+            script="feed_kohya_folder.py",
+            loop_sleep=3600,
+        ))
+
     # gallery-dl URL-based scraper (Pixiv, DeviantArt, booru sites, ArtStation,
     # Tumblr, Newgrounds, X, Reddit, Imgur, Flickr — anything gallery-dl knows).
     # Only desired when both the toggle is on AND at least one URL is configured;
@@ -505,7 +589,160 @@ def compute_desired_agents(topic: str) -> dict[str, AgentSpec]:
         if spec is not None:
             add(spec)
 
-    return agents
+    # Per-job priority: reorder the agents dict so the top-priority scraper
+    # spawns first. Non-priority labels (Local-*, Kohya-*, Vision-*, dynamic
+    # Discord-N > 1) keep their insertion order behind the priority head — see
+    # _apply_priority for the contract. Ordering is decided here so
+    # queue_manager stays untouched.
+    return _apply_priority(agents)
+
+
+# ── Multi-active helpers (shared vision fleet + per-slug scrapers) ────────────
+#
+# In the multi-active model the supervisor spawns:
+#   * one scraper subprocess per (active slug, scraper), labelled
+#     f"{slug}::{scraper}", each with the SLUG's resolved env; and
+#   * one shared vision-fleet subprocess per unique (provider, base_url, model)
+#     across every active slug's vision.workers, with PIPELINE_ACTIVE_SLUGS_JSON
+#     projected so queue_manager's shim pops weighted round-robin across the
+#     active slugs' queues.
+#
+# The active-slug JSON blob is the ONE new env contract:
+#   [[slug, weight], [slug, weight], …]
+# — read by queue_manager._active_slugs_from_env().
+
+def _scraper_agents_for_env(env: dict[str, str]) -> dict[str, AgentSpec]:
+    """Return only the SCRAPER agents (no vision workers) driven by ``env``.
+
+    Reuses :func:`compute_desired_agents` under a temporarily-overlaid
+    ``os.environ`` and strips vision-worker labels off the result.
+    ``compute_desired_agents`` was designed for a single active env; this
+    helper lets us call it once per active slug with that slug's env.
+    """
+    saved = {k: os.environ.get(k) for k in env}
+    try:
+        os.environ.update({k: str(v) for k, v in env.items() if v is not None})
+        # Force the registry-vision path OFF for the per-slug call: the shared
+        # fleet is built separately across all slugs' vision.workers.
+        os.environ["PIPELINE_VISION_WORKERS"] = ""
+        all_agents = compute_desired_agents(env.get("PIPELINE_TOPIC", "") or "")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return {label: spec for label, spec in all_agents.items()
+            if not label.startswith("Vision-")}
+
+
+def _shared_vision_fleet_specs(
+    slug_envs: dict[str, dict[str, str]],
+    priorities: dict[str, int],
+) -> list[AgentSpec]:
+    """Union the ``vision.workers`` from every active slug's env, deduped by
+    ``(provider, base_url, model)``, and return one ``AgentSpec`` per unique
+    endpoint carrying the shared multi-active projection env.
+
+    Each spec's ``env`` includes ``PIPELINE_ACTIVE_SLUGS_JSON`` so the worker's
+    queue-poll shim fair-shares across every active slug's queue by weight.
+    The Vision label matches the historic ``Vision-<name>`` scheme so the
+    supervisor's start/stop reconcile treats them like any other agent.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    labels_used: set[str] = set()
+    specs: list[AgentSpec] = []
+    active_json = json.dumps([[slug, int(priorities.get(slug, 1) or 1)]
+                              for slug in slug_envs.keys()])
+    for slug, env in slug_envs.items():
+        raw = (env.get("VISION_WORKERS_JSON", "") or "").strip()
+        if not raw:
+            continue
+        try:
+            fleet = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(fleet, list):
+            continue
+        for i, w in enumerate(fleet):
+            if not isinstance(w, dict):
+                continue
+            provider = str(w.get("provider", "") or "").strip().lower()
+            base_url = str(w.get("base_url", "") or "").strip()
+            model = str(w.get("model", "") or "").strip()
+            if provider not in _VISION_PROVIDER_SCRIPTS or not base_url:
+                continue
+            key = (provider, base_url, model)
+            if key in seen:
+                continue
+            seen.add(key)
+            name = (str(w.get("name", "") or w.get("id", "") or f"w{i}")).strip() or f"w{i}"
+            label = base = f"Vision-{name}"
+            n = 2
+            while label in labels_used:
+                label, n = f"{base}-{n}", n + 1
+            labels_used.add(label)
+            worker_env = {
+                "VISION_INSTANCE_ID": str(w.get("id", "") or name),
+                "VISION_INSTANCE_NAME": name,
+                # Multi-active projection: the queue-shim reads this to
+                # weighted-round-robin across active slugs' queues; the
+                # vision-worker base reads it to route sorted outputs by
+                # per-image slug rather than the (undefined) PIPELINE_SLUG.
+                "PIPELINE_ACTIVE_SLUGS_JSON": active_json,
+            }
+            api_key = str(w.get("api_key", "") or "")
+            if provider in ("lmstudio", "llamacpp"):
+                worker_env.update({"OPENAI_COMPAT_URL": base_url,
+                                   "OPENAI_COMPAT_MODEL": model,
+                                   "OPENAI_COMPAT_API_KEY": api_key})
+            else:  # ollama
+                worker_env.update({"OLLAMA_URL": base_url,
+                                   "OLLAMA_MODEL": model,
+                                   "OLLAMA_API_KEY": api_key})
+            specs.append(AgentSpec(
+                label=label,
+                script=_VISION_PROVIDER_SCRIPTS[provider],
+                env=worker_env,
+                loop_sleep=10,
+                slug=None,  # shared — spawned against the supervisor base env
+            ))
+    return specs
+
+
+def compute_desired_agents_multi(
+    slug_envs: dict[str, dict[str, str]],
+    priorities: dict[str, int],
+) -> dict[str, AgentSpec]:
+    """Combined desired-agent set across every active slug.
+
+    Layout of the returned dict:
+      * per-slug scrapers labelled ``"{slug}::{label}"`` (Local/Kohya/gallery-
+        dl/discord/etc. shards included), each tagged with ``spec.slug`` so
+        the supervisor spawns them under that slug's resolved env; then
+      * shared vision-fleet workers labelled ``Vision-<name>`` (deduped by
+        provider + base_url + model), each carrying PIPELINE_ACTIVE_SLUGS_JSON
+        for weighted-round-robin queue polling and per-image sorted-dir
+        routing.
+
+    Weights beyond the vision fleet's round-robin are TODO: for v1 the per-job
+    priority weight also LOGS an intended scraper-spawn intensity multiplier;
+    each scraper is its own subprocess whose per-source poll cadence is
+    unchanged. Real per-slug scraper throttling can attach here once the
+    vision fleet stops being the bottleneck.
+    """
+    combined: dict[str, AgentSpec] = {}
+    for slug, env in slug_envs.items():
+        scrapers = _scraper_agents_for_env(env)
+        for label, spec in scrapers.items():
+            prefixed = f"{slug}::{label}"
+            combined[prefixed] = AgentSpec(
+                label=prefixed, script=spec.script, args=list(spec.args),
+                env=dict(spec.env), loop_sleep=spec.loop_sleep, slug=slug,
+            )
+    for spec in _shared_vision_fleet_specs(slug_envs, priorities):
+        combined[spec.label] = spec
+    return combined
 
 
 # ── Supervisor ────────────────────────────────────────────────────────────────
@@ -514,14 +751,23 @@ class Supervisor:
     """Reconciles desired agents with actually-running subprocesses."""
 
     def __init__(self, topic: str, base_env: dict[str, str], log_file,
-                 job_slug: str | None = None) -> None:
+                 job_slug: str | None = None,
+                 job_slugs: list[str] | None = None) -> None:
         self.topic = topic
         self.base_env = base_env
         self.log_file = log_file
         # The job slug this supervisor is currently running. None in the legacy
         # CLI/topic path; set in the jobs path so we can detect when the
         # dashboard switches the active job and restart into the new one.
+        # In multi-active mode ``job_slugs`` holds the full list; ``job_slug``
+        # is the head for legacy readers. ``_slug_envs`` maps every active
+        # slug to its resolved spawn env (used by ``_spawn`` for slug-tagged
+        # agents; the shared vision fleet uses ``self.base_env``).
         self.job_slug = job_slug
+        self.job_slugs: list[str] = list(job_slugs) if job_slugs is not None \
+            else ([job_slug] if job_slug else [])
+        self._slug_envs: dict[str, dict[str, str]] = {}
+        self._slug_queue_dirs: dict[str, Path] = {}
         self._lock = threading.Lock()
         self._active: dict[str, subprocess.Popen] = {}  # label -> proc
         self._desired_snapshot: dict[str, AgentSpec] = {}
@@ -571,6 +817,82 @@ class Supervisor:
         except OSError:
             return 0.0
 
+    def _compute_desired_agents(self) -> dict[str, AgentSpec]:
+        """Route to the multi-active builder when >1 slug is active.
+
+        Single-slug (or legacy CLI/topic) supervisor runs keep hitting the
+        v1 ``compute_desired_agents`` so nothing changes there. As soon as
+        two or more jobs are active, ``compute_desired_agents_multi`` takes
+        over: per-slug scrapers with per-slug env, plus a shared vision
+        fleet fanned out across every slug's ``vision.workers`` (deduped by
+        provider+base_url+model) carrying PIPELINE_ACTIVE_SLUGS_JSON.
+        """
+        if len(self.job_slugs) > 1 and self._slug_envs:
+            priorities = {slug: max(1, int(env.get("_JOB_PRIORITY", "1") or 1))
+                          for slug, env in self._slug_envs.items()}
+            # Fall back to the live index priorities so tests / callers that
+            # don't populate the env sidecar still get weighted round-robin.
+            for slug in self.job_slugs:
+                if priorities.get(slug, 1) <= 1:
+                    priorities[slug] = job_config.get_job_priority(slug)
+            return compute_desired_agents_multi(self._slug_envs, priorities)
+        return compute_desired_agents(self.topic)
+
+    def _apply_active_slugs(self, slugs: list[str]) -> list[str]:
+        """Project EVERY active slug's env into ``self._slug_envs`` for spawn.
+
+        Returns the list of slugs that were successfully applied (missing
+        job files are skipped and logged). The supervisor's shared base_env
+        is updated with a ``PIPELINE_ACTIVE_SLUGS_JSON`` blob so any child
+        that reads the process env (queue_manager shim, shared vision fleet)
+        sees the multi-active projection without needing per-agent env.
+        """
+        applied: list[str] = []
+        self._slug_envs.clear()
+        self._slug_queue_dirs.clear()
+        priorities: list[list[Any]] = []
+        for slug in slugs:
+            job = job_config.get_job(slug)
+            if job is None:
+                logger.warning("multi-active: skipping unknown slug %r", slug)
+                continue
+            resolved = job_config.resolve_env(job)
+            queue_dir, sorted_dir = _prepare_slug_dirs(slug)
+            job_config.project_categories(job)
+            per_slug_env = {
+                **os.environ,
+                **resolved,
+                "PIPELINE_QUEUE": str(queue_dir),
+                "PIPELINE_SORTED": str(sorted_dir),
+            }
+            self._slug_envs[slug] = per_slug_env
+            self._slug_queue_dirs[slug] = queue_dir
+            weight = job_config.get_job_priority(slug)
+            priorities.append([slug, weight])
+            applied.append(slug)
+            # TODO(scalability): the per-job priority weight also implies
+            # scraper spawn intensity ("heavier weight → more turns per
+            # cycle"). For v1 we only wire it into the vision-fleet
+            # round-robin (via PIPELINE_ACTIVE_SLUGS_JSON) — the scraper
+            # spawn cadence remains per-source. Extend queue_manager /
+            # supervisor here to fair-share scraper starts by weight once
+            # the vision fleet stops being the bottleneck.
+            logger.info("multi-active: slug=%s weight=%d", slug, weight)
+        # Point spawn env + stale-.processing sweep at the active-set:
+        # PIPELINE_ACTIVE_SLUGS_JSON lets the shared vision fleet poll
+        # queues across every active slug via queue_manager's shim.
+        self.base_env = {
+            **self.base_env,
+            "PIPELINE_ACTIVE_SLUGS_JSON": json.dumps(priorities),
+        }
+        # Head-of-list stays the "primary" for legacy readers / the stale-
+        # .processing sweep (which only walks one queue dir).
+        self.job_slugs = applied
+        self.job_slug = applied[0] if applied else None
+        if applied:
+            self._queue_dir = self._slug_queue_dirs.get(applied[0])
+        return applied
+
     def _apply_active_job(self, slug: str) -> bool:
         """Project the job ``slug`` into the runtime env + taxonomy.
 
@@ -607,11 +929,26 @@ class Supervisor:
         self._queue_dir = queue_dir
         return True
 
+    def _base_env_for(self, spec: AgentSpec) -> dict[str, str]:
+        """Pick the base spawn env for ``spec``.
+
+        Multi-active: slug-tagged agents (per-slug scrapers) inherit their
+        own slug's resolved env from ``self._slug_envs`` so each scraper
+        sees the right PIPELINE_SLUG / PIPELINE_QUEUE / SCRAPER_DISABLED /
+        etc. The shared vision fleet has ``spec.slug is None`` and uses the
+        supervisor's ``self.base_env`` (which carries only global keys —
+        credentials, model endpoints — plus the PIPELINE_ACTIVE_SLUGS_JSON
+        the fleet-spec env layer sets per worker).
+        """
+        if spec.slug and spec.slug in self._slug_envs:
+            return self._slug_envs[spec.slug]
+        return self.base_env
+
     def _spawn(self, spec: AgentSpec) -> None:
         script_path = PIPELINE_CODE_DIR / spec.script
         # spec.env is merged OVER the base spawn env so per-agent overrides win
         # (civitai domain, vision keepalive flag, a local folder's LOCAL_IMPORT_*).
-        run_env = {**self.base_env, **spec.env}
+        run_env = {**self._base_env_for(spec), **spec.env}
         args = [PY, "-u", str(script_path)] + spec.args
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=run_env)
         self._active[spec.label] = proc
@@ -717,44 +1054,58 @@ class Supervisor:
         idx_mtime = self._current_jobs_index_mtime()
         if idx_mtime != self._jobs_index_mtime:
             self._jobs_index_mtime = idx_mtime
-            new_slug = desired_active_slug()
-            if not new_slug and self.job_slug:
-                # Active job cleared (dashboard stop / advance past end). Signal
-                # the run loop to exit so the top-level jobs driver terminates
-                # the children and returns to its idle wait. We do NOT auto-
-                # advance — the dashboard owns the queue.
+            new_slugs = desired_active_slugs()
+            if not new_slugs and self.job_slugs:
+                # Every active job cleared — stop the pipeline and idle.
+                self.job_slugs = []
                 self.job_slug = None
                 self._stop.set()
-                print("  [job-switch] active job cleared; stopping pipeline and idling",
+                print("  [job-switch] active jobs cleared; stopping pipeline and idling",
                       flush=True)
                 return
-            if new_slug:
-                slug_changed = new_slug != self.job_slug
-                if self._apply_active_job(new_slug):
-                    if slug_changed:
-                        structural_changed = True
-                        print(f"  [job-switch] active job -> {new_slug!r}; "
-                              "restarting children with its env + categories", flush=True)
-                    else:
-                        print(f"  [job-reload] active job {new_slug!r} config changed; "
+            if new_slugs:
+                slugs_changed = new_slugs != self.job_slugs
+                if len(new_slugs) > 1 or slugs_changed:
+                    # Multi-active path OR active-set membership changed → apply
+                    # the full active set and mark a structural restart if the
+                    # membership shifted (so children pick up the new spawn env).
+                    if self._apply_active_slugs(new_slugs):
+                        if slugs_changed:
+                            structural_changed = True
+                            print(f"  [job-switch] active set -> {new_slugs}; "
+                                  "restarting children with per-slug env + shared vision fleet",
+                                  flush=True)
+                        else:
+                            print(f"  [job-reload] active set {new_slugs} config changed; "
+                                  "re-projected env + categories", flush=True)
+                        self._categories_mtime = self._current_categories_mtime()
+                        new_struct = _structural_env_snapshot()
+                        if not slugs_changed and new_struct != self._struct_snapshot:
+                            structural_changed = True
+                            print("  [job-reload] structural key changed; soft-restarting children",
+                                  flush=True)
+                        self._struct_snapshot = new_struct
+                else:
+                    # Single-active path: preserve historic single-slug wiring
+                    # (the pre-existing _apply_active_job overlays os.environ so
+                    # compute_desired_agents sees the same view as v1 today).
+                    only = new_slugs[0]
+                    if self._apply_active_job(only):
+                        self.job_slugs = [only]
+                        print(f"  [job-reload] active job {only!r} config changed; "
                               "re-projected env + categories", flush=True)
-                    # Re-baseline the categories mtime so re-projecting (which
-                    # rewrote cull_categories.json with identical-or-new content)
-                    # doesn't double-trigger the categories watch below; the diff
-                    # against the OLD struct snapshot still drives a restart when
-                    # a structural key actually changed.
-                    self._categories_mtime = self._current_categories_mtime()
-                    new_struct = _structural_env_snapshot()
-                    if not slug_changed and new_struct != self._struct_snapshot:
-                        structural_changed = True
-                        print("  [job-reload] structural key changed; soft-restarting children",
-                              flush=True)
-                    self._struct_snapshot = new_struct
-                elif slug_changed:
-                    print(f"  [job-switch] active slug {new_slug!r} has no job file; "
-                          "ignoring", flush=True)
+                        self._categories_mtime = self._current_categories_mtime()
+                        new_struct = _structural_env_snapshot()
+                        if new_struct != self._struct_snapshot:
+                            structural_changed = True
+                            print("  [job-reload] structural key changed; soft-restarting children",
+                                  flush=True)
+                        self._struct_snapshot = new_struct
+                    else:
+                        print(f"  [job-switch] active slug {only!r} has no job file; "
+                              "ignoring", flush=True)
 
-        desired = compute_desired_agents(self.topic)
+        desired = self._compute_desired_agents()
         self._desired_snapshot = desired
 
         with self._lock:
@@ -908,46 +1259,87 @@ def run_topic(topic: str, vision_worker: str = "balanced-groq") -> None:
 # ── Jobs runner (default path) ─────────────────────────────────────────────────
 
 def run_active_job(slug: str, vision_worker: str = "balanced-groq") -> None:
-    """Run the active job ``slug`` under the supervisor.
+    """Run a single active job ``slug`` under the supervisor (legacy shim).
 
-    Projects the job into env + taxonomy, sets up its slug dirs, then hands the
-    Supervisor a ``job_slug`` so it watches ``_index.json`` and restarts itself
-    into a different job when the dashboard switches the active pointer — no
-    return to the idle loop needed for a job→job switch.
+    Kept for callers that still ask to run one specific slug. The dashboard-
+    driven multi-active loop is :func:`run_active_jobs`.
     """
-    job = job_config.get_job(slug)
-    if job is None:
-        print(f"  [jobs] active slug {slug!r} has no job file; skipping", flush=True)
+    run_active_jobs([slug], vision_worker=vision_worker)
+
+
+def run_active_jobs(slugs: list[str], vision_worker: str = "balanced-groq") -> None:
+    """Run one or more active jobs under a single Supervisor.
+
+    Single-slug case (``len(slugs) == 1``): projects that slug's env into
+    ``os.environ`` and reuses the historic single-active spawn path — the
+    Supervisor keeps its ``compute_desired_agents`` call unchanged.
+
+    Multi-slug case: each slug's env is prepared and held per-slug in the
+    Supervisor's ``_slug_envs`` map. The Supervisor spawns per-slug scrapers
+    (labelled ``"{slug}::{label}"``) plus a SHARED vision fleet (union across
+    all slugs' vision.workers, deduped by provider+base_url+model), the
+    fleet carrying PIPELINE_ACTIVE_SLUGS_JSON so its queue-poll shim fair-
+    shares across every active slug.
+    """
+    resolved_slugs = [s for s in slugs if job_config.get_job(s) is not None]
+    if not resolved_slugs:
+        print(f"  [jobs] no runnable slugs in {slugs!r}; skipping", flush=True)
         return
 
-    # Project the job down into the runtime contracts BEFORE we read env/taxonomy.
-    resolved = job_config.resolve_env(job)
-    os.environ.update(resolved)
-    job_config.project_categories(job)
+    head = resolved_slugs[0]
+    head_job = job_config.get_job(head)
 
-    topic = resolved.get("PIPELINE_TOPIC", "") or job.name
+    # For the SINGLE-slug case we keep the historic wiring (env projected into
+    # os.environ) so compute_desired_agents' env-reading path is unchanged.
+    single = len(resolved_slugs) == 1
+    if single:
+        resolved = job_config.resolve_env(head_job)
+        os.environ.update(resolved)
+        job_config.project_categories(head_job)
+        topic = resolved.get("PIPELINE_TOPIC", "") or head_job.name
+    else:
+        topic = head_job.name
+        # Multi-active: DO NOT overlay any one slug's env on os.environ — each
+        # slug's env is passed per-agent via _slug_envs. Still project the
+        # HEAD job's taxonomy so cull_categories.json isn't empty (the shared
+        # vision fleet reads schema from that file). Subsequent slugs' per-
+        # image sorted routing uses the queue-slug path derivation.
+        job_config.project_categories(head_job)
+
     print(f"\n{'=' * 60}", flush=True)
-    print(f"=== JOB: {job.name} (slug: {slug}) ===", flush=True)
+    if single:
+        print(f"=== JOB: {head_job.name} (slug: {head}) ===", flush=True)
+    else:
+        print(f"=== ACTIVE JOBS ({len(resolved_slugs)}): "
+              f"{', '.join(resolved_slugs)} ===", flush=True)
     print(f"=== TOPIC: {topic} ===", flush=True)
-    print(f"=== VISION WORKER LIST: {vision_worker_list() or [vision_worker]} ===", flush=True)
+    print(f"=== VISION WORKER LIST: {vision_worker_list() or [vision_worker]} ===",
+          flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
-    queue_dir, sorted_dir = _prepare_slug_dirs(slug)
-    log_file = _open_slug_log(slug)
+    queue_dir, sorted_dir = _prepare_slug_dirs(head)
+    log_file = _open_slug_log(head)
 
     base_env = {
         "PYTHONUTF8": "1",
         "PYTHONUNBUFFERED": "1",
         "PIPELINE_QUEUE": str(queue_dir),
         "PIPELINE_SORTED": str(sorted_dir),
-        **os.environ,  # already carries the resolved job env (PIPELINE_TOPIC/SLUG/…)
+        **os.environ,
     }
 
     if not vision_worker_list() and vision_worker:
         os.environ["PIPELINE_VISION_WORKERS"] = vision_worker
 
-    supervisor = Supervisor(topic=topic, base_env=base_env, log_file=log_file, job_slug=slug)
+    supervisor = Supervisor(
+        topic=topic, base_env=base_env, log_file=log_file,
+        job_slug=head, job_slugs=resolved_slugs,
+    )
     supervisor._queue_dir = queue_dir
+    if not single:
+        # Prime per-slug env + PIPELINE_ACTIVE_SLUGS_JSON before the first
+        # reconcile so the initial spawn is multi-active-aware.
+        supervisor._apply_active_slugs(resolved_slugs)
     _install_sigint(supervisor)
 
     try:
@@ -957,18 +1349,20 @@ def run_active_job(slug: str, vision_worker: str = "balanced-groq") -> None:
 
 
 def run_jobs_loop(vision_worker: str = "balanced-groq") -> None:
-    """Top-level driver for the jobs model.
+    """Top-level driver for the jobs model — multi-active aware.
 
-    Idles gracefully while no job is active (watching ``_index.json`` for one to
-    appear), then runs the active job. ``run_active_job`` handles job→job
-    switches internally via the supervisor's index watch; this loop only regains
-    control when the active job is *cleared* (stop / advance-past-end), at which
-    point it idles again. The dashboard drives advance — we never auto-advance.
+    Idles gracefully while no job is active (watching ``_index.json`` for one
+    to appear), then hands the whole active set to :func:`run_active_jobs`.
+    Job-set changes are handled inside the supervisor's index watch (see
+    :meth:`Supervisor.reconcile`); this loop only regains control when the
+    active set is *cleared* (stop / advance-past-end), at which point it
+    idles again. The dashboard drives activate/deactivate/advance — this
+    loop never auto-advances.
     """
     announced_idle = False
     while True:
-        slug = desired_active_slug()
-        if not slug:
+        slugs = desired_active_slugs()
+        if not slugs:
             if not announced_idle:
                 print("  [jobs] no active job; waiting for the dashboard to "
                       "activate one...", flush=True)
@@ -980,16 +1374,16 @@ def run_jobs_loop(vision_worker: str = "balanced-groq") -> None:
                 return
             continue
         announced_idle = False
-        if job_config.get_job(slug) is None:
-            # Orphaned active pointer — don't spin hot; wait for the dashboard to
-            # fix it (advance() skips orphans, so this is a transient state).
-            print(f"  [jobs] active slug {slug!r} has no job file; waiting...", flush=True)
+        runnable = [s for s in slugs if job_config.get_job(s) is not None]
+        if not runnable:
+            print(f"  [jobs] active slugs {slugs!r} have no job files; waiting...",
+                  flush=True)
             try:
                 time.sleep(IDLE_POLL_SECONDS)
             except KeyboardInterrupt:
                 return
             continue
-        run_active_job(slug, vision_worker=vision_worker)
+        run_active_jobs(runnable, vision_worker=vision_worker)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

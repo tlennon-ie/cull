@@ -6,7 +6,7 @@ scraper_x.py - Scrape X.com for image/media posts
 - Handles JSON prompts, XML/role prompts, plain text prompts
 - Saves to source-based queue using queue_manager for balanced processing
 """
-import asyncio, json, re, hashlib, os, requests, tempfile
+import asyncio, json, re, hashlib, os, requests, tempfile, time
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -22,6 +22,7 @@ import media_policy
 _TOPIC_CFG = _load_topic_config()
 from paths import base_dir
 from rate_limit import RateLimitConfig, RateLimiter
+from credentials import get_optional as _cred_optional
 
 # Per-source pacing + 429 backoff + optional proxy for the requests-based image
 # downloads (page scraping is Playwright). Opt-in: unthrottled unless
@@ -51,20 +52,149 @@ from seen_store import SeenStore  # noqa: E402
 _SEEN_NAME = "x"
 
 
+# X.com rebranded from twitter.com in 2023 and continues to serve pages under
+# both hostnames — depending on how a user copied their cookies (from an
+# x.com session, a twitter.com session, or a Netscape cookies.txt export)
+# the ``Domain`` attribute could legitimately be either ``.x.com`` or
+# ``.twitter.com``. Playwright ONLY sends a cookie whose ``domain`` matches the
+# request's host, so setting a single domain silently loses cookies for the
+# other. Fix: emit each parsed cookie for BOTH domains. Costs nothing (the
+# browser deduplicates by (name, domain)); makes the scraper robust to
+# whichever domain the user's session came from.
+_X_COOKIE_DOMAINS: tuple[str, ...] = (".x.com", ".twitter.com")
+
+
+def _cookie_entries(name: str, value: str) -> list[dict]:
+    """Emit one Playwright cookie entry per X-family domain."""
+    return [
+        {"name": name, "value": value, "domain": domain, "path": "/"}
+        for domain in _X_COOKIE_DOMAINS
+    ]
+
+
 def _parse_twitter_cookies(raw: str) -> list[dict]:
-    """Parse `name=value; name=value;` into Playwright cookie dicts."""
+    """Parse a raw ``name=value; name=value;`` header into Playwright cookies.
+
+    Tolerates a leading ``Cookie:`` prefix (users often paste the whole request
+    header line, header name and all) and skips malformed pairs quietly instead
+    of crashing the scraper on a single stray semicolon.
+    """
+    raw = (raw or "").strip()
+    if raw[:7].lower() == "cookie:":
+        raw = raw[7:].strip()
     cookies: list[dict] = []
     for chunk in (c.strip() for c in raw.split(";") if c.strip()):
         if "=" not in chunk:
             continue
         name, value = chunk.split("=", 1)
-        cookies.append({"name": name.strip(), "value": value.strip(), "domain": ".x.com", "path": "/"})
+        name = name.strip()
+        if not name or " " in name:
+            continue
+        cookies.extend(_cookie_entries(name, value.strip()))
     return cookies
 
 
-X_COOKIES: list[dict] = _parse_twitter_cookies(os.environ.get("TWITTER_COOKIES", ""))
-if not X_COOKIES:
-    print("[scraper_x] WARNING: TWITTER_COOKIES empty in .env — X.com scraping will likely fail", flush=True)
+def _load_netscape_cookies_x(path: str) -> list[dict]:
+    """Load Playwright cookies from a Netscape cookies.txt file.
+
+    Used when ``X_COOKIES_TXT`` is set — preferred over the raw
+    ``TWITTER_COOKIES`` string because a cookies.txt export carries the
+    per-cookie ``Domain`` and ``expires`` attributes (so the scraper stops
+    guessing whether a session cookie belongs to ``.x.com`` or ``.twitter.com``,
+    and can surface an early ``expired`` warning). Malformed lines are logged
+    and skipped; a completely unreadable file drops back to an empty list so
+    the scraper degrades to search-only mode rather than crashing.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(path).expanduser()
+    if not p.is_file():
+        print(f"[scraper_x] X_COOKIES_TXT path is not a file: {p}", flush=True)
+        return []
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"[scraper_x] cannot read X_COOKIES_TXT ({p}): {exc}", flush=True)
+        return []
+
+    now = int(time.time())
+    cookies: list[dict] = []
+    expired_seen = 0
+    parsed = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        parsed += 1
+        try:
+            expires = int(parts[4])
+        except ValueError:
+            expires = 0
+        name = parts[5].strip()
+        value = parts[6].strip()
+        if not name:
+            continue
+        # Skip clearly-expired cookies; if they're relevant to auth_token/ct0
+        # the summary print will flag it.
+        if expires > 0 and expires < now:
+            expired_seen += 1
+            continue
+        # Ignore the source domain — apply to both x.com and twitter.com for
+        # the same reason as _cookie_entries. Users who exported from one
+        # domain still get cookies attached to the other.
+        cookies.extend(_cookie_entries(name, value))
+    if expired_seen:
+        print(
+            f"[scraper_x] {expired_seen} cookies in {p.name} are already expired "
+            "— re-export from your browser if X.com scraping fails",
+            flush=True,
+        )
+    if parsed == 0:
+        print(f"[scraper_x] {p.name} parsed no Netscape cookie rows — check the file format", flush=True)
+    return cookies
+
+
+def _load_x_cookies() -> tuple[list[dict], str]:
+    """Load X.com cookies from either ``X_COOKIES_TXT`` (preferred) or the
+    inline ``TWITTER_COOKIES`` header. Returns (playwright_cookies, source_label).
+    """
+    txt_path = _cred_optional("X_COOKIES_TXT")
+    if txt_path:
+        cookies = _load_netscape_cookies_x(txt_path)
+        return cookies, f"X_COOKIES_TXT ({txt_path})"
+    raw = _cred_optional("TWITTER_COOKIES") or ""
+    return _parse_twitter_cookies(raw), "TWITTER_COOKIES env"
+
+
+X_COOKIES, _X_COOKIE_SOURCE = _load_x_cookies()
+if X_COOKIES:
+    # Two entries per cookie name (one per domain) — collapse for the count.
+    _unique_names = {c["name"] for c in X_COOKIES}
+    _has_auth = "auth_token" in _unique_names
+    _has_ct0 = "ct0" in _unique_names
+    _missing = [n for n, ok in (("auth_token", _has_auth), ("ct0", _has_ct0)) if not ok]
+    if _missing:
+        print(
+            f"[scraper_x] cookies from {_X_COOKIE_SOURCE} missing required "
+            f"name(s): {', '.join(_missing)} — X.com will refuse the session",
+            flush=True,
+        )
+    else:
+        print(
+            f"[scraper_x] loaded {len(_unique_names)} cookies from {_X_COOKIE_SOURCE} "
+            f"(applied to {', '.join(_X_COOKIE_DOMAINS)})",
+            flush=True,
+        )
+else:
+    print(
+        "[scraper_x] WARNING: no X cookies loaded — set TWITTER_COOKIES (paste "
+        "the full Cookie header from a logged-in x.com tab) or X_COOKIES_TXT "
+        "(path to a Netscape cookies.txt export). X.com scraping will fail.",
+        flush=True,
+    )
 
 
 # ── Topic-aware search query generator ──────────────────────────────────────
@@ -258,6 +388,47 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
         return False
 
 
+_AUTH_FAIL_ANNOUNCED = False
+
+
+def _looks_like_login_page(url: str) -> bool:
+    """True if Playwright navigated to X's login/flow page instead of content.
+
+    X redirects unauthenticated requests to ``/i/flow/login`` or ``/login``.
+    Catching this early lets us print a single, actionable AUTH FAILURE
+    message rather than letting every subsequent scrape return zero results.
+    """
+    if not url:
+        return False
+    low = url.lower()
+    return (
+        "/i/flow/login" in low
+        or low.rstrip("/").endswith("/login")
+        or "/i/flow/signup" in low
+    )
+
+
+def _announce_auth_failure(context: str) -> None:
+    """Print the standard AUTH FAILURE line once per process.
+
+    The supervisor's stdout capture surfaces this in the dashboard's log tab
+    (see pipeline_logging.py comment) — the phrasing ("AUTH FAILURE for X.com")
+    is deliberately fixed so we can grep for it across scrapers.
+    """
+    global _AUTH_FAIL_ANNOUNCED
+    if _AUTH_FAIL_ANNOUNCED:
+        return
+    _AUTH_FAIL_ANNOUNCED = True
+    print(
+        f"AUTH FAILURE for X.com: {context}. "
+        "Cookies are missing/invalid/expired — re-copy the full Cookie header "
+        "from a logged-in x.com tab into Global Settings > TWITTER_COOKIES (or "
+        "point X_COOKIES_TXT at a fresh Netscape cookies.txt export) and "
+        "re-test in Global Settings.",
+        flush=True,
+    )
+
+
 # ── Extract tweet images from a search/timeline page ───────────────────────
 async def collect_tweet_ids_from_page(page) -> list:
     """Return list of {tweet_id, author, img_srcs} from currently visible page."""
@@ -297,6 +468,13 @@ async def scrape_tweet_page(ctx, tweet_id: str, author: str, seen: set, saved_co
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(2.5)
+
+        # If cookies didn't authenticate us, X redirects to /i/flow/login.
+        # Print a single AUTH FAILURE line and bail — every downstream selector
+        # will otherwise miss and log a torrent of noise.
+        if _looks_like_login_page(page.url):
+            _announce_auth_failure(f"redirected to login while opening tweet {tweet_id}")
+            return
 
         # ── Grab all text in the tweet (body + expand "Show more" if present) ──
         show_more = await page.query_selector('[data-testid="tweet-text-show-more-link"]')
@@ -378,6 +556,12 @@ async def scrape_search(ctx, query: str, seen: set, saved_count: list):
         await page.close()
         return
 
+    # Search results silently redirect to /login when cookies are stale.
+    if _looks_like_login_page(page.url):
+        _announce_auth_failure(f"redirected to login while opening search '{query[:60]}'")
+        await page.close()
+        return
+
     collected = {}  # tweet_id -> author
     for _ in range(SCROLL_ROUNDS):
         items = await collect_tweet_ids_from_page(page)
@@ -413,6 +597,11 @@ async def scrape_account(ctx, handle: str, seen: set, saved_count: list):
         await asyncio.sleep(5)  # media tab needs extra time to hydrate
     except Exception as e:
         print(f"  Nav error @{handle}: {e}")
+        await page.close()
+        return
+
+    if _looks_like_login_page(page.url):
+        _announce_auth_failure(f"redirected to login while opening @{handle}/media")
         await page.close()
         return
 
