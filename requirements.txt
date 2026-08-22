@@ -19,7 +19,7 @@ python-dotenv>=1.0.1
 requests>=2.32                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.32
 
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
-groq>=0.20                        # Groq cloud worker
+groq>=1.5.0                        # Groq cloud worker
 openai>=1.40                      # OpenAI + OpenRouter cloud vision workers
 anthropic>=0.112.0                # Anthropic Claude cloud vision worker
 google-genai>=1.0                 # Gemini cloud vision worker (NEW SDK, not google-generativeai)
