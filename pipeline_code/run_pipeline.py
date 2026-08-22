@@ -151,6 +151,51 @@ class AgentSpec:
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def _notify_scraper_auth_failed(spec: "AgentSpec", returncode: int) -> None:
+    """Fire ``job.scraper_auth_failed`` webhooks. Never raises.
+
+    Lazy-imports ``webhook_dispatcher`` so a supervisor started in a stripped
+    environment (missing Flask etc.) still boots cleanly.
+    """
+    try:
+        import webhook_dispatcher  # noqa: PLC0415 - lazy to keep boot lean
+    except Exception:  # noqa: BLE001
+        return
+    active_slugs: list[str] = []
+    if spec.slug:
+        active_slugs.append(spec.slug)
+    else:
+        try:
+            active_slugs = list(job_config.get_active_slugs())
+        except Exception:  # noqa: BLE001
+            active_slugs = []
+    for slug in active_slugs:
+        try:
+            webhook_dispatcher.dispatch(
+                webhook_dispatcher.EVENT_SCRAPER_AUTH_FAILED,
+                slug,
+                {"scraper": spec.label, "exit_code": int(returncode)},
+            )
+        except Exception:  # noqa: BLE001 - best-effort
+            continue
+
+
+def _notify_job_completed(slug: str, *, reason: str = "queue-drained") -> None:
+    """Fire ``job.completed`` for ``slug`` — best-effort, never raises."""
+    try:
+        import webhook_dispatcher  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        webhook_dispatcher.dispatch(
+            webhook_dispatcher.EVENT_JOB_COMPLETED,
+            slug,
+            {"reason": reason},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def topic_slug(topic: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_")
 
@@ -1131,6 +1176,11 @@ class Supervisor:
                         f"next respawn in {int(cooldown)}s",
                         flush=True,
                     )
+                    # Best-effort: notify subscribers when a scraper exits with
+                    # ``MissingCredentialError`` (EX_CONFIG / 78). Never let the
+                    # notification fail the reconcile tick.
+                    if proc.returncode == 78 and spec is not None:
+                        _notify_scraper_auth_failed(spec, proc.returncode)
 
             # Start anything desired that isn't active and isn't cooling down.
             now = time.monotonic()
