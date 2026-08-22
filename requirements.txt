@@ -34,7 +34,7 @@ gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@v1.32.4
 yt-dlp>=2026.6.9                  # video scraping lane (scraper_yt_dlp.py)
 
 # ── Dataset export ───────────────────────────────────────────────────────
-huggingface_hub>=1.21.0           # push curated sets to a private HF dataset repo (hf_export.py)
+huggingface_hub>=1.22.0           # push curated sets to a private HF dataset repo (hf_export.py)
 
 # ── Bundled ffmpeg (for the video lane) ──────────────────────────────────
 # imageio-ffmpeg ships a static ffmpeg binary via pip (~5MB, cross-platform).
