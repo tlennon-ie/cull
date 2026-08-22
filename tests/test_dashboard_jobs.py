@@ -829,5 +829,82 @@ def test_preset_put_rejects_non_http_vision_url(client):
     assert r.status_code == 400
 
 
+# ── multi-active endpoints (v2) ──────────────────────────────────────────────
+
+def test_jobs_list_exposes_active_slugs_and_priority(client):
+    c, jc, _tmp = client
+    c.post("/api/jobs", json={"name": "Alpha"})
+    c.post("/api/jobs", json={"name": "Beta"})
+    c.post("/api/jobs/alpha/activate")
+    c.post("/api/jobs/beta/activate")
+    body = c.get("/api/jobs").get_json()
+    assert body["active"] == "alpha"                          # legacy head
+    assert body["active_slugs"] == ["alpha", "beta"]          # v2 list
+    assert "priority" in body and isinstance(body["priority"], dict)
+    cards = {j["slug"]: j for j in body["jobs"]}
+    assert cards["alpha"]["is_active"] is True                # both cards active
+    assert cards["beta"]["is_active"] is True
+    assert cards["alpha"]["priority"] == jc.PRIORITY_WEIGHT_DEFAULT
+
+
+def test_activate_additive_via_endpoint(client):
+    c, jc, _tmp = client
+    c.post("/api/jobs", json={"name": "A"})
+    c.post("/api/jobs", json={"name": "B"})
+    c.post("/api/jobs/a/activate")
+    c.post("/api/jobs/b/activate")
+    assert jc.get_active_slugs() == ["a", "b"]
+
+
+def test_activate_exclusive_query_resets_active_set(client):
+    c, jc, _tmp = client
+    c.post("/api/jobs", json={"name": "A"})
+    c.post("/api/jobs", json={"name": "B"})
+    c.post("/api/jobs/a/activate")
+    c.post("/api/jobs/b/activate?exclusive=true")
+    assert jc.get_active_slugs() == ["b"]
+
+
+def test_deactivate_removes_from_active_set(client):
+    c, jc, _tmp = client
+    c.post("/api/jobs", json={"name": "A"})
+    c.post("/api/jobs", json={"name": "B"})
+    c.post("/api/jobs/a/activate")
+    c.post("/api/jobs/b/activate")
+    r = c.post("/api/jobs/a/deactivate")
+    assert r.status_code == 200
+    assert r.get_json()["active_slugs"] == ["b"]
+    assert jc.get_active_slugs() == ["b"]
+
+
+def test_priority_endpoint_clamps_and_returns_stored(client):
+    c, jc, _tmp = client
+    c.post("/api/jobs", json={"name": "A"})
+    r = c.put("/api/jobs/a/priority", json={"weight": 99})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["weight"] == jc.PRIORITY_WEIGHT_MAX
+    assert jc.get_job_priority("a") == jc.PRIORITY_WEIGHT_MAX
+    # Round-trip: the /api/jobs card echoes it.
+    body = c.get("/api/jobs").get_json()
+    cards = {j["slug"]: j for j in body["jobs"]}
+    assert cards["a"]["priority"] == jc.PRIORITY_WEIGHT_MAX
+
+
+def test_priority_endpoint_rejects_bad_body(client):
+    c, _jc, _tmp = client
+    c.post("/api/jobs", json={"name": "A"})
+    r = c.put("/api/jobs/a/priority", json={})
+    assert r.status_code == 400
+    r = c.put("/api/jobs/a/priority", json={"weight": "not-int"})
+    assert r.status_code == 400
+
+
+def test_deactivate_unknown_job_404(client):
+    c, _jc, _tmp = client
+    r = c.post("/api/jobs/ghost/deactivate")
+    assert r.status_code == 404
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

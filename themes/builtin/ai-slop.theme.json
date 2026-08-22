@@ -1,0 +1,28 @@
+{
+  "name": "ai-slop",
+  "font_family": "Space Grotesk, ui-sans-serif, system-ui, sans-serif",
+  "vars": {
+    "--color-bg": "#0a0014",
+    "--color-bg-elev": "#12001f",
+    "--color-fg": "#f2e6ff",
+    "--color-fg-muted": "#a78bfa",
+    "--color-surface": "rgba(24, 0, 40, 0.85)",
+    "--color-surface-alt": "#1a0033",
+    "--color-border": "rgba(139, 92, 246, 0.35)",
+    "--color-border-strong": "#8b5cf6",
+    "--color-accent": "#e879f9",
+    "--color-accent-hover": "#d946ef",
+    "--color-accent-fg": "#0a0014",
+    "--color-success": "#22d3ee",
+    "--color-success-fg": "#0a0014",
+    "--color-warn": "#fde047",
+    "--color-warn-fg": "#0a0014",
+    "--color-danger": "#ff2d95",
+    "--color-danger-fg": "#0a0014",
+    "--color-input-bg": "#1a0033",
+    "--color-input-fg": "#f2e6ff",
+    "--color-input-placeholder": "#a78bfa",
+    "--color-pill-bg": "rgba(232, 121, 249, 0.15)",
+    "--color-pill-fg": "#f0abfc"
+  }
+}

@@ -53,6 +53,16 @@ logger = logging.getLogger(__name__)
 
 DB_FILENAME = "cull_index.sqlite3"
 IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+# Video containers the indexer surfaces so gallery / historical / insights show
+# them alongside stills. Mirrors ``video_frames.VIDEO_EXT`` and the queue-manager
+# video globs so all three stay in lockstep — a file the queue can pop must be
+# indexable, and an indexed row must survive its "does this path still resolve
+# to a media file" checks in the API layer.
+VIDEO_EXTS: frozenset[str] = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"})
+# Union used by every filesystem scan below. Callers that need to distinguish
+# stills from clips (thumbnail generation, PIL-only ops) still branch on
+# ``IMAGE_EXTS`` / ``VIDEO_EXTS`` explicitly.
+MEDIA_EXTS: frozenset[str] = IMAGE_EXTS | VIDEO_EXTS
 
 # Per-thread connections so each Flask request handler / indexer thread has
 # its own connection without locking each other out.
@@ -489,8 +499,20 @@ def get_meta(key: str) -> str | None:
 # index; if missing or stale, read the .vision.json + .txt and upsert. After
 # the scan, delete index rows whose path no longer exists on disk.
 
-def _is_image(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_EXTS
+def _is_media(path: Path) -> bool:
+    """True for any file the indexer should ingest — stills OR video clips.
+
+    Video containers land in the same SQLite table as images so the gallery,
+    historical view, and insights surface them uniformly. ``width`` / ``height``
+    fall back to ``0`` for videos (PIL can't probe them without a frame-extract
+    backend, and ``_resolve_image_dims`` already tolerates the zero case).
+    """
+    return path.suffix.lower() in MEDIA_EXTS
+
+
+# Back-compat alias for external callers that imported ``_is_image``. Kept as an
+# alias (not a copy) so a future rename in one place doesn't silently diverge.
+_is_image = _is_media
 
 
 def _is_in_archive(path: Path) -> bool:
@@ -539,8 +561,14 @@ def _row_for_sorted(image_path: Path, sorted_root: Path) -> dict[str, Any] | Non
         int(payload["height"]) if "height" in payload else None,
     )
     if width is None or height is None:
-        # Backfill dimensions once; PIL is slow but only fires on new rows.
-        width, height = _resolve_dims(image_path)
+        # Videos: skip PIL (it can't decode containers) and record 0 dimensions.
+        # The dashboard's ``_resolve_image_dims`` treats 0 as "unknown" and hides
+        # the resolution chip — that's the right UX for a clip anyway.
+        if image_path.suffix.lower() in VIDEO_EXTS:
+            width, height = 0, 0
+        else:
+            # Backfill dimensions once; PIL is slow but only fires on new rows.
+            width, height = _resolve_dims(image_path)
     try:
         stat = image_path.stat()
     except OSError:
@@ -702,7 +730,7 @@ def scan(
     try:
         if sorted_root.exists():
             for image_path in sorted_root.glob("**/*"):
-                if not _is_image(image_path) or _is_in_archive(image_path):
+                if not _is_media(image_path) or _is_in_archive(image_path):
                     continue
                 _ingest(
                     image_path,
@@ -712,7 +740,7 @@ def scan(
 
         if queue_root.exists():
             for image_path in queue_root.glob("**/*"):
-                if not _is_image(image_path) or _is_in_archive(image_path):
+                if not _is_media(image_path) or _is_in_archive(image_path):
                     continue
                 if image_path.suffix == ".processing":
                     continue  # in-flight; vision worker owns it

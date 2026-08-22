@@ -36,7 +36,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -87,7 +89,7 @@ _SCRAPER_DESCRIPTIONS: dict[str, str] = {
     "Civitai-Com": "Civitai (civitai.com)",
     "Civitai-Red": "Civitai (civitai.red)",
     "Web":         "Reddit",
-    "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in the job's Scraper targets.",
+    "Gallery-DL":  "gallery-dl (Pixiv, DeviantArt, booru, ArtStation, Tumblr, X, Reddit, Imgur, FurAffinity, e621, Flickr…). Configure URLs + cookies in this card.",
 }
 
 # _STATIC_SCRAPERS is derived from job_config.SCRAPER_NAMES (built just below,
@@ -126,6 +128,9 @@ import scheduler
 import fleet_health
 import vision_prompt
 import credentials
+import demo_seed
+import digest as _digest_mod
+import requeue_sorted as _requeue_mod
 
 # Now that job_config is importable, derive the canonical scraper toggle list
 # from its SCRAPER_NAMES (single source of truth) annotated with UI descriptions.
@@ -164,6 +169,75 @@ except Exception as _exc:  # pragma: no cover - never block dashboard boot
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ── Security response headers ─────────────────────────────────────────────────
+#
+# cull is a local-only single-user admin tool. Even so, a rogue tab on the same
+# machine can browse to http://localhost:5000 unless we lock the surface down:
+#
+#   * Content-Security-Policy — Alpine.js + inline scripts are inlined into the
+#     HTML template (single-file Flask app, zero build step), so we allow
+#     'unsafe-inline' + 'self'. img-src permits `data:` (thumb URLs) and `blob:`
+#     (video previews). No third-party origins are ever loaded.
+#   * X-Frame-Options: DENY + frame-ancestors 'none' block clickjacking framing
+#     from other tabs.
+#   * X-Content-Type-Options: nosniff — never let a browser MIME-sniff a JSON
+#     payload as HTML.
+#   * Referrer-Policy: no-referrer — nothing outbound; the dashboard never leaks
+#     the page it was reached from to any external origin (e.g. the "Supported
+#     sites" link in the gallery-dl card).
+#   * Permissions-Policy — kill features cull never uses (camera/mic/geo/etc.).
+#
+# Applied via after_request so every response, including /api/* JSON and
+# thumbnail bytes, carries the same guard-rails.
+# The dashboard loads Tailwind and Alpine.js from their CDNs, plus a Google
+# Font, all declared in the HTML_TEMPLATE below. The CSP must whitelist those
+# origins or the entire UI fails to style/render. `script-src-elem` and
+# `style-src-elem` are set explicitly so browsers that use those fallbacks
+# (rather than script-src/style-src) also load the assets. If you ever vendor
+# Tailwind + Alpine locally, drop the cdn.tailwindcss.com / unpkg.com origins
+# here and the whole surface tightens automatically.
+_CSP_SCRIPT_SRC = "'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://unpkg.com"
+_CSP_STYLE_SRC = "'self' 'unsafe-inline' https://fonts.googleapis.com"
+_CSP_FONT_SRC = "'self' data: https://fonts.gstatic.com"
+
+_SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        f"script-src {_CSP_SCRIPT_SRC}; "
+        f"script-src-elem {_CSP_SCRIPT_SRC}; "
+        f"style-src {_CSP_STYLE_SRC}; "
+        f"style-src-elem {_CSP_STYLE_SRC}; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
+        f"font-src {_CSP_FONT_SRC}; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    ),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+        "accelerometer=(), gyroscope=(), magnetometer=()"
+    ),
+}
+
+
+@app.after_request
+def _apply_security_headers(response):
+    """Attach the fixed security-header set to every response.
+
+    Uses direct assignment (not setdefault) so no future endpoint can weaken
+    this defensive posture by pre-setting a laxer value.
+    """
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers[name] = value
+    return response
+
 
 _pipeline_proc: subprocess.Popen | None = None
 _pipeline_lock = threading.Lock()
@@ -326,16 +400,23 @@ def safe_inside(raw: str, roots: list[Path]) -> Path | None:
 RESERVED_JOB_SLUGS: frozenset[str] = frozenset({"queue", "advance"})
 
 
+_ALL_JOBS_SENTINELS: frozenset[str] = frozenset({"__all__", "all", "*"})
+
+
 def _resolve_job_slug(default: str | None = "__active__") -> str | None:
     """Effective slug for a request.
 
-    ``?job=<slug>`` wins when present and well-formed; otherwise fall back to
-    ``default`` (sentinel ``"__active__"`` means "use the active job"). A
-    malformed ``?job=`` falls back too (never silently widens scope to *all*
-    jobs). Returns None only when there is no active job and none was supplied —
-    callers treat that as "unscoped / behave as today" for pre-jobs installs.
+    ``?job=<slug>`` wins when present and well-formed. The special values in
+    :data:`_ALL_JOBS_SENTINELS` (``__all__`` / ``all`` / ``*``) resolve to
+    ``None`` — the caller then treats it as "no scoping, aggregate every job".
+    A malformed ``?job=`` falls back to ``default`` (sentinel ``"__active__"``
+    means "use the active job") — never silently widens scope. Returns None
+    only when there is no active job and none was supplied (pre-jobs installs)
+    OR the caller explicitly asked for all jobs.
     """
     raw = (request.args.get("job") or "").strip()
+    if raw in _ALL_JOBS_SENTINELS:
+        return None
     if raw and job_config.JOB_SLUG_RE.match(raw):
         return raw
     if default == "__active__":
@@ -416,24 +497,40 @@ def _job_status_label(slug: str, job: job_config.Job, *, active: str | None,
     return job.status or "idle"
 
 
-def _job_card(job: job_config.Job, *, active: str | None, queue: list[str]) -> dict[str, Any]:
-    """Compact per-job payload for the jobs grid (list view)."""
+def _job_card(job: job_config.Job, *, active: str | None, queue: list[str],
+              active_slugs: list[str] | None = None,
+              priorities: dict[str, int] | None = None) -> dict[str, Any]:
+    """Compact per-job payload for the jobs grid (list view).
+
+    Multi-active v2 fields:
+      * ``is_active`` — this job is in the active SET (was: head-only match)
+      * ``priority`` — weighted round-robin weight (1-10, default 5)
+    Legacy fields (``queue_position``, ``status``) still key off the HEAD of
+    the active list so existing UI code keeps rendering.
+    """
     counts = _scoped_counts(job.slug)
-    if job.slug == active:
+    active_set = set(active_slugs or ([active] if active else []))
+    is_active_head = job.slug == active
+    is_active = job.slug in active_set
+    if is_active_head:
         position = 0
     elif job.slug in queue:
         position = 1 + queue.index(job.slug)
     else:
         position = None
+    priority_map = priorities or {}
     return {
         "slug": job.slug,
         "name": job.name,
         "status": _job_status_label(job.slug, job, active=active, queue=queue),
-        "is_active": job.slug == active,
+        "is_active": is_active,
+        "is_active_head": is_active_head,
         "queue_position": position,
         "queued": counts["queued"],
         "sorted": counts["sorted"],
         "updated_at": job.updated_at,
+        "priority": int(priority_map.get(
+            job.slug, job_config.PRIORITY_WEIGHT_DEFAULT)),
     }
 
 
@@ -476,6 +573,196 @@ def _job_for_scope(slug: str | None) -> job_config.Job | None:
     if slug is None:
         return None
     return job_config.get_job(slug)
+
+
+# ── T1: SSE event stream (queue + activity + status) ─────────────────────────
+#
+# One long-lived endpoint (`/api/stream/events`) replaces three 5-second polls
+# from the browser. The generator ticks once per second, diffs against the
+# per-client snapshot, and emits `activity`/`queue`/`status` events only when
+# something actually changed. Every 30 s a `:hb` comment line is written so
+# reverse-proxies don't idle-kill the socket. Per-IP concurrency is capped at
+# _SSE_MAX_CONN_PER_IP so a single client can't exhaust the socket budget.
+_SSE_TICK_SECONDS: float = 1.0
+_SSE_HEARTBEAT_SECONDS: float = 30.0
+_SSE_MAX_CONN_PER_IP: int = 5
+_SSE_MAX_STREAM_SECONDS: float = 60 * 60  # cap any one stream at an hour
+_sse_ip_counts: dict[str, int] = {}
+_sse_ip_lock = threading.Lock()
+_sse_event_seq: int = 0
+_sse_seq_lock = threading.Lock()
+
+
+def _sse_next_id() -> int:
+    """Monotonic event id shared across every open stream so `Last-Event-ID`
+    reconnects can carry a stable cursor. The counter never rolls back — a
+    restart resets to 0 which is fine (the browser only compares within a
+    session)."""
+    global _sse_event_seq
+    with _sse_seq_lock:
+        _sse_event_seq += 1
+        return _sse_event_seq
+
+
+def _sse_client_ip() -> str:
+    """Best-effort client IP for the per-IP connection cap. Trusts
+    X-Forwarded-For when set (the dashboard sits behind at most one
+    reverse-proxy in production); falls back to remote_addr."""
+    fwd = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return fwd or (request.remote_addr or "unknown")
+
+
+def _sse_acquire_slot(ip: str) -> bool:
+    with _sse_ip_lock:
+        if _sse_ip_counts.get(ip, 0) >= _SSE_MAX_CONN_PER_IP:
+            return False
+        _sse_ip_counts[ip] = _sse_ip_counts.get(ip, 0) + 1
+        return True
+
+
+def _sse_release_slot(ip: str) -> None:
+    with _sse_ip_lock:
+        n = _sse_ip_counts.get(ip, 0) - 1
+        if n <= 0:
+            _sse_ip_counts.pop(ip, None)
+        else:
+            _sse_ip_counts[ip] = n
+
+
+def _sse_activity_snapshot(slug: str | None, limit: int = 12) -> list[dict[str, Any]]:
+    """Compact activity payload matching /api/activity's shape so the browser
+    can consume both interchangeably."""
+    out: list[dict[str, Any]] = []
+    for item in _list_recent_sorted_scoped(slug, limit):
+        if not Path(item.path).exists():
+            continue
+        vj = item.vision_json or {}
+        ovr = vj.get("OVR_Quality_Score") if isinstance(vj, dict) else None
+        rel = vj.get("REL_Quality_Score") if isinstance(vj, dict) else None
+        reason = vj.get("reason", "") if isinstance(vj, dict) else ""
+        caption = vj.get("caption", "") if isinstance(vj, dict) else ""
+        out.append({
+            "name": Path(item.path).name,
+            "path": item.path,
+            "category": item.category,
+            "source": item.source,
+            "modified": datetime.fromtimestamp(item.mtime).isoformat(),
+            "thumbnail": f"/api/thumbnail?path={item.path}",
+            "prompt_url": f"/api/prompt?path={item.path}",
+            "summary": reason,
+            "quality": item.quality,
+            "reason": reason,
+            "OVR_Quality_Score": ovr,
+            "REL_Quality_Score": rel,
+            "caption": caption,
+        })
+    return out
+
+
+def _sse_queue_snapshot(slug: str | None) -> dict[str, Any]:
+    counts = _scoped_queue_by_source(slug)
+    return {"sources": counts, "total": sum(counts.values())}
+
+
+def _sse_status_snapshot() -> dict[str, Any]:
+    return {
+        "running": pipeline_running(),
+        "pid": _pipeline_proc.pid if pipeline_running() else None,
+        "vision_worker": os.environ.get("PIPELINE_VISION_WORKER", ""),
+        "vision_workers": _active_vision_workers(),
+        "throttle": int(os.environ.get("DASHBOARD_THROTTLE_PERCENT", 100)),
+    }
+
+
+@app.route("/api/stream/events")
+def api_stream_events():
+    """Server-Sent Events feed for the dashboard: activity / queue / status.
+
+    Replaces three 5 s polls with one long-lived stream. The generator ticks
+    at :data:`_SSE_TICK_SECONDS`, diffs against the per-client snapshot, and
+    only writes an event when a slice actually changed — so a quiet pipeline
+    stays cheap. A `:hb` heartbeat comment is written every
+    :data:`_SSE_HEARTBEAT_SECONDS` to keep reverse-proxies from idle-killing
+    the connection.
+
+    Query: ``?job=<slug>`` scopes activity/queue to one job (defaults to the
+    active job). ``Last-Event-ID`` is honoured only informationally; the
+    server always sends fresh snapshots on reconnect.
+    """
+    ip = _sse_client_ip()
+    if not _sse_acquire_slot(ip):
+        # Cap open connections per remote IP so a runaway client can't drain
+        # the worker pool. 429 is retry-after-friendly.
+        return Response(
+            "too many event streams from this IP\n",
+            status=429,
+            mimetype="text/plain",
+            headers={"Retry-After": "10"},
+        )
+    slug = _resolve_job_slug()
+
+    def _stream():
+        try:
+            last: dict[str, Any] = {"activity": None, "queue": None, "status": None}
+            last_heartbeat = _time.time()
+            started = _time.time()
+            # Kick-off with the current snapshot for each slice so the client
+            # doesn't have to wait for the first change.
+            for kind, snap in (
+                ("activity", {"job": slug, "items": _sse_activity_snapshot(slug)}),
+                ("queue",    {"job": slug, **_sse_queue_snapshot(slug)}),
+                ("status",   {"job": slug, **_sse_status_snapshot()}),
+            ):
+                last[kind] = snap
+                payload = json.dumps(snap, default=str)
+                yield f"id: {_sse_next_id()}\nevent: {kind}\ndata: {payload}\n\n"
+            while True:
+                # Long streams get force-recycled so pathological clients can't
+                # hold a socket forever; the browser reconnects seamlessly.
+                if _time.time() - started > _SSE_MAX_STREAM_SECONDS:
+                    return
+                _time.sleep(_SSE_TICK_SECONDS)
+                emitted = False
+                # activity: diff on the top-N path list — cheapest signal that
+                # something classified. Full items only re-sent when the list
+                # actually changed.
+                act = {"job": slug, "items": _sse_activity_snapshot(slug)}
+                if [i.get("path") for i in act["items"]] != [
+                    i.get("path") for i in (last["activity"] or {}).get("items", [])
+                ]:
+                    last["activity"] = act
+                    payload = json.dumps(act, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: activity\ndata: {payload}\n\n"
+                    emitted = True
+                q = {"job": slug, **_sse_queue_snapshot(slug)}
+                if q != last["queue"]:
+                    last["queue"] = q
+                    payload = json.dumps(q, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: queue\ndata: {payload}\n\n"
+                    emitted = True
+                st = {"job": slug, **_sse_status_snapshot()}
+                if st != last["status"]:
+                    last["status"] = st
+                    payload = json.dumps(st, default=str)
+                    yield f"id: {_sse_next_id()}\nevent: status\ndata: {payload}\n\n"
+                    emitted = True
+                # Heartbeat: keep proxies from dropping an idle socket. Any
+                # data write resets the clock so busy streams don't add noise.
+                now = _time.time()
+                if emitted:
+                    last_heartbeat = now
+                elif now - last_heartbeat >= _SSE_HEARTBEAT_SECONDS:
+                    last_heartbeat = now
+                    yield ": hb\n\n"
+        finally:
+            _sse_release_slot(ip)
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",  # disable nginx buffering
+        "Connection": "keep-alive",
+    }
+    return Response(_stream(), mimetype="text/event-stream", headers=headers)
 
 
 def _job_effective_scrapers(job: job_config.Job) -> dict[str, Any]:
@@ -527,7 +814,7 @@ def _scraper_enabled_response(job: job_config.Job | None) -> list[dict[str, Any]
                 "name": f"Local-{nm}",
                 "description": f"Local folder ({folder.get('dir') or '(no dir set)'})",
                 "enabled": bool(folder.get("enabled", False)),
-                "kind": "local",          # read-only; managed in Job Settings
+                "kind": "local",          # read-only; managed in the Scrapers → Local folders card
             })
         return rows
     disabled = disabled_set()
@@ -578,10 +865,10 @@ def api_scraper_toggle():
     job = _job_for_scope(_resolve_job_slug())
     if job is not None:
         # Only the 6 canonical scrapers are togglable; Local-<name> rows are
-        # read-only status (configure folders in Job Settings → Local folders).
+        # read-only status (configure folders in the Scrapers → Local folders card).
         if name not in job_config.SCRAPER_NAMES:
             return jsonify({
-                "error": "local folders are configured in Job Settings → Local folders",
+                "error": "local folders are configured in the Scrapers → Local folders card",
                 "name": name,
             }), 400
         # SPARSE override: merge only the toggled key into the EXISTING override
@@ -1433,26 +1720,48 @@ def _validate_inheritable_cfg(cfg: Any, *, partial: bool) -> tuple[dict | None, 
     dashboard's job & preset save paths can never drift from config_io's
     importer/exporter validation. Adapts its raise-based API to the (clean, err)
     tuple the dashboard callers expect.
+
+    Enforces the SOFT category cap here (12 — mirrors ``_MAX_CATEGORIES``
+    above and the shipped preset ceiling) so a NEW dashboard save can't blow
+    past what the UI grid can comfortably render, while ``config_io``'s
+    envelope importer stays generous enough for a legacy on-disk file to
+    still load on upgrade (see ``config_io._MAX_CATEGORIES`` = 40).
     """
     try:
-        return config_io.validate_inheritable_cfg(cfg, partial=partial), ""
+        return config_io.validate_inheritable_cfg(
+            cfg, partial=partial, category_cap=config_io.SOFT_MAX_CATEGORIES,
+        ), ""
     except config_io.ValidationError as exc:
         return None, str(exc)
 
 
 @app.route("/api/jobs")
 def api_jobs_list():
-    """List jobs with status, queue position, and queued/sorted counts, plus the
-    active slug and queue order from the index."""
+    """List jobs with status + counts, plus the ACTIVE SET, queue order, and
+    per-job priority weights from the index.
+
+    v2 payload additions (backwards compatible — no field was renamed):
+      * ``active_slugs``: list[str] — every currently running job (multi-active)
+      * ``active``: str | None — head of the active list (legacy single-active
+        view; every existing consumer that reads ``active`` keeps working)
+      * ``priority``: {slug: 1-10} — per-job weight (defaults to 5 when unset)
+      * per-card ``is_active`` now reflects membership in ``active_slugs``
+    """
     idx = job_config.get_index()
-    active = idx.get("active")
+    active_slugs = list(idx.get("active") or [])
+    active_head = active_slugs[0] if active_slugs else None
     queue = list(idx.get("queue") or [])
+    priorities = dict(idx.get("priority") or {})
     jobs = job_config.list_jobs()
     return jsonify({
-        "active": active,
+        "active": active_head,
+        "active_slugs": active_slugs,
         "queue": queue,
+        "priority": priorities,
         "pipeline_running": pipeline_running(),
-        "jobs": [_job_card(j, active=active, queue=queue) for j in jobs],
+        "jobs": [_job_card(j, active=active_head, queue=queue,
+                           active_slugs=active_slugs, priorities=priorities)
+                 for j in jobs],
     })
 
 
@@ -1602,12 +1911,65 @@ def api_jobs_clone(slug: str):
 
 @app.route("/api/jobs/<slug>/activate", methods=["POST"])
 def api_jobs_activate(slug: str):
+    """Mark ``slug`` active. Additive by default (multi-active), or exclusive
+    via ``?exclusive=true`` (historic single-active behaviour).
+
+    The default flipped from exclusive to additive in the multi-active wave:
+    every existing caller who wants the OLD reset-then-set semantics must
+    now pass ``?exclusive=true`` (see api_jobs_deactivate for the inverse).
+    """
     if not _valid_slug_or_400(slug):
         return jsonify({"error": "invalid slug"}), 400
     if job_config.get_job(slug) is None:
         return jsonify({"error": "job not found"}), 404
-    job_config.activate(slug)
-    return jsonify({"success": True, "active": slug})
+    exclusive = (request.args.get("exclusive", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
+    job_config.activate(slug, exclusive=exclusive)
+    return jsonify({
+        "success": True,
+        "active": job_config.get_active_slug(),
+        "active_slugs": job_config.get_active_slugs(),
+    })
+
+
+@app.route("/api/jobs/<slug>/deactivate", methods=["POST"])
+def api_jobs_deactivate(slug: str):
+    """Remove ``slug`` from the active set (no-op if it wasn't running).
+
+    Pairs with the additive ``activate`` — the UI's Run slider flips between
+    the two. Does not touch the queue; a deactivated job stays where it was
+    (idle / queued) and can be re-run without going through the wizard.
+    """
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    job_config.deactivate(slug)
+    return jsonify({
+        "success": True,
+        "active": job_config.get_active_slug(),
+        "active_slugs": job_config.get_active_slugs(),
+    })
+
+
+@app.route("/api/jobs/<slug>/priority", methods=["PUT"])
+def api_jobs_priority(slug: str):
+    """Set this job's priority weight (1-10). Out-of-range values are CLAMPED
+    to the bounds rather than rejected — the UI slider stays honest and no
+    silly typed value can starve or hog the vision fleet."""
+    if not _valid_slug_or_400(slug):
+        return jsonify({"error": "invalid slug"}), 400
+    if job_config.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
+    data = request.get_json() or {}
+    if not isinstance(data, dict) or "weight" not in data:
+        return jsonify({"error": "body must be an object with a weight field"}), 400
+    try:
+        weight = int(data["weight"])
+    except (TypeError, ValueError):
+        return jsonify({"error": "weight must be an integer"}), 400
+    stored = job_config.set_job_priority(slug, weight)
+    return jsonify({"success": True, "slug": slug, "weight": stored})
 
 
 @app.route("/api/jobs/queue", methods=["POST"])
@@ -1672,11 +2034,388 @@ def _valid_preset_name(name: str) -> bool:
 @app.route("/api/presets")
 def api_presets_list():
     lib = job_config.list_presets()
+    # Surface the builtin preset descriptions + tag chips so the onboarding
+    # form doesn't have to guess what each preset is for. Names not shipped
+    # by cull (user-created / imported presets) return empty entries.
+    try:
+        from builtin_presets import PRESET_DESCRIPTIONS, PRESET_TAGS
+    except Exception:  # pragma: no cover - defensive
+        PRESET_DESCRIPTIONS, PRESET_TAGS = {}, {}
+    names = sorted(lib.get("presets", {}).keys())
+    # PRESET_DESCRIPTIONS is dict[str, {headline, description}]; flatten to a
+    # plain str the UI can render without producing "[object Object]".
+    def _desc(n: str) -> str:
+        entry = PRESET_DESCRIPTIONS.get(n, "")
+        if isinstance(entry, dict):
+            return entry.get("description") or entry.get("headline") or ""
+        return str(entry or "")
+    def _head(n: str) -> str:
+        entry = PRESET_DESCRIPTIONS.get(n, "")
+        if isinstance(entry, dict):
+            return entry.get("headline") or ""
+        return ""
     return jsonify({
         "default": lib.get("default", "default"),
-        "presets": sorted(lib.get("presets", {}).keys()),
+        "presets": names,
         "builtins": sorted(job_config.builtin_preset_names()),
+        "descriptions": {n: _desc(n) for n in names},
+        "headlines": {n: _head(n) for n in names},
+        "tags": {n: list(PRESET_TAGS.get(n, ())) for n in names},
     })
+
+
+# Built-in preset keys are always [a-z0-9_], but a user-created preset name
+# can carry spaces, hyphens, and mixed case (PRESET_NAME_RE = ^[A-Za-z0-9 _-]{1,40}$)
+# — e.g. "Female Influencer". The thumbnail routes must accept any valid preset
+# name; internally we slugify it to a filesystem-safe stem via
+# ``_preset_thumb_key`` so lookups are stable regardless of case / whitespace.
+_PRESET_THUMB_KEY_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}$")
+
+
+def _preset_thumb_key(raw: str) -> str | None:
+    """Normalise a preset-name URL segment into a lookup-safe filesystem stem.
+
+    Returns ``None`` when the input fails the preset-name regex — callers
+    should treat that as a 400 (invalid preset key). Otherwise returns the
+    slugified stem (lowercase, non-alnum → `_`, collapsed) so both the GET
+    thumbnail lookup and the POST upload write/read the same filename.
+    """
+    if not raw or not _PRESET_THUMB_KEY_RE.match(raw):
+        return None
+    try:
+        return job_config.slugify(raw) or None
+    except Exception:  # noqa: BLE001 - never let slugify crash a request
+        return None
+_PRESET_THUMB_EXTS: tuple[tuple[str, str], ...] = (
+    (".gif", "image/gif"),
+    (".png", "image/png"),
+    (".jpg", "image/jpeg"),
+    (".jpeg", "image/jpeg"),
+    (".webp", "image/webp"),
+    (".svg", "image/svg+xml"),
+)
+
+
+def _preset_thumb_placeholder(key: str) -> bytes:
+    """Deterministic 16:9 SVG for a preset key that has no shipped or user
+    asset. Uses two hash-derived hues plus the key's first letter so every
+    preset still gets a distinct card without any external font/image."""
+    import colorsys
+    import hashlib
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    hue_a = (digest[0] / 255.0) * 360
+    hue_b = ((digest[1] / 255.0) * 360 + 55) % 360
+    r1, g1, b1 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_a / 360, 0.32, 0.55))
+    r2, g2, b2 = (int(c * 255) for c in colorsys.hls_to_rgb(hue_b / 360, 0.18, 0.60))
+    letter = (key[:1] or "?").upper()
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        f"<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        f"<stop offset='0' stop-color='rgb({r1},{g1},{b1})'/>"
+        f"<stop offset='1' stop-color='rgb({r2},{g2},{b2})'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        f"<text x='160' y='112' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='88' font-weight='700' fill='#f8fafc' opacity='0.85'>{letter}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+# Directories the thumbnail lookup + upload endpoints reach into. Kept as
+# helpers so tests can monkeypatch ``WORKSPACE_ROOT`` and the resolution
+# picks up the new value on every call.
+def _preset_user_thumbnail_dir() -> Path:
+    """Where user-uploaded overrides for shipped preset thumbnails live."""
+    return WORKSPACE_ROOT / "presets" / "thumbnails"
+
+
+def _preset_community_thumbnail_dir() -> Path:
+    """Where community-preset thumbnails ship AND land on upload."""
+    return WORKSPACE_ROOT / "presets" / "community" / "thumbnails"
+
+
+def _preset_thumb_lookup_in(root: Path, key: str) -> tuple[Path, str] | None:
+    """Return the first ``<root>/<key>.<ext>`` match with a traversal-safe check.
+
+    ``key`` is regex-restricted upstream. We still normalise-then-contain each
+    candidate so a hostile symlink planted under ``root`` can never escape it.
+    """
+    try:
+        root_real = os.path.realpath(str(root))
+    except OSError:
+        return None
+    for ext, mime in _PRESET_THUMB_EXTS:
+        candidate = root / f"{key}{ext}"
+        try:
+            candidate_real = os.path.realpath(str(candidate))
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if os.path.commonpath([candidate_real, root_real]) != root_real:
+                continue
+        except ValueError:
+            continue
+        return candidate, mime
+    return None
+
+
+@app.route("/api/presets/thumbnail")
+def api_presets_thumbnail():
+    """Return a preview image for a preset card.
+
+    Lookup order (traversal-safe, ``key`` restricted to ``^[a-z0-9_]+$``):
+      1. ``<repo>/presets/thumbnails/<key>.{gif,png,jpg,jpeg,webp,svg}``
+         (user-supplied override — highest priority so operators can restyle a
+         built-in preset without editing the shipped SVGs)
+      2. ``<repo>/presets/community/thumbnails/<key>.{...}`` (community-shipped
+         thumbnail colocated with the preset JSON, or a user upload for a
+         community preset)
+      3. ``<repo>/presets/thumbnails/_builtin/<key>.svg`` (shipped defaults)
+      4. Deterministic gradient-with-letter SVG placeholder (any other key)
+    """
+    key = _preset_thumb_key(request.args.get("key") or "")
+    if key is None:
+        abort(400)
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is not None:
+            candidate, mime = hit
+            # max_age=0 forces the browser to revalidate via ETag on every load.
+            # send_file(conditional=True) still emits Last-Modified + ETag, so
+            # unchanged files return a cheap 304 — but a shipped JPG replacing a
+            # cached SVG for the same key becomes visible on the very next page
+            # load instead of after the 1-hour Cache-Control expiry.
+            return send_file(candidate, mimetype=mime, max_age=0, conditional=True)
+    builtin = _preset_user_thumbnail_dir() / "_builtin" / f"{key}.svg"
+    if builtin.is_file():
+        return send_file(builtin, mimetype="image/svg+xml",
+                         max_age=0, conditional=True)
+    return Response(
+        _preset_thumb_placeholder(key),
+        mimetype="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# Upload constraints for /api/presets/<key>/thumbnail. Keep in step with the
+# GET lookup: only formats listed here are accepted, and each carries a magic-
+# byte prefix we verify server-side (mime-type strings from the browser are
+# advisory only).
+_PRESET_THUMB_UPLOAD_MAX_BYTES = 2 * 1024 * 1024   # 2 MB hard cap
+
+# (ext, mime, [magic-byte prefixes]) — every prefix is checked against the
+# first 32 bytes of the upload. Empty prefix list disables the magic check
+# (SVG is text; we accept it as long as it starts with '<').
+_PRESET_THUMB_UPLOAD_SPECS: tuple[tuple[str, str, tuple[bytes, ...]], ...] = (
+    (".gif",  "image/gif",     (b"GIF87a", b"GIF89a")),
+    (".png",  "image/png",     (b"\x89PNG\r\n\x1a\n",)),
+    (".jpg",  "image/jpeg",    (b"\xff\xd8\xff",)),
+    (".jpeg", "image/jpeg",    (b"\xff\xd8\xff",)),
+    (".webp", "image/webp",    (b"RIFF",)),  # RIFF....WEBP; header check below tightens
+)
+
+
+def _detect_upload_ext(head: bytes, declared_ext: str, declared_mime: str) -> tuple[str, str] | None:
+    """Return (ext, mime) if ``head`` matches any accepted image format.
+
+    Preference order: (1) match by magic bytes; (2) fall back to the declared
+    extension IFF its magic-byte spec allows an empty prefix list. We never
+    trust the browser-supplied mime type alone — spoofed content-type headers
+    are a classic upload-bypass vector.
+    """
+    for ext, mime, prefixes in _PRESET_THUMB_UPLOAD_SPECS:
+        if not prefixes:
+            continue
+        for prefix in prefixes:
+            if head.startswith(prefix):
+                if ext == ".webp":
+                    # RIFF...WEBP — the WEBP marker sits at bytes 8..12.
+                    if len(head) >= 12 and head[8:12] == b"WEBP":
+                        return ext, mime
+                    continue
+                return ext, mime
+    # Reject unknown formats — declared ext is not authoritative.
+    _ = (declared_ext, declared_mime)
+    return None
+
+
+@app.route("/api/presets/<key>/thumbnail", methods=["POST"])
+def api_presets_thumbnail_upload(key: str):
+    """Accept a user-uploaded thumbnail for preset ``key``.
+
+    Loopback-only. Multipart form upload under the ``file`` field. Accepts
+    .gif/.png/.jpg/.jpeg/.webp with magic-byte verification, capped at 2 MB.
+    Built-in preset keys land in ``presets/thumbnails/``; community preset
+    keys (matched by the presence of ``presets/community/<key>.preset.json``)
+    land in ``presets/community/thumbnails/`` so the file ships alongside
+    its preset when it's later published.
+
+    Returns ``{ok, path, url}`` — ``url`` is cache-busted so a stale browser
+    cache of the previous thumbnail becomes visible on the next paint.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = _preset_thumb_key(key)
+    if key is None:
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify({"ok": False, "error": "missing 'file' upload"}), 400
+    # Peek the head bytes for magic-byte validation without reading the whole
+    # file into memory twice. request.files streams from a SpooledTemporaryFile.
+    stream = upload.stream
+    try:
+        stream.seek(0)
+    except (OSError, AttributeError):
+        pass
+    head = stream.read(32)
+    declared_ext = ("." + (upload.filename or "").rsplit(".", 1)[-1].lower()) if "." in (upload.filename or "") else ""
+    detected = _detect_upload_ext(head, declared_ext, upload.mimetype or "")
+    if detected is None:
+        return jsonify({"ok": False, "error": "unsupported image format"}), 400
+    ext, mime = detected
+    try:
+        stream.seek(0)
+    except (OSError, AttributeError):
+        return jsonify({"ok": False, "error": "upload stream not seekable"}), 400
+    body = stream.read(_PRESET_THUMB_UPLOAD_MAX_BYTES + 1)
+    if len(body) > _PRESET_THUMB_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "error": f"file exceeds {_PRESET_THUMB_UPLOAD_MAX_BYTES} bytes"}), 400
+    if not body:
+        return jsonify({"ok": False, "error": "empty upload"}), 400
+
+    # Decide destination:
+    #  - built-in preset key → presets/thumbnails/ (existing user-override slot)
+    #  - community preset (matched by presets/community/<key>.preset.json)
+    #    → presets/community/thumbnails/ (colocated for git-based publish)
+    #  - anything else → user-override slot (a user-created preset name is
+    #    treated the same as a built-in override — they own the file).
+    dest_dir = _preset_user_thumbnail_dir()
+    try:
+        import builtin_presets as _bp
+        builtin_names = set(_bp.PRESET_NAMES)
+    except Exception:  # noqa: BLE001 - defensive: still allow uploads if the import fails
+        builtin_names = set()
+    community_file = _community_preset_dir() / f"{key}.preset.json"
+    if key not in builtin_names and community_file.is_file():
+        dest_dir = _preset_community_thumbnail_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove any stale thumbnail for this key (different extension) so the
+    # GET lookup doesn't return an older file after the browser cache-busts.
+    for spec_ext, _mime, _prefixes in _PRESET_THUMB_UPLOAD_SPECS:
+        if spec_ext == ext:
+            continue
+        stale = dest_dir / f"{key}{spec_ext}"
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                logger.warning("could not remove stale thumbnail: %s", stale)
+
+    dest = dest_dir / f"{key}{ext}"
+    # Extra containment check: dest must resolve inside dest_dir.
+    try:
+        dest_real = os.path.realpath(str(dest))
+        dir_real = os.path.realpath(str(dest_dir))
+        if os.path.commonpath([dest_real, dir_real]) != dir_real:
+            return jsonify({"ok": False, "error": "destination escapes thumbnail dir"}), 400
+    except (OSError, ValueError):
+        return jsonify({"ok": False, "error": "invalid destination path"}), 400
+    try:
+        dest.write_bytes(body)
+    except OSError as exc:
+        return _err("could not write thumbnail file", exc, 500)
+
+    ts = int(_wave_time.time())
+    return jsonify({
+        "ok": True,
+        "path": str(dest.relative_to(WORKSPACE_ROOT)).replace("\\", "/"),
+        "url": f"/api/presets/thumbnail?key={_urlquote(key, safe='')}&v={ts}",
+        "mime": mime,
+        "bytes": len(body),
+    })
+
+
+@app.route("/api/presets/<key>/thumbnail/status", methods=["GET"])
+def api_presets_thumbnail_status(key: str):
+    """Report whether preset ``key`` has a user-uploaded thumbnail on disk.
+
+    Powers the editor's "Remove custom thumbnail" affordance so the button
+    only appears for real uploads (not the shipped SVG or gradient
+    placeholder). Loopback-only — this is admin-side metadata, not something
+    a normal viewer needs.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = _preset_thumb_key(key)
+    if key is None:
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    path = None
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is not None:
+            path = str(hit[0].relative_to(WORKSPACE_ROOT)).replace("\\", "/")
+            break
+    return jsonify({"ok": True, "has_custom": bool(path), "path": path})
+
+
+@app.route("/api/presets/<key>/thumbnail", methods=["DELETE"])
+def api_presets_thumbnail_delete(key: str):
+    """Remove the user-uploaded thumbnail override for preset ``key``.
+
+    Loopback-only. Deletes only the first hit under ``presets/thumbnails/``
+    (built-in override slot) OR ``presets/community/thumbnails/`` (community
+    slot) — whichever ships as the user upload. The shipped ``_builtin/*.svg``
+    is never touched, so the preset falls back to its shipped thumbnail (or
+    the gradient placeholder) on the next GET.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = _preset_thumb_key(key)
+    if key is None:
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+    removed: list[str] = []
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key)
+        if hit is None:
+            continue
+        candidate, _mime = hit
+        try:
+            candidate.unlink()
+            removed.append(str(candidate.relative_to(WORKSPACE_ROOT)).replace("\\", "/"))
+        except OSError as exc:
+            return _err("could not remove thumbnail file", exc, 500)
+    if not removed:
+        return jsonify({"ok": True, "removed": [], "message": "no user thumbnail to remove"})
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/api/presets/descriptions")
+def api_presets_descriptions():
+    """Return human-facing metadata for every built-in preset (T1 #2/#5).
+
+    Shape: ``[{key, name, headline, description, use_cases: [str, ...]}]``.
+    Powers the first-run wizard's preset picker and the comparison card grid
+    in the Presets tab. Uses :mod:`builtin_presets` as the source of truth so
+    it never drifts from the shipped preset library.
+    """
+    try:
+        import builtin_presets  # local import — cheap and keeps the top clean
+    except Exception as exc:
+        return jsonify({"error": f"builtin_presets import failed: {exc}"}), 500
+    out: list[dict] = []
+    for key in builtin_presets.PRESET_NAMES:
+        try:
+            meta = builtin_presets.get_preset_display_meta(key)
+            meta["use_cases"] = builtin_presets.preset_use_cases(key)
+            out.append(meta)
+        except Exception:
+            continue
+    return jsonify({"presets": out})
 
 
 @app.route("/api/presets", methods=["POST"])
@@ -2230,6 +2969,83 @@ def brand_asset(filename: str):
     return send_file(asset_path, mimetype="image/png", max_age=86400)
 
 
+_VIDEO_THUMB_EXTS: frozenset[str] = frozenset(
+    {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+)
+
+
+def _video_placeholder_svg(ext_label: str) -> bytes:
+    """Deterministic offline placeholder shown when no ffmpeg/scenedetect
+    backend is installed. Play triangle on a dark gradient with an extension
+    chip in the corner. No external references — safe under the strict CSP."""
+    label = (ext_label or "vid").lstrip(".").upper()[:4]
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 180' "
+        "preserveAspectRatio='xMidYMid slice'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#1e293b'/>"
+        "<stop offset='1' stop-color='#0f172a'/></linearGradient></defs>"
+        "<rect width='320' height='180' fill='url(#g)'/>"
+        "<circle cx='160' cy='90' r='34' fill='#0f172a' opacity='0.75'/>"
+        "<polygon points='150,72 150,108 184,90' fill='#e2e8f0'/>"
+        f"<rect x='268' y='150' width='42' height='20' rx='4' fill='#0f172a' opacity='0.85'/>"
+        f"<text x='289' y='164' text-anchor='middle' font-family='system-ui,sans-serif' "
+        f"font-size='11' font-weight='600' fill='#94a3b8'>{label}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
+    """Extract a single poster frame at ~1s via ffmpeg-python, cache the
+    resulting JPEG in ``data/thumb_cache/<sha>/<sha>_<size>_video.jpg`` and
+    return its path. Returns ``None`` on any failure so the caller can fall
+    back to the SVG placeholder without raising.
+    """
+    try:
+        # Reuse thumb_cache's content-hashed path so re-encoding the same
+        # (video, size) pair hits the disk cache on subsequent requests.
+        cache_file = thumb_cache.cache_path_for(video_path, size)
+    except (ValueError, FileNotFoundError):
+        return None
+    poster = cache_file.with_name(cache_file.stem + "_video.jpg")
+    if poster.exists():
+        try:
+            os.utime(poster, None)
+        except OSError:
+            pass
+        return poster
+    try:
+        import ffmpeg  # type: ignore
+    except Exception:
+        return None
+    tmp = poster.with_suffix(".tmp")
+    try:
+        (
+            ffmpeg
+            .input(str(video_path), ss=1.0)
+            .filter("scale", size, -2, force_original_aspect_ratio="decrease")
+            .output(str(tmp), vframes=1, format="image2", vcodec="mjpeg")
+            .global_args("-loglevel", "error")
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - extraction is best-effort
+        logger.debug("video poster extract failed for %s: %s", video_path.name, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    if not tmp.exists() or tmp.stat().st_size == 0:
+        return None
+    try:
+        tmp.replace(poster)
+    except OSError:
+        return None
+    return poster
+
+
 @app.route("/api/thumbnail")
 def api_thumbnail():
     """Serve a JPEG thumbnail from the disk cache.
@@ -2238,6 +3054,10 @@ def api_thumbnail():
     to data/thumb_cache/<sha>/<sha>_<size>.jpg. Subsequent requests serve
     the file directly. send_file sets Last-Modified + ETag headers so
     browsers 304 on F5.
+
+    Videos: when ffmpeg is available we extract a poster frame at ~1s and cache
+    a JPEG; otherwise we return a deterministic SVG placeholder so the gallery
+    still shows *something* instead of a broken-image icon.
     """
     raw = request.args.get("path", "")
     try:
@@ -2247,6 +3067,30 @@ def api_thumbnail():
     path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
     if path is None or not path.exists():
         abort(404)
+    # Video branch — never let PIL see a container file (it raises on every
+    # video extension we accept). ffmpeg gives us a poster frame; if absent we
+    # ship an inline SVG so the UI degrades gracefully.
+    if path.suffix.lower() in _VIDEO_THUMB_EXTS:
+        try:
+            import video_frames
+            has_backend = video_frames.has_any_backend()
+        except Exception:
+            has_backend = False
+        if has_backend:
+            poster = _video_poster_jpeg(path, size)
+            if poster is not None:
+                return send_file(
+                    poster,
+                    mimetype="image/jpeg",
+                    max_age=0,
+                    conditional=True,
+                )
+        # Placeholder path — no disk write, no PIL, no external refs.
+        return Response(
+            _video_placeholder_svg(path.suffix),
+            mimetype="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
     try:
         cache_file = thumb_cache.get_or_create(path, size)
     except FileNotFoundError:
@@ -2281,6 +3125,63 @@ def api_prompt():
         return Response(txt.read_text(encoding="utf-8", errors="replace"), mimetype="text/plain")
     except OSError:
         abort(404)
+
+
+# ── raw media serving ─────────────────────────────────────────────────────────
+#
+# ``/api/thumbnail`` degrades videos to a JPEG poster / SVG placeholder because
+# it always returns an *image*. When the operator opens the detail modal for a
+# video item we need the actual clip so the ``<video>`` element can play it.
+# This endpoint serves the raw file with proper MIME + Range support so the
+# browser can seek/buffer without loading the whole file into memory.
+
+_MEDIA_MIME_BY_EXT: dict[str, str] = {
+    # Videos — the whole point of this endpoint.
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    # Images — fall-through so the modal can share a single URL scheme when it
+    # wants the full-fidelity original instead of a re-encoded thumbnail.
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".avif": "image/avif",
+}
+
+
+@app.route("/api/media/raw")
+def api_media_raw():
+    """Serve the raw media file at ``?path=<abs_path>`` with Range support.
+
+    Guarded by the same ``safe_inside`` sanitiser as ``/api/thumbnail`` so
+    nothing outside the queue/sorted trees is reachable. Uses Flask's
+    ``send_file(..., conditional=True)`` which handles If-Modified-Since AND
+    HTTP Range requests natively — that's what makes the ``<video>`` element
+    in the detail modal seek/buffer instead of downloading the whole clip.
+    ``Accept-Ranges: bytes`` is set explicitly so proxies that strip Flask's
+    header don't disable seeking.
+    """
+    raw = request.args.get("path", "")
+    path = safe_inside(raw, [PIPELINE_QUEUE, PIPELINE_SORTED])
+    if path is None or not path.exists() or not path.is_file():
+        abort(404)
+    mimetype = _MEDIA_MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    response = send_file(
+        path,
+        mimetype=mimetype,
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["Accept-Ranges"] = "bytes"
+    return response
 
 
 @app.route("/api/logs/history")
@@ -2337,13 +3238,25 @@ def _is_in_archive(path: Path) -> bool:
 @app.route("/api/activity")
 def api_activity():
     """Newest classified items, served from the SQLite index. Scoped to
-    ?job=<slug> (default active)."""
+    ?job=<slug> (default active).
+
+    Extended for the reasoning panel: each row now includes ``reason``,
+    ``OVR_Quality_Score``, ``REL_Quality_Score`` and ``caption`` sourced from the
+    same ``.vision.json`` sidecar the indexer stored. Missing fields fall back
+    to ``None`` (or an empty string for ``reason``/``caption``) so pre-schema
+    rows still render.
+    """
     limit = int(request.args.get("limit", 12))
     slug = _resolve_job_slug()
     results: list[dict[str, Any]] = []
     for item in _list_recent_sorted_scoped(slug, limit):
         if not Path(item.path).exists():
             continue  # indexer hasn't caught up to a deletion / move
+        vj = item.vision_json or {}
+        ovr = vj.get("OVR_Quality_Score") if isinstance(vj, dict) else None
+        rel = vj.get("REL_Quality_Score") if isinstance(vj, dict) else None
+        reason = vj.get("reason", "") if isinstance(vj, dict) else ""
+        caption = vj.get("caption", "") if isinstance(vj, dict) else ""
         results.append({
             "name": Path(item.path).name,
             "path": item.path,
@@ -2352,8 +3265,14 @@ def api_activity():
             "modified": datetime.fromtimestamp(item.mtime).isoformat(),
             "thumbnail": f"/api/thumbnail?path={item.path}",
             "prompt_url": f"/api/prompt?path={item.path}",
-            "summary": (item.vision_json or {}).get("reason", "") if item.vision_json else "",
+            "summary": reason,
             "quality": item.quality,
+            # Extended fields for the reasoning panel — additive; existing
+            # clients that ignore them keep working.
+            "reason": reason,
+            "OVR_Quality_Score": ovr,
+            "REL_Quality_Score": rel,
+            "caption": caption,
         })
     return jsonify(results)
 
@@ -2505,8 +3424,12 @@ def _resolution_bucket(width: int, height: int) -> str:
 def _item_to_card(item: _SortedItem) -> dict[str, Any]:
     """Compact JSON representation used by gallery + stats payloads."""
     payload = item.payload
+    is_video = item.image_path.suffix.lower() in _VIDEO_THUMB_EXTS
     width, height = item.width, item.height
-    if width <= 0 or height <= 0:
+    # Videos never go through PIL — leave width/height at 0 so the resolution
+    # chip renders as "unknown" instead of triggering a decode attempt that
+    # would just fail (and pollute logs).
+    if not is_video and (width <= 0 or height <= 0):
         width, height = _resolve_image_dims(item.image_path)
         item.width, item.height = width, height
     return {
@@ -2527,6 +3450,12 @@ def _item_to_card(item: _SortedItem) -> dict[str, Any]:
         "height": height,
         "resolution_bucket": _resolution_bucket(width, height),
         "prompt_excerpt": (item.prompt_text or "").strip()[:240],
+        # Flags for a future UI pass (e.g. a play-icon overlay on gallery
+        # cards). Additive today — no template consumes them yet, but the
+        # payload contract is fixed here so the UI can adopt without a
+        # backend churn later.
+        "video": is_video,
+        "is_video": is_video,
     }
 
 
@@ -2537,6 +3466,11 @@ def api_stats():
     """Aggregates over every sorted image: keyword frequency, top thumbnails,
     per-source platform analytics. Cached for 60s via _get_sorted_items.
     Scoped to ?job=<slug> (default active).
+
+    When ``?by=job`` is present the payload gains a ``by_job`` map — a compact
+    per-job breakdown ``{slug: {total, kept, discarded}}`` used by the Global
+    Stats donut chart (T4). This is derived from the FULL unscoped set so a
+    single request answers the donut regardless of the primary ``?job=`` filter.
     """
     items = _get_sorted_items_scoped(_resolve_job_slug())
     non_discard = [it for it in items if it.category.upper() != "DISCARD"]
@@ -2616,7 +3550,7 @@ def api_stats():
         })
     sources.sort(key=lambda r: r["total"], reverse=True)
 
-    return jsonify({
+    payload: dict[str, Any] = {
         "totals": {
             "all": len(items),
             "non_discard": len(non_discard),
@@ -2628,7 +3562,24 @@ def api_stats():
         "top_relative": top_relative,
         "sources": sources,
         "cached_age": round(_time.time() - _sorted_cache["ts"], 1),
-    })
+    }
+    # T4: per-job breakdown for the Global Stats donut chart. Derived from the
+    # FULL unscoped set (never the ?job=<slug> filter) so one call powers the
+    # donut regardless of the drill-down. Keys are the job slug ('default' when
+    # a row has no topic_slug set); values are {total, kept, discarded}.
+    if (request.args.get("by") or "").lower() == "job":
+        all_items = _get_sorted_items(force=False)
+        breakdown: dict[str, dict[str, int]] = {}
+        for it in all_items:
+            slug_key = it.topic_slug or "default"
+            bucket = breakdown.setdefault(slug_key, {"total": 0, "kept": 0, "discarded": 0})
+            bucket["total"] += 1
+            if it.category.upper() == "DISCARD":
+                bucket["discarded"] += 1
+            else:
+                bucket["kept"] += 1
+        payload["by_job"] = breakdown
+    return jsonify(payload)
 
 
 # ── API: gallery (paginated + filtered) ───────────────────────────────────────
@@ -2745,6 +3696,64 @@ def api_gallery():
             "sources": sorted({it.source for it in items}),
             "categories": sorted({it.category for it in items}),
             "resolutions": [b[0] for b in _RESOLUTION_BUCKETS] + ["ultra", "unknown"],
+        },
+    })
+
+
+@app.route("/api/gallery/global")
+def api_gallery_global():
+    """T3: cross-job gallery — same shape as ``/api/gallery`` but aggregated
+    over every job. ``?jobs=slug1,slug2`` narrows to the listed slugs (comma-
+    separated); an empty / absent value keeps the aggregate. Each card carries
+    ``topic_slug`` so the client can chip the job name onto the tile.
+
+    Reuses ``_get_sorted_items(None)`` + ``_filter_items`` so gallery filter
+    semantics (source/category/resolution/date/scores/keyword) stay identical
+    to the per-job endpoint — the only differences are scope and the job
+    filter applied here on top.
+    """
+    items = _get_sorted_items_scoped(None)
+    jobs_arg = (request.args.get("jobs") or "").strip()
+    if jobs_arg:
+        wanted = {
+            s.strip() for s in jobs_arg.split(",")
+            if s.strip() and job_config.JOB_SLUG_RE.match(s.strip())
+        }
+        if wanted:
+            items = [it for it in items if (it.topic_slug or "default") in wanted]
+    filtered = _filter_items(items, request.args)
+    sort_key = (request.args.get("sort") or "newest").lower()
+    if sort_key == "ovr":
+        filtered.sort(key=lambda it: float(it.payload.get("OVR_Quality_Score") or 0), reverse=True)
+    elif sort_key == "rel":
+        filtered.sort(key=lambda it: float(it.payload.get("REL_Quality_Score") or 0), reverse=True)
+    elif sort_key == "quality":
+        filtered.sort(key=lambda it: float(it.payload.get("quality_score") or 0), reverse=True)
+    else:
+        filtered.sort(key=lambda it: it.mtime, reverse=True)
+    page = max(1, _parse_int(request.args.get("page"), default=1))
+    page_size = max(1, min(240, _parse_int(request.args.get("page_size"), default=_GALLERY_PAGE_LIMIT)))
+    start = (page - 1) * page_size
+    page_items = filtered[start:start + page_size]
+
+    def _card(it: _SortedItem) -> dict[str, Any]:
+        card = _item_to_card(it)
+        # topic_slug lets the client chip the job name on each tile — the
+        # per-job endpoint doesn't need it, but here it disambiguates the mix.
+        card["topic_slug"] = it.topic_slug or "default"
+        return card
+
+    return jsonify({
+        "page": page,
+        "page_size": page_size,
+        "total": len(filtered),
+        "total_unfiltered": len(items),
+        "items": [_card(it) for it in page_items],
+        "available": {
+            "sources": sorted({it.source for it in items}),
+            "categories": sorted({it.category for it in items}),
+            "resolutions": [b[0] for b in _RESOLUTION_BUCKETS] + ["ultra", "unknown"],
+            "jobs": sorted({(it.topic_slug or "default") for it in items}),
         },
     })
 
@@ -3434,6 +4443,2072 @@ def api_vision_health():
                     "error": None})
 
 
+# ── User-acquisition wave endpoints (T1–T3) ───────────────────────────────────
+#
+# These are the endpoints added by the user-acquisition wave: demo mode, preset
+# marketplace, quick-sort, vision-worker discovery + dry-run, export preview,
+# bulk gallery actions, undo/requeue, gallery-dl URL test, cookies converter,
+# log tail (SSE), VRAM hint, Gist publishing, and digest build/send. Grouped
+# together so the block stays easy to find and audit.
+#
+# Every user-supplied path is guarded by ``safe_inside``. Fetches from remote
+# hosts (preset marketplace, gist publish) reuse ``scheduler._is_public_http_url``
+# as the SSRF sanitiser plus a per-host allowlist. Cookies + gist endpoints
+# reject any request whose ``remote_addr`` isn't loopback — they are single-user
+# admin-only.
+
+import mimetypes
+import tempfile as _tempfile
+import time as _wave_time
+from urllib.parse import urlparse as _wave_urlparse
+
+# SSRF guard: reuse the one that ships with scheduler. Keeps the invariant that
+# there's exactly ONE public/private classifier for the whole codebase.
+from scheduler import _is_public_http_url as _wave_is_public_http_url
+
+# 15s cap on every remote fetch (presets, gists, LM Studio model info).
+_WAVE_HTTP_TIMEOUT: float = 15.0
+# 512 KB cap on preset payloads — a preset is JSON config, not a dataset.
+_WAVE_PRESET_MAX_BYTES: int = 512 * 1024
+# 20 MB cap on the dry-run image upload.
+_WAVE_UPLOAD_MAX_BYTES: int = 20 * 1024 * 1024
+# Allowlisted preset-hosting origins for the marketplace fetch.
+_WAVE_PRESET_ALLOWED_HOSTS: frozenset[str] = frozenset({
+    "github.com",
+    "gist.github.com",
+    "raw.githubusercontent.com",
+    "codeberg.org",
+    "huggingface.co",
+    "huggingface.io",
+})
+
+
+def _wave_data_root() -> Path:
+    """Return the resolved data root (mirrors the module-level ``_DATA_ROOT``).
+
+    Read via a helper so tests that monkeypatch ``os.environ`` see the current
+    value, not the snapshot taken at import time.
+    """
+    return _DATA_ROOT
+
+
+def _wave_is_loopback_request() -> bool:
+    """True iff ``request.remote_addr`` looks like loopback.
+
+    Localhost-only endpoints (cookies converter, gist publish) hard-refuse
+    non-loopback callers regardless of what proxy is in front. We check the
+    string form directly — ipaddress.ip_address would need an extra strip for
+    the IPv6-mapped IPv4 form (``::ffff:127.0.0.1``).
+    """
+    addr = (request.remote_addr or "").strip()
+    if not addr:
+        return False
+    if addr in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if addr.startswith("::ffff:127."):
+        return True
+    return False
+
+
+def _wave_fetch_preset_body(url: str) -> tuple[bool, str, dict | None]:
+    """Fetch a preset JSON body from ``url`` with SSRF + host + size guards.
+
+    Returns ``(ok, error, body)``. On success ``body`` is the parsed JSON dict.
+    On failure ``error`` carries a short user-facing reason and ``body`` is
+    None.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False, "url is required", None
+    url = url.strip()
+    try:
+        parsed = _wave_urlparse(url)
+    except ValueError:
+        return False, "invalid url", None
+    if parsed.scheme.lower() != "https":
+        return False, "url must be https", None
+    host = (parsed.hostname or "").strip().lower()
+    if host not in _WAVE_PRESET_ALLOWED_HOSTS:
+        return False, f"host not allowed: {host!r}", None
+    # SSRF guard: reject DNS names that resolve to private / loopback / link-
+    # local / metadata addresses even when the string-level allowlist matches.
+    if not _wave_is_public_http_url(url):
+        return False, "url must resolve to a public host", None
+    try:
+        import requests as _requests
+        # allow_redirects=False so a hostile host can't 302 to a private URL.
+        resp = _requests.get(url, timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+    except Exception as exc:  # noqa: BLE001 - network failure is user-facing, not a 500
+        logger.warning("preset fetch failed for %s: %s", host, exc)
+        return False, "fetch failed", None
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}", None
+    # Enforce the size cap on the raw body BEFORE parsing.
+    raw = resp.content or b""
+    if len(raw) > _WAVE_PRESET_MAX_BYTES:
+        return False, f"payload too large ({len(raw)} bytes, max {_WAVE_PRESET_MAX_BYTES})", None
+    try:
+        parsed_body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return False, f"invalid JSON: {exc}", None
+    if not isinstance(parsed_body, dict):
+        return False, "payload must be a JSON object", None
+    return True, "", parsed_body
+
+
+# ── T1 #1 — Demo mode ─────────────────────────────────────────────────────────
+
+@app.route("/api/demo/seed", methods=["POST"])
+def api_demo_seed():
+    """Seed the demo dataset (idempotent). Body: ``{"force": bool}`` (optional)."""
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force"))
+    try:
+        result = demo_seed.seed_demo(force=force)
+    except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return _err("failed to seed demo dataset", exc, 500)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/demo/unseed", methods=["POST"])
+def api_demo_unseed():
+    """Remove the demo dataset (guarded by the marker file)."""
+    try:
+        result = demo_seed.unseed_demo()
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to unseed demo dataset", exc, 500)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/demo/status")
+def api_demo_status():
+    """Return whether the demo dataset is seeded + basic counts."""
+    try:
+        return jsonify(demo_seed.demo_status())
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to read demo status", exc, 500)
+
+
+# ── Native folder picker (localhost-only, first-run wizard) ─────────────────
+#
+# The dashboard runs on the user's own machine, so Tk is fine — but Tk plus
+# Flask's threaded dev server plus Windows dialog quirks (dismissal via Alt+F4
+# leaving Tk state alive) is fragile. We spawn a fresh subprocess whose only
+# job is opening the dialog: the parent stays responsive, Tk state can't leak,
+# and the subprocess timeout is our natural hang-guard. Serialised through a
+# module-level lock so two concurrent wizard clicks can't spawn two dialogs.
+
+_FOLDER_PICKER_LOCK = threading.Lock()
+_FOLDER_PICKER_TIMEOUT_SEC = 60
+
+
+_FOLDER_PICKER_CHILD = r"""
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception as exc:
+    sys.stderr.write('tkinter-unavailable:' + str(exc))
+    sys.exit(2)
+try:
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    root.update()
+    path = filedialog.askdirectory(
+        title='Choose a folder for cull to import', mustexist=True,
+    )
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    # Empty string = user cancelled.
+    if path:
+        sys.stdout.write(path)
+    sys.exit(0)
+except Exception as exc:
+    sys.stderr.write('picker-failed:' + str(exc))
+    sys.exit(3)
+"""
+
+
+@app.route("/api/system/folder-picker", methods=["POST"])
+def api_system_folder_picker():
+    """Open a native folder-picker dialog on the server (i.e. this machine).
+
+    Localhost-only: refuses non-loopback callers so a proxied/remote dashboard
+    can never trigger a dialog on the operator's desktop. Returns:
+        {ok, path, cancelled, error}
+    """
+    remote = (request.remote_addr or "").strip()
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "folder picker is available on localhost only"}), 403
+    # Try to serialise; if another picker is already open, tell the client
+    # cleanly rather than block a Flask worker.
+    if not _FOLDER_PICKER_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "path": None, "cancelled": False,
+                        "error": "a folder picker is already open"}), 409
+    try:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", _FOLDER_PICKER_CHILD],
+                capture_output=True, text=True,
+                timeout=_FOLDER_PICKER_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "folder picker timed out"}), 504
+        except FileNotFoundError as exc:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": f"could not spawn picker: {exc}"}), 500
+
+        if proc.returncode == 2:
+            # tkinter missing: this is common on stripped-down Python builds.
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": "tkinter not available; type the path manually"}), 200
+        if proc.returncode == 3:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or "picker failed").strip()}), 500
+        if proc.returncode != 0:
+            return jsonify({"ok": False, "path": None, "cancelled": False,
+                            "error": (proc.stderr or f"picker exit {proc.returncode}").strip()}), 500
+
+        picked = (proc.stdout or "").strip()
+        if not picked:
+            return jsonify({"ok": False, "path": None, "cancelled": True, "error": None}), 200
+        return jsonify({"ok": True, "path": picked, "cancelled": False, "error": None})
+    finally:
+        _FOLDER_PICKER_LOCK.release()
+
+
+@app.route("/api/video/backend-status")
+def api_video_backend_status():
+    """Report which video-frame extraction backends are installed.
+
+    Consumed by the Settings tab to warn the operator when
+    ``VIDEO_CLASSIFY_ENABLED`` is on but no backend is available — the vision
+    worker would otherwise route every clip to Unclassified_Video, which is
+    correct but easy to miss.
+    """
+    try:
+        import video_frames
+        backends = video_frames.available_backends()
+        has_any = video_frames.has_any_backend()
+    except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return _err("failed to read video backend status", exc, 500)
+    return jsonify({"backends": backends, "has_any": has_any})
+
+
+# ── T1 #3 — Preset marketplace ────────────────────────────────────────────────
+
+def _community_preset_dir() -> Path:
+    """Repo-relative folder holding shipped community presets."""
+    return WORKSPACE_ROOT / "presets" / "community"
+
+
+@app.route("/api/presets/community")
+def api_presets_community():
+    """List presets shipped under ``<repo>/presets/community/``.
+
+    Each preset is a JSON envelope; we read the ``_meta`` block for a
+    headline / description / category tags where present, and fall back to
+    the filename otherwise. Never fails — an empty directory returns [].
+    """
+    root = _community_preset_dir()
+    out: list[dict[str, Any]] = []
+    if not root.exists() or not root.is_dir():
+        return jsonify(out)
+    for path in sorted(root.glob("*.json")):
+        try:
+            stat = path.stat()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        meta = payload.get("_meta") if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+        headline = str(meta.get("headline") or path.stem.replace("_", " ").title()).strip()
+        description = str(meta.get("description") or "").strip()
+        cats = meta.get("categories")
+        if not isinstance(cats, list):
+            cats = []
+        out.append({
+            "filename": path.name,
+            "headline": headline,
+            "description": description,
+            "categories": [str(c) for c in cats if isinstance(c, (str, int))],
+            "size_bytes": int(stat.st_size),
+        })
+    return jsonify(out)
+
+
+_COMMUNITY_FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.preset\.json$", re.IGNORECASE)
+
+
+def _load_community_preset_body(filename: str) -> tuple[bool, str, dict | None]:
+    """Read a community preset from ``presets/community/<filename>`` — no HTTP.
+
+    Community presets ship in the repo, so preview / install for them must NOT
+    go through the SSRF-guarded fetcher (they carry no https URL). The filename
+    is regex-restricted and containment-checked against the community root so a
+    crafted value can't escape the intended directory.
+    """
+    if not _COMMUNITY_FILENAME_RE.match(filename or ""):
+        return False, "invalid community filename", None
+    root = _community_preset_dir()
+    path = root / filename
+    try:
+        real = os.path.realpath(str(path))
+        if os.path.commonpath([real, os.path.realpath(str(root))]) != os.path.realpath(str(root)):
+            return False, "path escapes the community directory", None
+    except (OSError, ValueError):
+        return False, "path resolution failed", None
+    if not path.is_file():
+        return False, "community preset not found", None
+    try:
+        return True, "", json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"failed to read community preset: {exc}", None
+
+
+@app.route("/api/presets/preview")
+def api_presets_preview():
+    """PREVIEW a preset — does NOT install anything.
+
+    Query: ``?url=<https://…>`` OR ``?filename=<local community preset>``.
+    Remote URLs are host-allowlisted, SSRF-guarded, fetched with a 15s +
+    512 KB cap. Local community filenames are read from
+    ``presets/community/<filename>`` (regex-restricted + containment-checked
+    against traversal). Either payload is run through the same validator that
+    guards imports (``config_io.import_preset`` if the payload looks like a
+    portable envelope; ``_validate_inheritable_cfg`` otherwise). Returns
+    ``{ok, cfg, warnings, error}`` — nothing is written to disk.
+    """
+    filename = (request.args.get("filename") or "").strip()
+    url = (request.args.get("url") or "").strip()
+    if filename and not url:
+        ok, err, body = _load_community_preset_body(filename)
+    else:
+        ok, err, body = _wave_fetch_preset_body(url)
+    if not ok:
+        return jsonify({"ok": False, "cfg": None, "warnings": [], "error": err}), 400
+    warnings: list[str] = []
+    try:
+        # Portable envelope form: {kind, name, preset|cfg, version}.
+        _name, cfg = config_io.import_preset(body)
+    except config_io.ValidationError as exc:
+        # Fall back to treating the raw payload as a bare inheritable cfg.
+        cleaned, err = _validate_inheritable_cfg(body, partial=False)
+        if err or cleaned is None:
+            return jsonify({"ok": False, "cfg": None, "warnings": [],
+                            "error": f"validation failed: {exc}"}), 400
+        cfg = cleaned
+        warnings.append("payload was not a portable preset envelope; validated as raw cfg")
+    return jsonify({"ok": True, "cfg": cfg, "warnings": warnings, "error": None})
+
+
+@app.route("/api/presets/install", methods=["POST"])
+def api_presets_install():
+    """Fetch + validate + install a remote preset under ``name``.
+
+    Body: ``{url, name}``. Rejects the request if ``name`` already exists
+    (mirrors ``/api/presets/import``). SSRF + host + size guards match
+    ``/api/presets/preview``; the validated cfg is saved via
+    ``_import_one_preset`` so the on-disk shape is identical to a normal
+    import.
+    """
+    data = request.get_json() or {}
+    filename = (data.get("filename") or "").strip()
+    url = (data.get("url") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not _valid_preset_name(name):
+        return jsonify({"ok": False, "error": "invalid preset name"}), 400
+    if _preset_exists(name):
+        return jsonify({"ok": False, "error": "preset already exists", "exists": True}), 409
+    if filename and not url:
+        ok_fetch, err, body = _load_community_preset_body(filename)
+    else:
+        ok_fetch, err, body = _wave_fetch_preset_body(url)
+    if not ok_fetch:
+        return jsonify({"ok": False, "error": err}), 400
+    # Accept both a portable envelope and a bare cfg — same as the preview.
+    try:
+        _name, cfg = config_io.import_preset(body)
+    except config_io.ValidationError:
+        cleaned, verr = _validate_inheritable_cfg(body, partial=False)
+        if verr or cleaned is None:
+            return jsonify({"ok": False, "error": f"invalid preset: {verr}"}), 400
+        cfg = cleaned
+    ok_save, reason = _import_one_preset(name, cfg, overwrite=False)
+    if not ok_save:
+        return jsonify({"ok": False, "error": f"install failed: {reason}"}), 400
+    return jsonify({"ok": True, "key": name})
+
+
+# ── T1 #4 — Quick-sort folder ─────────────────────────────────────────────────
+
+_QUICK_SORT_TEMPLATES: dict[str, str] = {
+    "quality_only": "quality_only",  # references a preset key if present
+    "default": "default",
+}
+
+
+@app.route("/api/quick-sort", methods=["POST"])
+def api_quick_sort():
+    """Spin up an ephemeral job that sorts one local folder, then start pipeline.
+
+    Body: ``{folder: str, template: "quality_only"|"default", vision_worker_id: str|None}``.
+
+    * ``folder`` is validated to exist + be a directory. We deliberately allow
+      any path the local user can already read; this is a single-user admin
+      tool.
+    * ``template`` selects a preset — falls back to ``default`` if the named
+      one isn't in the library.
+    * A fresh job with slug ``_quick_<unix ts>`` is created, its
+      ``scrapers.local_imports`` override is set to the folder, then the job
+      is activated and the pipeline started.
+    """
+    data = request.get_json() or {}
+    folder_raw = (data.get("folder") or "").strip()
+    template = (data.get("template") or "default").strip() or "default"
+    if not folder_raw:
+        return jsonify({"ok": False, "error": "folder is required"}), 400
+    folder = Path(folder_raw)
+    try:
+        resolved = folder.resolve(strict=True)
+    except (OSError, FileNotFoundError):
+        return jsonify({"ok": False, "error": "folder does not exist"}), 400
+    if not resolved.is_dir():
+        return jsonify({"ok": False, "error": "folder is not a directory"}), 400
+
+    # Pick a preset. Prefer the requested template; if it doesn't exist,
+    # fall back to the library's default so quick-sort still boots.
+    presets = job_config.list_presets().get("presets", {}) or {}
+    if template not in presets:
+        template = job_config.default_preset_name()
+
+    # Generate a slug of the form "_quick_<timestamp>". Job slugs must match
+    # JOB_SLUG_RE (^[a-z0-9_]+$), so we replace the leading underscore with
+    # 'quick' — a leading underscore is technically valid but the slugify path
+    # normalises names into that shape anyway. Add a trailing rand for
+    # uniqueness within one wall-clock second.
+    ts = int(_wave_time.time())
+    rand = uuid.uuid4().hex[:4]
+    slug = f"quick_{ts}_{rand}"
+    name = f"Quick sort {ts}"
+    try:
+        job = job_config.create_job(name, preset=template)
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to create ephemeral job", exc, 500)
+
+    # If create_job derived a different slug from the name, use ours. We
+    # rewrite the on-disk job to carry the deterministic slug so the caller's
+    # returned identity matches later listings.
+    if job.slug != slug:
+        # Deleting the collision-free auto-slug and saving under our slug
+        # keeps the job model's invariants intact.
+        try:
+            job_config.delete_job(job.slug)
+        except Exception:  # noqa: BLE001
+            pass
+        job = job.with_updates(slug=slug)
+        job_config.save_job(job)
+
+    # Point the local-imports list at the requested folder.
+    quick_local = [{
+        "name": "quick",
+        "dir": str(resolved),
+        "enabled": True,
+        "migrate_from": None,
+    }]
+    job = job_config.set_override(job, "scrapers.local_imports", quick_local)
+    # Optional: pin the fleet to a single named worker if the caller wants
+    # to route the batch through a specific GPU.
+    vwid = (data.get("vision_worker_id") or "").strip()
+    if vwid:
+        eff = job_config.effective_config(job)
+        fleet = job_config.clean_vision_fleet(
+            (eff.get("vision") or {}).get("workers"))
+        chosen = [w for w in fleet if w.get("id") == vwid]
+        if chosen:
+            job = job_config.set_override(job, "vision.workers", chosen)
+
+    job_config.save_job(job)
+    try:
+        job_config.activate(slug)
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to activate quick-sort job", exc, 500)
+
+    # Piggy-back on the same pipeline-start machinery the UI button uses.
+    # Silently no-op if it's already running so the caller's second click
+    # doesn't 500.
+    global _pipeline_proc
+    with _pipeline_lock:
+        if not pipeline_running():
+            try:
+                env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+                args = [sys.executable, "-u", "run_pipeline.py"]
+                kwargs: dict[str, Any] = {"cwd": str(PIPELINE_CODE_DIR), "env": env}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                _pipeline_proc = subprocess.Popen(args, **kwargs)
+                update_env("DASHBOARD_PAUSED", "false")
+            except Exception as exc:  # noqa: BLE001
+                return _err("failed to start pipeline", exc, 500)
+    return jsonify({"ok": True, "slug": slug})
+
+
+# ── T2 #9 — Test-drive one image (dry run against the fleet) ──────────────────
+
+@app.route("/api/vision/dry-run", methods=["POST"])
+def api_vision_dry_run():
+    """Classify ONE uploaded image against a chosen worker without saving anything.
+
+    Multipart form: ``image`` (file, ≤ 20 MB), ``worker_id`` (string). Reads the
+    active job's effective config for the prompt + scoring, calls the worker's
+    endpoint OpenAI-compatibly, runs the response through ``apply_scores``, and
+    reports where the sorter WOULD have moved the image. Never writes anything.
+    """
+    image = request.files.get("image")
+    worker_id = (request.form.get("worker_id") or "").strip()
+    if image is None:
+        return jsonify({"ok": False, "error": "image file is required"}), 400
+
+    # Read the upload, enforcing the 20 MB cap without touching disk.
+    stream = image.stream
+    stream.seek(0, io.SEEK_END)
+    size = stream.tell()
+    stream.seek(0)
+    if size > _WAVE_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False,
+                        "error": f"image too large ({size} bytes; max {_WAVE_UPLOAD_MAX_BYTES})"}), 413
+    raw_bytes = stream.read(_WAVE_UPLOAD_MAX_BYTES + 1)
+    if len(raw_bytes) > _WAVE_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+
+    # Resolve the active job so the prompt matches what production sees.
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    vision = eff.get("vision") if isinstance(eff.get("vision"), dict) else {}
+    fleet = job_config.clean_vision_fleet(vision.get("workers"))
+    chosen = next((w for w in fleet if w.get("id") == worker_id), None)
+    if chosen is None:
+        return jsonify({"ok": False,
+                        "error": f"worker not found in active job's fleet: {worker_id!r}"}), 404
+
+    # Compress to JPEG + b64 the same way BaseVisionWorker does before an
+    # API call. We keep it in-memory throughout; no temp files.
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.thumbnail((512, 512), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=90)
+        b64 = _b64encode_bytes(buf.getvalue())
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": f"could not read image: {exc}"}), 400
+
+    # ``build_classification_prompt`` reads the score / caption config from env,
+    # which the supervisor projects from the active job. Nothing else to wire.
+    prompt = vision_prompt.build_classification_prompt()
+    schema = vision_prompt.build_response_format()
+
+    # Dispatch to the worker's provider. LM Studio / llama.cpp / OpenAI-
+    # compat all speak OpenAI /v1/chat/completions; Ollama speaks
+    # /api/chat. We keep the fanout small — this endpoint is a DEV probe.
+    provider = (chosen.get("provider") or "").strip().lower()
+    base_url = (chosen.get("base_url") or "").strip().rstrip("/")
+    model = (chosen.get("model") or "").strip()
+    api_key = (chosen.get("api_key") or "").strip()
+    if not base_url:
+        return jsonify({"ok": False, "error": "worker has no base_url"}), 400
+    # SSRF gate: the vision fleet is by design a LOCAL / LAN construct —
+    # loopback (127.0.0.1 / ::1) or private RFC1918 ranges. Cloud vision
+    # providers (OpenAI / Anthropic / Groq / OpenRouter / Gemini) go through
+    # their own registered workers, not the fleet's base_url. Rejecting public
+    # URLs here blocks a crafted job config from steering the dry-run at cloud
+    # metadata endpoints or arbitrary internet hosts.
+    if _wave_is_public_http_url(base_url):
+        return jsonify({"ok": False,
+                        "error": (
+                            "vision fleet endpoints must be loopback / LAN "
+                            "(RFC1918 / link-local). Cloud providers are "
+                            "reached via their registered vision workers, "
+                            "not the fleet's base_url.")}), 400
+
+    import requests as _requests
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    raw_response: dict[str, Any] = {}
+    parsed: dict[str, Any] = {}
+    # Preserve the upstream URL for diagnostics — showing the endpoint we
+    # actually hit is half the battle when a user misconfigures base_url.
+    try:
+        if provider == "ollama":
+            call_url = f"{base_url}/api/chat"
+            payload = {
+                "model": model or "llama3.2-vision",
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": [b64],
+                }],
+                "format": schema.get("json_schema", {}).get("schema") if isinstance(schema, dict) else "json",
+                "stream": False,
+                "options": {"temperature": 0},
+            }
+            resp = _requests.post(
+                call_url, headers=headers, json=payload,
+                timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
+            raw_response = resp.json() if resp.content else {}
+            content = ((raw_response.get("message") or {}).get("content") or "")
+        else:
+            # Default OpenAI-compat path: lmstudio / llamacpp / openai / openrouter.
+            call_url = f"{base_url}/v1/chat/completions"
+            payload = {
+                "model": model or "gpt-4o-mini",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                }],
+                "response_format": schema,
+                "temperature": 0,
+            }
+            resp = _requests.post(
+                call_url, headers=headers, json=payload,
+                timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code >= 400:
+                return jsonify({"ok": False,
+                                "error": _format_upstream_error(resp, call_url)}), 502
+            raw_response = resp.json() if resp.content else {}
+            choices = raw_response.get("choices") or []
+            content = (choices[0].get("message", {}).get("content") or "") if choices else ""
+    except Exception as exc:  # noqa: BLE001 - never 500 the dry-run
+        # Network-level failures (ConnectionError, Timeout, DNS, etc.).
+        return jsonify({"ok": False, "error": f"worker call failed: {exc}"}), 502
+
+    # Parse + score-apply the model's JSON exactly like the worker would.
+    try:
+        parsed = vision_prompt._safe_parse_vision_json(content) or {}
+    except Exception:  # noqa: BLE001 - degrade to raw text
+        parsed = {}
+    try:
+        score_result = vision_prompt.apply_scores(parsed) if parsed else {}
+    except Exception:  # noqa: BLE001
+        score_result = {}
+    would_land = (score_result.get("category")
+                  or parsed.get("category")
+                  or "Unknown")
+
+    return jsonify({
+        "ok": True,
+        "raw_response": raw_response,
+        "parsed": parsed,
+        "would_land_in": would_land,
+        "score_result": score_result,
+    })
+
+
+def _b64encode_bytes(data: bytes) -> str:
+    """Base64-encode bytes to a UTF-8 string (helper for dry-run)."""
+    import base64 as _b64
+    return _b64.b64encode(data).decode("ascii")
+
+
+_UPSTREAM_BODY_MAX = 400  # was 800 — smaller cap to keep echoed content minimal
+_UPSTREAM_STRIP_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]")
+
+
+def _format_upstream_error(resp: Any, url: str) -> str:
+    """Format a rich diagnostic string from a non-2xx upstream response.
+
+    LM Studio / llama.cpp / Ollama frequently return 400 with a JSON body that
+    explains WHY (bad model name, unsupported field, schema issue). Surfacing
+    that body — status + url + up to ~400 chars, pretty-printed if JSON —
+    turns "worker call failed: 400 Client Error" into an actually actionable
+    error. Control chars are stripped and the body is truncated so that a
+    malicious upstream can't smuggle terminal escapes or unlimited payload
+    text back through the diagnostic surface.
+    """
+    body_text = ""
+    try:
+        # Prefer the parsed JSON body when the upstream sent one — safer to
+        # re-serialise than to echo raw response bytes verbatim. Also strips
+        # any control characters via the sanitiser below.
+        payload = resp.json()
+        body_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - fall through to raw text
+        try:
+            body_text = resp.text or ""
+        except Exception:  # noqa: BLE001
+            body_text = ""
+    # Scrub control chars — an attacker upstream could otherwise ship ANSI
+    # escapes or NUL bytes back through the /api/vision/dry-run JSON.
+    body_text = _UPSTREAM_STRIP_RE.sub("", body_text)
+    if len(body_text) > _UPSTREAM_BODY_MAX:
+        body_text = body_text[:_UPSTREAM_BODY_MAX] + "…"
+    status = getattr(resp, "status_code", "?")
+    return f"upstream {status} from {url}: {body_text}".strip()
+
+
+# ── T2 #10 — Endpoint discovery ───────────────────────────────────────────────
+
+@app.route("/api/vision/discover")
+def api_vision_discover():
+    """Probe common loopback endpoints (LM Studio / llama.cpp / Ollama)."""
+    try:
+        result = fleet_health.discover_local_endpoints()
+    except Exception as exc:  # noqa: BLE001
+        return _err("discovery failed", exc, 500)
+    return jsonify(result)
+
+
+@app.route("/api/vision/discover/add", methods=["POST"])
+def api_vision_discover_add():
+    """Append a discovered endpoint to the active job's vision.workers list.
+
+    Body: ``{provider, base_url, name, model?}``. The addition is stored as an
+    override on the active job so it takes effect on the next pipeline restart
+    without touching the shared preset library.
+    """
+    data = request.get_json() or {}
+    provider = (data.get("provider") or "").strip().lower()
+    base_url = (data.get("base_url") or "").strip()
+    name = (data.get("name") or "").strip()
+    model = (data.get("model") or "").strip()
+    if provider not in {"lmstudio", "llamacpp", "ollama"}:
+        return jsonify({"ok": False, "error": "provider must be lmstudio/llamacpp/ollama"}), 400
+    if not base_url or not name:
+        return jsonify({"ok": False, "error": "base_url and name are required"}), 400
+    if not re.match(r"^https?://", base_url, re.I):
+        return jsonify({"ok": False, "error": "base_url must be http(s)"}), 400
+
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    vision = eff.get("vision") if isinstance(eff.get("vision"), dict) else {}
+    fleet = list(job_config.clean_vision_fleet(vision.get("workers")))
+    new_worker: dict[str, Any] = {
+        "id": uuid.uuid4().hex[:12],
+        "name": name,
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": "",
+        "enabled": True,
+    }
+    fleet.append(new_worker)
+    job = job_config.set_override(job, "vision.workers", fleet)
+    job_config.save_job(job)
+    # Never ship raw api_keys back — mirror the /api/vision/health scrubber.
+    return jsonify(_scrub_fleet(fleet))
+
+
+# ── T2 #11 — Digest webhook (build + send) ────────────────────────────────────
+
+@app.route("/api/digest/build", methods=["POST"])
+def api_digest_build():
+    """Assemble a digest payload for ``slug`` over the last ``since_hours``.
+
+    Body: ``{slug, since_hours, top_n}``. Returns the payload verbatim plus a
+    pre-rendered Markdown body under ``markdown``.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip()
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"ok": False, "error": "invalid slug"}), 400
+    hours = max(1, int(data.get("since_hours") or 24))
+    top_n = max(0, int(data.get("top_n") or 20))
+    import datetime as _dt
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
+    try:
+        payload = _digest_mod.build_digest(slug, since=since, top_n=top_n)
+        markdown = _digest_mod.render_markdown(payload)
+    except Exception as exc:  # noqa: BLE001
+        return _err("digest build failed", exc, 500)
+    return jsonify({"ok": True, "payload": payload, "markdown": markdown})
+
+
+@app.route("/api/digest/send", methods=["POST"])
+def api_digest_send():
+    """Build a digest AND POST it to ``webhook_url`` (Discord / Slack style).
+
+    Body: ``{slug, webhook_url, webhook_style, since_hours, top_n}``. The
+    webhook URL is passed to ``scheduler.run_digest`` which owns the SSRF
+    guard and the 15s POST cap.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip()
+    webhook_url = (data.get("webhook_url") or "").strip()
+    style = (data.get("webhook_style") or "discord").strip().lower()
+    if not job_config.JOB_SLUG_RE.match(slug):
+        return jsonify({"ok": False, "error": "invalid slug"}), 400
+    if not webhook_url:
+        return jsonify({"ok": False, "error": "webhook_url is required"}), 400
+    hours = max(1, int(data.get("since_hours") or 24))
+    top_n = max(0, int(data.get("top_n") or 20))
+    try:
+        scheduler.run_digest(slug, since_hours=hours, top_n=top_n,
+                             webhook_url=webhook_url, webhook_style=style)
+    except Exception as exc:  # noqa: BLE001
+        return _err("digest send failed", exc, 500)
+    return jsonify({"ok": True})
+
+
+# ── T2 #12 — Export dry-run preview ───────────────────────────────────────────
+
+@app.route("/api/export/preview", methods=["POST"])
+def api_export_preview():
+    """Sample-iterate an export profile without copying anything.
+
+    Body: ``{profile, job_slug?, sample_size?}``. We iterate
+    ``export_profiles.iter_samples`` for the effective slug, sample up to
+    ``sample_size`` (default 200), and report counts + a resolution histogram
+    + the average caption length.
+    """
+    data = request.get_json() or {}
+    profile = (data.get("profile") or "").strip()
+    slug = (data.get("job_slug") or "").strip() or _resolve_job_slug()
+    sample_size = int(data.get("sample_size") or 200)
+    if sample_size < 1:
+        sample_size = 1
+    if profile and profile not in export_profiles.PROFILES:
+        return jsonify({"ok": False, "error": f"unknown profile: {profile}"}), 400
+    if not slug:
+        return jsonify({"ok": False, "error": "no active job"}), 409
+
+    total = 0
+    kept = 0
+    category_counts: dict[str, int] = {}
+    resolution_hist: dict[str, int] = {"< 512": 0, "512-1024": 0, "1024-2048": 0, "2048+": 0}
+    caption_lengths: list[int] = []
+    orphans = 0
+    sample_paths: list[str] = []
+    try:
+        for sample in export_profiles.iter_samples(slug):
+            total += 1
+            category_counts[sample.category] = category_counts.get(sample.category, 0) + 1
+            if sample.caption:
+                kept += 1
+                caption_lengths.append(len(sample.caption))
+            else:
+                orphans += 1
+            # Cheap dimension read from meta (already stored in .vision.json)
+            width = 0
+            height = 0
+            if isinstance(sample.meta, dict):
+                width = int(sample.meta.get("width") or 0)
+                height = int(sample.meta.get("height") or 0)
+            if width <= 0 or height <= 0:
+                try:
+                    with Image.open(sample.image_path) as img:
+                        width, height = img.size
+                except (OSError, ValueError):
+                    pass
+            longest = max(width, height)
+            if longest <= 0:
+                pass
+            elif longest < 512:
+                resolution_hist["< 512"] += 1
+            elif longest < 1024:
+                resolution_hist["512-1024"] += 1
+            elif longest < 2048:
+                resolution_hist["1024-2048"] += 1
+            else:
+                resolution_hist["2048+"] += 1
+            if len(sample_paths) < 12:
+                sample_paths.append(str(sample.image_path))
+            if total >= sample_size:
+                break
+    except Exception as exc:  # noqa: BLE001 - never 500 the preview
+        return _err("export preview failed", exc, 500)
+
+    avg_caption_len = int(round(sum(caption_lengths) / len(caption_lengths))) if caption_lengths else 0
+    return jsonify({
+        "ok": True,
+        "profile": profile,
+        "slug": slug,
+        "total": total,
+        "kept": kept,
+        "category_counts": category_counts,
+        "resolution_histogram": resolution_hist,
+        "avg_caption_length": avg_caption_len,
+        "orphan_count": orphans,
+        "sample_paths": sample_paths,
+    })
+
+
+# ── T3 #13 — Bulk gallery actions ─────────────────────────────────────────────
+
+def _trash_dir_for(slug: str | None) -> Path:
+    """Recoverable trash folder for one slug (created lazily)."""
+    root = _wave_data_root() / "trash" / (slug or "default")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@app.route("/api/gallery/bulk-action", methods=["POST"])
+def api_gallery_bulk_action():
+    """Batch move / delete / reclassify sorted images.
+
+    Body: ``{paths: [str], action: "move"|"delete"|"reclassify",
+              target_category?: str, reason?: str}``. Every path is
+    ``safe_inside``-guarded against PIPELINE_SORTED. ``delete`` moves the file
+    (and its sidecars) into ``data/trash/<slug>/`` — never :func:`os.remove`
+    directly — so the operation is recoverable. Returns ``{moved: int,
+    failed: [{path, error}]}``.
+    """
+    data = request.get_json() or {}
+    paths = data.get("paths")
+    action = (data.get("action") or "").strip().lower()
+    target = (data.get("target_category") or "").strip()
+    if not isinstance(paths, list) or not paths:
+        return jsonify({"moved": 0, "failed": [{"path": "", "error": "paths list required"}]}), 400
+    if action not in {"move", "delete", "reclassify"}:
+        return jsonify({"moved": 0, "failed": [{"path": "", "error": f"unknown action: {action}"}]}), 400
+    if action in {"move", "reclassify"} and not target:
+        return jsonify({"moved": 0,
+                        "failed": [{"path": "", "error": "target_category required for move/reclassify"}]}), 400
+    if action in {"move", "reclassify"} and target not in set(_categories_mod.get_all_categories()):
+        return jsonify({"moved": 0,
+                        "failed": [{"path": "", "error": f"unknown target category: {target}"}]}), 400
+
+    moved = 0
+    failed: list[dict[str, str]] = []
+    slug = _resolve_job_slug()
+    for raw in paths:
+        if not isinstance(raw, str):
+            failed.append({"path": str(raw), "error": "path must be a string"})
+            continue
+        safe = safe_inside(raw, [PIPELINE_SORTED])
+        if safe is None or not safe.exists():
+            failed.append({"path": raw, "error": "path outside sorted roots or missing"})
+            continue
+        try:
+            if action == "delete":
+                trash = _trash_dir_for(slug)
+                for sibling in safe.parent.glob(f"{safe.stem}.*"):
+                    shutil.move(str(sibling), str(trash / sibling.name))
+                moved += 1
+                continue
+            # move + reclassify share the same destination-resolution path.
+            raw_dest = _recategorise_dest_dir(safe, target)
+            dest_dir = safe_inside(str(raw_dest), [PIPELINE_SORTED]) if raw_dest is not None else None
+            if dest_dir is None:
+                failed.append({"path": raw, "error": "could not resolve destination inside sorted"})
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for sibling in safe.parent.glob(f"{safe.stem}.*"):
+                shutil.move(str(sibling), str(dest_dir / sibling.name))
+            # Update the .vision.json category so the sidecar stays in sync.
+            new_meta = dest_dir / f"{safe.stem}.vision.json"
+            if new_meta.exists():
+                try:
+                    payload = json.loads(new_meta.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        payload["category"] = target
+                        new_meta.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+                except (OSError, json.JSONDecodeError):
+                    pass  # non-fatal — the move already succeeded
+            moved += 1
+        except OSError as exc:
+            failed.append({"path": raw, "error": f"filesystem error: {exc}"})
+    # Invalidate the sorted cache so the gallery reflects the moves.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"moved": moved, "failed": failed})
+
+
+# ── T3 #14 — Undo / requeue ───────────────────────────────────────────────────
+
+@app.route("/api/gallery/requeue", methods=["POST"])
+def api_gallery_requeue():
+    """Move classified images back to the queue for re-classification.
+
+    Body variants:
+      - ``{paths: [str]}`` — a specific list.
+      - ``{category, since, job_slug}`` — every image in ``category`` for
+        ``job_slug`` whose mtime is >= ``since`` (ISO8601).
+    Delegates the actual moves to ``requeue_sorted.requeue_triples`` so the
+    file-shuffling logic remains in one place.
+    """
+    data = request.get_json() or {}
+    slug = (data.get("job_slug") or "").strip() or _resolve_job_slug() or "default"
+    category = (data.get("category") or "").strip() or None
+    since_raw = (data.get("since") or "").strip()
+    paths_arg = data.get("paths")
+
+    # Build buckets the way requeue_sorted does — but filter to the caller's
+    # scope (an explicit path list wins over the since/category form).
+    try:
+        buckets = _requeue_mod.collect_buckets(category=category)
+    except Exception as exc:  # noqa: BLE001
+        return _err("collect_buckets failed", exc, 500)
+
+    if isinstance(paths_arg, list) and paths_arg:
+        # Filter buckets to just the requested stems (safe_inside-guarded).
+        wanted_stems: set[str] = set()
+        for raw in paths_arg:
+            if not isinstance(raw, str):
+                continue
+            safe = safe_inside(raw, [PIPELINE_SORTED])
+            if safe is None:
+                continue
+            wanted_stems.add(safe.stem)
+        filtered: dict = {}
+        for key, items in buckets.items():
+            keep = {stem: flags for stem, flags in items.items() if stem in wanted_stems}
+            if keep:
+                filtered[key] = keep
+        buckets = filtered
+    elif since_raw:
+        try:
+            import datetime as _dt
+            since_dt = _dt.datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            since_epoch = since_dt.timestamp()
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "invalid ISO8601 since"}), 400
+        filtered = {}
+        for key, items in buckets.items():
+            keep = {}
+            for stem, flags in items.items():
+                any_new = False
+                for p in flags.get("files", []):
+                    try:
+                        if p.stat().st_mtime >= since_epoch:
+                            any_new = True
+                            break
+                    except OSError:
+                        continue
+                if any_new:
+                    keep[stem] = flags
+            if keep:
+                filtered[key] = keep
+        buckets = filtered
+
+    try:
+        requeued = _requeue_mod.requeue_triples(buckets, dry_run=False, limit=None)
+    except Exception as exc:  # noqa: BLE001
+        return _err("requeue failed", exc, 500)
+    # Invalidate caches so the next gallery/stats read reflects the move.
+    with _sorted_cache_lock:
+        _sorted_cache["ts"] = 0.0
+        _sorted_cache["signature"] = None
+    return jsonify({"requeued": int(requeued), "failed": []})
+
+
+# ── T3 #17 — gallery-dl URL test ──────────────────────────────────────────────
+
+@app.route("/api/scrapers/gallery-dl/test-url", methods=["POST"])
+def api_scrapers_gallery_dl_test_url():
+    """Preflight one URL through gallery-dl's extractor (no downloads).
+
+    Accepts either ``cookies_txt`` (raw Netscape-format cookie content) OR
+    ``cookies_file`` (a filesystem PATH to a cookies file). When both are
+    present the PATH wins — the field is unambiguous, and this matches how
+    the scraper config already stores it. When ``cookies_file`` is supplied
+    we read the file server-side (bound to 127.0.0.1) and pass the content
+    down as ``cookies_txt`` so the underlying probe sees exactly one shape.
+    """
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    cookies_txt = data.get("cookies_txt")
+    cookies_file = data.get("cookies_file")
+    config_json = data.get("config_json")
+
+    # cookies_file (path) beats inline cookies_txt — surfaces a clearer error
+    # than gallery-dl's cryptic "not enough values to unpack" when the caller
+    # accidentally sent a PATH string as CONTENT.
+    if isinstance(cookies_file, str) and cookies_file.strip():
+        raw_path = cookies_file.strip()
+        # Reject Windows special-device paths outright — Path.resolve() can
+        # silently accept them, which is not what a "pick your local cookies
+        # file" flow should ever hit.
+        if raw_path.startswith(("\\\\?\\", "\\\\.\\", "//?/", "//./")):
+            return jsonify({"ok": False, "error": f"cookies file path not allowed: {raw_path}"})
+        try:
+            cp = Path(raw_path).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            return jsonify({"ok": False, "error": f"invalid cookies file path: {exc}"})
+        if not cp.exists() or not cp.is_file():
+            return jsonify({"ok": False, "error": f"cookies file not found: {cp}"})
+        try:
+            size = cp.stat().st_size
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot stat cookies file: {exc}"})
+        if size > 1_048_576:  # 1 MB defensive cap
+            return jsonify({"ok": False, "error": "cookies file too large (>1 MB)"})
+        try:
+            content = cp.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return jsonify({"ok": False, "error": f"cannot read cookies file: {exc}"})
+        # Netscape-format sanity check — saves users a bewildering downstream
+        # ValueError from gallery-dl's cookiejar parser.
+        first_line = content.lstrip().splitlines()[0] if content.strip() else ""
+        if not first_line.lower().startswith("# netscape http cookie file"):
+            return jsonify({
+                "ok": False,
+                "error": ("cookies file is not in Netscape format "
+                          "(expected first line '# Netscape HTTP Cookie File')"),
+            })
+        cookies_txt = content
+
+    try:
+        result = scraper_test._check_gallery_dl_url(
+            url,
+            cookies_txt=cookies_txt if isinstance(cookies_txt, str) else None,
+            config_json=config_json if isinstance(config_json, str) else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err("gallery-dl url test failed", exc, 500)
+    return jsonify(result)
+
+
+# yt-dlp URL preflight — parallels gallery-dl's endpoint. Uses the yt_dlp
+# Python package in extract_info(download=False) mode inside a 15s watchdog
+# so a slow / hostile remote can't stall the request thread.
+_YT_DLP_URL_TIMEOUT_SECONDS = 15.0
+
+
+@app.route("/api/scrapers/yt-dlp/test-url", methods=["POST"])
+def api_scrapers_yt_dlp_test_url():
+    """Preflight one URL through yt-dlp's extract_info (no downloads)."""
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"})
+    try:
+        scheme = _wave_urlparse(url).scheme.lower()
+    except Exception:  # noqa: BLE001
+        return jsonify({"ok": False, "error": "invalid url"})
+    if scheme not in ("http", "https"):
+        return jsonify({"ok": False, "error": "only http(s) URLs are allowed"})
+
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp not importable: %s", exc)
+        return jsonify({"ok": False, "error": "yt-dlp not installed"})
+
+    import concurrent.futures as _cf_ytdlp
+
+    # Heuristic: for a single video, extract_flat='in_playlist' makes yt-dlp
+    # skip metadata extraction on some paths and report "not available". Only
+    # keep flat mode for URLs that look like a playlist / channel / list.
+    _u_lower = url.lower()
+    _is_playlist = ("/playlist" in _u_lower
+                    or "/channel" in _u_lower
+                    or "list=" in _u_lower)
+
+    def _probe() -> dict:
+        opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            # Playlists → flat; single videos → full metadata pass.
+            "extract_flat": "in_playlist" if _is_playlist else False,
+            "socket_timeout": 10,
+            # A realistic UA + Accept-Language shuts down the vast majority
+            # of YouTube's "Sign in to confirm you're not a bot" refusals
+            # on server-hosted IPs.
+            "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[attr-defined]
+            info = ydl.extract_info(url, download=False)
+        info = info or {}
+        # Playlists / channels expose `entries` (may be a generator).
+        entries = info.get("entries")
+        count_estimate: int | None = None
+        if isinstance(entries, list):
+            count_estimate = len(entries)
+        elif entries is not None:
+            try:
+                # Best-effort: bounded iteration so a huge playlist doesn't
+                # eat memory.
+                count_estimate = 0
+                for _ in entries:
+                    count_estimate += 1
+                    if count_estimate >= 200:
+                        break
+            except Exception:  # noqa: BLE001
+                count_estimate = None
+        duration = info.get("duration")
+        return {
+            "ok": True,
+            "extractor": info.get("extractor") or info.get("extractor_key"),
+            "title": info.get("title"),
+            "duration_sec": int(duration) if isinstance(duration, (int, float)) else None,
+            "count_estimate": count_estimate,
+            "error": None,
+        }
+
+    try:
+        with _cf_ytdlp.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_probe)
+            result = fut.result(timeout=_YT_DLP_URL_TIMEOUT_SECONDS)
+        return jsonify(result)
+    except _cf_ytdlp.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": f"timed out after {int(_YT_DLP_URL_TIMEOUT_SECONDS)}s",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("yt-dlp test-url error for %s: %s", url, exc)
+        msg = str(exc)[:200]
+        # Bot-check / geo / age-gate / private → point the user at cookies.
+        if "not available" in msg.lower() or "sign in" in msg.lower():
+            msg = (f"{msg} — May be geo-blocked, age-restricted, private, or "
+                   "requiring a signed-in browser cookie file — try adding "
+                   "cookies in the scraper config.")
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {msg}",
+        })
+
+
+# ── T3 #18 — Cookies converter ────────────────────────────────────────────────
+
+# Netscape cookies.txt header the browser extensions all emit.
+_COOKIES_HEADER = (
+    "# Netscape HTTP Cookie File\n"
+    "# Generated by cull dashboard — https://github.com\n"
+    "# This is a generated file! Do not edit.\n"
+)
+# 30 days from now for cookies with no expiry set — matches the extension defaults.
+_COOKIES_DEFAULT_TTL_SECONDS = 30 * 24 * 3600
+_COOKIES_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _parse_devtools_cookies(raw: str, target_domain: str) -> list[dict]:
+    """Convert a semicolon-separated ``k=v`` string OR a JSON array of cookie
+    objects into a list of ``{name, value, domain, path, expires, secure,
+    http_only}`` dicts."""
+    text = raw.strip()
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        out: list[dict] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            value = str(entry.get("value") or "")
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "value": value,
+                "domain": str(entry.get("domain") or target_domain).strip(),
+                "path": str(entry.get("path") or "/").strip() or "/",
+                "expires": int(entry.get("expires") or 0) or 0,
+                "secure": bool(entry.get("secure", True)),
+                "http_only": bool(entry.get("httpOnly") or entry.get("http_only")),
+            })
+        return out
+    # Fall through: semicolon-separated ``k=v`` pairs (DevTools "Copy request
+    # cookies" output).
+    out = []
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        name, _, value = chunk.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "value": value.strip(),
+            "domain": target_domain,
+            "path": "/",
+            "expires": 0,
+            "secure": True,
+            "http_only": False,
+        })
+    return out
+
+
+def _render_netscape_cookies(cookies: list[dict]) -> str:
+    """Format cookies as Netscape cookies.txt."""
+    lines: list[str] = [_COOKIES_HEADER]
+    now = int(_wave_time.time())
+    for c in cookies:
+        domain = c.get("domain") or ""
+        if domain and not domain.startswith("."):
+            domain = "." + domain
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = c.get("path") or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        expires = int(c.get("expires") or 0)
+        if expires <= 0:
+            expires = now + _COOKIES_DEFAULT_TTL_SECONDS
+        lines.append(
+            "\t".join([domain, flag, path, secure, str(expires),
+                       c.get("name", ""), c.get("value", "")])
+        )
+    return "\n".join(lines) + "\n"
+
+
+@app.route("/api/cookies/convert", methods=["POST"])
+def api_cookies_convert():
+    """Convert pasted DevTools cookies into a Netscape ``cookies.txt`` on disk.
+
+    Body: ``{raw, target_domain, output_name}``. Loopback-only (rejects any
+    non-127.0.0.1 caller). Writes to ``<data_root>/cookies/<safe_name>.txt``
+    via ``safe_inside`` so the destination can never escape the cookies dir.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    data = request.get_json() or {}
+    raw = (data.get("raw") or "").strip()
+    domain = (data.get("target_domain") or "").strip()
+    output_name = (data.get("output_name") or "").strip()
+    if not raw:
+        return jsonify({"ok": False, "error": "raw is required"}), 400
+    if not domain:
+        return jsonify({"ok": False, "error": "target_domain is required"}), 400
+    if not _COOKIES_NAME_RE.match(output_name):
+        return jsonify({"ok": False,
+                        "error": "output_name must be [A-Za-z0-9._-]{1,64}"}), 400
+
+    cookies = _parse_devtools_cookies(raw, domain)
+    if not cookies:
+        return jsonify({"ok": False, "error": "no cookies parsed"}), 400
+    body = _render_netscape_cookies(cookies)
+
+    cookies_dir = _wave_data_root() / "cookies"
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+    # safe_inside guards the write destination against traversal via a
+    # malicious output_name (belt-and-braces — the regex already rejects it).
+    dest_raw = cookies_dir / f"{output_name}.txt"
+    dest = safe_inside(str(dest_raw), [cookies_dir])
+    if dest is None:
+        # `safe_inside` returns None when the resolved path doesn't yet exist;
+        # fall back to a manual containment check via commonpath. dest_raw's
+        # parent is guaranteed to be cookies_dir here (from the regex), so
+        # this is a hard confirm rather than a computation.
+        try:
+            resolved_parent = os.path.realpath(str(dest_raw.parent))
+            cookies_real = os.path.realpath(str(cookies_dir))
+            if os.path.commonpath([resolved_parent, cookies_real]) != cookies_real:
+                return jsonify({"ok": False, "error": "output path escapes cookies dir"}), 400
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "error": "invalid output path"}), 400
+        dest = dest_raw
+    try:
+        dest.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        return _err("could not write cookies file", exc, 500)
+    return jsonify({"ok": True, "path": str(dest), "count": len(cookies)})
+
+
+# ── T3 #19 — Log tail (SSE) ───────────────────────────────────────────────────
+
+def _newest_log_file() -> Path | None:
+    """Return the most-recently modified ``.log`` under LOG_DIR, or None."""
+    log_dir = LOG_DIR
+    if not log_dir.exists():
+        # Fall back to the paths.py resolution so the SSE stream works even
+        # when the module was imported before LOG_DIR was set.
+        try:
+            log_dir = _paths.log_dir()
+        except Exception:  # noqa: BLE001
+            return None
+    if not log_dir.exists():
+        return None
+    files = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+@app.route("/api/logs/stream")
+def api_logs_stream():
+    """Server-Sent Events stream of new lines appended to the newest log file.
+
+    Sends at most 1 line per 100 ms and a keepalive comment every 15 seconds.
+    Client disconnects propagate as a broken pipe on the send — the generator
+    exits cleanly.
+    """
+
+    def generate():
+        current: Path | None = _newest_log_file()
+        position = 0
+        if current is not None:
+            try:
+                position = current.stat().st_size
+            except OSError:
+                position = 0
+        last_keepalive = _wave_time.monotonic()
+        while True:
+            new_current = _newest_log_file()
+            if new_current is None:
+                # Nothing to tail yet — keepalive + short sleep.
+                if _wave_time.monotonic() - last_keepalive > 15:
+                    yield ": keepalive\n\n"
+                    last_keepalive = _wave_time.monotonic()
+                _wave_time.sleep(0.5)
+                continue
+            if current is None or new_current != current:
+                current = new_current
+                position = 0
+            try:
+                stat = current.stat()
+                if stat.st_size < position:
+                    position = 0  # file was rotated/truncated
+                if stat.st_size > position:
+                    with current.open("r", encoding="utf-8", errors="replace") as fh:
+                        fh.seek(position)
+                        chunk = fh.read(stat.st_size - position)
+                        position = fh.tell()
+                    for line in chunk.splitlines():
+                        if not line.strip():
+                            continue
+                        payload = {
+                            "file": current.name,
+                            "line": line,
+                            "ts": datetime.utcnow().isoformat() + "Z",
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        last_keepalive = _wave_time.monotonic()
+                        # Rate-limit: at most 1 line / 100 ms.
+                        _wave_time.sleep(0.1)
+            except OSError:
+                _wave_time.sleep(0.5)
+                continue
+            if _wave_time.monotonic() - last_keepalive > 15:
+                yield ": keepalive\n\n"
+                last_keepalive = _wave_time.monotonic()
+            _wave_time.sleep(0.25)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
+
+
+# ── T3 #20 — VRAM hint ────────────────────────────────────────────────────────
+
+# Rough per-quant memory footprint per billion params. Numbers are the widely
+# quoted "napkin math" for a 7B model as a base; scale linearly with param
+# count. Anything not on this list falls back to the FP16 estimate.
+_QUANT_GB_PER_B: dict[str, float] = {
+    "fp16": 2.0, "f16": 2.0,
+    "q8_0": 1.05, "q6_k": 0.85, "q5_k_m": 0.72, "q5_k_s": 0.68,
+    "q4_k_m": 0.60, "q4_k_s": 0.55, "q4_0": 0.55,
+    "q3_k_m": 0.48, "q3_k_s": 0.44,
+    "q2_k": 0.38,
+}
+_PARAM_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*[Bb](?!\w)")
+_QUANT_RE = re.compile(r"(fp16|f16|q[2-8][_.-]?[0-9km_s]{0,4})", re.I)
+
+
+def _estimate_worker_metadata(model_id: str, model_meta: dict[str, Any]) -> dict[str, Any]:
+    """Rough VRAM / quant / context-window estimate for one LM Studio model."""
+    mid = str(model_id or "")
+    # Try the loaded-model API's numeric fields first — they beat any guess.
+    ctx = model_meta.get("loaded_context_length") or model_meta.get("context_length")
+    quant = model_meta.get("quantization") or ""
+    size_bytes = model_meta.get("size") or model_meta.get("file_size")
+    if not quant:
+        q = _QUANT_RE.search(mid)
+        if q:
+            quant = q.group(1).lower().replace(".", "_").replace("-", "_")
+    vram_gb: float | None = None
+    if isinstance(size_bytes, (int, float)) and size_bytes > 0:
+        vram_gb = round(float(size_bytes) / 1_073_741_824, 2)
+    else:
+        # Fall back to param-count × per-quant scaling.
+        params_b = 0.0
+        m = _PARAM_RE.search(mid)
+        if m:
+            try:
+                params_b = float(m.group(1))
+            except ValueError:
+                params_b = 0.0
+        if params_b > 0:
+            scale = _QUANT_GB_PER_B.get((quant or "").lower(), _QUANT_GB_PER_B["fp16"])
+            vram_gb = round(params_b * scale, 2)
+    return {
+        "estimated_vram_gb": vram_gb,
+        "context_window": int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else None,
+        "quantization": quant or None,
+    }
+
+
+@app.route("/api/vision/worker-info")
+def api_vision_worker_info():
+    """Best-effort loaded-model info for an LM Studio worker.
+
+    Query: ``?worker_id=<id>``. Looks up the worker in the active job's fleet,
+    hits its ``/api/v0/models`` (LM Studio-specific, richer payload) with a
+    fallback to ``/v1/models``, and derives a VRAM/context/quant hint.
+    """
+    worker_id = (request.args.get("worker_id") or "").strip()
+    if not worker_id:
+        return jsonify({"error": "worker_id is required"}), 400
+    slug = _resolve_job_slug()
+    job = _job_for_scope(slug)
+    if job is None:
+        return jsonify({"error": "no active job"}), 409
+    eff = job_config.effective_config(job)
+    fleet = job_config.clean_vision_fleet(
+        (eff.get("vision") or {}).get("workers"))
+    chosen = next((w for w in fleet if w.get("id") == worker_id), None)
+    if chosen is None:
+        return jsonify({"error": f"unknown worker: {worker_id!r}"}), 404
+    base_url = (chosen.get("base_url") or "").rstrip("/")
+    model = (chosen.get("model") or "").strip()
+    api_key = (chosen.get("api_key") or "").strip()
+    if not base_url:
+        return jsonify({"error": "worker has no base_url"}), 400
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    import requests as _requests
+    meta: dict[str, Any] = {}
+    for path in ("/api/v0/models", "/v1/models"):
+        try:
+            resp = _requests.get(f"{base_url}{path}", headers=headers,
+                                 timeout=_WAVE_HTTP_TIMEOUT, allow_redirects=False)
+            if resp.status_code == 200:
+                payload = resp.json() if resp.content else {}
+                for item in (payload.get("data") or []):
+                    if isinstance(item, dict) and (not model or item.get("id") == model):
+                        meta = item
+                        break
+                if meta:
+                    break
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort
+            logger.debug("worker-info probe %s%s failed: %s", base_url, path, exc)
+    hints = _estimate_worker_metadata(model or meta.get("id", ""), meta)
+    return jsonify({"worker_id": worker_id, "model": model or meta.get("id"),
+                    **hints})
+
+
+# ── Community publish via git worktree + PR ───────────────────────────────────
+#
+# Community contributions never land directly on main. The publish flow spins
+# up a throwaway git WORKTREE at origin/main HEAD, drops the contribution
+# files into it, commits + pushes a fresh `contrib/*` branch, and opens a PR
+# via `gh` if the CLI is available (falling back to a compare URL the caller
+# can click). The worktree is torn down at the end. This never touches the
+# user's current branch or their working-tree WIP — the whole operation is
+# isolated in a scratch directory.
+#
+# Why a worktree instead of branch-swap-in-place?
+#   Branch-swap risked entangling other uncommitted user changes on the
+#   original branch. A dedicated worktree side-steps the risk entirely and
+#   matches what a well-behaved CI job would do.
+
+# Subprocess timeout for every git call this endpoint drives. 30 s matches the
+# task spec; a slow push (large repo, poor network) will fail loudly instead
+# of hanging the dashboard's Flask worker.
+_PRESET_PUBLISH_GIT_TIMEOUT: float = 30.0
+
+_PR_BASE_BRANCH_DEFAULT: str = "main"
+_PR_BRANCH_PREFIX: str = "contrib/preset"
+
+
+def _github_compare_url(remote_url: str, base: str, head: str) -> str | None:
+    """Build a GitHub compare URL for owner/repo derived from ``remote_url``.
+
+    Returns None for non-GitHub remotes; the caller falls back to a plain
+    "branch pushed" message so the flow still succeeds without gh CLI.
+    """
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", remote_url or "")
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://github.com/{owner}/{repo}/compare/{base}...{head}?expand=1"
+
+
+def _git_run(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    """Run a git command with strict, non-interactive settings.
+
+    Returns (returncode, stdout, stderr). shell=False and args-as-list to
+    keep the operator-supplied ``key`` out of a shell parse. Environment is
+    frozen with ``GIT_TERMINAL_PROMPT=0`` so a missing credential helper can
+    never block the dashboard waiting for input.
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = subprocess.run(  # noqa: S603 - args are a fixed literal + validated key
+        args,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_PRESET_PUBLISH_GIT_TIMEOUT,
+        shell=False,
+        check=False,
+    )
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def _clean_git_error(stderr: str, cap: int = 400) -> str:
+    """Strip control chars from git's stderr and truncate for a user-facing error."""
+    if not stderr:
+        return "(git produced no error output)"
+    # Strip terminal control sequences and CR/LF noise; keep printable ASCII/UTF.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", stderr).strip()
+    if len(text) > cap:
+        text = text[: cap - 1] + "…"
+    return text or "(git error was empty after sanitisation)"
+
+
+@app.route("/api/presets/<key>/publish", methods=["POST"])
+def api_presets_publish(key: str):
+    """Publish preset ``key`` (+ thumbnail if any) as a PR to origin.
+
+    Loopback-only. Empty body. Spins up a throwaway git worktree at
+    ``origin/main``, writes ``presets/community/<key>.preset.json`` from
+    ``config_io.export_preset_bytes(key)`` and the user's thumbnail (from
+    ``presets/thumbnails/<key>.<ext>`` or the community slot) into it,
+    commits a fresh ``contrib/preset-<slug>-<epoch>`` branch, pushes to
+    origin, and opens a PR via ``gh pr create`` when the CLI is available.
+    Falls back to a github.com compare URL when ``gh`` is missing.
+
+    The user's current branch and working-tree WIP are never touched —
+    all mutations happen inside the scratch worktree, which is removed
+    at the end of the request regardless of outcome.
+
+    Returns ``{ok, pr_url, branch, base, commit, files, gh_used}``.
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    key = (key or "").strip()
+    if not _valid_preset_name(key):
+        return jsonify({"ok": False, "error": "invalid preset name"}), 400
+    if not _preset_exists(key):
+        return jsonify({"ok": False, "error": "preset not found"}), 404
+    key_lower = _preset_thumb_key(key)
+    if key_lower is None:
+        return jsonify({"ok": False, "error": "invalid preset key"}), 400
+
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return jsonify({
+            "ok": False,
+            "error": "git not installed",
+            "hint": "Install git and clone the cull repo (see README).",
+        }), 400
+    if not (WORKSPACE_ROOT / ".git").exists():
+        return jsonify({
+            "ok": False,
+            "error": "not a git repository",
+            "hint": "cull was likely downloaded as a zip. Clone the repo instead: git clone https://github.com/tlennon-ie/cull",
+        }), 400
+
+    rc, out, err = _git_run([git_bin, "remote", "get-url", "origin"], WORKSPACE_ROOT)
+    if rc != 0 or not out.strip():
+        return jsonify({
+            "ok": False,
+            "error": "no 'origin' remote configured",
+            "hint": "git remote add origin <url> (see README).",
+        }), 400
+    remote_url = out.strip().splitlines()[0]
+
+    # Serialize the preset payload in-memory FIRST — nothing on disk in the
+    # user's tree changes if this fails.
+    try:
+        envelope_bytes = config_io.export_preset_bytes(key)
+    except Exception as exc:  # noqa: BLE001
+        return _err("failed to export preset", exc, 500)
+
+    # Locate an existing thumbnail (user or community slot) to include.
+    thumb_source: Path | None = None
+    for root in (_preset_user_thumbnail_dir(), _preset_community_thumbnail_dir()):
+        hit = _preset_thumb_lookup_in(root, key_lower)
+        if hit is not None:
+            thumb_source = hit[0]
+            break
+
+    # Fetch latest origin/main so the branch is cut from an up-to-date base.
+    base_branch = _PR_BASE_BRANCH_DEFAULT
+    rc, _out, err = _git_run([git_bin, "fetch", "origin", base_branch, "--quiet"], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git fetch origin {base_branch} failed: {_clean_git_error(err)}",
+            "hint": "check your network + credentials for origin.",
+        }), 500
+
+    branch = f"{_PR_BRANCH_PREFIX}-{key_lower}-{int(time.time())}"
+    worktree_dir = Path(tempfile.mkdtemp(prefix="cull-publish-"))
+    try:
+        # Create a fresh worktree that CHECKS OUT a new branch off origin/main.
+        rc, _out, err = _git_run(
+            [git_bin, "worktree", "add", "-b", branch, str(worktree_dir), f"origin/{base_branch}"],
+            WORKSPACE_ROOT,
+        )
+        if rc != 0:
+            return jsonify({
+                "ok": False,
+                "error": f"git worktree add failed: {_clean_git_error(err)}",
+            }), 500
+
+        preset_rel = f"presets/community/{key_lower}.preset.json"
+        preset_path = worktree_dir / preset_rel
+        preset_path.parent.mkdir(parents=True, exist_ok=True)
+        preset_path.write_bytes(envelope_bytes)
+        rel_paths: list[str] = [preset_rel]
+
+        if thumb_source is not None:
+            thumb_rel = f"presets/community/thumbnails/{key_lower}{thumb_source.suffix.lower()}"
+            thumb_dest = worktree_dir / thumb_rel
+            thumb_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(thumb_source), str(thumb_dest))
+            rel_paths.append(thumb_rel)
+
+        rc, _out, err = _git_run([git_bin, "add", "--", *rel_paths], worktree_dir)
+        if rc != 0:
+            return jsonify({"ok": False, "error": f"git add failed: {_clean_git_error(err)}"}), 500
+
+        commit_msg = f"community preset: {key_lower}"
+        rc, _out, err = _git_run(
+            [git_bin, "commit", "-m", commit_msg], worktree_dir,
+        )
+        if rc != 0:
+            cleaned = _clean_git_error(err)
+            if "nothing to commit" in cleaned.lower():
+                return jsonify({
+                    "ok": True,
+                    "pr_url": None,
+                    "branch": None,
+                    "base": base_branch,
+                    "files": rel_paths,
+                    "message": "no changes — preset is already at origin/main as-is",
+                    "gh_used": False,
+                })
+            return jsonify({"ok": False, "error": f"git commit failed: {cleaned}"}), 500
+
+        _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], worktree_dir)
+        new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+
+        rc, _out, err = _git_run(
+            [git_bin, "push", "-u", "origin", branch], worktree_dir,
+        )
+        if rc != 0:
+            return jsonify({
+                "ok": False,
+                "error": f"git push failed: {_clean_git_error(err)}",
+                "commit": new_sha,
+                "branch": branch,
+                "files": rel_paths,
+                "hint": "the commit exists on the local branch — push it manually: git push -u origin " + branch,
+            }), 500
+
+        # Try `gh pr create`. Falls back to a compare URL if gh isn't
+        # installed or isn't authenticated.
+        pr_url: str | None = None
+        gh_used = False
+        gh_bin = shutil.which("gh")
+        if gh_bin:
+            pr_title = f"community preset: {key_lower}"
+            pr_body = (
+                f"Adds `{key_lower}` to `presets/community/`.\n\n"
+                "Published via the cull dashboard's community-share flow. "
+                "Review the preset envelope + thumbnail then squash-merge."
+            )
+            rc, gh_out, gh_err = _git_run(
+                [gh_bin, "pr", "create", "--base", base_branch, "--head", branch,
+                 "--title", pr_title, "--body", pr_body],
+                worktree_dir,
+            )
+            if rc == 0:
+                # gh prints the PR URL on stdout.
+                for line in (gh_out or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("https://"):
+                        pr_url = line
+                        break
+                gh_used = True
+            # If gh failed (e.g. not authenticated) we silently fall through
+            # to the compare URL — the branch is already pushed either way.
+
+        if not pr_url:
+            pr_url = _github_compare_url(remote_url, base_branch, branch)
+
+        return jsonify({
+            "ok": True,
+            "pr_url": pr_url,
+            "branch": branch,
+            "base": base_branch,
+            "commit": new_sha,
+            "remote": remote_url,
+            "files": rel_paths,
+            "gh_used": gh_used,
+            "hint": None if pr_url else "branch pushed; open the compare page on your git host to raise the PR",
+        })
+    finally:
+        # Always tear the worktree down so a stray directory can't accumulate
+        # across many publishes. --force covers the case where the branch was
+        # partially initialised before an error.
+        try:
+            _git_run(
+                [git_bin, "worktree", "remove", "--force", str(worktree_dir)],
+                WORKSPACE_ROOT,
+            )
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            shutil.rmtree(str(worktree_dir), ignore_errors=True)
+
+
+# ── Themes: registry + editor + community publish ─────────────────────────────
+#
+# Mirrors the presets marketplace. The three layers are:
+#   * builtin   — themes/builtin/<slug>.theme.json (checked in)
+#   * community — themes/community/<slug>.theme.json (contributed, publishable)
+#   * user      — data/themes/<slug>.json (per install)
+#
+# theme_config.py owns the on-disk shape + validation; this module wires that
+# to Flask routes and re-uses the git helpers (_git_run, _clean_git_error) that
+# the preset publish flow already ships. No new subprocess plumbing is added.
+
+import theme_config as _theme_config  # noqa: E402
+
+
+def _valid_theme_name(name: str) -> bool:
+    """Boundary validator for every theme route."""
+    return bool(_theme_config.is_valid_name(name))
+
+
+@app.route("/api/themes")
+def api_themes_list():
+    """List every theme visible to the dashboard.
+
+    Returns ``{themes: [...], core: [...]}``. Core names are the CSS-only
+    themes (dark / light / hc) so the client can flag them as read-only.
+    """
+    try:
+        items = _theme_config.list_themes()
+    except Exception as exc:  # noqa: BLE001 — never let a bad file crash listing
+        return _err("failed to list themes", exc, 500)
+    return jsonify({
+        "themes": items,
+        "core": list(_theme_config.CORE_THEMES),
+        "var_keys": list(_theme_config.THEME_VAR_KEYS),
+    })
+
+
+@app.route("/api/themes/<name>")
+def api_themes_get(name: str):
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+    return jsonify({"ok": True, "theme": theme})
+
+
+@app.route("/api/themes/<name>", methods=["PUT"])
+def api_themes_put(name: str):
+    """Save a user theme (creates or overwrites the ``data/themes/<slug>.json``).
+
+    Body: ``{font_family, vars}``. Unknown vars keys are dropped; unsafe values
+    are dropped; sanitisation happens in theme_config._sanitize_theme.
+    """
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "body must be a JSON object"}), 400
+    try:
+        path = _theme_config.write_theme(name, body)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        return _err("failed to write theme", exc, 500)
+    return jsonify({"ok": True, "name": name, "path": str(path)})
+
+
+@app.route("/api/themes/<name>", methods=["DELETE"])
+def api_themes_delete(name: str):
+    """Remove a user theme override. Builtin + community files are never touched."""
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    if _theme_config.is_builtin(name):
+        return jsonify({"ok": False, "error": "cannot delete a built-in theme"}), 400
+    ok = _theme_config.delete_theme(name)
+    if not ok:
+        return jsonify({"ok": False, "error": "no user theme to delete"}), 404
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/themes/<name>/install", methods=["POST"])
+def api_themes_install(name: str):
+    """Copy a builtin or community theme into ``data/themes/`` for local editing.
+
+    Loopback-only. Mirrors the preset "install from URL" flow (SAVE the shipped
+    payload as a user copy so subsequent edits don't touch the shipped file).
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+    # Force a user-layer copy — read_theme picked whichever layer wins today,
+    # but installing means "give me my own editable copy".
+    try:
+        path = _theme_config.write_theme(name, {
+            "font_family": theme.get("font_family", ""),
+            "vars": theme.get("vars", {}),
+        })
+    except (ValueError, OSError) as exc:
+        return _err("failed to install theme", exc, 500)
+    return jsonify({"ok": True, "name": name, "path": str(path)})
+
+
+@app.route("/api/themes/<name>/publish", methods=["POST"])
+def api_themes_publish(name: str):
+    """Publish a user theme to ``themes/community/`` via git add / commit / push.
+
+    Loopback-only. Empty body. Copies ``data/themes/<slug>.json`` (or the
+    effective theme when the user hasn't saved a local copy — a user might
+    want to re-publish a builtin's tweaked variables straight from the JSON
+    that ships) to ``themes/community/<slug>.theme.json`` and commits ONLY
+    that file (``git commit -o``) so unrelated working-tree changes stay
+    uncommitted, then pushes to ``origin HEAD``. Uses the same helpers the
+    preset publish route uses (never touches _api_presets_publish which is
+    being refactored in a parallel PR).
+    """
+    if not _wave_is_loopback_request():
+        return jsonify({"ok": False, "error": "endpoint is loopback-only"}), 403
+    if not _valid_theme_name(name):
+        return jsonify({"ok": False, "error": "invalid theme name"}), 400
+    theme = _theme_config.read_theme(name)
+    if theme is None:
+        return jsonify({"ok": False, "error": "theme not found"}), 404
+
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return jsonify({
+            "ok": False,
+            "error": "git not installed",
+            "hint": "Install git and clone the cull repo (see README).",
+        }), 400
+    if not (WORKSPACE_ROOT / ".git").exists():
+        return jsonify({
+            "ok": False,
+            "error": "not a git repository",
+            "hint": "cull was likely downloaded as a zip. Clone the repo instead: git clone https://github.com/tlennon-ie/cull",
+        }), 400
+
+    # Verify origin exists.
+    rc, out, err = _git_run([git_bin, "remote", "get-url", "origin"], WORKSPACE_ROOT)
+    if rc != 0 or not out.strip():
+        return jsonify({
+            "ok": False,
+            "error": "no 'origin' remote configured",
+            "hint": "git remote add origin <url> (see README).",
+        }), 400
+    remote_url = out.strip().splitlines()[0]
+
+    # Serialise the community envelope. We deliberately DROP the transient
+    # ``source`` / ``path`` fields the list endpoint adds — the published file
+    # is a portable theme, not a listing row.
+    community_dir = _theme_config.community_themes_dir()
+    community_dir.mkdir(parents=True, exist_ok=True)
+    dest = _theme_config.community_file_for(name)
+    envelope = {
+        "name": theme["name"],
+        "font_family": theme.get("font_family", ""),
+        "vars": theme.get("vars", {}),
+    }
+    try:
+        # Containment check — dest MUST live under community_themes_dir so no
+        # crafted slug can escape (theme name regex already prevents it, but
+        # defence in depth matches how the preset publish route validates).
+        if safe_inside(str(dest), [community_dir]) is None and not dest.exists():
+            # dest doesn't exist yet — check parent instead.
+            if safe_inside(str(dest.parent), [community_dir]) is None:
+                return jsonify({"ok": False, "error": "invalid destination path"}), 400
+        dest.write_text(
+            json.dumps(envelope, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return _err("could not write community theme file", exc, 500)
+
+    rel_path = str(dest.relative_to(WORKSPACE_ROOT)).replace("\\", "/")
+
+    rc, _out, err = _git_run([git_bin, "add", "--", rel_path], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git add failed: {_clean_git_error(err)}",
+        }), 500
+
+    commit_msg = f"community theme: {name}"
+    rc, _out, err = _git_run(
+        [git_bin, "commit", "-o", rel_path, "-m", commit_msg],
+        WORKSPACE_ROOT,
+    )
+    if rc != 0:
+        cleaned = _clean_git_error(err)
+        if "nothing to commit" in cleaned.lower() or "no changes added to commit" in cleaned.lower():
+            _rc, sha, _e = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+            return jsonify({
+                "ok": True,
+                "commit": sha.strip(),
+                "pushed_to": None,
+                "files": [rel_path],
+                "message": "no changes — theme already committed as-is",
+            })
+        return jsonify({
+            "ok": False,
+            "error": f"git commit failed: {cleaned}",
+        }), 500
+
+    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
+
+    rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
+    if rc != 0:
+        return jsonify({
+            "ok": False,
+            "error": f"git push failed: {_clean_git_error(err)}",
+            "commit": new_sha,
+            "files": [rel_path],
+            "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
+        }), 500
+
+    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
+    branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
+
+    return jsonify({
+        "ok": True,
+        "commit": new_sha,
+        "pushed_to": f"{remote_url} ({branch})",
+        "remote": remote_url,
+        "branch": branch,
+        "files": [rel_path],
+    })
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
@@ -3547,14 +6622,905 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
   .tip:hover .tip-i, .tip:focus-within .tip-i { border-color:#38bdf8; color:#7dd3fc; }
   .tip-pop { visibility:hidden; opacity:0; transition:opacity .12s ease; position:absolute; z-index:80;
              left:0; top:1.5em; width:18rem; max-width:min(18rem,70vw); padding:.55rem .65rem;
-             border-radius:.4rem; background:#1e293b; border:1px solid #475569; color:#e2e8f0;
-             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.45);
+             border-radius:.4rem;
+             background: var(--color-surface-alt);
+             border: 1px solid var(--color-border-strong);
+             color: var(--color-fg);
+             font-size:.72rem; line-height:1.4; box-shadow:0 10px 25px rgba(0,0,0,.25);
              text-transform:none; letter-spacing:normal; font-weight:400; white-space:normal; }
   .tip:hover .tip-pop, .tip:focus-within .tip-pop { visibility:visible; opacity:1; }
   .tip.tip-r .tip-pop { left:auto; right:0; }
-  .tip-pop b { color:#f1f5f9; font-weight:600; }
-  .tip-pop code { background:#0f172a; border:1px solid #334155; border-radius:3px; padding:0 .25rem; color:#fcd34d; }
-  .tip-pop .ex { color:#9aa6b6; display:block; margin-top:.35rem; }
+  .tip-pop b { color: var(--color-fg); font-weight:600; }
+  .tip-pop code { background: var(--color-bg); border:1px solid var(--color-border);
+                  border-radius:3px; padding:0 .25rem; color: var(--color-accent); }
+  .tip-pop .ex { color: var(--color-fg-muted); display:block; margin-top:.35rem; }
+
+  /* Theme-aware nav tooltip: replaces the browser-native `title=` attribute
+     on sidebar tabs (Chrome's default tooltip renders dark in newer versions,
+     breaking light-mode contrast). Uses [data-tooltip=...] + ::after so the
+     tooltip inherits our tokens and never mismatches the page theme. */
+  .nav-tip { position: relative; }
+  .nav-tip[data-tooltip]:hover::after,
+  .nav-tip[data-tooltip]:focus-visible::after {
+    content: attr(data-tooltip);
+    position: absolute; left: calc(100% + 6px); top: 50%; transform: translateY(-50%);
+    background: var(--color-surface-alt); color: var(--color-fg);
+    border: 1px solid var(--color-border-strong); border-radius: 4px;
+    padding: 4px 8px; font-size: 11px; white-space: nowrap; z-index: 100;
+    pointer-events: none; box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  }
+
+  /* ── Theme system (T3 #22) — three color modes stored on <html>. Dark
+     stays the default; light + high-contrast override the full token set so
+     hard-coded Tailwind-esque utility classes across the tree flip
+     automatically via blanket selector overrides below. */
+  :root {
+    --color-bg: #020617;
+    --color-bg-elev: #0f172a;
+    --color-fg: #f1f5f9;
+    --color-fg-muted: #94a3b8;
+    --color-surface: rgba(15,23,42,0.78);
+    --color-surface-alt: #1e293b;
+    --color-border: rgba(51,65,85,0.5);
+    --color-border-strong: #334155;
+    --color-accent: #6366f1;
+    --color-accent-hover: #4f46e5;
+    --color-accent-fg: #ffffff;
+    --color-success: #10b981;
+    --color-success-fg: #ffffff;
+    --color-warn: #f59e0b;
+    --color-warn-fg: #0f172a;
+    --color-danger: #e11d48;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #0f172a;
+    --color-input-fg: #f1f5f9;
+    --color-input-placeholder: #64748b;
+    --color-pill-bg: rgba(30,41,59,0.6);
+    --color-pill-fg: #cbd5e1;
+  }
+
+  /* Sticky save-bar (used by Global Settings, Job Settings and the Preset
+     editor headers). Themed via CSS variables so the backdrop stays legible
+     across every theme without a hard-coded slate colour. color-mix gives us
+     a semi-transparent surface that still admits the blur behind it. */
+  .sticky-save-bar {
+    background: color-mix(in oklab, var(--color-bg) 92%, transparent);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  /* Base defaults for elements. Dark uses the :root values; light overrides
+     everything below. This block is theme-agnostic — it reads variables. */
+  input, select, textarea {
+    color: var(--color-input-fg);
+    background: var(--color-input-bg);
+    border-color: var(--color-border);
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--color-input-placeholder);
+    opacity: 1;
+    font-style: italic;
+  }
+  input:not(:placeholder-shown):not([type=checkbox]):not([type=radio]),
+  textarea:not(:placeholder-shown) {
+    color: var(--color-input-fg);
+    font-weight: 500;
+  }
+
+  /* ── LIGHT THEME ── comprehensive coverage. Overrides tokens + then blanket
+     selectors so existing utility classes flip without editing markup. */
+  html.theme-light {
+    --color-bg: #f5f2ec;
+    --color-bg-elev: #ffffff;
+    --color-fg: #0f172a;
+    --color-fg-muted: #475569;
+    --color-surface: #ffffff;
+    --color-surface-alt: #f1f5f9;
+    --color-border: #e2e8f0;
+    --color-border-strong: #cbd5e1;
+    --color-accent: #4f46e5;
+    --color-accent-hover: #4338ca;
+    --color-accent-fg: #ffffff;
+    --color-success: #059669;
+    --color-success-fg: #ffffff;
+    --color-warn: #d97706;
+    --color-warn-fg: #ffffff;
+    --color-danger: #dc2626;
+    --color-danger-fg: #ffffff;
+    --color-input-bg: #ffffff;
+    --color-input-fg: #0f172a;
+    --color-input-placeholder: #94a3b8;
+    --color-pill-bg: #eef2ff;
+    --color-pill-fg: #3730a3;
+  }
+  html.theme-light body { background: var(--color-bg) !important; color: var(--color-fg) !important; }
+  html.theme-light aside,
+  html.theme-light aside.bg-slate-900\/70,
+  html.theme-light .bg-slate-900\/70 {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html.theme-light .card {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Surface / panel backgrounds. */
+  html.theme-light .bg-slate-800,
+  html.theme-light .bg-slate-800\/60,
+  html.theme-light .bg-slate-800\/50,
+  html.theme-light .bg-slate-800\/40,
+  html.theme-light .bg-slate-900,
+  html.theme-light .bg-slate-900\/60,
+  html.theme-light .bg-slate-900\/50,
+  html.theme-light .bg-slate-900\/40,
+  html.theme-light .bg-slate-900\/30,
+  html.theme-light .bg-slate-950,
+  html.theme-light .bg-slate-950\/60,
+  html.theme-light .bg-slate-700,
+  html.theme-light .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Hover variants — Tailwind renders these as :hover pseudo-selectors, so the
+     bare `.bg-slate-*` overrides above don't catch them. Without these, an
+     inactive sidebar tab hovering to `hover:bg-slate-800` would land on a
+     dark surface with the light-theme's dark text (invisible). */
+  html.theme-light .hover\:bg-slate-700:hover,
+  html.theme-light .hover\:bg-slate-800:hover,
+  html.theme-light .hover\:bg-slate-900:hover {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  /* Text tokens. */
+  html.theme-light .text-slate-100,
+  html.theme-light .text-slate-200,
+  html.theme-light .text-slate-300,
+  html.theme-light .text-white { color: var(--color-fg) !important; }
+  html.theme-light .text-slate-400,
+  html.theme-light .text-slate-500,
+  html.theme-light .text-slate-600 { color: var(--color-fg-muted) !important; }
+  /* Borders. */
+  html.theme-light .border-slate-600,
+  html.theme-light .border-slate-700,
+  html.theme-light .border-slate-800,
+  html.theme-light .border-slate-900 { border-color: var(--color-border) !important; }
+  /* Accent buttons. */
+  html.theme-light .bg-indigo-500,
+  html.theme-light .bg-indigo-600,
+  html.theme-light .hover\:bg-indigo-500:hover,
+  html.theme-light .hover\:bg-indigo-600:hover,
+  html.theme-light .hover\:bg-indigo-700:hover {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-fg) !important;
+  }
+  html.theme-light .text-indigo-300,
+  html.theme-light .text-indigo-400,
+  html.theme-light .text-indigo-500 { color: var(--color-accent) !important; }
+  /* Success (emerald). */
+  html.theme-light .bg-emerald-500,
+  html.theme-light .bg-emerald-600,
+  html.theme-light .hover\:bg-emerald-500:hover,
+  html.theme-light .hover\:bg-emerald-600:hover,
+  html.theme-light .bg-emerald-800,
+  html.theme-light .bg-emerald-800\/60 {
+    background: var(--color-success) !important;
+    color: var(--color-success-fg) !important;
+  }
+  html.theme-light .text-emerald-100,
+  html.theme-light .text-emerald-200,
+  html.theme-light .text-emerald-300,
+  html.theme-light .text-emerald-400 { color: var(--color-success) !important; }
+  /* Warn (amber). */
+  html.theme-light .bg-amber-500,
+  html.theme-light .bg-amber-600,
+  html.theme-light .hover\:bg-amber-400:hover,
+  html.theme-light .hover\:bg-amber-500:hover {
+    background: var(--color-warn) !important;
+    color: var(--color-warn-fg) !important;
+  }
+  html.theme-light .text-amber-300,
+  html.theme-light .text-amber-400 { color: var(--color-warn) !important; }
+  /* Danger (rose / red). */
+  html.theme-light .bg-rose-500,
+  html.theme-light .bg-rose-600,
+  html.theme-light .bg-red-500,
+  html.theme-light .bg-red-600,
+  html.theme-light .bg-rose-900\/60,
+  html.theme-light .bg-rose-950\/60,
+  html.theme-light .hover\:bg-rose-500:hover,
+  html.theme-light .hover\:bg-rose-800:hover {
+    background: var(--color-danger) !important;
+    color: var(--color-danger-fg) !important;
+  }
+  /* Light rose text (rose-100 / rose-200) lives ON a rose background —
+     paint it with the danger-FG (white) so it doesn't render red-on-red.
+     Darker rose text (rose-300+) is standalone error text — keep it red. */
+  html.theme-light .text-rose-100,
+  html.theme-light .text-rose-200 { color: var(--color-danger-fg) !important; }
+  html.theme-light .text-rose-300,
+  html.theme-light .text-rose-400,
+  html.theme-light .text-red-400 { color: var(--color-danger) !important; }
+  /* Inputs / selects / textareas — already set via :root; enforce for
+     Tailwind-classed inputs that hard-code dark bgs. */
+  html.theme-light input,
+  html.theme-light select,
+  html.theme-light textarea {
+    background: var(--color-input-bg) !important;
+    color: var(--color-input-fg) !important;
+    border-color: var(--color-border-strong) !important;
+  }
+  html.theme-light input::placeholder,
+  html.theme-light textarea::placeholder { color: var(--color-input-placeholder) !important; }
+  /* Pills. */
+  html.theme-light .pill { background: var(--color-pill-bg) !important; color: var(--color-pill-fg) !important; }
+  /* Table headers with hardcoded dark bg (Global Stats etc.). */
+  html.theme-light thead,
+  html.theme-light thead tr,
+  html.theme-light th { background: var(--color-surface-alt) !important; color: var(--color-fg) !important; }
+  /* Code + <code> spans. */
+  html.theme-light code {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-accent) !important;
+    border-color: var(--color-border) !important;
+  }
+  /* Links. */
+  html.theme-light a, html.theme-light .link-btn { color: var(--color-accent) !important; }
+
+  /* ── HIGH-CONTRAST THEME ── pure black/white/yellow, comprehensive. */
+  html.theme-hc {
+    --color-bg: #000000;
+    --color-bg-elev: #000000;
+    --color-fg: #ffffff;
+    --color-fg-muted: #ffffff;
+    --color-surface: #000000;
+    --color-surface-alt: #000000;
+    --color-border: #ffffff;
+    --color-border-strong: #ffffff;
+    --color-accent: #ffe600;
+    --color-accent-hover: #ffd400;
+    --color-accent-fg: #000000;
+    --color-success: #00ff88;
+    --color-success-fg: #000000;
+    --color-warn: #ffe600;
+    --color-warn-fg: #000000;
+    --color-danger: #ff5c5c;
+    --color-danger-fg: #000000;
+    --color-input-bg: #000000;
+    --color-input-fg: #ffffff;
+    --color-input-placeholder: #cccccc;
+    --color-pill-bg: #000000;
+    --color-pill-fg: #ffe600;
+  }
+  html.theme-hc body { background: #000 !important; color: #fff !important; }
+  html.theme-hc .card { background: #000 !important; border: 2px solid #fff !important; color: #fff !important; }
+  html.theme-hc aside { background: #000 !important; border-color: #fff !important; color: #fff !important; }
+  html.theme-hc .link-btn, html.theme-hc a { color: #ffe600 !important; text-decoration: underline !important; }
+  html.theme-hc input, html.theme-hc select, html.theme-hc textarea {
+    background: #000 !important; color: #fff !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc input::placeholder, html.theme-hc textarea::placeholder { color: #cccccc !important; font-style: italic; }
+  html.theme-hc .pill { background: #000 !important; color: #ffe600 !important; border: 1px solid #ffe600 !important; }
+  html.theme-hc .bg-slate-800, html.theme-hc .bg-slate-900, html.theme-hc .bg-slate-900\/60,
+  html.theme-hc .bg-slate-900\/40, html.theme-hc .bg-slate-950, html.theme-hc .bg-slate-700 {
+    background: #000 !important; color: #fff !important;
+  }
+  html.theme-hc .text-slate-100, html.theme-hc .text-slate-200, html.theme-hc .text-slate-300,
+  html.theme-hc .text-slate-400, html.theme-hc .text-slate-500 { color: #fff !important; }
+  html.theme-hc .border-slate-600, html.theme-hc .border-slate-700,
+  html.theme-hc .border-slate-800 { border-color: #fff !important; }
+  html.theme-hc .bg-indigo-500, html.theme-hc .bg-indigo-600, html.theme-hc .bg-emerald-500,
+  html.theme-hc .bg-emerald-600, html.theme-hc .bg-amber-500, html.theme-hc .bg-amber-600,
+  html.theme-hc .bg-rose-500, html.theme-hc .bg-rose-600 {
+    background: #ffe600 !important; color: #000 !important; border: 2px solid #fff !important;
+  }
+  html.theme-hc thead, html.theme-hc th { background: #000 !important; color: #ffe600 !important; border-color: #fff !important; }
+
+  /* ── NEW BUILT-IN THEMES (T3 #22 batch 2) ─────────────────────────────────
+     Each theme is a set of CSS variable overrides on html.theme-<slug>. The
+     ``:root`` block above defines the dark defaults; every override slot only
+     needs to redefine the tokens that differ. The Tailwind-utility class
+     blanket overrides used by html.theme-light also apply to these when the
+     theme registry ships the same tokens (see the light-theme block above for
+     the pattern the JS side reuses). */
+  html.theme-ai-slop {
+    --color-bg: #0a0014;
+    --color-bg-elev: #12001f;
+    --color-fg: #f2e6ff;
+    --color-fg-muted: #a78bfa;
+    --color-surface: rgba(24,0,40,0.85);
+    --color-surface-alt: #1a0033;
+    --color-border: rgba(139,92,246,0.35);
+    --color-border-strong: #8b5cf6;
+    --color-accent: #e879f9;
+    --color-accent-hover: #d946ef;
+    --color-accent-fg: #0a0014;
+    --color-success: #22d3ee;
+    --color-success-fg: #0a0014;
+    --color-warn: #fde047;
+    --color-warn-fg: #0a0014;
+    --color-danger: #ff2d95;
+    --color-danger-fg: #0a0014;
+    --color-input-bg: #1a0033;
+    --color-input-fg: #f2e6ff;
+    --color-input-placeholder: #a78bfa;
+    --color-pill-bg: rgba(232,121,249,0.15);
+    --color-pill-fg: #f0abfc;
+  }
+  html.theme-beige {
+    --color-bg: #f5efe4;
+    --color-bg-elev: #faf5ec;
+    --color-fg: #1a1613;
+    --color-fg-muted: #6b5f52;
+    --color-surface: #faf5ec;
+    --color-surface-alt: #ede4d3;
+    --color-border: #d9cdb8;
+    --color-border-strong: #a89680;
+    --color-accent: #b8543a;
+    --color-accent-hover: #9c4530;
+    --color-accent-fg: #faf5ec;
+    --color-success: #5c7a3f;
+    --color-success-fg: #faf5ec;
+    --color-warn: #b8873a;
+    --color-warn-fg: #faf5ec;
+    --color-danger: #992a1a;
+    --color-danger-fg: #faf5ec;
+    --color-input-bg: #faf5ec;
+    --color-input-fg: #1a1613;
+    --color-input-placeholder: #a89680;
+    --color-pill-bg: #ede4d3;
+    --color-pill-fg: #5c483a;
+  }
+  html.theme-wood {
+    --color-bg: #241611;
+    --color-bg-elev: #2f1c14;
+    --color-fg: #f4e8d8;
+    --color-fg-muted: #c4a880;
+    --color-surface: rgba(58,34,22,0.9);
+    --color-surface-alt: #3a2216;
+    --color-border: rgba(139,94,60,0.4);
+    --color-border-strong: #8b5e3c;
+    --color-accent: #d4a04a;
+    --color-accent-hover: #c08a35;
+    --color-accent-fg: #241611;
+    --color-success: #8fa860;
+    --color-success-fg: #241611;
+    --color-warn: #e0a850;
+    --color-warn-fg: #241611;
+    --color-danger: #c8553d;
+    --color-danger-fg: #f4e8d8;
+    --color-input-bg: #2f1c14;
+    --color-input-fg: #f4e8d8;
+    --color-input-placeholder: #a08560;
+    --color-pill-bg: rgba(212,160,74,0.15);
+    --color-pill-fg: #e8c88a;
+  }
+  html.theme-cyberpunk {
+    --color-bg: #000000;
+    --color-bg-elev: #0a0010;
+    --color-fg: #e0f7ff;
+    --color-fg-muted: #78d0e8;
+    --color-surface: rgba(10,0,16,0.92);
+    --color-surface-alt: #12001a;
+    --color-border: rgba(255,46,147,0.4);
+    --color-border-strong: #ff2e93;
+    --color-accent: #00e5ff;
+    --color-accent-hover: #00b8d4;
+    --color-accent-fg: #000000;
+    --color-success: #00ff88;
+    --color-success-fg: #000000;
+    --color-warn: #ffd60a;
+    --color-warn-fg: #000000;
+    --color-danger: #ff2e93;
+    --color-danger-fg: #000000;
+    --color-input-bg: #12001a;
+    --color-input-fg: #e0f7ff;
+    --color-input-placeholder: #78d0e8;
+    --color-pill-bg: rgba(0,229,255,0.12);
+    --color-pill-fg: #00e5ff;
+  }
+  html.theme-forest {
+    --color-bg: #0e1f18;
+    --color-bg-elev: #132a20;
+    --color-fg: #f0ead6;
+    --color-fg-muted: #a3b8a5;
+    --color-surface: rgba(19,42,32,0.9);
+    --color-surface-alt: #1a3a2a;
+    --color-border: rgba(122,158,108,0.35);
+    --color-border-strong: #5c8a4a;
+    --color-accent: #e8a54a;
+    --color-accent-hover: #d4903a;
+    --color-accent-fg: #0e1f18;
+    --color-success: #7fbf5c;
+    --color-success-fg: #0e1f18;
+    --color-warn: #e8a54a;
+    --color-warn-fg: #0e1f18;
+    --color-danger: #c85a3f;
+    --color-danger-fg: #f0ead6;
+    --color-input-bg: #132a20;
+    --color-input-fg: #f0ead6;
+    --color-input-placeholder: #7a8e7c;
+    --color-pill-bg: rgba(232,165,74,0.15);
+    --color-pill-fg: #f0c07a;
+  }
+  /* ── Shared "non-dark" blanket overrides for the JSON-backed themes ───────
+     The Tailwind-utility overrides html.theme-light uses (bg-slate-*, text-*,
+     border-*) work equally well for every theme once its token set is
+     defined — a light theme (beige) and dark themes (ai-slop / wood /
+     cyberpunk / forest) all just need those Tailwind classes to resolve to
+     `var(--color-*)` instead of the hard-coded slate/indigo/emerald values.
+     Rather than duplicate a huge selector list per theme, we opt every named
+     theme (except dark, which the utilities already match) into the same
+     blanket via the `[data-theme]` selector the JS sets in tandem with the
+     class name (see applyTheme()). */
+  html[data-theme]:not([data-theme="dark"]) body { background: var(--color-bg) !important; color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) aside,
+  html[data-theme]:not([data-theme="dark"]) aside.bg-slate-900\/70,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/70 {
+    background: var(--color-bg-elev) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .card {
+    background: var(--color-surface) !important;
+    border-color: var(--color-border) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/50,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-800\/40,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/50,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/40,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-900\/30,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-950,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-950\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-700,
+  html[data-theme]:not([data-theme="dark"]) .bg-slate-700\/60 {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-700:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-800:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-slate-900:hover {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-slate-100,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-200,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-300,
+  html[data-theme]:not([data-theme="dark"]) .text-white { color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) .text-slate-400,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-500,
+  html[data-theme]:not([data-theme="dark"]) .text-slate-600 { color: var(--color-fg-muted) !important; }
+  html[data-theme]:not([data-theme="dark"]) .border-slate-600,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-700,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-800,
+  html[data-theme]:not([data-theme="dark"]) .border-slate-900 { border-color: var(--color-border) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-indigo-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-indigo-600,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-600:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-indigo-700:hover {
+    background: var(--color-accent) !important;
+    color: var(--color-accent-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-300,
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-400,
+  html[data-theme]:not([data-theme="dark"]) .text-indigo-500 { color: var(--color-accent) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-800,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-800\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-emerald-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-emerald-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-emerald-600:hover {
+    background: var(--color-success) !important;
+    color: var(--color-success-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-100,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-200,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-300,
+  html[data-theme]:not([data-theme="dark"]) .text-emerald-400 { color: var(--color-success) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-amber-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-amber-600,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-amber-400:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-amber-500:hover {
+    background: var(--color-warn) !important;
+    color: var(--color-warn-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-amber-300,
+  html[data-theme]:not([data-theme="dark"]) .text-amber-400 { color: var(--color-warn) !important; }
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-red-500,
+  html[data-theme]:not([data-theme="dark"]) .bg-red-600,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-900\/60,
+  html[data-theme]:not([data-theme="dark"]) .bg-rose-950\/60,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-rose-500:hover,
+  html[data-theme]:not([data-theme="dark"]) .hover\:bg-rose-800:hover {
+    background: var(--color-danger) !important;
+    color: var(--color-danger-fg) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) .text-rose-100,
+  html[data-theme]:not([data-theme="dark"]) .text-rose-200 { color: var(--color-danger-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) .text-rose-300,
+  html[data-theme]:not([data-theme="dark"]) .text-rose-400,
+  html[data-theme]:not([data-theme="dark"]) .text-red-400 { color: var(--color-danger) !important; }
+  html[data-theme]:not([data-theme="dark"]) input,
+  html[data-theme]:not([data-theme="dark"]) select,
+  html[data-theme]:not([data-theme="dark"]) textarea {
+    background: var(--color-input-bg) !important;
+    color: var(--color-input-fg) !important;
+    border-color: var(--color-border-strong) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) input::placeholder,
+  html[data-theme]:not([data-theme="dark"]) textarea::placeholder { color: var(--color-input-placeholder) !important; }
+  html[data-theme]:not([data-theme="dark"]) .pill { background: var(--color-pill-bg) !important; color: var(--color-pill-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) thead,
+  html[data-theme]:not([data-theme="dark"]) thead tr,
+  html[data-theme]:not([data-theme="dark"]) th { background: var(--color-surface-alt) !important; color: var(--color-fg) !important; }
+  html[data-theme]:not([data-theme="dark"]) code {
+    background: var(--color-surface-alt) !important;
+    color: var(--color-accent) !important;
+    border-color: var(--color-border) !important;
+  }
+  html[data-theme]:not([data-theme="dark"]) a,
+  html[data-theme]:not([data-theme="dark"]) .link-btn { color: var(--color-accent) !important; }
+
+  /* Live theme preview mini-mock used inside the theme editor. Scoped to a
+     .theme-preview root so its palette can override the outer theme without
+     affecting siblings. Every element pulls from the same CSS variables the
+     real dashboard consumes, so the preview mirrors reality. */
+  .theme-preview { border:1px solid var(--color-border); border-radius:.6rem; padding:1rem;
+                   background: var(--color-bg); color: var(--color-fg); }
+  .theme-preview .tp-card { background: var(--color-bg-elev); border:1px solid var(--color-border);
+                             border-radius:.5rem; padding:.9rem; }
+  .theme-preview .tp-btn { background: var(--color-accent); color: var(--color-accent-fg);
+                            border:none; border-radius:.35rem; padding:.4rem .9rem; font-weight:600;
+                            cursor:pointer; }
+  .theme-preview .tp-btn:hover { background: var(--color-accent-hover); }
+  .theme-preview .tp-btn-secondary { background: var(--color-surface-alt); color: var(--color-fg);
+                                      border:1px solid var(--color-border-strong); }
+  .theme-preview .tp-chip { display:inline-block; background: var(--color-pill-bg);
+                             color: var(--color-pill-fg); border-radius:9999px;
+                             padding:.15rem .55rem; font-size:.7rem; letter-spacing:.03em; }
+  .theme-preview .tp-input { background: var(--color-input-bg); color: var(--color-input-fg);
+                              border:1px solid var(--color-border); border-radius:.35rem;
+                              padding:.35rem .6rem; }
+  .theme-preview .tp-input::placeholder { color: var(--color-input-placeholder); }
+  .theme-preview .tp-heading { color: var(--color-fg); font-weight:600; margin:0 0 .4rem; }
+  .theme-preview .tp-muted { color: var(--color-fg-muted); font-size:.75rem; }
+  .theme-preview .tp-success { background: var(--color-success); color: var(--color-success-fg);
+                                border-radius:.25rem; padding:.1rem .5rem; font-size:.7rem; font-weight:500; }
+  .theme-preview .tp-danger { background: var(--color-danger); color: var(--color-danger-fg);
+                               border-radius:.25rem; padding:.1rem .5rem; font-size:.7rem; font-weight:500; }
+
+  /* Theme editor swatch — reusable colour tile next to each colour picker. */
+  .swatch { display:inline-block; width:1.25rem; height:1.25rem; border-radius:.25rem;
+            border:1px solid var(--color-border-strong); vertical-align:middle; }
+
+  /* Preset marketplace + wizard shared card styling. */
+  .preset-card { transition: transform .12s, border-color .12s; }
+  .preset-card:hover { transform: translateY(-2px); border-color:#818cf8 !important; }
+  /* Fired for ~2.5s after a community preset install so the user can spot
+     the newly landed card in the list. Uses accent-tinted ring + shadow. */
+  @keyframes preset-highlight-pulse {
+    0%   { box-shadow: 0 0 0 3px rgba(99,102,241,0.65), 0 0 24px 4px rgba(99,102,241,0.35); }
+    100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+  }
+  .preset-highlight { animation: preset-highlight-pulse 2.5s ease-out 1;
+                      border-color: var(--color-accent) !important; }
+  /* Use-case chip: themed via CSS variables so light mode gets legible
+     contrast (previously #c7d2fe pale-indigo text on white bg was near-
+     invisible). --color-pill-* are set per-theme in :root / theme-light. */
+  .use-case-chip { display:inline-block; font-size:.65rem; padding:.15rem .5rem; border-radius:9999px;
+                   background: var(--color-pill-bg); border: 1px solid var(--color-border);
+                   color: var(--color-pill-fg);
+                   margin-right:.25rem; margin-top:.25rem; }
+
+  /* Bulk-select overlay checkbox on gallery cards. */
+  .bulk-check { position:absolute; top:.35rem; left:.35rem; z-index:5; width:1.1rem; height:1.1rem;
+                accent-color:#6366f1; cursor:pointer; background:rgba(15,23,42,.85);
+                border-radius:3px; }
+  .bulk-bar { position:sticky; bottom:1rem; z-index:15; }
+
+  /* T1: subtle fade-in for items appended/prepended by the SSE stream so a
+     just-arrived classification/queue entry visibly enters the list without
+     the pop of a hard-swap. Runs once per element. */
+  @keyframes sseFadeIn { from { opacity: 0; transform: translateY(-2px); }
+                         to   { opacity: 1; transform: none; } }
+  .sse-fade { animation: sseFadeIn 220ms ease-out both; }
+
+  /* Live-log stream viewer. */
+  .log-stream { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.72rem;
+                line-height:1.4; background:#020617; border:1px solid #334155; border-radius:.5rem;
+                padding:.65rem .75rem; max-height:60vh; overflow-y:auto; white-space:pre-wrap;
+                word-break:break-word; color:#cbd5e1; }
+  .log-stream .lvl-error { color:#f87171; }
+  .log-stream .lvl-warn { color:#fbbf24; }
+
+  /* ── Universal hover affordances ─────────────────────────────────────────
+     Consolidates the pointer/hover/focus discovery grammar for the whole
+     dashboard so every clickable thing telegraphs its interactivity in all
+     three themes (dark / light / high-contrast). Non-clickable pills (score
+     tiles, resolution tiles) intentionally opt OUT — they never get these
+     classes. */
+  :root {
+    --hover-transition: transform .12s ease, box-shadow .12s ease,
+                        background-color .12s ease, border-color .12s ease,
+                        color .12s ease;
+  }
+  /* Baseline pointer on every interactive control the browser doesn't already
+     make explicit. Disabled controls fall back to `not-allowed` below. */
+  button:not(:disabled), a[href], [role="button"]:not([aria-disabled="true"]),
+  select:not(:disabled), summary, label[for], .link-btn, .chip-click, .click,
+  .hover-card, .drop-zone {
+    cursor: pointer;
+  }
+  button:disabled, [aria-disabled="true"], select:disabled { cursor: not-allowed; }
+  /* Cards + tiles that navigate on click — small lift + accented border. */
+  .hover-card { transition: var(--hover-transition); }
+  .hover-card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+    border-color: var(--color-accent) !important;
+  }
+  /* Clickable images (gallery + global-gallery thumbnails). */
+  img.click { transition: var(--hover-transition); }
+  img.click:hover {
+    box-shadow: 0 0 0 2px var(--color-accent);
+    transform: scale(1.02);
+  }
+  /* iOS-style toggle switch — reusable for boolean settings (Show NSFW,
+     Jobs Run, scraper enable). Multi-select checkboxes for images/rows
+     stay as native <input type=checkbox>, this class ONLY applies to
+     high-level yes/no settings. Wraps a hidden native checkbox so form
+     semantics + keyboard focus stay intact. */
+  .toggle-switch {
+    position: relative; display: inline-block;
+    width: 2.25rem; height: 1.25rem;
+    flex-shrink: 0;
+  }
+  .toggle-switch input {
+    opacity: 0; width: 0; height: 0;
+    position: absolute; inset: 0;
+  }
+  .toggle-switch__track {
+    position: absolute; inset: 0;
+    background: var(--color-surface-alt);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 9999px;
+    transition: background .18s ease, border-color .18s ease;
+    cursor: pointer;
+  }
+  .toggle-switch__thumb {
+    position: absolute; top: 2px; left: 2px;
+    width: calc(1.25rem - 6px); height: calc(1.25rem - 6px);
+    background: var(--color-fg);
+    border-radius: 9999px;
+    transition: transform .18s ease, background .18s ease;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+    pointer-events: none;
+  }
+  .toggle-switch input:checked ~ .toggle-switch__track {
+    background: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+  .toggle-switch input:checked ~ .toggle-switch__track .toggle-switch__thumb {
+    transform: translateX(1rem);
+    background: var(--color-accent-fg);
+  }
+  .toggle-switch input:focus-visible ~ .toggle-switch__track {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  .toggle-switch input:disabled ~ .toggle-switch__track {
+    opacity: .5; cursor: not-allowed;
+  }
+  .toggle-label {
+    display: inline-flex; align-items: center; gap: .5rem;
+    cursor: pointer; user-select: none;
+    font-size: .8rem;
+  }
+  .toggle-label:hover .toggle-switch__track { border-color: var(--color-accent); }
+
+  /* Filter/tag chips that toggle a value. Subtle scale + accent border on
+     hover; the active-state colour is still owned by the caller so this
+     doesn't fight per-tab styling. */
+  .chip-click { transition: var(--hover-transition); border-radius: 9999px; }
+  .chip-click:hover { transform: scale(1.05); border-color: var(--color-accent); }
+  /* File-upload / drag-drop zones — dashed border warms to the accent on hover. */
+  .drop-zone { transition: var(--hover-transition); }
+  .drop-zone:hover {
+    border-color: var(--color-accent);
+    background: color-mix(in oklab, var(--color-accent) 8%, transparent);
+  }
+  /* Focus-visible ring — one consistent shape everywhere. */
+  button:focus-visible, a:focus-visible, [role="button"]:focus-visible,
+  select:focus-visible, input:focus-visible, textarea:focus-visible,
+  summary:focus-visible, .chip-click:focus-visible, .hover-card:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  /* High-contrast: swap the subtle indigo for yellow ring + underline so it
+     survives the black/white/yellow palette. */
+  html.theme-hc button:focus-visible, html.theme-hc a:focus-visible,
+  html.theme-hc [role="button"]:focus-visible, html.theme-hc select:focus-visible,
+  html.theme-hc input:focus-visible, html.theme-hc textarea:focus-visible,
+  html.theme-hc .chip-click:focus-visible, html.theme-hc .hover-card:focus-visible {
+    outline: 3px solid #ffe600;
+    outline-offset: 2px;
+  }
+  html.theme-hc a:hover, html.theme-hc .link-btn:hover { text-decoration: underline !important; }
+  html.theme-hc img.click:hover { box-shadow: 0 0 0 3px #ffe600; }
+  html.theme-hc .hover-card:hover { border-color: #ffe600 !important; box-shadow: 0 0 0 2px #ffe600; }
+  html.theme-hc .chip-click:hover { border-color: #ffe600 !important; }
+
+  /* ── Filter modal / popover ──────────────────────────────────────────────
+     Single reusable panel skinned via CSS variables so it flips cleanly
+     across the three themes. The pill triggers it; the panel body carries
+     chip groups, range sliders, and toggles for whichever tab opened it. */
+  .filter-toolbar {
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  }
+  .filter-pill, .sort-pill {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .35rem .8rem; border-radius: 9999px;
+    background: var(--color-surface-alt);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    font-size: .75rem; font-weight: 500;
+    transition: var(--hover-transition);
+    cursor: pointer;
+  }
+  .filter-pill:hover, .sort-pill:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+  .filter-pill[aria-expanded="true"] {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-pill .badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 1.25rem; height: 1.25rem; padding: 0 .35rem; border-radius: 9999px;
+    background: var(--color-accent); color: var(--color-accent-fg);
+    font-size: .65rem; font-weight: 700;
+  }
+  .filter-pill[aria-expanded="true"] .badge {
+    background: var(--color-accent-fg); color: var(--color-accent);
+  }
+  .filter-search {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .3rem .6rem; border-radius: 9999px;
+    background: var(--color-surface-alt);
+    border: 1px solid var(--color-border-strong);
+    transition: var(--hover-transition);
+  }
+  .filter-search:focus-within { border-color: var(--color-accent); }
+  .filter-search input {
+    background: transparent !important; border: 0 !important;
+    padding: 0 !important; font-size: .8rem; width: 12rem; min-width: 6rem;
+    color: var(--color-input-fg);
+  }
+  .filter-search input:focus { outline: none !important; }
+  .filter-backdrop {
+    position: fixed; inset: 0; z-index: 1055; background: rgba(0, 0, 0, .35);
+  }
+  /* position: fixed portals the panel out of the .card's backdrop-filter
+     stacking context — that context otherwise traps the popover behind
+     sibling cards regardless of z-index. Anchor coords set inline via JS. */
+  .filter-panel {
+    position: fixed; z-index: 1060;
+    top: 4rem; right: 1rem;
+    width: min(28rem, calc(100vw - 2rem));
+    max-height: min(70vh, 640px);
+    background: var(--color-bg-elev);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    border-radius: .75rem;
+    box-shadow: 0 20px 45px rgba(0, 0, 0, .35);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .filter-panel__body {
+    padding: 1rem 1.15rem; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  .filter-panel__footer {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: .5rem; padding: .75rem 1.15rem;
+    background: var(--color-surface-alt);
+    border-top: 1px solid var(--color-border);
+  }
+  .filter-section__header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: .5rem;
+  }
+  .filter-section__title {
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--color-fg-muted); font-weight: 600;
+  }
+  .filter-section__reset {
+    font-size: .7rem; color: var(--color-accent);
+    background: none; border: 0; cursor: pointer; padding: 0;
+  }
+  .filter-section__reset:hover { text-decoration: underline; }
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: .3rem;
+    padding: .28rem .65rem; border-radius: 9999px;
+    font-size: .72rem;
+    background: var(--color-surface-alt);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    transition: var(--hover-transition);
+    cursor: pointer;
+  }
+  .filter-chip:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+    transform: scale(1.04);
+  }
+  .filter-chip.is-active {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-chip.is-active:hover { color: var(--color-accent-fg); }
+  .filter-range { display: grid; gap: .35rem; }
+  .filter-range__row { display: flex; align-items: center; gap: .5rem; }
+  .filter-range input[type="range"] {
+    flex: 1; accent-color: var(--color-accent);
+    background: transparent; padding: 0; border: 0;
+  }
+  .filter-range__value {
+    min-width: 2.6rem; text-align: right; font-family: ui-monospace, monospace;
+    font-size: .75rem; color: var(--color-fg);
+  }
+  .filter-date {
+    display: grid; grid-template-columns: 1fr 1fr; gap: .5rem;
+  }
+  .filter-date input {
+    font-size: .75rem; padding: .3rem .5rem;
+    background: var(--color-input-bg); color: var(--color-input-fg);
+    border: 1px solid var(--color-border-strong); border-radius: .35rem;
+  }
+  .filter-footer-btn {
+    padding: .45rem .95rem; border-radius: .5rem; font-size: .78rem; font-weight: 500;
+    transition: var(--hover-transition); cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .filter-footer-btn.is-secondary {
+    background: transparent; color: var(--color-fg-muted);
+    border-color: transparent;
+  }
+  .filter-footer-btn.is-secondary:hover {
+    color: var(--color-fg);
+    background: color-mix(in oklab, var(--color-fg-muted) 15%, transparent);
+  }
+  .filter-footer-btn.is-primary {
+    background: var(--color-accent); color: var(--color-accent-fg);
+    border-color: var(--color-accent);
+  }
+  .filter-footer-btn.is-primary:hover { background: var(--color-accent-hover); }
+  /* Compact "meta row" that shows result count + pagination beside the panel
+     trigger — keeps the header height stable when the panel is closed. */
+  .filter-meta { font-size: .72rem; color: var(--color-fg-muted); }
+
+  /* Mobile: promote the popover to a bottom sheet so it never runs off-screen
+     on narrow viewports. Retains the desktop absolute-positioning on larger
+     displays. */
+  @media (max-width: 640px) {
+    .filter-panel {
+      position: fixed; inset: auto 0 0 0; top: auto; right: 0;
+      width: 100vw; max-height: 82vh;
+      border-radius: 1rem 1rem 0 0;
+    }
+  }
 </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
@@ -3659,6 +7625,369 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     </div>
   </div>
 
+  <!-- First-run wizard modal (T1 #2). 3 steps: subject → preset → URL/folder.
+       Uses the /api/presets/descriptions endpoint for the preset picker. -->
+  <div x-show="wizard.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="closeWizard()">
+    <div class="card rounded-xl shadow-2xl max-w-2xl w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-lg">Create your first curation job</h3>
+        <button @click="closeWizard()" class="text-slate-400 hover:text-slate-100" aria-label="Close">✕</button>
+      </div>
+      <div class="flex items-center gap-1 mb-4 text-xs">
+        <template x-for="s in [1,2,3]" :key="'wz'+s">
+          <span class="px-2 py-1 rounded"
+                :class="wizard.step === s ? 'bg-indigo-600 text-white' : (wizard.step > s ? 'bg-emerald-800 text-emerald-100' : 'bg-slate-800 text-slate-400')"
+                x-text="'Step ' + s"></span>
+        </template>
+      </div>
+      <div x-show="wizard.error" x-cloak class="text-xs text-rose-300 mb-2 flex items-center gap-2">
+        <span x-text="wizard.error"></span>
+        <button x-show="wizard.canRetryUnique" @click="wizardRetryWithNewName()"
+                :disabled="wizard.submitting"
+                class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] disabled:opacity-50">
+          Retry with new name
+        </button>
+      </div>
+
+      <div x-show="wizard.step === 1">
+        <label class="block">
+          <span class="text-sm text-slate-300">What are you curating?</span>
+          <input x-model="wizard.subject" @keydown.enter.prevent="wizardNext()"
+                 placeholder="e.g. Aerial drone photography over cities"
+                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          <p class="text-[11px] text-slate-500 mt-1">This becomes the job's topic line — used for relevance scoring.</p>
+        </label>
+      </div>
+
+      <div x-show="wizard.step === 2">
+        <div class="text-sm text-slate-300 mb-2">Pick a starter preset</div>
+        <div class="grid md:grid-cols-2 gap-2 max-h-[50vh] overflow-y-auto pr-1">
+          <template x-for="p in wizard.presets" :key="p.key">
+            <div class="preset-card border rounded p-3 cursor-pointer"
+                 :class="wizard.selectedPreset === p.key ? 'border-indigo-500 bg-indigo-950/30' : 'border-slate-700 bg-slate-900/40'"
+                 @click="wizard.selectedPreset = p.key">
+              <div class="font-semibold text-sm" x-text="p.name"></div>
+              <div class="text-[11px] text-slate-400 mb-1" x-text="p.headline"></div>
+              <div class="text-xs text-slate-300" x-text="p.description"></div>
+              <div class="mt-1">
+                <template x-for="uc in (p.use_cases || [])" :key="uc">
+                  <span class="use-case-chip" x-text="uc"></span>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <div x-show="wizard.step === 3">
+        <div class="text-sm text-slate-300 mb-2">Optional starting source (skip if unsure)</div>
+        <div class="flex gap-2 mb-2 text-xs">
+          <button @click="wizard.sourceMode = 'none'"
+                  :class="wizard.sourceMode === 'none' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">None</button>
+          <button @click="wizard.sourceMode = 'url'"
+                  :class="wizard.sourceMode === 'url' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">Paste a URL</button>
+          <button @click="wizard.sourceMode = 'folder'"
+                  :class="wizard.sourceMode === 'folder' ? 'bg-indigo-600 text-white' : 'bg-slate-800'"
+                  class="px-3 py-1.5 rounded">Local folder</button>
+        </div>
+        <template x-if="wizard.sourceMode === 'url'">
+          <input x-model="wizard.sourceUrl" placeholder="https://www.pixiv.net/en/users/12345"
+                 class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+        </template>
+        <template x-if="wizard.sourceMode === 'folder'">
+          <div class="flex gap-2 items-stretch mt-1">
+            <input x-model="wizard.sourceFolder" placeholder="C:\Users\you\Pictures\my-set"
+                   class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs"/>
+            <button @click="pickWizardFolder()" :disabled="wizard.pickingFolder"
+                    class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm shrink-0 disabled:opacity-50">
+              <span x-text="wizard.pickingFolder ? 'Opening…' : 'Browse…'"></span>
+            </button>
+          </div>
+        </template>
+      </div>
+
+      <div class="flex items-center justify-between mt-5">
+        <button @click="wizardBack()" x-show="wizard.step > 1" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Back</button>
+        <span x-show="wizard.step === 1"></span>
+        <div class="flex gap-2">
+          <button @click="closeWizard()" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+          <button x-show="wizard.step < 3" @click="wizardNext()" :disabled="!wizardCanAdvance()"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">Next →</button>
+          <button x-show="wizard.step === 3" @click="wizardSubmit()" :disabled="wizard.submitting"
+                  class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm disabled:opacity-50">
+            <span x-text="wizard.submitting ? 'Creating…' : 'Create job'"></span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick-sort modal (T1 #4). Sorts an existing folder into a new job. -->
+  <div x-show="quickSort.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="quickSort.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-lg w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Quick-sort a folder</h3>
+        <button @click="quickSort.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">Points cull at a folder and creates a new job. The existing files stay put; classifications land in <code>data/sorted/&lt;slug&gt;</code>.</p>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Folder path</span>
+        <input x-model="quickSort.folder" placeholder="C:\Users\you\Pictures\to-sort"
+               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+      </label>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Preset</span>
+        <select x-model="quickSort.preset" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="quality_only">quality_only (topic-agnostic)</option>
+          <option value="default">default</option>
+          <template x-for="p in presetsList" :key="'qs_'+p">
+            <option :value="p" x-text="p"></option>
+          </template>
+        </select>
+      </label>
+      <label class="block mb-3">
+        <span class="text-xs text-slate-400">Vision worker</span>
+        <select x-model="quickSort.worker" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="">(active fleet default)</option>
+          <template x-for="w in quickSortWorkers()" :key="w.id || w.name">
+            <option :value="w.id || w.name" x-text="(w.name || w.id) + ' — ' + (w.provider || '')"></option>
+          </template>
+        </select>
+      </label>
+      <div x-show="quickSort.error" class="text-xs text-rose-300 mb-2" x-text="quickSort.error"></div>
+      <div class="flex justify-end gap-2">
+        <button @click="quickSort.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Cancel</button>
+        <button @click="submitQuickSort()" :disabled="quickSort.busy"
+                class="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded text-sm disabled:opacity-50">
+          <span x-text="quickSort.busy ? 'Sorting…' : 'Sort folder'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Apply-changes restart-confirm modal. Only opens when applying edits to
+       the ACTIVE running job would force a worker restart. -->
+  <div x-show="applyConfirm.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="applyConfirm.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-md w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Restart pipeline?</h3>
+        <button @click="applyConfirm.open = false" class="text-slate-400 hover:text-slate-100" aria-label="Close">✕</button>
+      </div>
+      <p class="text-sm text-slate-300 mb-4">
+        If you apply these changes, the current workers need to be restarted
+        to pick up the changes. Confirm you want to restart the pipeline?
+      </p>
+      <div class="flex justify-end gap-2">
+        <button @click="applyConfirm.open = false" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">Cancel</button>
+        <button @click="confirmApplyRestart()" :disabled="applyConfirm.submitting"
+                class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 rounded text-sm font-medium disabled:opacity-50">
+          <span x-text="applyConfirm.submitting ? 'Restarting…' : 'Confirm — apply + restart'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Preset preview modal (T1 #3). Fetches /api/presets/preview and shows the
+       cfg alongside install / gist actions. -->
+  <div x-show="presetPreview.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="presetPreview.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-2xl w-full p-6">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold" x-text="'Preset preview — ' + (presetPreview.meta?.headline || presetPreview.source)"></h3>
+        <button @click="presetPreview.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div x-show="presetPreview.loading" class="text-xs text-slate-400">Fetching…</div>
+      <div x-show="presetPreview.error" class="text-xs text-rose-300" x-text="presetPreview.error"></div>
+      <template x-if="!presetPreview.loading && presetPreview.cfg">
+        <div class="space-y-2">
+          <div class="text-xs text-slate-400" x-text="presetPreview.meta?.description || ''"></div>
+          <div class="text-xs">
+            <span class="font-semibold">Categories:</span>
+            <template x-for="c in (presetPreview.cfg.categories || [])" :key="c.name">
+              <span class="use-case-chip" x-text="c.name"></span>
+            </template>
+          </div>
+          <label class="block">
+            <span class="text-xs text-slate-400">Install as</span>
+            <input x-model="presetPreview.installName" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <div class="mt-3 max-h-64 overflow-y-auto bg-slate-950 border border-slate-700 rounded p-2 text-[11px] font-mono whitespace-pre-wrap"
+               x-text="JSON.stringify(presetPreview.cfg, null, 2)"></div>
+        </div>
+      </template>
+      <div class="mt-4 flex justify-end gap-2">
+        <button @click="presetPreview.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
+        <button @click="installPreviewedPreset()" :disabled="presetPreview.installing || !presetPreview.cfg"
+                class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm disabled:opacity-50">
+          <span x-text="presetPreview.installing ? 'Installing…' : 'Install'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Cookies-paste converter modal (T3 #18). Accepts JSON or header-format
+       cookies, POSTs /api/cookies/convert, and returns a filesystem path. -->
+  <div x-show="cookiesModal.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="cookiesModal.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-lg w-full p-5">
+      <h3 class="font-semibold mb-2">Paste cookies</h3>
+      <p class="text-[11px] text-slate-400 mb-2">Paste browser cookies (JSON export or <code>name=value; name2=value2</code>) — cull converts them into a Netscape <code>cookies.txt</code> for <span class="font-mono" x-text="cookiesModal.domain || '(target)'"></span>.</p>
+      <textarea x-model="cookiesModal.raw" rows="6" placeholder='[{"name":"sessionid","value":"..."}] or name=value; other=value'
+                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs"></textarea>
+      <div x-show="cookiesModal.error" class="text-xs text-rose-300 mt-2" x-text="cookiesModal.error"></div>
+      <div x-show="cookiesModal.result" class="text-xs text-emerald-300 mt-2">
+        Saved to <span class="font-mono" x-text="cookiesModal.result?.path"></span>
+      </div>
+      <div class="flex justify-end gap-2 mt-3">
+        <button @click="cookiesModal.open = false" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm">Close</button>
+        <button @click="submitCookies()" :disabled="cookiesModal.busy || !cookiesModal.raw"
+                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+          <span x-text="cookiesModal.busy ? 'Converting…' : 'Convert & save'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export preview modal (T2 #12). -->
+  <div x-show="exportPreview.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="exportPreview.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Export preview — <span class="font-mono" x-text="currentJob"></span></h3>
+        <button @click="exportPreview.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div x-show="exportPreview.loading" class="text-xs text-slate-400">Computing…</div>
+      <div x-show="exportPreview.error" class="text-xs text-rose-300" x-text="exportPreview.error"></div>
+      <template x-if="!exportPreview.loading && exportPreview.data">
+        <div class="space-y-3">
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-emerald-300">Total kept</div>
+              <div class="text-2xl font-mono mt-1" x-text="exportPreview.data.totals?.kept ?? 0"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-indigo-300">Avg caption</div>
+              <div class="text-2xl font-mono mt-1" x-text="(exportPreview.data.totals?.avg_caption_length ?? 0) + ' ch'"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-amber-300">Orphans</div>
+              <div class="text-2xl font-mono mt-1" x-text="exportPreview.data.totals?.orphans ?? 0"></div>
+            </div>
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 text-center">
+              <div class="pill text-slate-300">Distinct cats</div>
+              <div class="text-2xl font-mono mt-1" x-text="Object.keys(exportPreview.data.by_category || {}).length"></div>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">By category</div>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs">
+              <template x-for="[k,v] in Object.entries(exportPreview.data.by_category || {})" :key="k">
+                <div class="flex justify-between bg-slate-900/40 border border-slate-800 rounded px-2 py-1">
+                  <span x-text="k"></span><span class="font-mono" x-text="v"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">Resolution histogram</div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-1 text-xs">
+              <template x-for="[k,v] in Object.entries(exportPreview.data.resolution_histogram || {})" :key="k">
+                <div class="flex justify-between bg-slate-900/40 border border-slate-800 rounded px-2 py-1">
+                  <span x-text="k"></span><span class="font-mono" x-text="v"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div x-show="(exportPreview.data.samples || []).length">
+            <div class="text-xs text-slate-400 mb-1">Sample paths</div>
+            <div class="grid grid-cols-3 md:grid-cols-4 gap-2">
+              <template x-for="s in (exportPreview.data.samples || []).slice(0,12)" :key="s.path || s">
+                <div class="text-[10px] font-mono truncate" :title="s.path || s" x-text="s.name || s.path || s"></div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- Vision test-drive modal (T2 #9 companion). File-drop + result panel. -->
+  <div x-show="dryRun.open" x-cloak class="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+       @click.self="dryRun.open = false">
+    <div class="card rounded-xl shadow-2xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Test-drive vision worker</h3>
+        <button @click="dryRun.open = false" class="text-slate-400 hover:text-slate-100">✕</button>
+      </div>
+      <div class="text-xs text-slate-400 mb-2">Sends one image through the selected worker WITHOUT saving anything, so you can preview the classifier's response before batching.</div>
+      <label class="block mb-2">
+        <span class="text-xs text-slate-400">Worker</span>
+        <select x-model="dryRun.workerId" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+          <option value="">(active fleet default)</option>
+          <template x-for="w in quickSortWorkers()" :key="'dry_'+(w.id || w.name)">
+            <option :value="w.id || w.name" x-text="(w.name || w.id) + ' — ' + (w.provider || '')"></option>
+          </template>
+        </select>
+      </label>
+      <!-- Drop-zone: single source of truth is dryRun.file. Native <input> is
+           sr-only so its "No file chosen" text never surfaces; a labelled
+           button routes clicks to it. Preview swaps in once a file is set. -->
+      <div class="drop-zone border-2 border-dashed border-slate-700 rounded p-6 text-center text-xs text-slate-400 mb-3"
+           @dragover.prevent="dryRun.dragOver = true" @dragleave.prevent="dryRun.dragOver = false"
+           :class="dryRun.dragOver ? 'border-indigo-500' : ''"
+           @drop.prevent="handleDryRunDrop($event)">
+        <input x-ref="dryRunFileInput" type="file" accept="image/*"
+               @change="handleDryRunPick($event)" class="sr-only"/>
+        <template x-if="!dryRun.file">
+          <div>
+            <div class="mb-2">Drop an image here or click to browse</div>
+            <button type="button" @click="$refs.dryRunFileInput.click()"
+                    class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs">Choose file</button>
+          </div>
+        </template>
+        <template x-if="dryRun.file">
+          <div>
+            <img :src="dryRun.previewDataUrl" class="max-h-48 mx-auto rounded shadow" alt="uploaded"/>
+            <div class="mt-2 text-xs text-slate-300 font-mono truncate" x-text="dryRun.filename + ' · ' + formatDryRunSize(dryRun.file.size)"></div>
+            <button type="button" @click="clearDryRunFile()"
+                    class="mt-2 px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Clear</button>
+          </div>
+        </template>
+      </div>
+      <div class="flex justify-end gap-2 mb-3">
+        <button @click="runDryRun()" :disabled="dryRun.busy || !dryRun.file"
+                class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+          <span x-text="dryRun.busy ? 'Classifying…' : 'Run'"></span>
+        </button>
+      </div>
+      <div x-show="dryRun.error" class="text-xs text-rose-300" x-text="dryRun.error"></div>
+      <template x-if="dryRun.result">
+        <div class="space-y-2">
+          <div class="text-xs">
+            <span class="font-semibold">Would land in:</span>
+            <span class="font-mono ml-2" x-text="dryRun.result.would_land_in || '(unclassified)'"></span>
+          </div>
+          <div class="text-xs">
+            <span class="font-semibold">Score result:</span>
+            <span class="font-mono ml-2" x-text="dryRun.result.score_result ? JSON.stringify(dryRun.result.score_result) : ''"></span>
+          </div>
+          <details><summary class="text-xs text-slate-300 cursor-pointer">Parsed</summary>
+            <pre class="mt-2 bg-slate-950 border border-slate-700 rounded p-2 text-[11px] whitespace-pre-wrap overflow-x-auto" x-text="JSON.stringify(dryRun.result.parsed, null, 2)"></pre>
+          </details>
+          <details><summary class="text-xs text-slate-300 cursor-pointer">Raw model response</summary>
+            <pre class="mt-2 bg-slate-950 border border-slate-700 rounded p-2 text-[11px] whitespace-pre-wrap overflow-x-auto" x-text="dryRun.result.raw_response || ''"></pre>
+          </details>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- Mobile hamburger - hidden on lg+ where the sidebar is always visible. -->
   <button @click="sidebarOpen = !sidebarOpen" aria-label="Toggle navigation"
     class="lg:hidden fixed top-3 left-3 z-40 bg-slate-800 hover:bg-slate-700 rounded p-2">
@@ -3680,12 +8009,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <span class="font-brand text-2xl font-medium tracking-tight">cull</span>
       </a>
       <p class="text-xs text-slate-400 mt-1" x-text="'Worker: ' + (status.pipeline?.vision_worker || '...')"></p>
-      <div class="mt-2">
-        <span class="pill px-2 py-0.5 rounded"
+      <div class="mt-2 min-w-0 flex flex-wrap items-center gap-1">
+        <span class="pill px-2 py-0.5 rounded shrink-0"
           :class="status.pipeline?.running ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'"
           x-text="status.pipeline?.running ? 'running' : 'stopped'"></span>
-        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 ml-1"
-          x-show="jobsActive" x-text="'active: ' + (jobsActive || '')"></span>
+        <!-- Multi-active: show all running slugs (comma-separated, truncated),
+             with the full list on tooltip so long active sets stay legible. -->
+        <span class="pill px-2 py-0.5 rounded bg-slate-800 text-slate-300 truncate max-w-full inline-block"
+          x-show="jobsActiveSlugs.length" :title="jobsActiveSlugs.join(', ')"
+          x-text="(jobsActiveSlugs.length === 1 ? 'active: ' : 'running (' + jobsActiveSlugs.length + '): ') + jobsActiveSlugs.join(', ')"></span>
       </div>
     </div>
 
@@ -3694,9 +8026,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       <div class="space-y-1">
         <template x-for="tab in globalTabs" :key="tab.id">
           <button @click="active = tab.id; sidebarOpen = false"
-            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            class="nav-tip w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            x-text="tab.label"></button>
+            :data-tooltip="tab.hint || ''" :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -3705,15 +8037,16 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
     <template x-if="view === 'job'">
       <div class="space-y-1">
         <button @click="backToJobs()"
-          class="w-full text-left px-3 py-2 rounded text-sm text-slate-300 hover:bg-slate-800 transition flex items-center gap-2">
+          class="w-full text-left px-3 py-2 rounded text-sm text-slate-300 hover:bg-slate-800 transition flex items-center gap-2"
+          title="Back to all jobs">
           <span aria-hidden="true">←</span> Jobs
         </button>
         <div class="px-3 py-1 text-xs text-slate-500 truncate" x-text="currentJob"></div>
         <template x-for="tab in jobTabs" :key="tab.id">
           <button @click="active = tab.id; sidebarOpen = false"
-            class="w-full text-left px-3 py-2 rounded text-sm transition"
+            class="nav-tip w-full text-left px-3 py-2 rounded text-sm transition"
             :class="active === tab.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-            x-text="tab.label"></button>
+            :data-tooltip="tab.hint || ''" :title="tab.hint || ''" x-text="tab.label"></button>
         </template>
       </div>
     </template>
@@ -3734,6 +8067,70 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          class="mt-2 text-[11px] text-slate-500"
          x-text="'Indexed ' + ((indexer.queue_total || 0) + (indexer.sorted_total || 0)).toLocaleString() + ' images'">
     </div>
+
+    <!-- Updates strip (T6) — compact self-update UX pinned to the sidebar so
+         it's reachable from every tab without cluttering Global Settings.
+         The /api/update/check + /api/update/run endpoints are unchanged; only
+         the location + surface have moved. Update failures surface as toasts. -->
+    <div class="mt-4 pt-3 border-t border-slate-800 space-y-1.5 text-[11px]">
+      <div class="flex items-center justify-between gap-1">
+        <span class="font-mono text-slate-400 truncate"
+              :title="'Installed: ' + (update.local_sha || 'unknown')"
+              x-text="'cull @ ' + (update.local_sha ? update.local_sha.slice(0,7) : '…')"></span>
+        <a href="https://github.com/tlennon-ie/cull" target="_blank" rel="noopener"
+           class="text-slate-400 hover:text-slate-200 transition shrink-0"
+           title="Open cull on GitHub" aria-label="Open cull on GitHub">
+          <!-- Octocat glyph (inline SVG). Keeps this dependency-free. -->
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+            <path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 005.47 7.59c.4.07.55-.17.55-.38
+              0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+              -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+              .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
+              -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27
+              .68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12
+              .51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48
+              0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42
+              -3.58-8-8-8z"/>
+          </svg>
+        </a>
+      </div>
+      <div class="flex items-center gap-1 flex-wrap">
+        <template x-if="!update.checked || update.checking">
+          <button @click="checkUpdate(true)" :disabled="update.checking"
+                  class="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-60"
+                  x-text="update.checking ? 'Checking…' : 'Check for updates'"></button>
+        </template>
+        <template x-if="update.checked && !update.checking && update.behind === 0 && !update.error">
+          <!-- Theme-token pill: previously bg-emerald-900/60 + text-emerald-300 which the
+               light-theme mapping only partially caught (bg fell through, text turned
+               green on white ≈ invisible). Now uses --color-success / --color-success-fg
+               explicitly so every theme lands a legible pill. -->
+          <span class="px-2 py-0.5 rounded text-[11px] font-medium"
+                style="background: var(--color-success); color: var(--color-success-fg);"
+                title="Latest cull is already installed">up to date</span>
+        </template>
+        <template x-if="update.checked && update.behind > 0">
+          <div class="flex flex-col gap-1 w-full">
+            <div class="flex items-center gap-1 text-amber-300">
+              <span>Update available</span>
+              <span class="font-mono text-slate-500 truncate"
+                    x-text="(update.local_sha ? update.local_sha.slice(0,7) : '…') + ' → ' + (update.remote_sha ? update.remote_sha.slice(0,7) : '…')"></span>
+            </div>
+            <button @click="runUpdate()" :disabled="update.running"
+                    class="px-2 py-1 rounded bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold text-[11px] disabled:opacity-60"
+                    x-text="update.running ? 'Updating…' : 'Update to latest &amp; restart'"></button>
+            <button @click="checkUpdate(true)" :disabled="update.checking"
+                    class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] disabled:opacity-60"
+                    x-text="update.checking ? 'Rechecking…' : 'Re-check'"></button>
+          </div>
+        </template>
+        <template x-if="update.checked && update.error && !update.checking">
+          <button @click="checkUpdate(true)"
+                  class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                  title="Last check failed — try again">Re-check</button>
+        </template>
+      </div>
+    </div>
   </aside>
 
   <!-- Backdrop when sidebar is open on mobile. -->
@@ -3748,38 +8145,154 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <span x-show="view === 'jobs' && active === 'jobs'">Each job is a curation target with its own scrapers, taxonomy, and scoring. Activate one to run it.</span>
           <span x-show="view === 'jobs' && active === 'settings'">Global credentials, model endpoints, and storage roots. Per-job settings live inside each job.</span>
           <span x-show="view === 'jobs' && active === 'gstats'">Aggregate analytics across every job — filter to one job to drill in.</span>
+          <span x-show="view === 'jobs' && active === 'globalGallery'">Every job's sorted library in one grid — chip filter by job, plus the standard prompt/source/category filters.</span>
           <span x-show="view === 'job' && active !== 'gallery'" x-text="'Job: ' + currentJob + ' — auto-refresh every 5 s'"></span>
           <span x-show="view === 'job' && active === 'gallery'" x-text="'Filter, browse, edit, and export ' + currentJob + '\'s sorted library'"></span>
         </p>
       </div>
-      <div class="flex gap-2" x-show="view === 'job'">
-        <template x-if="!status.pipeline?.running">
-          <button @click="startPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-emerald-600 hover:bg-emerald-500">Start pipeline</button>
+      <div class="flex items-center gap-2">
+        <!-- T2: Global "Show NSFW" toggle. Client-only; persists to
+             localStorage['cull_show_nsfw'] and drives shouldBlurNsfw() so
+             EVERY image surface honours a single switch. Default OFF. -->
+        <label class="toggle-label bg-slate-800 border border-slate-700 rounded px-2 py-1.5"
+               :title="showNsfw ? 'Hide NSFW imagery (blurs across every surface)' : 'Reveal NSFW imagery on every surface'">
+          <span class="toggle-switch">
+            <input type="checkbox" :checked="showNsfw" @change="setShowNsfw($event.target.checked)" aria-label="Show NSFW imagery"/>
+            <span class="toggle-switch__track"><span class="toggle-switch__thumb"></span></span>
+          </span>
+          <span>Show NSFW</span>
+        </label>
+        <!-- Theme selector (T3 #22) — persists to localStorage, applied on <html>.
+             Driven from availableThemes() so shipped + community + user themes
+             show up automatically. The visible label capitalises the slug so
+             `ai-slop` renders as `Ai-slop` etc.; users see the slug they saved. -->
+        <select :value="theme" @change="setTheme($event.target.value)"
+                title="Colour theme"
+                class="text-xs bg-slate-800 border border-slate-700 rounded px-2 py-1.5 mr-1">
+          <template x-for="t in availableThemes()" :key="'th_' + t.name">
+            <option :value="t.name"
+                    x-text="'Theme: ' + (t.name.charAt(0).toUpperCase() + t.name.slice(1))"></option>
+          </template>
+        </select>
+        <template x-if="view === 'job'">
+          <div class="flex gap-2">
+            <template x-if="!status.pipeline?.running">
+              <button @click="startPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-emerald-600 hover:bg-emerald-500">Start pipeline</button>
+            </template>
+            <template x-if="status.pipeline?.running">
+              <button @click="stopPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-rose-600 hover:bg-rose-500">Stop pipeline</button>
+            </template>
+            <button @click="refresh()" class="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-sm">Refresh</button>
+          </div>
         </template>
-        <template x-if="status.pipeline?.running">
-          <button @click="stopPipeline()" class="px-4 py-2 rounded text-sm font-medium bg-rose-600 hover:bg-rose-500">Stop pipeline</button>
-        </template>
-        <button @click="refresh()" class="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-sm">Refresh</button>
       </div>
     </header>
 
     <!-- JOBS LANDING ──────────────────────────────────────────────────────
-         The first thing the user sees: a grid of job cards + a New Job card.
+         The first thing the user sees. On a fresh install the empty-state
+         hero is the sole surface; once jobs exist we surface the run-queue
+         strip + a grid of job cards + the New Job composer.
          Each job is its own curation target; activating one makes the
          supervisor run it. -->
     <section x-show="view === 'jobs' && active === 'jobs'" class="space-y-4">
-      <!-- Job queue strip: active job + next queued, with advance control. -->
-      <div class="card rounded-xl p-5" x-show="jobsActive || jobsQueue.length">
+
+      <!-- First-run welcome hero: only when there are zero jobs on disk AND
+           the user hasn't dismissed it. Dismissal persists across reloads. -->
+      <template x-if="!jobsLoading && jobsList.length === 0 && !welcome.dismissed">
+        <div class="card rounded-xl p-6 relative overflow-hidden">
+          <button @click="dismissWelcome()" aria-label="Dismiss welcome"
+            class="absolute top-3 right-3 text-slate-400 hover:text-slate-100 text-lg leading-none">✕</button>
+          <div class="flex items-start gap-4">
+            <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64" class="shrink-0 hidden sm:block"/>
+            <div class="flex-1 min-w-0">
+              <div class="text-xs uppercase tracking-wider text-amber-300 mb-1">Welcome to cull</div>
+              <h3 class="font-brand text-2xl font-medium tracking-tight">Curate an AI image dataset in three steps.</h3>
+              <ol class="mt-3 grid gap-3 md:grid-cols-3 text-sm">
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">1. Pick a starting preset</div>
+                  <div class="text-slate-300 mt-1">Aerial, wildlife, product, anime, video… 13 shipped, plus your own.</div>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">2. Point it at sources</div>
+                  <div class="text-slate-300 mt-1">Reddit, X, Civitai, Discord, gallery-dl URLs, or your local folder.</div>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-xs text-amber-300 font-semibold">3. Start the pipeline</div>
+                  <div class="text-slate-300 mt-1">Vision workers classify each image against your taxonomy — you keep the wins.</div>
+                </li>
+              </ol>
+              <div class="mt-4 flex flex-wrap items-center gap-2">
+                <button @click="showShortcuts = true"
+                  class="px-3 py-2 bg-slate-800 hover:bg-slate-700 rounded text-sm"
+                  title="Press ? at any time">
+                  Keyboard shortcuts
+                </button>
+                <span class="text-[11px] text-slate-500 ml-auto">Pick an entry point below to start.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Empty-jobs onboarding: three parallel entry points — seed sample
+           data + open a first-run wizard + quick-sort an existing folder.
+           Rendered alongside the welcome hero so a user has both the
+           educational context AND concrete actions in front of them. -->
+      <div x-show="!jobsLoading && jobsList.length === 0" x-cloak class="grid md:grid-cols-3 gap-4">
+        <div class="card rounded-xl p-5 border-2 border-dashed border-indigo-700 flex flex-col">
+          <div class="pill text-indigo-300 mb-1">Get started</div>
+          <h3 class="font-semibold mb-1">Try cull with sample data</h3>
+          <p class="text-xs text-slate-400 mb-3">Seed a demo job with pre-classified images so you can explore the gallery, stats, and export flow without a scraper run.</p>
+          <div class="mt-auto flex flex-wrap gap-2">
+            <button @click="seedDemo()" :disabled="demoStatus.busy"
+                    class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium disabled:opacity-50">
+              <span x-text="demoStatus.busy ? 'Seeding…' : 'Load demo data'"></span>
+            </button>
+            <button x-show="demoStatus.exists" @click="unseedDemo()" :disabled="demoStatus.busy"
+                    class="px-3 py-2 bg-rose-900/60 hover:bg-rose-800 rounded text-sm text-rose-100 disabled:opacity-50">Remove demo</button>
+          </div>
+        </div>
+        <div class="card rounded-xl p-5 border-2 border-dashed border-emerald-700 flex flex-col">
+          <div class="pill text-emerald-300 mb-1">Create</div>
+          <h3 class="font-semibold mb-1">Create your first curation job</h3>
+          <p class="text-xs text-slate-400 mb-3">Pick a subject, choose a starter preset, and optionally point at a URL or a folder. Takes ~1 minute.</p>
+          <button @click="openWizard()"
+                  class="mt-auto px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Start wizard</button>
+        </div>
+        <div class="card rounded-xl p-5 border-2 border-dashed border-amber-700 flex flex-col">
+          <div class="pill text-amber-300 mb-1">Already have images?</div>
+          <h3 class="font-semibold mb-1">Sort a folder you already have</h3>
+          <p class="text-xs text-slate-400 mb-3">Point cull at a local directory of images and it will classify them into buckets — no scraping required.</p>
+          <button @click="openQuickSort()"
+                  class="mt-auto px-3 py-2 bg-amber-600 hover:bg-amber-500 rounded text-sm font-medium">Quick-sort a folder</button>
+        </div>
+      </div>
+
+      <!-- Run strip: every currently-running job (multi-active) + queued list.
+           v2: "Active" (singular) becomes "Running" (plural). Each chip shows
+           slug · weight so the operator sees at-a-glance how the shared vision
+           fleet is fair-sharing between concurrent jobs. Advance still exists
+           for the queued tail (Run to lift a queued job into the active set). -->
+      <div class="card rounded-xl p-5" x-show="jobsActiveSlugs.length || jobsQueue.length">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold">Run queue</h3>
           <button @click="advanceQueue()" :disabled="!jobsQueue.length"
             class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"
-            title="Promote the next queued job to active">Advance →</button>
+            title="Promote the next queued job into the active set (adds — does not replace)">Advance →</button>
         </div>
         <div class="flex flex-wrap items-center gap-2 text-sm">
-          <span class="text-xs text-slate-400">Active:</span>
-          <span class="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 font-mono text-xs"
-                x-text="jobsActive || '(none — activate a job)'"></span>
+          <span class="text-xs text-slate-400">Running:</span>
+          <template x-if="!jobsActiveSlugs.length">
+            <span class="px-2 py-1 rounded bg-slate-800 text-slate-400 text-xs">
+              (none — flip a Run switch on a job below)
+            </span>
+          </template>
+          <template x-for="slug in jobsActiveSlugs" :key="'run_'+slug">
+            <span class="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 font-mono text-xs">
+              <span x-text="slug"></span>
+              <span class="opacity-60 ml-1" x-text="'· w' + (jobsPriority[slug] || priorityWeightDefault)"></span>
+            </span>
+          </template>
           <template x-if="jobsQueue.length">
             <span class="text-xs text-slate-400 ml-2">then:</span>
           </template>
@@ -3788,12 +8301,38 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   x-text="(i+1) + '. ' + slug"></span>
           </template>
         </div>
+        <p x-show="jobsActiveSlugs.length > 3" x-cloak
+           class="text-[11px] text-amber-400 mt-2">
+          Running <span x-text="jobsActiveSlugs.length"></span> jobs in parallel —
+          vision workers are shared and prioritised by weight.
+        </p>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        <!-- Existing jobs -->
+        <!-- Loading skeletons: shown only on the first fetch, so a slow disk
+             scan doesn't leave the grid blank for seconds. -->
+        <template x-if="jobsLoading && jobsList.length === 0">
+          <template x-for="i in 3" :key="'skel_'+i">
+            <div class="card rounded-xl p-5 animate-pulse">
+              <div class="h-4 w-2/3 bg-slate-800 rounded mb-2"></div>
+              <div class="h-3 w-1/3 bg-slate-800/60 rounded mb-4"></div>
+              <div class="grid grid-cols-2 gap-2 my-2">
+                <div class="h-12 bg-slate-800/60 rounded"></div>
+                <div class="h-12 bg-slate-800/60 rounded"></div>
+              </div>
+              <div class="h-6 w-24 bg-slate-800/60 rounded mt-3"></div>
+            </div>
+          </template>
+        </template>
+
+        <!-- Existing jobs (v2 multi-active): Run toggle + priority stepper
+             replace the old Activate button. Toggling Run ON adds the job to
+             the active set (additive activate); OFF removes it (deactivate).
+             Priority (1-10, default 5) scales the shared vision fleet's
+             weighted round-robin turns per cycle. -->
         <template x-for="jb in jobsList" :key="jb.slug">
-          <div class="card rounded-xl p-5 flex flex-col">
+          <div class="card rounded-xl p-5 flex flex-col"
+               :class="jb.is_active ? 'ring-2 ring-indigo-500/50' : ''">
             <div class="flex items-start justify-between gap-2 mb-2">
               <div class="min-w-0">
                 <div class="font-semibold truncate" x-text="jb.name"></div>
@@ -3801,6 +8340,36 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
               <span class="pill px-2 py-0.5 rounded shrink-0" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
             </div>
+
+            <!-- Run + Priority controls: matches the visual language of the
+                 scraper toggles. Priority is echoed on every priority slider
+                 next to the Run switch so weights are always visible. -->
+            <div class="flex items-center gap-3 mb-3">
+              <label class="toggle-label"
+                     :title="jb.is_active ? 'Running — flip off to remove from active set' : 'Idle — flip on to run in parallel'">
+                <span class="toggle-switch">
+                  <input type="checkbox" :checked="jb.is_active"
+                         @change="toggleJobRun(jb.slug, $event.target.checked)"
+                         :aria-label="'Run ' + jb.name"/>
+                  <span class="toggle-switch__track"><span class="toggle-switch__thumb"></span></span>
+                </span>
+                <span class="uppercase tracking-wide text-slate-400 text-[11px]">Run</span>
+              </label>
+              <div class="flex items-center gap-1 ml-auto">
+                <span class="text-[11px] uppercase tracking-wide text-slate-500 mr-1">Priority</span>
+                <button type="button" @click="stepJobPriority(jb.slug, -1)"
+                        class="w-6 h-6 text-xs bg-slate-800 hover:bg-slate-700 rounded"
+                        title="Fewer round-robin turns per cycle">−</button>
+                <input type="number" :min="priorityWeightMin" :max="priorityWeightMax"
+                       :value="jb.priority || priorityWeightDefault"
+                       @change="setJobPriority(jb.slug, $event.target.value)"
+                       class="w-12 h-6 text-center bg-slate-800 border border-slate-700 rounded text-xs" />
+                <button type="button" @click="stepJobPriority(jb.slug, +1)"
+                        class="w-6 h-6 text-xs bg-slate-800 hover:bg-slate-700 rounded"
+                        title="More round-robin turns per cycle">+</button>
+              </div>
+            </div>
+
             <div class="grid grid-cols-2 gap-2 text-center my-2">
               <div class="bg-slate-900/60 border border-slate-800 rounded p-2">
                 <div class="pill text-indigo-300">Queued</div>
@@ -3812,12 +8381,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </div>
             <div class="text-[11px] text-slate-500 mb-3" x-show="jb.queue_position !== null"
-                 x-text="jb.queue_position === 0 ? 'Active' : ('Queue position #' + jb.queue_position)"></div>
+                 x-text="jb.queue_position === 0 ? 'Running (head)' : ('Queue position #' + jb.queue_position)"></div>
             <div class="mt-auto flex flex-wrap gap-1.5">
               <button @click="openJob(jb.slug)" class="px-2.5 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Open</button>
-              <button @click="activateJob(jb.slug)" :disabled="jb.is_active"
-                class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40"
-                x-text="jb.is_active ? 'Active' : 'Activate'"></button>
               <button @click="openJob(jb.slug); active='jobSettings'" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
               <button @click="cloneJob(jb.slug)" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
               <template x-if="!jb.is_active && jb.queue_position === null">
@@ -3832,19 +8398,26 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           </div>
         </template>
 
-        <!-- New Job card -->
-        <div class="card rounded-xl p-5 border-dashed border-2 border-slate-700 flex flex-col justify-center">
+        <!-- New Job composer. Preset filter kicks in above 6 shown presets so a
+             library with 13+ built-ins + the user's own doesn't drown the picker.
+             The description hint updates live from `/api/presets` metadata. -->
+        <div class="card rounded-xl p-5 border-dashed border-2 border-slate-700 flex flex-col justify-center" x-ref="newJobCard">
           <h3 class="font-semibold mb-2">New job</h3>
-          <input x-model="newJob.name" @keydown.enter="createJob()"
+          <input x-model="newJob.name" @keydown.enter="createJob()" x-ref="newJobName"
             placeholder="Job name (e.g. Car Ads)"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2"/>
+          <input x-show="presetsList.length > 6 && !newJob.base_on" x-cloak
+            x-model="newJob.presetFilter" placeholder="Filter presets…"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs mb-1"/>
           <select x-model="newJob.preset" :disabled="!!newJob.base_on"
-            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-2 disabled:opacity-50">
-            <option value="">Preset: default</option>
-            <template x-for="p in presetsList" :key="'np_'+p">
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-1 disabled:opacity-50">
+            <option value="">Preset: default (general triage)</option>
+            <template x-for="p in filteredPresets()" :key="'np_'+p">
               <option :value="p" x-text="'Preset: ' + p"></option>
             </template>
           </select>
+          <p class="text-[11px] text-slate-500 min-h-[1.25rem] mb-2"
+             x-text="presetDescription(newJob.preset || presetsDefault) || 'Applies the shipped default triage (Keep / Borderline / OffTopic).'"></p>
           <select x-model="newJob.base_on"
             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm mb-3">
             <option value="">Start fresh from preset</option>
@@ -3855,10 +8428,6 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <button @click="createJob()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium">Create job</button>
         </div>
       </div>
-
-      <template x-if="!jobsLoading && jobsList.length === 0">
-        <div class="text-xs text-slate-500">No jobs yet — create one above to begin curating.</div>
-      </template>
     </section>
 
     <!-- SCHEDULES (per-job cadence → scrape/curate/export) -->
@@ -3898,12 +8467,60 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div x-show="schedules.error" x-cloak class="text-xs text-rose-300 mt-2" x-text="schedules.error"></div>
       </div>
 
+      <!-- Daily digest webhook (T2 #11). Discord/Slack markdown summary of
+           the last N hours of curation activity — post to a webhook URL. -->
+      <div class="card rounded-xl p-5">
+        <h3 class="font-semibold mb-1">Daily digest</h3>
+        <p class="text-xs text-slate-400 mb-3">Post a summary of the last <span x-text="digest.since_hours"></span>h of activity to a Discord or Slack webhook. Preview shows the markdown before you commit.</p>
+        <div class="grid md:grid-cols-4 gap-3 mb-3">
+          <label class="md:col-span-2 block">
+            <span class="text-xs text-slate-400">Webhook URL</span>
+            <input x-model="digest.webhook_url" placeholder="https://discord.com/api/webhooks/..." autocomplete="off"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Style</span>
+            <select x-model="digest.webhook_style" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1">
+              <option value="discord">Discord</option>
+              <option value="slack">Slack</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Since (hours)</span>
+            <input type="number" min="1" max="168" x-model.number="digest.since_hours"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+          <label class="block">
+            <span class="text-xs text-slate-400">Top N per bucket</span>
+            <input type="number" min="1" max="50" x-model.number="digest.top_n"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button @click="previewDigest()" :disabled="digest.busy"
+                  class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
+            <span x-text="digest.busy && digest.action === 'preview' ? 'Building…' : 'Preview'"></span>
+          </button>
+          <button @click="sendDigest()" :disabled="digest.busy || !digest.webhook_url"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
+            <span x-text="digest.busy && digest.action === 'send' ? 'Sending…' : 'Test send'"></span>
+          </button>
+          <span x-show="digest.status" x-text="digest.status" class="text-xs text-emerald-300"></span>
+          <span x-show="digest.error" x-text="digest.error" class="text-xs text-rose-300"></span>
+        </div>
+        <pre x-show="digest.markdown" x-cloak
+             class="mt-3 bg-slate-950 border border-slate-700 rounded p-3 text-[11px] whitespace-pre-wrap max-h-64 overflow-y-auto"
+             x-text="digest.markdown"></pre>
+      </div>
+
       <div class="card rounded-xl p-5">
         <div class="flex items-center justify-between mb-3">
           <h4 class="font-semibold text-sm">Active schedules</h4>
           <button @click="loadSchedules()" class="text-xs link-btn">refresh</button>
         </div>
-        <div x-show="!schedules.rows.length" class="text-sm text-slate-500">No schedules yet.</div>
+        <div x-show="!schedules.rows.length" class="text-sm text-slate-500 py-3">
+          No schedules yet. Add one above to run a job on a cadence — handy for jobs that pull from live feeds.
+        </div>
         <table x-show="schedules.rows.length" class="w-full text-sm">
           <thead><tr class="text-left text-xs text-slate-400 border-b border-slate-700">
             <th class="py-1">Job</th><th>Cadence</th><th>Action</th><th>Enabled</th><th>Last run</th><th></th>
@@ -3938,7 +8555,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <label class="text-xs text-slate-400">Job filter</label>
             <select x-model="globalStatsJob" @change="loadGlobalStats()"
               class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm">
-              <option value="">All jobs</option>
+              <option value="__all__">All jobs</option>
               <template x-for="jb in jobsList" :key="'gs_'+jb.slug">
                 <option :value="jb.slug" x-text="jb.name"></option>
               </template>
@@ -3953,7 +8570,97 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-rose-300">Discarded</div><div class="text-2xl font-mono mt-1 text-rose-200" x-text="stats.totals?.discard ?? 0"></div></div>
           <div class="bg-slate-900/60 border border-slate-800 rounded p-3"><div class="pill text-slate-400">Sources</div><div class="text-2xl font-mono mt-1" x-text="(stats.sources?.length ?? 0)"></div></div>
         </div>
+
+        <!-- T4: per-job donut. Hover a slice or legend row to lift the paired
+             element; keeps donut + legend visually linked for large legends. -->
+        <div class="mt-6 grid gap-6 md:grid-cols-[280px_1fr] items-center"
+             x-show="globalStatsDonutSlices().length">
+          <div class="mx-auto md:mx-0 w-full max-w-[280px]">
+            <svg viewBox="0 0 220 220" width="100%" height="100%" role="img"
+                 :aria-label="'Per-job classification totals — ' + (globalStatsGrandTotal() || 0) + ' total'">
+              <template x-for="s in globalStatsDonutSlices()" :key="'gd_'+s.slug">
+                <path :d="s.pathOffset(110, 110, statsHoverSlug === s.slug ? 96 : 90)"
+                      :fill="s.fill"
+                      stroke="var(--color-bg-elev)"
+                      :stroke-width="statsHoverSlug === s.slug ? 2 : 1"
+                      :opacity="statsHoverSlug && statsHoverSlug !== s.slug ? 0.35 : 1"
+                      style="cursor: pointer; transition: opacity .15s, stroke-width .15s;"
+                      @mouseenter="statsHoverSlug = s.slug" @mouseleave="statsHoverSlug = null"
+                      @click="globalStatsJob = s.slug; loadGlobalStats()"
+                      :aria-label="s.slug + ' ' + s.count + ' (' + s.pct + '%)'">
+                  <title x-text="s.slug + ' — ' + s.count.toLocaleString() + ' (' + s.pct + '%) — click to filter'"></title>
+                </path>
+              </template>
+              <circle cx="110" cy="110" r="52" fill="var(--color-bg-elev)"/>
+              <text x="110" y="102" text-anchor="middle" font-size="11"
+                    fill="var(--color-fg-muted)" letter-spacing="0.08em"
+                    x-text="(statsHoverSlug || 'total').toUpperCase()"></text>
+              <text x="110" y="124" text-anchor="middle" font-size="22" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+                    fill="var(--color-fg)"
+                    x-text="(statsHoverSlug ? (stats.by_job?.[statsHoverSlug]?.total || 0) : globalStatsGrandTotal()).toLocaleString()"></text>
+              <text x="110" y="140" text-anchor="middle" font-size="10"
+                    fill="var(--color-fg-muted)"
+                    x-text="statsHoverSlug ? (Math.round(((stats.by_job?.[statsHoverSlug]?.total || 0) / (globalStatsGrandTotal() || 1)) * 100) + '%') : ''"></text>
+            </svg>
+          </div>
+          <div class="text-xs">
+            <div class="flex items-center justify-between mb-2">
+              <div class="font-semibold text-sm" x-text="'By job (' + globalStatsDonutSlices().length + ')'"></div>
+              <div class="text-[11px] text-slate-500">click a slice to filter</div>
+            </div>
+            <div class="max-h-[240px] overflow-y-auto pr-1 space-y-1.5">
+              <template x-for="s in globalStatsDonutSlices()" :key="'gdl_'+s.slug">
+                <div class="flex items-center gap-2 rounded px-1.5 py-1 cursor-pointer transition"
+                     :style="statsHoverSlug === s.slug ? 'background: color-mix(in oklab, ' + s.fill + ' 12%, transparent);' : ''"
+                     @mouseenter="statsHoverSlug = s.slug" @mouseleave="statsHoverSlug = null"
+                     @click="globalStatsJob = s.slug; loadGlobalStats()">
+                  <span class="inline-block w-3 h-3 rounded-sm shrink-0" :style="'background:'+s.fill"></span>
+                  <span class="font-mono truncate flex-1" x-text="s.slug"></span>
+                  <div class="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
+                    <div class="h-full rounded-full" :style="'width: ' + s.pct + '%; background: ' + s.fill"></div>
+                  </div>
+                  <span class="font-mono text-slate-300 w-16 text-right" x-text="s.count.toLocaleString()"></span>
+                  <span class="font-mono text-slate-500 w-10 text-right" x-text="s.pct + '%'"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+        <div x-show="!globalStatsDonutSlices().length" class="mt-3 text-xs text-slate-500 italic">
+          No per-job data yet — donut renders once a job classifies its first image.
+        </div>
       </div>
+
+      <!-- Per-source stacked bar chart: shows KEPT vs DISCARDED per source
+           with volume + NSFW meter. Replaces the flat percentage-only table
+           with something eyeball-scannable. -->
+      <div class="card rounded-xl p-5" x-show="statsSourceBars().length">
+        <h3 class="font-semibold mb-1">Source composition</h3>
+        <p class="text-xs text-slate-400 mb-4">Kept vs discarded volume per source, with NSFW share below.</p>
+        <div class="space-y-3">
+          <template x-for="s in statsSourceBars()" :key="'ssb_'+s.source">
+            <div>
+              <div class="flex items-center justify-between text-xs mb-1">
+                <span class="font-mono" x-text="s.source"></span>
+                <span class="text-slate-400 font-mono" x-text="s.total.toLocaleString() + ' · ' + s.discard_pct + '% discarded · ' + s.nsfw_pct + '% NSFW'"></span>
+              </div>
+              <div class="h-3 rounded-full overflow-hidden bg-slate-800 flex" :title="s.source + ': ' + s.kept.toLocaleString() + ' kept + ' + s.discarded.toLocaleString() + ' discarded of ' + s.total.toLocaleString() + ' (bar length = share of largest source)'">
+                <div class="h-full bg-emerald-500 transition-all" :style="'width: ' + (s.keptShare * 100) + '%'"></div>
+                <div class="h-full bg-rose-500 transition-all" :style="'width: ' + (s.discardShare * 100) + '%'"></div>
+              </div>
+              <div class="h-1 mt-1 rounded-full bg-slate-800 overflow-hidden" x-show="s.nsfw_pct > 0">
+                <div class="h-full bg-amber-500" :style="'width: ' + s.nsfw_pct + '%'" :title="s.nsfw_pct + '% NSFW'"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="flex items-center gap-4 mt-4 text-[11px] text-slate-400">
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span>Kept</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-rose-500"></span>Discarded</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-amber-500"></span>NSFW share</span>
+        </div>
+      </div>
+
       <div class="card rounded-xl p-5">
         <h3 class="font-semibold mb-3">Per-source platform analytics</h3>
         <div class="scroll-box"><table>
@@ -3978,6 +8685,181 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             </template>
           </tbody>
         </table></div>
+      </div>
+    </section>
+
+    <!-- GLOBAL GALLERY ────────────────────────────────────────────────────
+         T3: every job's sorted library in one grid. Same tile renderer as the
+         per-job gallery, plus a jobs multi-select filter and a job chip on
+         each card. Respects the global NSFW toggle (T2). -->
+    <section x-show="view === 'jobs' && active === 'globalGallery'" class="space-y-4">
+      <!-- Compact filter toolbar for the cross-job view. Mirrors the per-job
+           gallery pattern so the two feel like one product; jobs live in the
+           panel here since they're the discriminator for this tab. -->
+      <div class="card rounded-xl p-3">
+        <div class="filter-toolbar justify-between">
+          <div class="filter-toolbar">
+            <label class="filter-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+              </svg>
+              <input type="search" x-model="globalGalleryFilters.q" @keydown.enter="loadGlobalGallery(1)"
+                     placeholder="Search prompts…" aria-label="Search prompts / descriptions"/>
+            </label>
+            <select class="sort-pill" x-model="globalGalleryFilters.sort"
+                    @change.debounce.300ms="loadGlobalGallery(1)" aria-label="Sort by">
+              <option value="newest">Sort · Newest</option>
+              <option value="ovr">Sort · OVR (craft)</option>
+              <option value="rel">Sort · REL (relevance)</option>
+              <option value="quality">Sort · quality_score</option>
+            </select>
+            <div class="relative" @keydown.escape.window="filterPanel === 'globalGallery' && (filterPanel = null)">
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('globalGallery', $event)"
+                      :aria-expanded="filterPanel === 'globalGallery'" aria-haspopup="dialog"
+                      aria-controls="filter-panel-global-gallery">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 5h18M6 12h12M10 19h4"/>
+                </svg>
+                Filters
+                <span class="badge" x-show="globalGalleryFilterCount() > 0" x-text="globalGalleryFilterCount()"></span>
+              </button>
+              <!-- Teleport panel to <body> so it escapes ancestor .card's
+                   backdrop-filter (which otherwise makes position: fixed
+                   containing-block-relative to the card, trapping the popover
+                   behind sibling cards). -->
+              <template x-teleport="body">
+                <div x-show="filterPanel === 'globalGallery'" x-cloak class="filter-backdrop"
+                     @click="filterPanel = null" aria-hidden="true"></div>
+              </template>
+              <template x-teleport="body">
+              <div x-show="filterPanel === 'globalGallery'" x-cloak
+                   id="filter-panel-global-gallery" class="filter-panel" role="dialog"
+                   aria-label="Global gallery filters">
+                <div class="filter-panel__body">
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Jobs <span class="text-slate-500 lowercase font-normal">(none = all jobs)</span></span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.jobs = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.jobs.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="jb in jobsList" :key="'gg_jf_'+jb.slug">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.jobs.includes(jb.slug) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryJob(jb.slug)"
+                                x-text="jb.name || jb.slug"></button>
+                      </template>
+                      <template x-if="!jobsList.length">
+                        <span class="text-xs text-slate-500 italic">No jobs to filter by yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Sources</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.sources = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.sources.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="src in globalGallery.available?.sources ?? []" :key="'gg_src_'+src">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.sources.includes(src) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryList('sources', src)"
+                                x-text="src"></button>
+                      </template>
+                      <template x-if="(globalGallery.available?.sources?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No sources indexed yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Categories</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="globalGalleryFilters.categories = []; loadGlobalGallery(1)"
+                              x-show="globalGalleryFilters.categories.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="cat in globalGallery.available?.categories ?? []" :key="'gg_cat_'+cat">
+                        <button type="button" class="filter-chip"
+                                :class="globalGalleryFilters.categories.includes(cat) ? 'is-active' : ''"
+                                @click="toggleGlobalGalleryList('categories', cat)"
+                                x-text="cat"></button>
+                      </template>
+                      <template x-if="(globalGallery.available?.categories?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No categories yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                </div>
+                <div class="filter-panel__footer">
+                  <button type="button" class="filter-footer-btn is-secondary"
+                          @click="clearGlobalGalleryFilters()">Reset all</button>
+                  <button type="button" class="filter-footer-btn is-primary"
+                          @click="loadGlobalGallery(1); filterPanel = null">Apply</button>
+                </div>
+              </div>
+              </template>
+            </div>
+          </div>
+          <span class="filter-meta">
+            <span x-text="globalGallery.total"></span> / <span x-text="globalGallery.total_unfiltered"></span> match
+          </span>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Results (all jobs)</h3>
+          <div class="flex items-center gap-2 text-xs">
+            <button @click="loadGlobalGallery(Math.max(1, globalGallery.page - 1))"
+                    :disabled="globalGallery.page <= 1"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">Prev</button>
+            <span>Page <span x-text="globalGallery.page"></span> / <span x-text="Math.max(1, Math.ceil(globalGallery.total / globalGallery.pageSize))"></span></span>
+            <button @click="loadGlobalGallery(globalGallery.page + 1)"
+                    :disabled="globalGallery.page >= Math.max(1, Math.ceil(globalGallery.total / globalGallery.pageSize))"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50">Next</button>
+          </div>
+        </div>
+        <div x-show="globalGalleryLoading" class="text-xs text-slate-400">Loading…</div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+          <template x-for="c in globalGallery.items" :key="'gg_'+c.path">
+            <div class="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs flex flex-col relative">
+              <span class="nsfw-wrap block">
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded click"
+                     :class="{ 'nsfw-blur': shouldBlurNsfw(c) }" loading="lazy"
+                     @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
+                <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal NSFW image"
+                      x-show="shouldBlurNsfw(c)" @click.stop="revealNsfw(c)" title="Reveal NSFW">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+                  </svg>
+                </span>
+              </span>
+              <div class="mt-1 flex items-center justify-between gap-1">
+                <span class="pill px-1.5 py-0.5 rounded bg-slate-800" x-text="c.category"></span>
+                <span class="text-slate-400 truncate" :title="c.source" x-text="c.source"></span>
+              </div>
+              <div class="mt-1 flex items-center justify-between gap-1">
+                <span class="pill px-1.5 py-0.5 rounded bg-indigo-950/60 text-indigo-200 font-mono truncate"
+                      :title="'job: ' + c.topic_slug"
+                      x-text="c.topic_slug"></span>
+                <span class="text-slate-500 text-[11px]" x-text="c.resolution_bucket"></span>
+              </div>
+              <div class="mt-1 text-slate-400 text-[11px] truncate" x-text="c.prompt_excerpt || '(no prompt)'"></div>
+              <div class="mt-1 flex items-center gap-3">
+                <span class="link-btn" @click.stop="openModalFromCard(c)">Open</span>
+              </div>
+            </div>
+          </template>
+          <template x-if="!globalGalleryLoading && (globalGallery.items?.length ?? 0) === 0">
+            <div class="col-span-full text-center py-10 text-sm text-slate-500">
+              Nothing matches these filters across any job.
+            </div>
+          </template>
+        </div>
       </div>
     </section>
 
@@ -4032,6 +8914,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   <div class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-200" x-text="a.category"></div>
                   <div class="mt-1 font-mono truncate" x-text="a.name"></div>
                   <div class="text-slate-400 mt-0.5" x-text="a.source + ' - Q:' + (a.quality ?? '?')"></div>
+                  <!-- T2 #7: reasoning + score breakdown from /api/activity. -->
+                  <div class="mt-0.5 flex gap-1 text-[10px]" x-show="a.OVR_Quality_Score != null || a.REL_Quality_Score != null">
+                    <span class="bg-slate-800/60 rounded px-1" x-show="a.OVR_Quality_Score != null" :title="'Overall quality ' + a.OVR_Quality_Score">O <span x-text="a.OVR_Quality_Score"></span></span>
+                    <span class="bg-slate-800/60 rounded px-1" x-show="a.REL_Quality_Score != null" :title="'Relevance ' + a.REL_Quality_Score">R <span x-text="a.REL_Quality_Score"></span></span>
+                  </div>
+                  <div class="mt-0.5 text-slate-400 line-clamp-2" x-show="a.reason" :title="a.reason"
+                       x-text="(a.reason || '').slice(0, 200) + ((a.reason || '').length > 200 ? '…' : '')"></div>
+                  <div class="mt-0.5 text-emerald-300 truncate" x-show="a.caption" :title="a.caption"
+                       x-text="'caption: ' + (a.caption || '').slice(0, 80)"></div>
                   <span class="link-btn" @click="openModalFromActivity(a)">See more</span>
                 </div>
               </div>
@@ -4162,102 +9053,166 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- GALLERY (job-scoped) -->
     <section x-show="view === 'job' && active === 'gallery'" class="space-y-4">
-      <div class="card rounded-xl p-4">
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-3">
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Search prompts / descriptions</label>
-            <input x-model="galleryFilters.q" @keydown.enter="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"
-              placeholder="e.g. blonde hair, beach, neon"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Sort by</label>
-            <select x-model="galleryFilters.sort" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-              <option value="newest">Newest first</option>
-              <option value="ovr">OVR (craft)</option>
-              <option value="rel">REL (relevance)</option>
-              <option value="quality">quality_score</option>
+      <!-- Compact filter toolbar (T2: replaces the busy inline filter row).
+           Search + Sort stay one-click; every other filter tucks into the
+           Filters popover so the tab body starts at the grid itself. -->
+      <div class="card rounded-xl p-3">
+        <div class="filter-toolbar justify-between">
+          <div class="filter-toolbar">
+            <label class="filter-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+              </svg>
+              <input type="search" x-model="galleryFilters.q" @keydown.enter="galleryReload()"
+                     placeholder="Search prompts…" aria-label="Search prompts / descriptions"/>
+            </label>
+            <select class="sort-pill" x-model="galleryFilters.sort"
+                    @change.debounce.300ms="galleryReload()" aria-label="Sort by">
+              <option value="newest">Sort · Newest</option>
+              <option value="ovr">Sort · OVR (craft)</option>
+              <option value="rel">Sort · REL (relevance)</option>
+              <option value="quality">Sort · quality_score</option>
             </select>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">NSFW</label>
-            <select x-model="galleryFilters.nsfw" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-              <option value="any">Show all</option>
-              <option value="exclude">Hide NSFW</option>
-              <option value="only">Only NSFW</option>
-            </select>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Date from</label>
-            <input type="date" x-model="galleryFilters.dateFrom" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Date to</label>
-            <input type="date" x-model="galleryFilters.dateTo" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min OVR</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minOvr" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min REL</label>
-            <input type="number" min="0" max="100" x-model.number="galleryFilters.minRel" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-2">
-            <label class="text-xs text-slate-400">Min quality (1-10)</label>
-            <input type="number" min="0" max="10" x-model.number="galleryFilters.minQuality" @change.debounce.300ms="galleryReload()"
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm"/>
-          </div>
-          <div class="lg:col-span-6 flex items-end gap-2">
-            <button @click="galleryReload()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Apply</button>
-            <button @click="galleryClearFilters()" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Clear</button>
-            <button @click="galleryDownload()" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm"
-              title="Stream a zip of the current filtered view (image + .txt + .vision.json)">Download view as ZIP</button>
-            <span class="text-xs text-slate-400 ml-auto">
-              <span x-text="gallery.total"></span> / <span x-text="gallery.total_unfiltered"></span> match
-            </span>
-          </div>
-
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Sources</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="src in gallery.available?.sources ?? []" :key="src">
-                <button @click="toggleGalleryFilter('sources', src)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.sources.includes(src) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="src"></button>
+            <div class="relative" @keydown.escape.window="filterPanel === 'gallery' && (filterPanel = null)">
+              <button type="button" class="filter-pill" @click="toggleFilterPanel('gallery', $event)"
+                      :aria-expanded="filterPanel === 'gallery'" aria-haspopup="dialog"
+                      aria-controls="filter-panel-gallery">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 5h18M6 12h12M10 19h4"/>
+                </svg>
+                Filters
+                <span class="badge" x-show="galleryFilterCount() > 0" x-text="galleryFilterCount()"></span>
+              </button>
+              <template x-teleport="body">
+                <div x-show="filterPanel === 'gallery'" x-cloak class="filter-backdrop" @click="filterPanel = null" aria-hidden="true"></div>
+              </template>
+              <template x-teleport="body">
+              <div x-show="filterPanel === 'gallery'" x-cloak
+                   id="filter-panel-gallery" class="filter-panel" role="dialog" aria-label="Gallery filters">
+                <div class="filter-panel__body">
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Sources</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.sources = []; galleryReload()"
+                              x-show="galleryFilters.sources.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="src in gallery.available?.sources ?? []" :key="'gf_src_'+src">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.sources.includes(src) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('sources', src)"
+                                x-text="src"></button>
+                      </template>
+                      <template x-if="(gallery.available?.sources?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No sources indexed yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Categories</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.categories = []; galleryReload()"
+                              x-show="galleryFilters.categories.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="cat in gallery.available?.categories ?? []" :key="'gf_cat_'+cat">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.categories.includes(cat) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('categories', cat)"
+                                x-text="cat"></button>
+                      </template>
+                      <template x-if="(gallery.available?.categories?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No categories yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Resolution</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.resolutions = []; galleryReload()"
+                              x-show="galleryFilters.resolutions.length">Reset</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="res in gallery.available?.resolutions ?? []" :key="'gf_res_'+res">
+                        <button type="button" class="filter-chip"
+                                :class="galleryFilters.resolutions.includes(res) ? 'is-active' : ''"
+                                @click="toggleGalleryFilter('resolutions', res)"
+                                x-text="res"></button>
+                      </template>
+                      <template x-if="(gallery.available?.resolutions?.length ?? 0) === 0">
+                        <span class="text-xs text-slate-500">No resolution buckets yet.</span>
+                      </template>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Score gates</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.minOvr = 0; galleryFilters.minRel = 0; galleryFilters.minQuality = 0; galleryReload()"
+                              x-show="galleryFilters.minOvr || galleryFilters.minRel || galleryFilters.minQuality">Reset</button>
+                    </div>
+                    <div class="filter-range">
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_ovr">Min OVR</label>
+                        <input id="gf_min_ovr" type="range" min="0" max="100" step="1"
+                               x-model.number="galleryFilters.minOvr"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minOvr"></span>
+                      </div>
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_rel">Min REL</label>
+                        <input id="gf_min_rel" type="range" min="0" max="100" step="1"
+                               x-model.number="galleryFilters.minRel"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minRel"></span>
+                      </div>
+                      <div class="filter-range__row">
+                        <label class="text-xs w-16 text-slate-400" for="gf_min_q">Min quality</label>
+                        <input id="gf_min_q" type="range" min="0" max="10" step="1"
+                               x-model.number="galleryFilters.minQuality"
+                               @change.debounce.300ms="galleryReload()"/>
+                        <span class="filter-range__value" x-text="galleryFilters.minQuality"></span>
+                      </div>
+                    </div>
+                  </section>
+                  <section>
+                    <div class="filter-section__header">
+                      <span class="filter-section__title">Date range</span>
+                      <button type="button" class="filter-section__reset"
+                              @click="galleryFilters.dateFrom = ''; galleryFilters.dateTo = ''; galleryReload()"
+                              x-show="galleryFilters.dateFrom || galleryFilters.dateTo">Reset</button>
+                    </div>
+                    <div class="filter-date">
+                      <input type="date" aria-label="From date" x-model="galleryFilters.dateFrom"
+                             @change.debounce.300ms="galleryReload()"/>
+                      <input type="date" aria-label="To date" x-model="galleryFilters.dateTo"
+                             @change.debounce.300ms="galleryReload()"/>
+                    </div>
+                  </section>
+                </div>
+                <div class="filter-panel__footer">
+                  <button type="button" class="filter-footer-btn is-secondary"
+                          @click="galleryClearFilters()">Reset all</button>
+                  <button type="button" class="filter-footer-btn is-primary"
+                          @click="galleryReload(); filterPanel = null">Apply</button>
+                </div>
+              </div>
               </template>
             </div>
+            <button @click="galleryDownload()" class="filter-pill"
+                    title="Stream a zip of the current filtered view (image + .txt + .vision.json)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/>
+              </svg>
+              Download ZIP
+            </button>
           </div>
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Categories</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="cat in gallery.available?.categories ?? []" :key="cat">
-                <button @click="toggleGalleryFilter('categories', cat)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.categories.includes(cat) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="cat"></button>
-              </template>
-            </div>
-          </div>
-          <div class="lg:col-span-4">
-            <label class="text-xs text-slate-400">Resolution</label>
-            <div class="flex flex-wrap gap-1 mt-1">
-              <template x-for="res in gallery.available?.resolutions ?? []" :key="res">
-                <button @click="toggleGalleryFilter('resolutions', res)"
-                  class="px-2 py-0.5 text-xs rounded border"
-                  :class="galleryFilters.resolutions.includes(res) ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'"
-                  x-text="res"></button>
-              </template>
-            </div>
-          </div>
+          <span class="filter-meta">
+            <span x-text="gallery.total"></span> / <span x-text="gallery.total_unfiltered"></span> match
+          </span>
         </div>
       </div>
 
@@ -4265,6 +9220,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold">Results</h3>
           <div class="flex items-center gap-2 text-xs">
+            <!-- Bulk-select toggle + Select all / Clear (T3 #13). -->
+            <label class="flex items-center gap-1 cursor-pointer">
+              <input type="checkbox" x-model="bulk.mode" @change="!bulk.mode && bulkClear()" class="accent-indigo-500"/>
+              <span>Select</span>
+            </label>
+            <button x-show="bulk.mode" @click="bulkSelectAllPage()"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Select all</button>
+            <button x-show="bulk.mode && bulk.selected.length" @click="bulkClear()"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Clear</button>
             <button @click="galleryPrev()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50" :disabled="gallery.page <= 1">Prev</button>
             <span>Page <span x-text="gallery.page"></span> / <span x-text="Math.max(1, Math.ceil(gallery.total / gallery.pageSize))"></span></span>
             <button @click="galleryNext()" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded disabled:opacity-50"
@@ -4298,12 +9262,15 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div x-show="galleryLoading" class="text-xs text-slate-400">Loading...</div>
         <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
           <template x-for="(c, idx) in gallery.items" :key="c.path">
-            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow"
+            <div class="bg-slate-900/60 border rounded p-2 text-xs flex flex-col transition-shadow relative"
                  :data-cull-idx="idx"
-                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : 'border-slate-800'"
+                 :class="cullFocus === idx ? 'border-indigo-400 ring-2 ring-indigo-400/70' : (bulk.selected.includes(c.path) ? 'border-emerald-400 ring-1 ring-emerald-400/60' : 'border-slate-800')"
                  @click="cullFocus = idx">
+              <input x-show="bulk.mode" type="checkbox" class="bulk-check"
+                     :checked="bulk.selected.includes(c.path)"
+                     @click.stop="bulkToggle(c.path)"/>
               <span class="nsfw-wrap block">
-                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded"
+                <img :src="c.thumbnail" :alt="c.name" class="w-full aspect-square object-cover rounded click"
                      :class="{ 'nsfw-blur': shouldBlurNsfw(c) }"
                      loading="lazy"
                      @click="shouldBlurNsfw(c) ? revealNsfw(c) : openModalFromCard(c)"/>
@@ -4337,26 +9304,53 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="text-xs text-slate-500 mt-1">
                 Start a scraper, or run
                 <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">python tools/seed_demo_data.py</code>
+                <button class="link-btn ml-1" @click="copyToClipboard('python tools/seed_demo_data.py')" title="Copy command">copy</button>
                 from the repo root to populate a synthetic preview.
               </div>
             </div>
           </template>
         </div>
+        <!-- Floating bulk action bar (T3 #13/#14). -->
+        <div x-show="bulk.mode && bulk.selected.length > 0" x-cloak
+             class="bulk-bar mt-3 flex flex-wrap items-center gap-2 bg-slate-900 border border-indigo-500 rounded p-3 shadow-2xl">
+          <span class="text-sm font-semibold" x-text="bulk.selected.length + ' selected'"></span>
+          <select x-model="bulk.targetCategory" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+            <option value="">Category…</option>
+            <template x-for="cat in cullCategories" :key="'bcat_'+cat.name">
+              <option :value="cat.name" x-text="cat.name"></option>
+            </template>
+          </select>
+          <button @click="bulkAction('move')" :disabled="!bulk.targetCategory || bulk.busy"
+                  class="px-3 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded disabled:opacity-50">Move to</button>
+          <button @click="bulkAction('reclassify')" :disabled="!bulk.targetCategory || bulk.busy"
+                  class="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">Reclassify to</button>
+          <button @click="bulkRequeue()" :disabled="bulk.busy"
+                  class="px-3 py-1 text-xs bg-amber-600 hover:bg-amber-500 rounded disabled:opacity-50">Requeue</button>
+          <button @click="bulkAction('delete')" :disabled="bulk.busy"
+                  class="px-3 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-50">Move to trash</button>
+          <span x-show="bulk.error" class="text-xs text-rose-300" x-text="bulk.error"></span>
+        </div>
       </div>
 
-      <!-- Find-similar results strip (CLIP embeddings; on-demand). -->
-      <div x-show="sim.open" x-cloak class="card rounded-xl p-4">
+      <!-- Find-similar results strip (CLIP embeddings; on-demand). The panel
+           is scrolled into view + accent-ringed on open so it's obvious the
+           click did something — otherwise it opens above the fold when the
+           user clicked Find similar on a card far down the grid. -->
+      <div x-show="sim.open" x-cloak x-ref="simPanel"
+           class="card rounded-xl p-4 border-2 border-indigo-500 shadow-lg">
         <div class="flex items-center justify-between mb-2">
           <h3 class="font-semibold">Similar to <span class="font-mono text-xs" x-text="sim.sourceName"></span></h3>
           <button @click="sim.open = false" class="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Close</button>
         </div>
         <div x-show="sim.loading" class="text-xs text-slate-400">Searching…</div>
-        <div x-show="!sim.loading && sim.message" x-cloak class="text-xs text-amber-300" x-text="sim.message"></div>
+        <div x-show="!sim.loading && sim.message" x-cloak
+             class="text-sm text-amber-200 bg-amber-950/40 border border-amber-800 rounded p-3 whitespace-pre-line" x-text="sim.message"></div>
         <div x-show="!sim.loading && !sim.message && sim.results.length === 0" x-cloak class="text-xs text-slate-500">No similar images found.</div>
         <div class="flex flex-wrap gap-3 mt-2">
           <template x-for="m in sim.results" :key="m.path">
             <div class="relative w-32">
-              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700"/>
+              <img :src="m.thumb_url" loading="lazy" class="w-32 h-32 object-cover rounded border border-slate-700 cursor-pointer hover:border-indigo-400 transition"
+                   @click="openModalFromCard(m)"/>
               <div class="text-[11px] text-slate-400 mt-1">score <span x-text="m.score"></span></div>
             </div>
           </template>
@@ -4491,6 +9485,9 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">
             <span x-text="exportForm.running ? 'Exporting…' : 'Run export'"></span>
           </button>
+          <button @click="openExportPreview()" :disabled="exportForm.running"
+                  class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50"
+                  title="Compute totals + category breakdown + resolution histogram + sample paths before you commit to a full export">Preview</button>
           <span x-show="exportForm.error" class="text-xs text-rose-300" x-text="exportForm.error"></span>
         </div>
         <div x-show="exportForm.summary" x-cloak class="mt-3 bg-slate-900/70 border border-slate-700 rounded p-3 text-xs font-mono whitespace-pre-wrap" x-text="exportForm.summary ? JSON.stringify(exportForm.summary, null, 2) : ''"></div>
@@ -4526,55 +9523,381 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
     </section>
 
-    <!-- SCRAPERS (per-job toggles via overrides; Local-<name> rows read-only) -->
-    <section x-show="view === 'job' && active === 'scrapers'" class="card rounded-xl p-5">
-      <div class="flex items-start justify-between gap-4 mb-3">
-        <div>
-          <h3 class="font-semibold">Scraper controls</h3>
-          <p class="text-xs text-slate-400 mt-1">Per-job toggles (overrides on <code>scrapers.enabled</code>). The active job applies on leave / Apply. Local folders are managed in <button class="link-btn" @click="active='jobSettings'">Job Settings → Local folders</button>.</p>
-        </div>
-        <div class="flex gap-2">
-          <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off (vision only)</button>
-          <button @click="scrapersBulk('enable_all')" class="px-3 py-1.5 text-xs bg-emerald-600/80 hover:bg-emerald-500 rounded font-medium">All on</button>
+    <!-- SCRAPERS — unified card list.
+         One card per canonical scraper (SCRAPER_NAMES + YT-DLP). Each card:
+           * drag handle (⋮⋮) — DOM order = supervisor spawn priority
+           * name + description + status pill + Enable toggle
+           * priority weight input (1-10, default 5)
+           * collapsible body with THIS scraper's settings (moved here from
+             Job Settings — nothing removed, just consolidated)
+           * footer with a Test-connection button
+         Local folders live in their own multi-row card below (Local-<name>
+         agents fan out at spawn time — they are not part of the priority
+         reorder, and share this scraper card's shell for visual consistency). -->
+    <section x-show="view === 'job' && active === 'scrapers'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4 mb-1">
+          <div>
+            <h3 class="font-semibold">Scrapers</h3>
+            <p class="text-xs text-slate-400 mt-1">Drag by the <span class="font-mono">⋮⋮</span> handle to set priority (top = fires first). <b>Weight</b> (1-10) scales this scraper's round-robin turns. Auto-saves as an override; the active job applies on leave / Apply.</p>
+          </div>
+          <div class="flex gap-2">
+            <button @click="scrapersBulk('disable_all')" class="px-3 py-1.5 text-xs bg-rose-600/80 hover:bg-rose-500 rounded font-medium">All off</button>
+            <button @click="scrapersBulk('enable_all')" class="px-3 py-1.5 text-xs bg-emerald-600/80 hover:bg-emerald-500 rounded font-medium">All on</button>
+            <button @click="resetScraperPriority()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Reset order + weights to preset defaults">Reset priority</button>
+          </div>
         </div>
       </div>
-      <div class="grid gap-2">
-        <template x-for="s in scrapers" :key="s.name">
-          <div class="flex items-center justify-between bg-slate-900/60 border border-slate-800 rounded px-4 py-3">
-            <div>
-              <div class="font-medium" x-text="s.name"></div>
-              <div class="text-xs text-slate-400" x-text="s.description"></div>
-              <div x-show="scraperTest[s.name] && !scraperTest[s.name].pending" class="text-xs mt-0.5"
-                :class="scraperTest[s.name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
-                x-text="(scraperTest[s.name]?.ok ? '✓ ' : '✕ ') + (scraperTest[s.name]?.message || '') + (scraperTest[s.name]?.latency_ms != null ? ' (' + scraperTest[s.name].latency_ms + 'ms)' : '')"></div>
+
+      <!-- Cards. dragOver.prevent enables drop; @dragover-native highlight is done
+           via draggingScraper. Keyboard: focus a handle, Space toggles grab mode,
+           ArrowUp/Down reorders, Space again drops. -->
+      <div class="space-y-3" role="list" aria-label="Scrapers in priority order">
+        <template x-for="(name, sIdx) in scraperOrder()" :key="'scr_' + name">
+          <div class="card rounded-xl border border-slate-800 overflow-hidden"
+               role="listitem"
+               :class="[draggingScraper === name ? 'ring-2 ring-indigo-400' : '', dragOverScraper === name ? 'border-indigo-500' : '']"
+               @dragover.prevent="scraperDragOver(name)"
+               @dragleave="scraperDragLeave(name)"
+               @drop.prevent="scraperDrop(name)">
+            <!-- Header row — always visible, click toggles collapse. -->
+            <div class="flex items-center gap-3 px-4 py-3 bg-slate-900/40 select-none">
+              <!-- Drag handle. draggable="true" ONLY on the handle so text
+                   selection in the body isn't hijacked. -->
+              <button type="button"
+                      class="shrink-0 px-1.5 py-1 rounded text-slate-500 hover:text-slate-200 hover:bg-slate-800 cursor-grab active:cursor-grabbing font-mono"
+                      :class="scraperGrabbed === name ? 'text-indigo-300 bg-slate-800' : ''"
+                      draggable="true"
+                      @dragstart="scraperDragStart($event, name)"
+                      @dragend="scraperDragEnd()"
+                      @keydown.space.prevent="toggleScraperGrab(name)"
+                      @keydown.arrow-up.prevent="scraperGrabbed === name && moveScraper(name, -1)"
+                      @keydown.arrow-down.prevent="scraperGrabbed === name && moveScraper(name, 1)"
+                      :aria-grabbed="scraperGrabbed === name"
+                      :aria-label="'Reorder ' + name">⋮⋮</button>
+              <button type="button" class="flex-1 min-w-0 text-left" @click="toggleScraperOpen(name)"
+                      :aria-expanded="scraperOpen[name] ? 'true' : 'false'"
+                      :aria-controls="'scr-body-' + name">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium" x-text="name"></span>
+                  <span class="pill px-1.5 py-0.5 rounded text-[10px]"
+                        :class="scraperEnabledMap[name] ? 'bg-emerald-900/50 text-emerald-300' : 'bg-slate-800 text-slate-400'"
+                        x-text="scraperEnabledMap[name] ? 'on' : 'off'"></span>
+                  <span x-show="scraperTest[name] && !scraperTest[name].pending" class="pill px-1.5 py-0.5 rounded text-[10px]"
+                        :class="scraperTest[name]?.ok ? 'bg-emerald-900/40 text-emerald-300' : 'bg-rose-900/50 text-rose-300'"
+                        x-text="scraperTest[name]?.ok ? '✓ connected' : '✕ ' + (scraperTest[name]?.message || 'failed').slice(0, 60)"></span>
+                </div>
+                <div class="text-xs text-slate-400 truncate" x-text="scraperDescription(name)"></div>
+              </button>
+              <!-- Priority weight (1-10). Keeps the input independent from the
+                   drag order so the user can boost a mid-list scraper's turns. -->
+              <label class="shrink-0 flex items-center gap-1 text-xs text-slate-400" title="Priority weight 1-10 (higher = more round-robin turns)">
+                <span class="hidden md:inline">weight</span>
+                <input type="number" min="1" max="10" step="1"
+                       :value="scraperWeight(name)"
+                       @input="setScraperWeight(name, Number($event.target.value))"
+                       class="w-14 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-center"
+                       :aria-label="'Priority weight for ' + name"/>
+              </label>
+              <!-- Enable slider — copies the classic toggleScraper contract. -->
+              <label class="shrink-0 inline-flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" :checked="scraperEnabledMap[name]"
+                       :aria-label="'Toggle scraper ' + name"
+                       @change="toggleScraper(name, $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
+                         checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
+                         before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
+                         checked:before:translate-x-5"/>
+              </label>
+              <button type="button"
+                      class="shrink-0 text-slate-500 hover:text-slate-200 px-1"
+                      @click="toggleScraperOpen(name)"
+                      :aria-label="scraperOpen[name] ? 'Collapse ' + name : 'Expand ' + name">
+                <span x-text="scraperOpen[name] ? '▾' : '▸'"></span>
+              </button>
             </div>
-            <!-- Togglable scrapers get a switch; Local-<name> rows are read-only status. -->
-            <template x-if="s.kind !== 'local'">
-              <div class="flex items-center gap-3 shrink-0">
-                <button type="button" @click="testScraper(s.name)" :disabled="!!scraperTest[s.name]?.pending"
-                  class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
-                  <span x-text="scraperTest[s.name]?.pending ? 'Testing…' : 'Test'"></span>
+
+            <!-- Body — collapsed by default. max-h scrolls so long bodies
+                 (gallery-dl with many URLs + cookies) don't push the page. -->
+            <div x-show="scraperOpen[name]" x-cloak :id="'scr-body-' + name"
+                 class="px-4 py-4 border-t border-slate-800 overflow-y-auto"
+                 style="max-height: 26rem">
+              <!-- Per-scraper body dispatch. Every branch reads/writes through
+                   the SAME effVal/setOverride pipeline used by the Job Settings
+                   tab — nothing new server-side. -->
+              <template x-if="name === 'X.com'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
+                    <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <input :value="effList('scrapers.x_accounts')" @change="setOverrideList('scrapers.x_accounts', $event.target.value)"
+                         placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
+                </div>
+              </template>
+
+              <template x-if="name === 'Discord-1'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
+                    <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <textarea :value="effVal('scrapers.discord_channels_json')" @input="setOverride('scrapers.discord_channels_json', $event.target.value)" rows="4"
+                    placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
+                    class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scrapers.discord_channels_json') ? 'text-slate-400' : ''"></textarea>
+                </div>
+              </template>
+
+              <template x-if="name === 'Civitai-Com' || name === 'Civitai-Red'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Civitai domain{{ tip('Tick to include this Civitai host. Both cards edit the same underlying <code>civitai_domains</code> list.') }}</span>
+                    <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="flex items-center gap-5 py-1.5" :class="!isOver('scrapers.civitai_domains') ? 'opacity-70' : ''">
+                    <label class="inline-flex items-center gap-2 text-sm cursor-pointer" x-show="name === 'Civitai-Com'">
+                      <input type="checkbox" :checked="civOn('civitai.com')" @change="civToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> Scrape civitai.com
+                    </label>
+                    <label class="inline-flex items-center gap-2 text-sm cursor-pointer" x-show="name === 'Civitai-Red'">
+                      <input type="checkbox" :checked="civOn('civitai.red')" @change="civToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> Scrape civitai.red
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="name === 'Web'">
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
+                    <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <input :value="effList('scrapers.reddit_subreddits')" @change="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
+                         class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
+                </div>
+              </template>
+
+              <template x-if="name === 'Gallery-DL'">
+                <div>
+                  <div class="flex items-center justify-between mb-2">
+                    <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="text-xs link-btn">supported sites ↗</a>
+                    <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="grid md:grid-cols-2 gap-4">
+                    <label class="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" :checked="effVal('scrapers.gallery_dl.enabled')" @change="setOverride('scrapers.gallery_dl.enabled', $event.target.checked)"
+                             class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                      <span class="text-sm">Enable gallery-dl for this job</span>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+                      <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
+                      <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
+                                placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                      <!-- Per-URL Test button (T3 #17). Extracts one URL per line, tests
+                           each via /api/scrapers/gallery-dl/test-url, shows extractor + count. -->
+                      <div class="mt-2">
+                        <div x-show="effUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                          <button @click.prevent="testGalleryDlAll()" :disabled="gdlTestAllBusy"
+                                  class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                            <span x-text="gdlTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                          </button>
+                          <span class="text-[10px] text-slate-400" x-show="gdlTestAllBusy">serial — one at a time</span>
+                        </div>
+                        <div class="space-y-1">
+                          <template x-for="(u, i) in effUrlsList()" :key="'gdlu_'+i">
+                            <div class="flex items-center gap-2 text-[11px]">
+                              <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                              <button @click.prevent="testGalleryDlUrl(u, i)" :disabled="gdlTest[i]?.busy"
+                                      class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                                <span x-text="gdlTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                              </button>
+                              <span x-show="gdlTest[i]?.result"
+                                    :class="gdlTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                                    x-text="gdlTest[i]?.result?.ok ? ('✓ ' + (gdlTest[i]?.result?.extractor || '?') + ' · ~' + (gdlTest[i]?.result?.sample_count ?? '?') + ' items') : ('✗ ' + (gdlTest[i]?.result?.error || gdlTest[i]?.result?.message || 'failed'))"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}
+                        <a class="link-btn ml-2" @click.prevent="openCookiesModal('gallery-dl')">Paste cookies</a></span>
+                      <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config file to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
+                      <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">Custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults AND the global gallery-dl config. Any option from the gallery-dl docs. Leave blank for none.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
+                      <textarea :value="effVal('scrapers.gallery_dl.config_json')" @change="setOverride('scrapers.gallery_dl.config_json', $event.target.value)" rows="3"
+                                placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}'
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="name === 'YT-DLP'">
+                <div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-xs text-slate-400">yt-dlp video/frame extractor — <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noopener noreferrer" class="link-btn">GitHub ↗</a></span>
+                    <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+                    <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
+                  </div>
+                  <div class="grid md:grid-cols-2 gap-4">
+                    <label class="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
+                             class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                      <span class="text-sm">Enable yt-dlp for this job</span>
+                    </label>
+                    <label class="block">
+                      <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
+                      <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+                      <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
+                                placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
+                                class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
+                      <!-- Per-URL Test + Test-all buttons — mirror of gallery-dl. -->
+                      <div class="mt-2">
+                        <div x-show="ytUrlsList().length > 0" class="flex items-center gap-2 mb-1">
+                          <button @click.prevent="testYtDlpAll()" :disabled="ytTestAllBusy"
+                                  class="px-2 py-0.5 text-[11px] bg-indigo-600 hover:bg-indigo-500 text-white rounded disabled:opacity-50">
+                            <span x-text="ytTestAllBusy ? 'Testing all…' : 'Test all'"></span>
+                          </button>
+                          <span class="text-[10px] text-slate-400" x-show="ytTestAllBusy">serial — one at a time</span>
+                        </div>
+                        <div class="space-y-1">
+                          <template x-for="(u, i) in ytUrlsList()" :key="'ytu_'+i">
+                            <div class="flex items-center gap-2 text-[11px]">
+                              <span class="font-mono truncate flex-1" :title="u" x-text="u"></span>
+                              <button @click.prevent="testYtDlpUrl(u, i)" :disabled="ytTest[i]?.busy"
+                                      class="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                                <span x-text="ytTest[i]?.busy ? 'Testing…' : 'Test'"></span>
+                              </button>
+                              <span x-show="ytTest[i]?.result"
+                                    :class="ytTest[i]?.result?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                                    x-text="ytTest[i]?.result?.ok ? ('✓ ' + (ytTest[i]?.result?.extractor || '?') + (ytTest[i]?.result?.count_estimate != null ? (' · ~' + ytTest[i]?.result?.count_estimate + ' items') : (ytTest[i]?.result?.duration_sec != null ? (' · ' + ytTest[i]?.result?.duration_sec + 's') : ''))) : ('✗ ' + (ytTest[i]?.result?.error || 'failed'))"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </label>
+                    <label class="block md:col-span-2">
+                      <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
+                      <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
+                             class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
+                    </label>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Footer: Test connection. Uses the same /api/scrapers/test
+                   contract; result also renders as the header pill. -->
+              <div class="mt-4 pt-3 border-t border-slate-800 flex items-center gap-3">
+                <button type="button" @click="testScraper(name)" :disabled="!!scraperTest[name]?.pending"
+                        class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                  <span x-text="scraperTest[name]?.pending ? 'Testing…' : 'Test connection'"></span>
                 </button>
-                <label class="inline-flex items-center cursor-pointer gap-2">
-                  <span class="text-xs" x-text="s.enabled ? 'On' : 'Off'"></span>
-                  <input type="checkbox" :checked="s.enabled" :aria-label="'Toggle scraper ' + s.name" @change="toggleScraper(s.name, $event.target.checked)"
-                    class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition
-                      checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5
-                      before:w-4 before:h-4 before:bg-white before:rounded-full before:transition
-                      checked:before:translate-x-5"/>
-                </label>
+                <span x-show="scraperTest[name] && !scraperTest[name].pending" class="text-xs"
+                      :class="scraperTest[name]?.ok ? 'text-emerald-400' : 'text-rose-400'"
+                      x-text="(scraperTest[name]?.ok ? '✓ ' : '✕ ') + (scraperTest[name]?.message || '') + (scraperTest[name]?.latency_ms != null ? ' (' + scraperTest[name].latency_ms + 'ms)' : '')"></span>
               </div>
-            </template>
-            <template x-if="s.kind === 'local'">
-              <span class="pill px-2 py-0.5 rounded" :class="s.enabled ? 'bg-emerald-900/60 text-emerald-300' : 'bg-slate-800 text-slate-400'" x-text="s.enabled ? 'enabled' : 'disabled'"></span>
-            </template>
+            </div>
           </div>
+        </template>
+      </div>
+
+      <!-- Local folders — same card shell, multi-row body. Each enabled folder
+           becomes its own Local-<name> agent at spawn; they aren't in the
+           priority reorder because the list is dynamic. -->
+      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Local folders</h3>
+            <p class="text-xs text-slate-400">Each enabled folder is a concurrent source, surfaced elsewhere as <code>Local-&lt;name&gt;</code>.</p>
+          </div>
+          <div>
+            <span x-show="!isOver('scrapers.local_imports')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+            <button x-show="isOver('scrapers.local_imports')" @click="resetOverride('scrapers.local_imports')" class="text-xs link-btn">reset ↺</button>
+          </div>
+        </div>
+        <template x-if="je.eff">
+        <div class="space-y-2">
+          <template x-for="(f, i) in localFolders()" :key="i">
+            <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
+              <input :value="f.name" @input="updateLocalFolder(i, 'name', $event.target.value)" placeholder="name"
+                     class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
+              <input :value="f.dir" @input="updateLocalFolder(i, 'dir', $event.target.value)" placeholder="absolute folder path"
+                     class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
+              <label class="col-span-2 flex items-center gap-1 text-xs">
+                <input type="checkbox" :checked="f.enabled" @change="updateLocalFolder(i, 'enabled', $event.target.checked)"/> on
+              </label>
+              <button @click="removeLocalFolder(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
+            </div>
+          </template>
+          <button @click="addLocalFolder()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
+        </div>
         </template>
       </div>
     </section>
 
     <!-- VISION (global endpoints readout + this job's captioning/scoring) -->
     <section x-show="view === 'job' && active === 'vision'" class="space-y-4">
+      <!-- Endpoint discovery strip (T2 #10). Scans the local network for
+           reachable OpenAI-compatible / Ollama vision endpoints not already in
+           the fleet, so a user can add them with one click. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-2">
+          <div>
+            <h3 class="font-semibold">Discovered endpoints{{ tip('Auto-probes common LM Studio / llama.cpp / Ollama ports on your machine. Endpoints already in the fleet are hidden.') }}</h3>
+            <p class="text-xs text-slate-400">Endpoints found on this machine that speak a supported vision API.</p>
+          </div>
+          <button @click="rescanDiscovery()" :disabled="discovery.loading"
+                  class="text-xs link-btn disabled:opacity-50">
+            <span x-text="discovery.loading ? 'Scanning…' : 'Rescan'"></span>
+          </button>
+        </div>
+        <div x-show="discovery.error" class="text-xs text-rose-300" x-text="discovery.error"></div>
+        <div x-show="!discovery.loading && discovery.candidates.length === 0" class="text-xs text-slate-500">Nothing new found. Add one manually below.</div>
+        <div class="flex flex-wrap gap-2">
+          <template x-for="d in discovery.candidates" :key="d.base_url + '_' + d.provider">
+            <div class="flex items-center gap-2 bg-slate-900/60 border border-slate-800 rounded px-2 py-1 text-xs">
+              <span class="font-mono" x-text="d.provider + ' · ' + d.base_url"></span>
+              <span class="text-emerald-400" x-show="d.reachable" title="reachable">✓</span>
+              <button @click="addDiscoveredEndpoint(d)" :disabled="d.adding"
+                      class="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-500 rounded text-xs disabled:opacity-50">
+                <span x-text="d.adding ? 'Adding…' : 'Add'"></span>
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Test-drive card (T2 #9). File-drop + Run against selected worker. -->
+      <div class="card rounded-xl p-5">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-semibold">Test drive{{ tip('Send one image through the classifier without saving. Fastest way to sanity-check a new worker or preset before batching.') }}</h3>
+          <button @click="dryRun.open = true" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Open test-drive</button>
+        </div>
+        <p class="text-xs text-slate-400">Drops one image into the vision pipeline in dry-run mode — see what category it would land in and the raw model output, without side effects.</p>
+      </div>
+
       <!-- Vision workers — the local-LLM fleet (per-job inherit/override). One
            row per GPU/host; lmstudio + llamacpp speak the OpenAI /v1 API, ollama
            its native API. Inherits the preset's global fleet until overridden. -->
@@ -4612,9 +9935,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="setFleetField(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer">
-                  <input type="checkbox" :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="setFleetField(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="fleetTest[idx] && !fleetTest[idx].testing"
@@ -4623,8 +9947,16 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                           class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
                     <span x-text="fleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span>
                   </button>
+                  <button @click="loadWorkerInfo(w)" class="px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 rounded" title="Model + VRAM estimate">info</button>
                   <button @click="removeFleetWorker(idx)" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Remove</button>
                 </div>
+              </div>
+              <!-- VRAM hint chip (T3 #20). Filled by loadWorkerInfo. -->
+              <div x-show="workerInfo[w.id || w.name]" x-cloak class="mt-1 text-[11px] text-slate-400 flex flex-wrap gap-2">
+                <span x-show="workerInfo[w.id || w.name]?.model" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'model: ' + workerInfo[w.id || w.name]?.model"></span>
+                <span x-show="workerInfo[w.id || w.name]?.estimated_vram_gb != null" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'~' + workerInfo[w.id || w.name]?.estimated_vram_gb + ' GB VRAM'"></span>
+                <span x-show="workerInfo[w.id || w.name]?.context_window" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'ctx: ' + workerInfo[w.id || w.name]?.context_window"></span>
+                <span x-show="workerInfo[w.id || w.name]?.quantization" class="bg-slate-800/60 rounded px-1.5 py-0.5" x-text="'quant: ' + workerInfo[w.id || w.name]?.quantization"></span>
               </div>
             </div>
           </template>
@@ -4820,6 +10152,21 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                       placeholder="e.g. prefer golden-hour natural light, penalise heavy over-smoothing"
                       class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scoring.notes') ? 'text-slate-400' : ''"></textarea>
           </div>
+          <!-- Aesthetic pre-filter toggle (T3 #15). Inheritable field. -->
+          <div class="md:col-span-2 border-t border-slate-800 pt-3">
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 cursor-pointer flex-1">
+                <input type="checkbox" :checked="effVal('prefilter.enabled')"
+                       @change="setOverride('prefilter.enabled', $event.target.checked)"
+                       class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                <span class="text-sm">Aesthetic pre-filter{{ tip('When on, runs a lightweight (CLIP-based) aesthetic gate before the vision model. Cheap frames drop early and never hit the model — saves VLM calls on obviously bad images.', 'saves ~30-50% of calls on scraped batches') }}</span>
+              </label>
+              <span x-show="!isOver('prefilter.enabled')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
+              <button x-show="isOver('prefilter.enabled')" @click="resetOverride('prefilter.enabled')" class="text-xs link-btn">reset ↺</button>
+            </div>
+            <div class="text-[11px] text-slate-500 mt-1" x-show="status.prefilter?.calls_saved_24h != null"
+                 x-text="(status.prefilter?.calls_saved_24h || 0).toLocaleString() + ' model calls saved (last 24h)'"></div>
+          </div>
         </div>
         </template>
       </div>
@@ -4863,8 +10210,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <div class="flex flex-wrap gap-2">
           <template x-for="jb in jobsList.filter(j => j.is_active || j.queue_position !== null)" :key="'jq_'+jb.slug">
             <button @click="openJob(jb.slug)"
-              class="text-left px-3 py-2 rounded border transition"
-              :class="jb.slug === currentJob ? 'bg-indigo-600/30 border-indigo-400' : 'bg-slate-900/60 border-slate-800 hover:border-slate-600'">
+              class="hover-card text-left px-3 py-2 rounded border"
+              :class="jb.slug === currentJob ? 'bg-indigo-600/30 border-indigo-400' : 'bg-slate-900/60 border-slate-800'">
               <div class="flex items-center gap-2">
                 <span class="pill px-1.5 py-0.5 rounded" :class="jobStatusClass(jb.status)" x-text="jb.status"></span>
                 <span class="font-mono text-xs" x-text="jb.slug"></span>
@@ -4879,24 +10226,40 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <!-- First-run welcome card: shown only when nothing has been queued OR
-           classified yet for THIS job. Keeps the empty state from looking like a bug. -->
+           classified yet for THIS job. Keeps the empty state from looking like a bug.
+           Steps are numbered so a new user knows the ordering isn't arbitrary. -->
       <template x-if="(status.queue?.total ?? 0) === 0 && (status.sorted?.total ?? 0) === 0">
         <div class="card rounded-xl p-6">
           <div class="flex items-start gap-4">
             <img src="/brand/logo-transparent-dark.png" alt="" width="64" height="64"
                  class="shrink-0"/>
-            <div class="flex-1">
+            <div class="flex-1 min-w-0">
               <h3 class="font-brand text-2xl font-medium tracking-tight">Nothing here yet</h3>
               <p class="text-sm text-slate-300 mt-1 mb-4">
-                This job has no queued or sorted images. Configure its scrapers and target, activate it, then start the pipeline.
+                This job has no queued or sorted images. Wire up sources, confirm a vision worker, then start the pipeline.
               </p>
-              <div class="flex flex-wrap gap-2">
-                <button @click="active = 'scrapers'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Configure scrapers</button>
-                <button @click="active = 'jobSettings'" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm">Job settings</button>
-                <button @click="active = 'vision'" class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm">Vision worker</button>
-              </div>
-              <p class="text-xs text-slate-500 mt-4">
-                Want a demo first? Run <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code> from the repo root.
+              <ol class="grid gap-3 md:grid-cols-3 text-xs mb-4">
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">1 · Sources</div>
+                  <div class="text-slate-300">Toggle scrapers on and add subs / accounts / gallery-dl URLs.</div>
+                  <button @click="active = 'scrapers'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Scrapers</button>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">2 · Vision</div>
+                  <div class="text-slate-300">Point at LM Studio / Ollama / Groq and click Test.</div>
+                  <button @click="active = 'vision'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Vision</button>
+                </li>
+                <li class="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
+                  <div class="text-amber-300 font-semibold mb-1">3 · Taxonomy</div>
+                  <div class="text-slate-300">Tune the topic, categories, and scoring gates.</div>
+                  <button @click="active = 'jobSettings'" class="mt-2 px-2 py-1 text-[11px] bg-indigo-600 hover:bg-indigo-500 rounded">Open Job Settings</button>
+                </li>
+              </ol>
+              <p class="text-xs text-slate-500">
+                Want a demo first? Run
+                <code class="font-brand bg-slate-800 px-1.5 py-0.5 rounded">python tools/seed_demo_data.py</code>
+                from the repo root.
+                <button class="link-btn ml-1" @click="copyToClipboard('python tools/seed_demo_data.py')" title="Copy command">copy</button>
               </p>
             </div>
           </div>
@@ -4904,13 +10267,98 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </template>
 
       <div class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Queue (newest 60) <span class="text-xs font-normal text-slate-500" x-text="'· ' + currentJob"></span></h3>
+      <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
+        <h3 class="font-semibold">Queue (newest 60) <span class="text-xs font-normal text-slate-500" x-text="'· ' + currentJob"></span></h3>
+        <div class="filter-toolbar">
+          <label class="filter-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <input type="search" x-model="queueFilters.q" placeholder="Search name / prompt…" aria-label="Filter queue by text"/>
+          </label>
+          <div class="relative" @keydown.escape.window="filterPanel === 'queue' && (filterPanel = null)">
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('queue', $event)"
+                    :aria-expanded="filterPanel === 'queue'" aria-haspopup="dialog"
+                    aria-controls="filter-panel-queue">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5h18M6 12h12M10 19h4"/>
+              </svg>
+              Filters
+              <span class="badge" x-show="queueFilterCount() > 0" x-text="queueFilterCount()"></span>
+            </button>
+            <template x-teleport="body">
+              <div x-show="filterPanel === 'queue'" x-cloak class="filter-backdrop"
+                   @click="filterPanel = null" aria-hidden="true"></div>
+            </template>
+            <template x-teleport="body">
+            <div x-show="filterPanel === 'queue'" x-cloak
+                 id="filter-panel-queue" class="filter-panel" role="dialog" aria-label="Queue filters">
+              <div class="filter-panel__body">
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Sources</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="queueFilters.sources = []"
+                            x-show="queueFilters.sources.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="src in queueSources()" :key="'qf_src_'+src">
+                      <button type="button" class="filter-chip"
+                              :class="queueFilters.sources.includes(src) ? 'is-active' : ''"
+                              @click="toggleQueueFilter('sources', src)"
+                              x-text="src"></button>
+                    </template>
+                    <template x-if="queueSources().length === 0">
+                      <span class="text-xs text-slate-500">Queue is empty.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Only show</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="queueFilters.corruptOnly = false"
+                            x-show="queueFilters.corruptOnly">Reset</button>
+                  </div>
+                  <label class="flex items-center gap-3 cursor-pointer text-xs">
+                    <input type="checkbox" x-model="queueFilters.corruptOnly"
+                           class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
+                    <span>Corrupt / broken files only</span>
+                  </label>
+                </section>
+              </div>
+              <div class="filter-panel__footer">
+                <button type="button" class="filter-footer-btn is-secondary"
+                        @click="clearQueueFilters()">Reset all</button>
+                <button type="button" class="filter-footer-btn is-primary"
+                        @click="filterPanel = null">Apply</button>
+              </div>
+            </div>
+            </template>
+          </div>
+          <span class="filter-meta">
+            <span x-text="filteredQueueFiles().length"></span> / <span x-text="queueFiles.length"></span> match
+          </span>
+        </div>
+      </div>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Name</th><th>Source</th><th>Size</th><th>Prompt</th><th></th></tr></thead>
         <tbody>
-          <template x-for="f in queueFiles" :key="f.path">
+          <template x-for="f in filteredQueueFiles()" :key="f.path">
             <tr :class="f.corrupt ? 'bg-rose-900/25' : ''">
-              <td><img :src="f.thumbnail" :alt="f.name" class="thumb" loading="lazy" @click="openModalFromFile(f)"/></td>
+              <td>
+                <span class="nsfw-wrap">
+                  <img :src="f.thumbnail" :alt="f.name" class="thumb click"
+                       :class="{ 'nsfw-blur': !showNsfw && !revealedNsfw[f.path] }"
+                       loading="lazy"
+                       @click="(!showNsfw && !revealedNsfw[f.path]) ? revealNsfw(f) : openModalFromFile(f)"/>
+                  <span class="nsfw-eye" role="button" tabindex="0" aria-label="Reveal thumbnail"
+                        x-show="!showNsfw && !revealedNsfw[f.path]"
+                        @click.stop="revealNsfw(f)" title="Reveal thumbnail">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-8 10-8 10 8 10 8-4 8-10 8S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                  </span>
+                </span>
+              </td>
               <td class="font-mono text-xs" x-text="f.name"></td>
               <td x-text="f.source"></td>
               <td class="font-mono text-xs" x-text="(f.size/1024).toFixed(1) + ' KB'"></td>
@@ -4925,25 +10373,126 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </td>
             </tr>
           </template>
-          <template x-if="queueFiles.length === 0">
-            <tr><td colspan="6" class="text-center text-slate-500 py-6">Queue is empty.</td></tr>
+          <template x-if="filteredQueueFiles().length === 0">
+            <tr><td colspan="6" class="text-center text-slate-500 py-8">
+              <div class="opacity-70" x-text="queueFiles.length === 0 ? 'Queue is empty.' : 'No queue items match these filters.'"></div>
+              <div class="text-[11px] text-slate-500 mt-1" x-show="queueFiles.length === 0">Scrapers deposit here — the vision workers drain it.</div>
+            </td></tr>
           </template>
         </tbody>
       </table></div>
       </div>
     </section>
 
-    <!-- LOGS (job-scoped Historical) -->
+    <!-- ACTIVITY (job-scoped classification log, newest first) -->
     <section x-show="view === 'job' && active === 'logs'" class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3">Historical sorter log</h3>
+      <div class="flex items-start justify-between mb-3 gap-2 flex-wrap">
+        <div>
+          <h3 class="font-semibold">Recent classifications</h3>
+          <p class="text-xs text-slate-400">Every image the vision worker has decided about, newest first. Use Gallery to browse and re-cull what you've kept.</p>
+        </div>
+        <div class="filter-toolbar">
+          <label class="filter-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <input type="search" x-model="activityFilters.q" placeholder="Search filename…" aria-label="Filter activity by text"/>
+          </label>
+          <div class="relative" @keydown.escape.window="filterPanel === 'activity' && (filterPanel = null)">
+            <button type="button" class="filter-pill" @click="toggleFilterPanel('activity', $event)"
+                    :aria-expanded="filterPanel === 'activity'" aria-haspopup="dialog"
+                    aria-controls="filter-panel-activity">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 5h18M6 12h12M10 19h4"/>
+              </svg>
+              Filters
+              <span class="badge" x-show="activityFilterCount() > 0" x-text="activityFilterCount()"></span>
+            </button>
+            <template x-teleport="body">
+              <div x-show="filterPanel === 'activity'" x-cloak class="filter-backdrop"
+                   @click="filterPanel = null" aria-hidden="true"></div>
+            </template>
+            <template x-teleport="body">
+            <div x-show="filterPanel === 'activity'" x-cloak
+                 id="filter-panel-activity" class="filter-panel" role="dialog" aria-label="Activity filters">
+              <div class="filter-panel__body">
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Sources</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.sources = []"
+                            x-show="activityFilters.sources.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="src in activitySources()" :key="'af_src_'+src">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.sources.includes(src) ? 'is-active' : ''"
+                              @click="toggleActivityFilter('sources', src)"
+                              x-text="src"></button>
+                    </template>
+                    <template x-if="activitySources().length === 0">
+                      <span class="text-xs text-slate-500">Nothing classified yet.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Categories</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.categories = []"
+                            x-show="activityFilters.categories.length">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="cat in activityCategories()" :key="'af_cat_'+cat">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.categories.includes(cat) ? 'is-active' : ''"
+                              @click="toggleActivityFilter('categories', cat)"
+                              x-text="cat"></button>
+                    </template>
+                    <template x-if="activityCategories().length === 0">
+                      <span class="text-xs text-slate-500">Nothing classified yet.</span>
+                    </template>
+                  </div>
+                </section>
+                <section>
+                  <div class="filter-section__header">
+                    <span class="filter-section__title">Status</span>
+                    <button type="button" class="filter-section__reset"
+                            @click="activityFilters.status = 'any'"
+                            x-show="activityFilters.status !== 'any'">Reset</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="opt in [{v:'any',l:'Any'},{v:'kept',l:'Kept'},{v:'discarded',l:'Discarded'}]" :key="'as_'+opt.v">
+                      <button type="button" class="filter-chip"
+                              :class="activityFilters.status === opt.v ? 'is-active' : ''"
+                              @click="activityFilters.status = opt.v"
+                              x-text="opt.l"></button>
+                    </template>
+                  </div>
+                </section>
+              </div>
+              <div class="filter-panel__footer">
+                <button type="button" class="filter-footer-btn is-secondary"
+                        @click="clearActivityFilters()">Reset all</button>
+                <button type="button" class="filter-footer-btn is-primary"
+                        @click="filterPanel = null">Apply</button>
+              </div>
+            </div>
+            </template>
+          </div>
+          <span class="filter-meta">
+            <span x-text="filteredHistory().length"></span> / <span x-text="history.length"></span> match
+          </span>
+        </div>
+      </div>
       <div class="scroll-box"><table>
         <thead><tr><th></th><th>Time</th><th>Image</th><th>Source</th><th>Classification</th></tr></thead>
         <tbody>
-          <template x-for="h in history" :key="(h.image||'') + (h.timestamp||'')">
+          <template x-for="h in filteredHistory()" :key="(h.image||'') + (h.timestamp||'')">
             <tr>
               <td>
                 <span class="nsfw-wrap">
-                  <img :src="h.thumbnail || ''" :alt="h.image" class="thumb" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
+                  <img :src="h.thumbnail || ''" :alt="h.image" class="thumb click" :class="{ 'nsfw-blur': shouldBlurNsfw(h) }"
                        loading="lazy"
                        onerror="this.style.visibility='hidden'"
                        @click="h.thumbnail && (shouldBlurNsfw(h) ? revealNsfw(h) : openModalFromHistory(h))"/>
@@ -4965,8 +10514,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </td>
             </tr>
           </template>
-          <template x-if="history.length === 0">
-            <tr><td colspan="5" class="text-center text-slate-500 py-6">No historical entries yet.</td></tr>
+          <template x-if="filteredHistory().length === 0">
+            <tr><td colspan="5" class="text-center text-slate-500 py-8">
+              <div class="opacity-70" x-text="history.length === 0 ? 'No classifications yet.' : 'No history matches these filters.'"></div>
+              <div class="text-[11px] text-slate-500 mt-1" x-show="history.length === 0">Start the pipeline (top-right) once you've added sources + a vision worker.</div>
+            </td></tr>
           </template>
         </tbody>
       </table></div>
@@ -4978,9 +10530,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
          value with a 'global' chip (inherited) or 'reset ↺' (overridden).
          Auto-saves (debounced); the active job applies on leave / Apply. -->
     <section x-show="view === 'job' && active === 'jobSettings'" class="space-y-4">
-      <!-- Header: subject + preset + save/apply state. -->
+      <!-- Header: subject + preset + save/apply state. The header ROW itself is
+           sticky so the Apply/saved-flash indicator stays reachable while
+           scrolling long field lists; the card body scrolls under it. Themed
+           via CSS variables so the backdrop reads correctly in dark AND light. -->
       <div class="card rounded-xl p-5" x-show="je.loaded">
-        <div class="flex items-start justify-between gap-4 mb-3">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-start justify-between gap-4 backdrop-blur">
           <div>
             <h3 class="font-semibold" x-text="je.name"></h3>
             <p class="text-xs text-slate-400">
@@ -4991,8 +10547,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="je.savedFlash"></span>
             <template x-if="currentJob === jobsActive && je.applyPending">
-              <button @click="applyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
-                title="Re-project + restart the running supervisor with these edits">Apply &amp; restart</button>
+              <button @click="requestApplyActiveJob()" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-400 text-slate-900 rounded font-medium"
+                title="Flush pending edits and re-project the active job. Restarts the pipeline only if it is currently running.">Apply changes</button>
             </template>
           </div>
         </div>
@@ -5063,9 +10619,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         <h3 class="font-semibold mb-3">Topic filters</h3>
         <template x-if="je.eff">
         <div class="grid md:grid-cols-2 gap-4">
+          <div class="md:col-span-2 -mb-2 text-xs text-slate-500">
+            Tip: keyword fields accept comma-separated terms <em>or</em> a query with <code class="px-1 rounded bg-slate-800 text-slate-300">AND</code> / <code class="px-1 rounded bg-slate-800 text-slate-300">OR</code> / <code class="px-1 rounded bg-slate-800 text-slate-300">NOT</code> and parentheses &mdash; e.g. <code class="px-1 rounded bg-slate-800 text-slate-300">(product OR packshot) AND NOT selfie</code>.
+          </div>
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated. When a source has a prompt/caption it must contain at least one of these, or the image is skipped.', 'e.g. drone, aerial, overhead') }}</span>
+              <span class="text-xs text-slate-400">Required keywords{{ tip('Comma-separated OR a query with AND/OR/NOT/parens. When a source has a prompt/caption it must match, or the image is skipped.', 'e.g. drone, aerial, overhead — or (aerial OR drone) AND NOT indoor') }}</span>
               <span x-show="!isOver('topic_filters.keywords_extra')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
               <button x-show="isOver('topic_filters.keywords_extra')" @click="resetOverride('topic_filters.keywords_extra')" class="text-xs link-btn">reset ↺</button>
             </div>
@@ -5114,174 +10673,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </template>
       </div>
 
-      <!-- Scraper targets (inheritable lists + Discord JSON). -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <h3 class="font-semibold mb-3">Scraper targets</h3>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-1 gap-4">
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">X.com accounts{{ tip('Comma-separated handles to scrape, <b>without</b> the @.', 'e.g. dronefeed, natureshots; leave empty to scrape search results only') }}</span>
-              <span x-show="!isOver('scrapers.x_accounts')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.x_accounts')" @click="resetOverride('scrapers.x_accounts')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <input :value="effList('scrapers.x_accounts')" @change="setOverrideList('scrapers.x_accounts', $event.target.value)"
-                   placeholder="account1,account2" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.x_accounts') ? 'text-slate-400' : ''"/>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Reddit subreddits{{ tip('Comma-separated subreddits to pull from (no r/ prefix).', 'e.g. drones, earthporn, aerialphotography') }}</span>
-              <span x-show="!isOver('scrapers.reddit_subreddits')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.reddit_subreddits')" @click="resetOverride('scrapers.reddit_subreddits')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <input :value="effList('scrapers.reddit_subreddits')" @change="setOverrideList('scrapers.reddit_subreddits', $event.target.value)"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2" :class="!isOver('scrapers.reddit_subreddits') ? 'text-slate-400' : ''"/>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Civitai domains{{ tip('Tick which Civitai hosts to scrape (civitai.com and/or the civitai.red mirror).') }}</span>
-              <span x-show="!isOver('scrapers.civitai_domains')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.civitai_domains')" @click="resetOverride('scrapers.civitai_domains')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <div class="flex items-center gap-5 py-1.5" :class="!isOver('scrapers.civitai_domains') ? 'opacity-70' : ''">
-              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
-                <input type="checkbox" :checked="civOn('civitai.com')" @change="civToggle('civitai.com', $event.target.checked)" class="accent-indigo-500"/> civitai.com
-              </label>
-              <label class="inline-flex items-center gap-2 text-sm cursor-pointer">
-                <input type="checkbox" :checked="civOn('civitai.red')" @change="civToggle('civitai.red', $event.target.checked)" class="accent-indigo-500"/> civitai.red
-              </label>
-            </div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-slate-400">Discord channels JSON{{ tip('JSON listing the channels to scrape. Each needs its <code>id</code> and <code>guild</code> id; <code>kind</code> picks how images are pulled.', 'e.g. {&quot;channels&quot;:[{&quot;id&quot;:&quot;123&quot;,&quot;guild&quot;:&quot;456&quot;,&quot;kind&quot;:&quot;png_embed&quot;}]}') }}</span>
-              <span x-show="!isOver('scrapers.discord_channels_json')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-              <button x-show="isOver('scrapers.discord_channels_json')" @click="resetOverride('scrapers.discord_channels_json')" class="text-xs link-btn">reset ↺</button>
-            </div>
-            <textarea :value="effVal('scrapers.discord_channels_json')" @input="setOverride('scrapers.discord_channels_json', $event.target.value)" rows="3"
-              placeholder='{"channels":[{"id":"...","name":"...","guild":"...","kind":"png_embed"}]}'
-              class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 font-mono text-xs" :class="!isOver('scrapers.discord_channels_json') ? 'text-slate-400' : ''"></textarea>
-          </div>
-        </div>
-        </template>
-      </div>
-
-      <!-- gallery-dl (overridden wholesale as scrapers.gallery_dl). -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">gallery-dl
-            <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="text-xs font-normal link-btn ml-1">supported sites ↗</a>
-          </h3>
-          <div>
-            <span x-show="!isOver('scrapers.gallery_dl')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.gallery_dl')" @click="resetOverride('scrapers.gallery_dl')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" :checked="effVal('scrapers.gallery_dl.enabled')" @change="setOverride('scrapers.gallery_dl.enabled', $event.target.checked)"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable gallery-dl for this job</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Images per URL{{ tip('Max images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
-            <input type="number" min="1" max="5000" :value="effVal('scrapers.gallery_dl.limit_per_url')" @input="setOverride('scrapers.gallery_dl.limit_per_url', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs{{ tip('One gallery-dl-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }}</span>
-            <textarea :value="effUrls()" @change="setOverrideUrls($event.target.value)" rows="4"
-                      placeholder="https://www.pixiv.net/users/123456&#10;https://danbooru.donmai.us/posts?tags=portrait"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (Pixiv, Twitter, FurAffinity).', 'export it with a browser cookies.txt extension') }}</span>
-            <input :value="effVal('scrapers.gallery_dl.cookies_file')" @input="setOverride('scrapers.gallery_dl.cookies_file', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Custom config path{{ tip('Path to a gallery-dl JSON config file to override extractor options. Advanced; leave blank for defaults.', 'see the gallery-dl docs for the config schema') }}</span>
-            <input :value="effVal('scrapers.gallery_dl.config_path')" @input="setOverride('scrapers.gallery_dl.config_path', $event.target.value)"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults AND the global gallery-dl config. Any option from the gallery-dl docs. Leave blank for none.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
-            <textarea :value="effVal('scrapers.gallery_dl.config_json')" @change="setOverride('scrapers.gallery_dl.config_json', $event.target.value)" rows="3"
-                      placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}'
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-        </div>
-        </template>
-      </div>
-
-      <!-- yt-dlp (overridden wholesale as scrapers.yt_dlp). Mirrors gallery-dl. -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">yt-dlp</h3>
-          <div>
-            <span x-show="!isOver('scrapers.yt_dlp')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.yt_dlp')" @click="resetOverride('scrapers.yt_dlp')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="grid md:grid-cols-2 gap-4">
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" :checked="effVal('scrapers.yt_dlp.enabled')" @change="setOverride('scrapers.yt_dlp.enabled', $event.target.checked)"
-                   class="w-10 h-5 appearance-none bg-slate-700 rounded-full relative transition checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition checked:before:translate-x-5"/>
-            <span class="text-sm">Enable yt-dlp for this job</span>
-          </label>
-          <label class="block">
-            <span class="text-xs text-slate-400">Frames per URL{{ tip('Max frames/images to pull from each URL per run.', 'e.g. 200; keep modest to avoid huge first runs') }}</span>
-            <input type="number" min="1" max="5000" :value="effVal('scrapers.yt_dlp.limit')" @input="setOverride('scrapers.yt_dlp.limit', Number($event.target.value))"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">URLs{{ tip('One yt-dlp-supported URL per line. Lines starting with <code>#</code> are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
-            <textarea :value="ytUrls()" @change="setYtUrls($event.target.value)" rows="4"
-                      placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://vimeo.com/123456789"
-                      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
-          </label>
-          <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">Cookies file{{ tip('Path to a Netscape-format <code>cookies.txt</code> for sites that need a login (age-gated / members-only videos).', 'export it with a browser cookies.txt extension') }}</span>
-            <input :value="effVal('scrapers.yt_dlp.cookies')" @input="setOverride('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt"
-                   class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/>
-          </label>
-        </div>
-        </template>
-      </div>
-
-      <!-- Local folders (multi): scrapers.local_imports list. Each row is its
-           own concurrent source. -->
-      <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
-        <div class="flex items-center justify-between mb-3">
-          <div>
-            <h3 class="font-semibold">Local folders</h3>
-            <p class="text-xs text-slate-400">Each enabled folder is a concurrent source, surfaced on the Scrapers tab as <code>Local-&lt;name&gt;</code>.</p>
-          </div>
-          <div>
-            <span x-show="!isOver('scrapers.local_imports')" class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">global</span>
-            <button x-show="isOver('scrapers.local_imports')" @click="resetOverride('scrapers.local_imports')" class="text-xs link-btn">reset ↺</button>
-          </div>
-        </div>
-        <template x-if="je.eff">
-        <div class="space-y-2">
-          <template x-for="(f, i) in localFolders()" :key="i">
-            <div class="grid grid-cols-12 gap-2 items-center bg-slate-900/40 border border-slate-800 rounded p-2">
-              <input :value="f.name" @input="updateLocalFolder(i, 'name', $event.target.value)" placeholder="name"
-                     class="col-span-3 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-              <input :value="f.dir" @input="updateLocalFolder(i, 'dir', $event.target.value)" placeholder="absolute folder path"
-                     class="col-span-6 bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-xs"/>
-              <label class="col-span-2 flex items-center gap-1 text-xs">
-                <input type="checkbox" :checked="f.enabled" @change="updateLocalFolder(i, 'enabled', $event.target.checked)"/> on
-              </label>
-              <button @click="removeLocalFolder(i)" class="col-span-1 px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">✕</button>
-            </div>
-          </template>
-          <button @click="addLocalFolder()" class="text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded">+ Add local folder</button>
-        </div>
-        </template>
-      </div>
+      <!-- Scraper-specific settings (targets, gallery-dl, yt-dlp, local folders)
+           are unified onto the Scrapers tab. Each scraper card carries the
+           full setting set for that source. This tab intentionally does NOT
+           duplicate those controls. -->
 
       <!-- Categories (inheritable; reject traversal/reserved at the boundary). -->
       <div class="card rounded-xl p-5" x-show="je.loaded && je.eff">
@@ -5327,35 +10722,112 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- PRESETS MANAGER (global) ─────────────────────────────────────────────
          List/create/clone/delete/set-default + a preset editor over the same
-         inheritable field set. Presets have no inheritance — values are absolute. -->
+         inheritable field set. Presets have no inheritance — values are absolute.
+
+         Two sub-views (Alpine state ``presetView``):
+           - 'grid'   → default: built-in comparison grid, community strip, main
+                        preset grid with per-preset Edit/Clone/Export/Publish.
+           - 'detail' → dedicated full-width editor for one preset; the grid
+                        + community strip are hidden so the editor gets the
+                        full screen and users can't miss it. Back arrow (and
+                        the browser back button) returns to 'grid'. -->
     <section x-show="view === 'jobs' && active === 'presets'" class="space-y-4">
-      <div class="card rounded-xl p-5">
+      <!-- Built-in preset comparison grid (T1 #5). Card per built-in preset
+           with headline / description / use-cases. Clicking "Use" opens the
+           first-run wizard pre-filled with this preset. -->
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid' && presetsMeta.length">
         <div class="flex items-center justify-between mb-3">
+          <div>
+            <h3 class="font-semibold">Built-in presets</h3>
+            <p class="text-xs text-slate-400">Every preset that ships with cull. Pick one as the starting point for a new job.</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="p in presetsMeta" :key="'meta_'+p.key">
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(p.key)"
+                   :alt="p.name" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm" x-text="p.name"></div>
+                <div class="text-[11px] text-indigo-300 mb-1" x-text="p.headline"></div>
+                <div class="text-xs text-slate-300 flex-1" x-text="p.description"></div>
+                <div class="my-2">
+                  <template x-for="uc in (p.use_cases || [])" :key="uc"><span class="use-case-chip" x-text="uc"></span></template>
+                </div>
+                <div class="mt-auto flex gap-2">
+                  <button @click="openWizardWithPreset(p.key)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Use this preset</button>
+                  <button @click="openPreset(p.key)" x-show="presetsList.includes(p.key)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Community presets marketplace (T1 #3). Lists community-authored
+           presets from /api/presets/community and supports install-from-URL. -->
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid'">
+        <div class="flex items-center justify-between mb-2">
+          <div>
+            <h3 class="font-semibold">Community presets</h3>
+            <p class="text-xs text-slate-400">Install shared presets by URL, or browse the curated list.</p>
+          </div>
+          <button @click="loadCommunityPresets()" :disabled="community.loading"
+                  class="text-xs link-btn disabled:opacity-50">
+            <span x-text="community.loading ? 'Loading…' : 'Refresh'"></span>
+          </button>
+        </div>
+        <div class="flex gap-2 mb-3">
+          <input x-model="community.urlInput" placeholder="https://example.com/preset.json"
+                 class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono text-xs"/>
+          <button @click="previewPresetUrl(community.urlInput)" :disabled="!community.urlInput"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-sm disabled:opacity-50">Preview from URL</button>
+        </div>
+        <div x-show="community.error" class="text-xs text-rose-300 mb-2" x-text="community.error"></div>
+        <div x-show="!community.loading && community.presets.length === 0" class="text-xs text-slate-500">No community presets available right now.</div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <template x-for="p in community.presets" :key="p.url || p.filename">
+            <div class="preset-card bg-slate-900/50 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(((p.filename||'').replace(/\.preset\.json$/,'').replace(/\.json$/,'').toLowerCase()))"
+                   :alt="p.headline || p.filename" class="w-full aspect-video object-cover border-b border-slate-800"
+                   loading="lazy"/>
+              <div class="p-3 flex flex-col flex-1">
+                <div class="font-semibold text-sm truncate" x-text="p.headline || p.filename"></div>
+                <div class="text-[11px] text-slate-400 truncate" x-text="p.filename || p.url"></div>
+                <div class="text-xs text-slate-300 mt-1 flex-1" x-text="p.description || ''"></div>
+                <div class="mt-2">
+                  <template x-for="c in (p.categories || [])" :key="'ccat_'+c">
+                    <span class="use-case-chip" x-text="c"></span>
+                  </template>
+                </div>
+                <div class="mt-2 flex gap-2">
+                  <button @click="previewPresetUrl(p.url || p.download_url || p.filename)"
+                          class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Preview</button>
+                  <button @click="installPresetFromUrl(p.url || p.download_url || p.filename, p.filename)"
+                          class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-500 rounded">Install</button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <div class="card rounded-xl p-5" x-show="presetView === 'grid'">
+        <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
           <div>
             <h3 class="font-semibold">Presets</h3>
             <p class="text-xs text-slate-400">Named default bundles a job inherits from. Edits auto-save.</p>
           </div>
+          <input x-model="newJob.presetFilter" placeholder="Filter presets…"
+                 class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-xs w-56"/>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          <template x-for="p in presetsList" :key="p">
-            <div class="bg-slate-900/60 border border-slate-800 rounded p-3 flex items-center justify-between gap-2"
-                 :class="presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : ''">
-              <div class="min-w-0">
-                <div class="font-mono text-sm truncate" x-text="p"></div>
-                <div class="text-[11px] text-amber-300" x-show="p === presetsDefault">default</div>
-              </div>
-              <div class="flex flex-wrap gap-1 shrink-0">
-                <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
-                <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
-                <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
-                <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
-                        title="Restore this shipped preset to its built-in defaults"
-                        class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
-                <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
-                <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
-              </div>
-            </div>
-          </template>
+          <!-- "New preset" card renders FIRST so a user landing on the tab
+               sees the primary CTA (create/import) before scrolling past a
+               long grid of existing presets. The x-for below carries the
+               existing library. -->
           <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
             <div class="flex items-center justify-between mb-2">
               <div class="text-sm font-semibold">New preset</div>
@@ -5372,18 +10844,132 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             </select>
             <button @click="createPreset()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
           </div>
+          <template x-for="p in filteredPresets()" :key="p">
+            <div :id="'preset-card-' + p"
+                 class="bg-slate-900/60 border border-slate-800 rounded overflow-hidden flex flex-col gap-0"
+                 :class="[
+                   presetEditor.open && presetEditor.name === p ? 'ring-1 ring-indigo-500' : '',
+                   recentlyInstalledPreset === p ? 'preset-highlight' : ''
+                 ]">
+              <!-- Thumbnail: user drop-in > shipped SVG > gradient placeholder,
+                   same endpoint the marketplace + comparison grid use. -->
+              <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(p)"
+                   :alt="p" loading="lazy"
+                   class="w-full aspect-video object-cover border-b border-slate-800"/>
+              <div class="p-3 flex flex-col gap-2">
+              <div class="flex items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <div class="font-mono text-sm truncate" x-text="p"></div>
+                  <div class="text-[11px] text-amber-300" x-show="p === presetsDefault">default</div>
+                </div>
+                <div class="flex flex-wrap gap-1 shrink-0 justify-end">
+                  <template x-for="t in (presetsMeta.tags?.[p] || [])" :key="p+'_t_'+t">
+                    <span class="pill px-1.5 py-0.5 rounded bg-slate-800 text-slate-300" x-text="t"></span>
+                  </template>
+                </div>
+              </div>
+              <p class="text-[11px] text-slate-400 leading-snug" x-text="presetDescription(p) || '(no description)'"></p>
+              <div class="flex flex-wrap gap-1">
+                <button @click="openPreset(p)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded">Edit</button>
+                <button @click="clonePreset(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+                <a :href="'/api/presets/' + encodeURIComponent(p) + '/export'" download class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Export</a>
+                <button @click="publishPresetViaGit(p)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Open a PR that adds this preset to presets/community/ (never lands on main directly)">Publish</button>
+                <button @click="resetPreset(p)" x-show="presetsBuiltins.includes(p)"
+                        title="Restore this shipped preset to its built-in defaults"
+                        class="px-2 py-1 text-xs bg-amber-900/50 hover:bg-amber-800 text-amber-100 rounded">Reset</button>
+                <button @click="setDefaultPreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-40">Default</button>
+                <button @click="deletePreset(p)" :disabled="p === presetsDefault" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-40">Delete</button>
+              </div>
+              </div>
+            </div>
+          </template>
+          <template x-if="filteredPresets().length === 0">
+            <div class="col-span-full text-center py-6 text-sm text-slate-500">
+              No presets match "<span class="font-mono" x-text="newJob.presetFilter"></span>".
+              <button class="link-btn ml-2" @click="newJob.presetFilter = ''">clear</button>
+            </div>
+          </template>
         </div>
       </div>
 
-      <!-- Preset editor -->
-      <div class="card rounded-xl p-5" x-show="presetEditor.open && presetEditor.cfg">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="font-semibold">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
+      <!-- Detail-view header. Only visible in presetView==='detail'; carries
+           the Back button + sticky Save flash so users always know how to
+           leave the editor. Sits ABOVE the editor card so its sticky top:0
+           inside the card doesn't fight the page scroll. -->
+      <div x-show="presetView === 'detail'" class="flex items-center justify-between gap-3 flex-wrap">
+        <button @click="closePresetDetail()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1.5">
+          <span aria-hidden="true">←</span> Back to presets
+        </button>
+        <span class="text-xs text-slate-500">Editing: <span class="font-mono" x-text="presetEditor.name"></span></span>
+      </div>
+
+      <!-- Preset editor. Sticky header keeps the Close button + savedFlash
+           indicator reachable while scrolling through long category / rules
+           blocks. Same CSS-variable backdrop as the other sticky save-bars.
+           id anchor is the scroll target from openPreset() so a click on Edit
+           auto-scrolls the editor into view instead of leaving the user at
+           the top of the presets grid wondering where it went. -->
+      <div id="preset-editor-anchor" class="card rounded-xl p-5"
+           x-show="presetView === 'detail' && presetEditor.open && presetEditor.cfg">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-center justify-between backdrop-blur">
+          <div class="flex items-center gap-3 min-w-0">
+            <button @click="closePresetDetail()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1 shrink-0" title="Back to presets">
+              <span aria-hidden="true">←</span> Back
+            </button>
+            <h3 class="font-semibold truncate">Editing preset: <span class="font-mono" x-text="presetEditor.name"></span></h3>
+          </div>
           <div class="flex items-center gap-3">
             <span class="text-xs text-emerald-300" x-text="presetEditor.savedFlash"></span>
-            <button @click="closePreset()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Close</button>
+            <button @click="closePresetDetail()" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Close</button>
           </div>
         </div>
+
+        <!-- Thumbnail card: drag-drop OR click-to-browse a new thumbnail for
+             this preset. Upload lands in presets/thumbnails/ (built-in preset
+             names) or presets/community/thumbnails/ (community presets) via
+             POST /api/presets/<key>/thumbnail. Preview cache-busts on every
+             save. Remove-custom is only offered when a user file exists. -->
+        <div class="mb-4 p-3 border border-slate-800 rounded bg-slate-900/40">
+          <div class="flex items-center justify-between mb-2">
+            <div>
+              <div class="text-sm font-semibold">Thumbnail</div>
+              <div class="text-[11px] text-slate-500">Drop an image or click to pick one. GIF / PNG / JPG / WebP, up to 2 MB.</div>
+            </div>
+            <button x-show="presetThumb.hasCustom" @click="removePresetThumbnail()"
+                    :disabled="presetThumb.busy"
+                    class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded disabled:opacity-50">
+              Remove custom thumbnail
+            </button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-[240px,1fr] gap-3">
+            <img :src="'/api/presets/thumbnail?key=' + encodeURIComponent(presetEditor.name) + '&v=' + presetThumb.cacheBust"
+                 :alt="presetEditor.name + ' thumbnail preview'"
+                 class="w-full aspect-video object-cover rounded border border-slate-800 bg-slate-950"
+                 loading="lazy"/>
+            <label
+              @dragover.prevent="presetThumb.dragOver = true"
+              @dragleave.prevent="presetThumb.dragOver = false"
+              @drop.prevent="presetThumb.dragOver = false; onPresetThumbDrop($event)"
+              :class="presetThumb.dragOver ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 bg-slate-900/40'"
+              class="drop-zone flex flex-col items-center justify-center border-2 border-dashed rounded p-4 text-center">
+              <input type="file" accept="image/gif,image/png,image/jpeg,image/webp"
+                     class="hidden" x-ref="presetThumbInput"
+                     @change="onPresetThumbPick($event)"/>
+              <div class="text-xs text-slate-300 mb-1">
+                <span x-show="!presetThumb.busy">Drop an image here, or</span>
+                <span x-show="presetThumb.busy">Uploading…</span>
+              </div>
+              <button @click.prevent="$refs.presetThumbInput.click()" :disabled="presetThumb.busy"
+                      class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50">
+                Choose file
+              </button>
+              <div x-show="presetThumb.error" class="mt-2 text-xs text-rose-300" x-text="presetThumb.error"></div>
+              <div x-show="presetThumb.status && !presetThumb.error" class="mt-2 text-xs text-emerald-300" x-text="presetThumb.status"></div>
+            </label>
+          </div>
+        </div>
+
         <div x-show="presetEditor.error" x-cloak class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="presetEditor.error"></div>
         <div class="text-[11px] text-slate-500 mb-3" x-show="presetEditor.referencedBy.length"
              x-text="'Used by ' + presetEditor.referencedBy.length + ' job(s): ' + presetEditor.referencedBy.join(', ')"></div>
@@ -5441,19 +11027,19 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               </div>
             </label>
             <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="presetEditor.cfg.scrapers.gallery_dl.enabled" @change="peSet('scrapers.gallery_dl.enabled', $event.target.checked)"/><span class="text-sm">gallery-dl enabled</span></label>
-            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">yt-dlp enabled</span></label>
+            <label class="flex items-center gap-2 mt-5 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="(presetEditor.cfg.scrapers.yt_dlp||{}).enabled" @change="peSet('scrapers.yt_dlp.enabled', $event.target.checked)"/><span class="text-sm">Youtube scraper enabled</span></label>
           </div>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl URLs{{ tip('One gallery-dl-supported URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.pixiv.net/en/users/12345') }} <a href="https://github.com/mikf/gallery-dl/blob/master/docs/supportedsites.md" target="_blank" rel="noopener noreferrer" class="link-btn">supported sites ↗</a></span>
             <textarea :value="peUrls()" @change="peSetUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <label class="block"><span class="text-xs text-slate-400">gallery-dl custom arguments (JSON){{ tip('Inline gallery-dl config (a JSON object) merged on top of the defaults + the global gallery-dl config. Any option from the gallery-dl docs.', 'e.g. {&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;videos&quot;: true}}}') }}</span>
             <textarea :value="(presetEditor.cfg.scrapers.gallery_dl||{}).config_json||''" @change="peSet('scrapers.gallery_dl.config_json', $event.target.value)" rows="2" placeholder='{&quot;extractor&quot;: {&quot;reddit&quot;: {&quot;comments&quot;: 0}}}' class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
           <div class="grid md:grid-cols-2 gap-3">
-            <label class="block"><span class="text-xs text-slate-400">yt-dlp URLs{{ tip('One yt-dlp-supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
+            <label class="block"><span class="text-xs text-slate-400">Youtube scraper URLs{{ tip('One Youtube scraper (yt-dlp) supported video URL per line; <code>#</code> lines are ignored.', 'e.g. https://www.youtube.com/watch?v=...') }}</span>
               <textarea :value="peYtUrls()" @input="peSetYtUrls($event.target.value)" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea></label>
             <div class="grid grid-cols-1 gap-3">
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp frames per URL</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper frames per URL</span>
                 <input type="number" min="1" max="5000" :value="(presetEditor.cfg.scrapers.yt_dlp||{}).limit" @input="peSet('scrapers.yt_dlp.limit', Number($event.target.value))" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1"/></label>
-              <label class="block"><span class="text-xs text-slate-400">yt-dlp cookies file</span>
+              <label class="block"><span class="text-xs text-slate-400">Youtube scraper cookies file</span>
                 <input :value="(presetEditor.cfg.scrapers.yt_dlp||{}).cookies" @input="peSet('scrapers.yt_dlp.cookies', $event.target.value)" placeholder="C:\\Users\\you\\cookies.txt" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"/></label>
             </div>
           </div>
@@ -5522,7 +11108,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
                   </div>
                   <div class="grid md:grid-cols-12 gap-2 mt-1 items-center">
                     <input type="password" :value="w.api_key" @change="peSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)" autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs"/>
-                    <label class="md:col-span-2 inline-flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)" class="accent-indigo-500"/><span x-text="w.enabled ? 'On' : 'Off'"></span></label>
+                    <label class="md:col-span-2 flex items-center gap-2 cursor-pointer"><input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer" :checked="w.enabled" @change="peSetFleet(idx,'enabled',$event.target.checked)"/><span class="text-xs text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span></label>
                     <div class="md:col-span-6 flex items-center gap-2 justify-end">
                       <span class="text-[11px] truncate max-w-[12rem]" x-show="peFleetTest[idx] && !peFleetTest[idx].testing" :class="peFleetTest[idx]?.ok ? 'text-emerald-400' : 'text-rose-400'" x-text="peFleetTest[idx]?.message"></span>
                       <button @click="peTestFleet(idx)" :disabled="!!peFleetTest[idx]?.testing" class="px-2 py-0.5 text-xs bg-slate-700 hover:bg-slate-600 rounded disabled:opacity-50"><span x-text="peFleetTest[idx]?.testing ? 'Testing…' : 'Test'"></span></button>
@@ -5542,14 +11128,17 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- GLOBAL SETTINGS ────────────────────────────────────────────────────
          Credentials, model endpoints, storage roots, and global UX. Per-job
-         settings (topic / targets / scoring / captioning) live in Job Settings.
-         Writes to .env via /api/settings. -->
+         topic/scoring/captioning live in Job Settings; per-job scraper
+         targets + gallery-dl / yt-dlp / local-folder config live in the
+         Scrapers tab's per-scraper cards. Writes to .env via /api/settings. -->
     <section x-show="view === 'jobs' && active === 'settings'" class="space-y-4"
       @input="markSettingsDirty()" @change="markSettingsDirty()">
 
       <!-- Sticky action bar: Save/Reload for the .env form, always reachable at
-           the top of the page (and pinned while scrolling). -->
-      <div class="sticky top-0 z-20 py-3 bg-slate-950/90 backdrop-blur border-b border-slate-800
+           the top of the page (and pinned while scrolling). Uses CSS variables
+           so the backdrop stays legible in dark AND light themes; the previous
+           hard-coded slate-950 looked wrong on the sand-coloured light theme. -->
+      <div class="sticky-save-bar sticky top-0 z-40 py-3 backdrop-blur
                   flex items-start justify-between gap-4">
         <div>
           <h3 class="font-semibold">Global settings</h3>
@@ -5557,7 +11146,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <div class="flex gap-2 shrink-0">
           <button @click="reloadSettings()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded">Reload</button>
-          <button @click="saveSettings()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Save</button>
+          <button @click="saveSettings()" :disabled="!settingsDirty || settingsSaving"
+                  :title="settingsSaving ? 'Saving…' : (settingsDirty ? '' : 'No unsaved changes')"
+                  class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                  x-text="settingsSaving ? 'Saving…' : (settingsDirty ? 'Save' : 'Saved')"></button>
         </div>
       </div>
       <template x-if="settingsBanner">
@@ -5567,40 +11159,7 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           x-text="settingsBanner"></div>
       </template>
 
-      <!-- Software updates — pull origin/main + restart. Mirrors the update toast. -->
-      <div class="card rounded-xl p-5">
-        <div class="flex items-start justify-between gap-4 mb-2">
-          <div>
-            <h3 class="font-semibold">Software updates</h3>
-            <p class="text-xs text-slate-400">Pull the latest cull from <code>origin/main</code> and restart. Needs a clean git checkout.</p>
-          </div>
-          <div class="flex gap-2 shrink-0">
-            <button @click="checkUpdate(true)" :disabled="!!update.checking"
-              class="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded text-sm disabled:opacity-50">
-              <span x-text="update.checking ? 'Checking…' : 'Check for updates'"></span>
-            </button>
-            <button @click="runUpdate()" :disabled="!!update.running || update.behind === 0 || !!update.dirty"
-              class="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded text-sm disabled:opacity-50"
-              :title="update.dirty ? 'Commit or stash local changes first' : (update.behind === 0 ? 'Already up to date' : '')">
-              <span x-text="update.running ? 'Updating…' : 'Update to latest &amp; restart'"></span>
-            </button>
-          </div>
-        </div>
-        <div class="text-xs text-slate-400 space-y-1">
-          <div>Installed: <span class="font-mono text-slate-200" x-text="update.local_sha || '—'"></span>
-            <template x-if="update.checked">
-              <span>· latest <span class="font-mono text-slate-200" x-text="update.remote_sha || '—'"></span>
-                <span x-show="update.behind > 0" class="text-amber-300" x-text="'· ' + update.behind + ' behind'"></span>
-                <span x-show="update.checked && update.behind === 0 && !update.error" class="text-emerald-300">· up to date</span>
-              </span>
-            </template>
-          </div>
-          <div x-show="update.remote_subject" class="truncate text-slate-500" x-text="'→ ' + update.remote_subject"></div>
-          <div x-show="update.dirty" class="text-rose-300">Working tree has uncommitted changes — commit or stash before updating.</div>
-          <div x-show="update.error" class="text-rose-300" x-text="'⚠ ' + update.error"></div>
-          <div x-show="update.running" class="text-slate-400">Pulling, reinstalling deps if needed, and relaunching. The dashboard will restart — refresh in a moment.</div>
-        </div>
-      </div>
+      <!-- Software updates now live in the sidebar (T6). -->
 
       <!-- Backup & restore — export/import all jobs + presets, or a single preset/job. -->
       <div class="card rounded-xl p-5">
@@ -5649,15 +11208,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
               <div class="grid md:grid-cols-12 gap-2 mt-2 items-center">
                 <input type="password" :value="w.api_key" @change="gSetFleet(idx,'api_key',$event.target.value)" placeholder="API key (optional)"
                        autocomplete="off" class="md:col-span-4 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"/>
-                <label class="md:col-span-2 inline-flex items-center gap-2 text-xs cursor-pointer select-none">
-                  <span class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
-                        :class="w.enabled ? 'bg-indigo-500' : 'bg-slate-600'">
-                    <input type="checkbox" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
-                      :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
-                    <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform pointer-events-none"
-                      :class="w.enabled ? 'translate-x-4' : 'translate-x-1'"></span>
-                  </span>
-                  <span x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
+                <label class="md:col-span-2 flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" class="appearance-none w-9 h-5 bg-slate-700 rounded-full relative transition-colors checked:bg-indigo-500 before:content-[''] before:absolute before:top-0.5 before:left-0.5 before:w-4 before:h-4 before:bg-white before:rounded-full before:transition-transform checked:before:translate-x-4 shrink-0 cursor-pointer"
+                         :checked="w.enabled" @change="gSetFleet(idx,'enabled',$event.target.checked)"/>
+                  <span class="text-sm text-slate-400" x-text="w.enabled ? 'Enabled' : 'Disabled'"></span>
                 </label>
                 <div class="md:col-span-6 flex items-center gap-2 justify-end">
                   <span class="text-xs truncate max-w-[16rem]" x-show="globalFleetTest[idx] && !globalFleetTest[idx].testing"
@@ -5675,6 +11229,166 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
         </div>
         <button @click="gAddFleet()" x-show="globalVision.loaded" class="mt-2 px-3 py-1.5 text-sm bg-slate-700 hover:bg-slate-600 rounded">+ Add vision worker</button>
         <div x-show="!globalVision.loaded" class="text-xs text-slate-500 italic mt-2">Loading…</div>
+      </div>
+
+      <!-- Themes: registry (built-in + community + user) + inline editor. Two
+           views like the presets tab: 'grid' shows every theme as a card,
+           'detail' hosts the colour-picker editor for one custom theme. Saves
+           via /api/themes; publish shares the git helpers the preset publish
+           route uses. Stop-propagates change/input so tweaks here don't mark
+           the .env form dirty. -->
+      <div class="card rounded-xl p-5" @change.stop @input.stop
+           x-show="themeEditor.view === 'grid'">
+        <div class="flex items-start justify-between gap-4 mb-3">
+          <div>
+            <h3 class="font-semibold">Themes</h3>
+            <p class="text-xs text-slate-400">Pick from shipped themes, install a community theme, or design a fully custom one. Custom themes save to <code>data/themes/</code>.</p>
+          </div>
+          <button @click="loadThemes()" class="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded shrink-0">Reload</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <!-- New / clone card. Same style as the presets 'New preset' card. -->
+          <div class="bg-slate-900/40 border-dashed border-2 border-slate-700 rounded p-3">
+            <div class="text-sm font-semibold mb-2">New theme</div>
+            <input x-model="themeEditor.newName" placeholder="theme-slug (lowercase)"
+                   class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2 font-mono"/>
+            <label class="block text-xs text-slate-400 mb-1">Start from a copy of</label>
+            <select x-model="themeEditor.newBase" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm mb-2">
+              <template x-for="t in availableThemes()" :key="'nb_'+t.name">
+                <option :value="t.name" x-text="t.name"></option>
+              </template>
+            </select>
+            <button @click="createTheme()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium w-full">Create</button>
+          </div>
+          <template x-for="t in (themes.list || [])" :key="'tc_'+t.name">
+            <div class="bg-slate-900/60 border border-slate-800 rounded overflow-hidden flex flex-col">
+              <!-- Mini swatch strip: 6 tokens at a glance. -->
+              <div class="flex h-14 border-b border-slate-800">
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-bg']||'#0f172a')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-surface-alt']||'#1e293b')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-accent']||'#6366f1')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-success']||'#10b981')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-warn']||'#f59e0b')"></div>
+                <div class="flex-1" :style="'background:'+((t.vars||{})['--color-danger']||'#e11d48')"></div>
+              </div>
+              <div class="p-3 flex flex-col gap-2">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="font-mono text-sm truncate" x-text="t.name"></div>
+                    <div class="text-[11px] text-slate-500" x-text="t.source"></div>
+                  </div>
+                  <span x-show="theme === t.name" class="pill px-1.5 py-0.5 rounded" style="background: var(--color-accent); color: var(--color-accent-fg);">Active</span>
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <button @click="setTheme(t.name)" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium">Apply</button>
+                  <button @click="openThemeEditor(t.name)" x-show="t.source === 'user'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Edit</button>
+                  <button @click="cloneTheme(t.name)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded">Clone</button>
+                  <button @click="installTheme(t.name)" x-show="t.source !== 'user'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Copy to data/themes/ so you can edit it">Customize</button>
+                  <button @click="publishTheme(t.name)" x-show="t.source === 'user' || t.source === 'community'" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded" title="Publish this theme to themes/community/ and push to origin">Publish</button>
+                  <button @click="deleteTheme(t.name)" x-show="t.source === 'user'" class="px-2 py-1 text-xs bg-rose-900/60 hover:bg-rose-800 text-rose-100 rounded">Delete</button>
+                </div>
+              </div>
+            </div>
+          </template>
+          <template x-if="!themes.loaded">
+            <div class="col-span-full text-xs text-slate-500 italic">Loading themes…</div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Theme editor detail view — reveals only when a custom theme is being
+           edited. Keeps the isolated deeper level pattern the preset editor
+           uses (Back button, sticky header, dedicated card). Colour pickers
+           use native <input type=color>; the live preview mirrors the actual
+           dashboard tokens so a change is instantly visible. -->
+      <div class="card rounded-xl p-5" @change.stop @input.stop
+           x-show="themeEditor.view === 'detail' && themeEditor.editing">
+        <div class="sticky-save-bar sticky top-0 z-30 -mx-5 -mt-5 px-5 pt-5 pb-3 mb-3
+                    flex items-center justify-between backdrop-blur">
+          <div class="flex items-center gap-3 min-w-0">
+            <button @click="closeThemeEditor()" class="px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded flex items-center gap-1 shrink-0" title="Back to themes">
+              <span aria-hidden="true">←</span> Back
+            </button>
+            <h3 class="font-semibold truncate">Editing theme: <span class="font-mono" x-text="themeEditor.editing"></span></h3>
+          </div>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-emerald-300" x-text="themeEditor.savedFlash"></span>
+            <button @click="saveTheme()" :disabled="themeEditor.saving"
+                    class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 rounded font-medium disabled:opacity-40">
+              <span x-text="themeEditor.saving ? 'Saving…' : 'Save'"></span>
+            </button>
+            <button @click="publishTheme(themeEditor.editing)" class="px-3 py-1.5 text-xs bg-slate-700 hover:bg-slate-600 rounded">Publish</button>
+          </div>
+        </div>
+        <div x-show="themeEditor.error" class="border text-xs px-3 py-2 rounded mb-3 bg-rose-950/60 border-rose-700 text-rose-200" x-text="themeEditor.error"></div>
+
+        <div class="grid lg:grid-cols-2 gap-5">
+          <!-- Left: pickers -->
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Font family</label>
+              <div class="flex gap-2">
+                <input x-model="themeEditor.draft.font_family" placeholder="Inter, system-ui, sans-serif"
+                       class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"/>
+                <select @change="themeEditor.draft.font_family = $event.target.value"
+                        class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
+                  <option value="">(preset stacks)</option>
+                  <template x-for="f in themeEditor.fontStacks" :key="'fp_'+f.label">
+                    <option :value="f.value" x-text="f.label"></option>
+                  </template>
+                </select>
+              </div>
+              <p class="text-[11px] text-slate-500 mt-1">Web-safe stacks apply immediately. Google Fonts (Inter, Space Grotesk, IBM Plex Sans, Playfair Display) load from fonts.googleapis.com — the CSP allowlists that origin.</p>
+            </div>
+
+            <div>
+              <h4 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Colours</h4>
+              <div class="grid grid-cols-1 gap-1.5">
+                <template x-for="k in themeEditor.varKeys" :key="'tv_'+k">
+                  <div class="flex items-center gap-2">
+                    <input type="color" :value="themeEditor.hexOf(k)"
+                           @input="themeEditor.setVar(k, $event.target.value)"
+                           class="w-9 h-8 rounded border border-slate-700 bg-transparent cursor-pointer p-0.5 shrink-0"
+                           :title="k"/>
+                    <input :value="themeEditor.draft.vars[k] || ''"
+                           @input="themeEditor.setVar(k, $event.target.value)"
+                           :placeholder="k"
+                           class="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono"/>
+                    <span class="text-[10px] text-slate-500 font-mono w-40 truncate shrink-0" x-text="k"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: live preview -->
+          <div>
+            <h4 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Live preview</h4>
+            <div class="theme-preview" :style="themeEditor.previewStyle()">
+              <div class="tp-card mb-3">
+                <h5 class="tp-heading">cull dashboard</h5>
+                <p class="tp-muted">Automating taste, one thumbnail at a time.</p>
+              </div>
+              <div class="flex gap-2 mb-3">
+                <button class="tp-btn">Primary action</button>
+                <button class="tp-btn tp-btn-secondary">Secondary</button>
+              </div>
+              <div class="flex gap-2 mb-3 flex-wrap">
+                <span class="tp-chip">portrait</span>
+                <span class="tp-chip">anime</span>
+                <span class="tp-chip">product</span>
+              </div>
+              <div class="mb-3">
+                <input class="tp-input w-full" placeholder="Search prompts…"/>
+              </div>
+              <div class="flex gap-2 flex-wrap">
+                <span class="tp-success">up to date</span>
+                <span class="tp-danger">discard</span>
+              </div>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-2">Preview uses the same CSS variables as the real dashboard, so anything readable here reads everywhere.</p>
+          </div>
+        </div>
       </div>
 
       <!-- LM Studio runtime — part of Local vision: VRAM unload policy + per-endpoint
@@ -5826,6 +11540,12 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
           {{ toggle('DESKTOP_NOTIFICATIONS', 'Desktop notifications', 'Fire a desktop toast when a job completes (best-effort; needs a notification backend installed).') }}
           {{ toggle('EMBEDDINGS_ENABLED', 'CLIP embeddings index', 'Build a CLIP embeddings index that powers near-duplicate detection and the “find similar” / balance tools.') }}
           {{ toggle('VIDEO_CLASSIFY_ENABLED', 'Classify video clips', 'Classify video clips from a sampled frame, not just still images.') }}
+          <template x-if="settings.VIDEO_CLASSIFY_ENABLED === 'true' && videoBackend.checked && !videoBackend.has_any">
+            <div class="md:col-span-2 rounded border border-amber-500/60 bg-amber-500/10 text-amber-200 text-xs p-2 leading-snug">
+              <div class="font-medium mb-1">Video mode is enabled but no frame-extraction backend is installed.</div>
+              <div>Install <code class="font-mono">ffmpeg</code> (recommended) or <code class="font-mono">scenedetect</code> to classify video clips. Meanwhile, scraped videos are held in <code class="font-mono">Unclassified_Video/</code> instead of being classified or deleted.</div>
+            </div>
+          </template>
           <label class="block md:col-span-2 mt-2">
             <span class="text-xs text-slate-400">WEBHOOK_URL{{ tip('POST a JSON event here when a job completes — fan out to Slack, Discord, or a home-automation hook. Leave blank to disable.') }}</span>
             <input x-model="settings.WEBHOOK_URL" placeholder="https://hooks.example.com/..."
@@ -5835,10 +11555,10 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
 
       <div class="card rounded-xl p-5">
-        <h3 class="font-semibold mb-3">YT-DLP scraper{{ tip('Pull frames/clips from any site yt-dlp supports (YouTube, Vimeo, and 1000+ more). Enable, paste URLs (one per line or comma-separated), optionally cap per-URL items and point at a cookies.txt for gated content.') }}</h3>
+        <h3 class="font-semibold mb-3">Youtube scraper{{ tip('Uses the yt-dlp library to scrape frames and clips from YouTube (and 1000+ other sites). <a href=\"https://github.com/yt-dlp/yt-dlp\" target=\"_blank\" rel=\"noopener\" class=\"link-btn\">GitHub</a>') }}</h3>
         <div class="grid md:grid-cols-2 gap-4">
           <div class="self-center">
-            {{ toggle('YT_DLP_ENABLED', 'yt-dlp scraper enabled', 'Enable the yt-dlp video lane for the URLs below.') }}
+            {{ toggle('YT_DLP_ENABLED', 'Youtube scraper enabled', 'Enable the Youtube scraper (yt-dlp) video lane for the URLs below.') }}
           </div>
           <label class="block">
             <span class="text-xs text-slate-400">YT_DLP_LIMIT — max items per URL</span>
@@ -5876,7 +11596,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             {{ testbtn('Civitai-Red') }}
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}</span>
+            <span class="text-xs text-slate-400">TWITTER_COOKIES{{ tip('Full cookie string from a logged-in X/Twitter browser session. Must include <code>auth_token</code> and <code>ct0</code>.', 'auth_token=...; ct0=...; twid=...') }}
+              <a class="link-btn ml-2" @click.prevent="openCookiesModal('x.com', 'TWITTER_COOKIES')">Paste cookies</a></span>
             <textarea x-model="settings.TWITTER_COOKIES" rows="2"
               placeholder="auth_token=...; ct0=...; twid=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
@@ -5899,7 +11620,8 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             {{ testbtn('Reddit') }}
           </label>
           <label class="block md:col-span-2">
-            <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}</span>
+            <span class="text-xs text-slate-400">REDDIT_COOKIES{{ tip('Optional. Full cookie string from a logged-in reddit.com browser session. The Reddit scraper runs a real browser (Playwright); paste your cookies here to reach NSFW / gated / quarantined subreddits. Leave blank for public content.', 'reddit_session=...; token_v2=...; over18=1') }}
+              <a class="link-btn ml-2" @click.prevent="openCookiesModal('reddit.com', 'REDDIT_COOKIES')">Paste cookies</a></span>
             <textarea x-model="settings.REDDIT_COOKIES" rows="2"
               placeholder="reddit_session=...; token_v2=..."
               class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 mt-1 font-mono text-xs"></textarea>
@@ -5948,17 +11670,60 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
     <!-- ERRORS (job-scoped) -->
     <section x-show="view === 'job' && active === 'errors'" class="card rounded-xl p-5">
-      <h3 class="font-semibold mb-3 text-rose-300">Recent errors</h3>
+      <div class="flex items-start justify-between mb-3 gap-3">
+        <div>
+          <h3 class="font-semibold text-rose-300">Recent errors</h3>
+          <p class="text-xs text-slate-400">Scraped from the tail of every log file. Click a line to copy the message.</p>
+        </div>
+        <button @click="refresh()" class="px-2.5 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded shrink-0">Refresh</button>
+      </div>
       <div class="space-y-2">
         <template x-for="e in status.errors ?? []" :key="e.timestamp + e.message">
-          <div class="bg-rose-950/40 border border-rose-800/50 rounded px-3 py-2 text-sm">
-            <div class="text-xs text-rose-300 font-mono" x-text="e.file + ' - ' + e.timestamp"></div>
+          <div class="bg-rose-950/40 border border-rose-800/50 rounded px-3 py-2 text-sm cursor-pointer hover:border-rose-600 transition"
+               @click="copyToClipboard(e.message)" title="Click to copy the full error message">
+            <div class="text-xs text-rose-300 font-mono" x-text="e.file + ' · ' + e.timestamp"></div>
             <div class="font-mono text-xs whitespace-pre-wrap" x-text="e.message"></div>
           </div>
         </template>
         <template x-if="(status.errors ?? []).length === 0">
-          <div class="text-sm text-slate-500">No errors logged recently.</div>
+          <div class="text-sm text-slate-500 py-4 text-center">
+            <div class="opacity-70">No errors logged recently.</div>
+            <div class="text-[11px] text-slate-500 mt-1">If a scraper is failing silently, check its Test button in the Scrapers tab.</div>
+          </div>
         </template>
+      </div>
+    </section>
+
+    <!-- LIVE LOG TAIL (T3 #19) ──────────────────────────────────────────
+         SSE-based tail from /api/logs/stream + a Follow toggle + Copy. -->
+    <section x-show="view === 'jobs' && active === 'liveLogs'" class="space-y-4">
+      <div class="card rounded-xl p-5">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <div>
+            <h3 class="font-semibold">Live logs</h3>
+            <p class="text-xs text-slate-400">Streams supervisor + worker output from <code>/api/logs/stream</code>. Use Follow to autoscroll.</p>
+          </div>
+          <div class="flex items-center gap-2 text-xs">
+            <label class="flex items-center gap-1 cursor-pointer">
+              <input type="checkbox" x-model="liveLogs.follow" class="accent-indigo-500"/>
+              <span>Follow</span>
+            </label>
+            <button @click="liveLogs.lines = []" class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Clear</button>
+            <button @click="copyLogsToClipboard()" class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded">Copy</button>
+            <template x-if="!liveLogs.connected">
+              <button @click="startLogStream()" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded">Start stream</button>
+            </template>
+            <template x-if="liveLogs.connected">
+              <button @click="stopLogStream()" class="px-2 py-1 bg-rose-700 hover:bg-rose-600 rounded">Stop</button>
+            </template>
+          </div>
+        </div>
+        <div x-show="liveLogs.recent.length" class="mb-2">
+          <div class="text-xs text-slate-400 mb-1">Recent history</div>
+          <pre class="log-stream max-h-40" x-text="liveLogs.recent.join('\n')"></pre>
+        </div>
+        <pre class="log-stream" x-ref="liveLogsPane" x-text="liveLogs.lines.join('\n')"></pre>
+        <div x-show="liveLogs.error" class="text-xs text-rose-300 mt-2" x-text="liveLogs.error"></div>
       </div>
     </section>
 
@@ -6040,6 +11805,13 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <div class="text-xs font-brand mt-2" x-text="status.pipeline?.vision_worker || '-'"></div>
           </div>
         </div>
+        <div class="mt-5 pt-5 border-t border-slate-800 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+          <span>Press <kbd class="kbd">?</kbd> anywhere for keyboard shortcuts.</span>
+          <button @click="showShortcuts = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Open shortcuts</button>
+          <button @click="welcome.dismissed = false; try { localStorage.removeItem('cull_welcome_dismissed'); } catch(_) {}; active='jobs'"
+                  class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded"
+                  title="Re-show the welcome hero on the Jobs landing.">Reset welcome</button>
+        </div>
       </div>
 
       <div class="card rounded-xl p-6">
@@ -6066,6 +11838,54 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
 
   </main>
 
+  <!-- KEYBOARD SHORTCUTS CHEAT-SHEET
+       Opened via `?` at any time (unless a modal / field owns the keyboard),
+       via the welcome hero, or via the About page. Uses the same backdrop-click
+       + Escape close contract as the confirm dialog. -->
+  <div x-show="showShortcuts" x-cloak x-transition.opacity
+       role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle"
+       @click.self="showShortcuts = false"
+       @keydown.escape.window="showShortcuts && (showShortcuts = false)"
+       class="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl max-w-xl w-full p-5 max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-3">
+        <h3 id="shortcutsTitle" class="font-semibold">Keyboard shortcuts</h3>
+        <button @click="showShortcuts = false" class="text-slate-400 hover:text-slate-100 text-lg leading-none" aria-label="Close">✕</button>
+      </div>
+      <div class="grid gap-4 text-sm">
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Anywhere</div>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">?</kbd></span><span>Open this cheat-sheet</span>
+            <span><kbd class="kbd">Esc</kbd></span><span>Close a modal / cancel a dialog</span>
+          </div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Gallery (keyboard culling)</div>
+          <p class="text-[11px] text-slate-500 mb-2">Focus a card by clicking it, then drive with the keyboard. Gated when you're typing in a field.</p>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">←</kbd> <kbd class="kbd">↑</kbd> <kbd class="kbd">↓</kbd> <kbd class="kbd">→</kbd></span><span>Move focus (also <kbd class="kbd">h j k l</kbd> — vim)</span>
+            <span><kbd class="kbd">k</kbd></span><span>Keep → primary keep bucket</span>
+            <span><kbd class="kbd">x</kbd></span><span>Reject → DISCARD</span>
+            <span><kbd class="kbd">1</kbd>–<kbd class="kbd">9</kbd></span><span>Move to Nth category in the taxonomy</span>
+            <span><kbd class="kbd">u</kbd></span><span>Undo the last move</span>
+            <span><kbd class="kbd">Esc</kbd></span><span>Clear focus (from a card)</span>
+          </div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 mb-2">Detail modal</div>
+          <div class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5">
+            <span><kbd class="kbd">Esc</kbd></span><span>Close (prompts on unsaved edits)</span>
+            <span><kbd class="kbd">Enter</kbd></span><span>Prepend trigger word to caption</span>
+          </div>
+        </div>
+      </div>
+      <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-500">
+        Tip: the sidebar's job-scoped tabs cover the same actions with the mouse.
+      </div>
+    </div>
+  </div>
+
   <!-- DETAIL MODAL -->
   <div x-show="modal.open" x-cloak role="dialog" aria-modal="true" aria-labelledby="modalName"
        @keydown.escape.window="closeModal()"
@@ -6082,11 +11902,22 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
       </div>
       <div class="grid lg:grid-cols-2 gap-4 overflow-hidden">
         <div class="bg-slate-950 rounded flex items-center justify-center min-h-[300px] overflow-auto relative">
-          <img :src="modal.imageUrl" :alt="modal.name"
-               class="max-w-full max-h-[75vh] object-contain"
-               :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          <template x-if="!modal.isVideo">
+            <img :src="modal.imageUrl" :alt="modal.name"
+                 class="max-w-full max-h-[75vh] object-contain"
+                 :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }"/>
+          </template>
+          <template x-if="modal.isVideo">
+            <video :src="modalVideoSrc()" controls preload="metadata" playsinline
+                   class="max-w-full max-h-[75vh]"
+                   :class="{ 'nsfw-blur': shouldBlurNsfw({ category: modal.category, path: modal.imageUrl }) }">
+              Your browser does not support HTML5 video.
+            </video>
+          </template>
+          <!-- NSFW reveal only for still-image modals: overlaying a click target
+               on top of the <video> would swallow the play-button click. -->
           <span class="nsfw-eye" style="background:rgba(15,23,42,0.55);"
-                x-show="shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
+                x-show="!modal.isVideo && shouldBlurNsfw({ category: modal.category, path: modal.imageUrl })"
                 @click="revealNsfw({ path: modal.imageUrl })" title="Reveal NSFW">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
@@ -6098,6 +11929,11 @@ HTML_TEMPLATE = r"""{% macro tip(body, example='') -%}
             <h4 class="text-xs uppercase tracking-wider text-slate-400">Full prompt</h4>
             <div class="flex items-center gap-2 text-xs">
               <span class="text-emerald-300" x-text="modal.savedFlash" x-show="modal.savedFlash"></span>
+              <template x-if="!modal.editing && modal.prompt && modal.prompt !== '(empty)' && modal.prompt !== '(no prompt saved for this image)'">
+                <button @click="copyToClipboard(modal.prompt)"
+                        class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded"
+                        title="Copy the prompt to clipboard">Copy</button>
+              </template>
               <template x-if="!modal.editing && modal.path">
                 <button @click="modal.editing = true" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded">Edit</button>
               </template>
@@ -6183,35 +12019,69 @@ function dashboard() {
     currentJob: null,         // slug of the job being viewed, when view==='job'
     active: 'jobs',           // active section id within the current view
     sidebarOpen: false,
-    // Job-scoped tabs (shown when view==='job'). Job Settings is the per-job
-    // config editor; the rest reuse today's sections filtered by currentJob.
+    // T2: Global "Show NSFW" — client-only. When false, EVERY image surface
+    // blurs NSFW items (via shouldBlurNsfw). Hydrated from localStorage on
+    // start(); watched below to persist changes. Default OFF.
+    showNsfw: false,
+    // T1: SSE connection state. `_sseSource` holds the EventSource; `_sseOpen`
+    // gates the legacy polls (skipped while streaming); `_sseSlug` remembers
+    // the job scope the current stream was opened with (so job switches
+    // reopen). `_sseLastEventId` is only informational — the server always
+    // sends fresh snapshots on reconnect.
+    _sseSource: null, _sseOpen: false, _sseSlug: null, _sseLastEventId: 0,
+    // Job-scoped tabs (shown when view==='job'). Ordered by frequency of use:
+    // Overview first (dashboard-of-dashboards), then curation surfaces
+    // (Gallery / Queue / Activity / Stats), then config, then troubleshooting.
+    // Job Settings is the per-job config editor; the rest reuse today's
+    // sections filtered by currentJob. IDs are load-bearing (matched by
+    // this.active + server routes) — labels + hints are the free bits.
     jobTabs: [
-      {id:'logs',         label:'Historical'},
-      {id:'queue',        label:'Queue'},
-      {id:'gallery',      label:'Gallery'},
-      {id:'duplicates',   label:'Duplicates'},
-      {id:'export',       label:'Export'},
-      {id:'stats',        label:'Stats'},
-      {id:'overview',     label:'Overview'},
-      {id:'scrapers',     label:'Scrapers'},
-      {id:'vision',       label:'Vision'},
-      {id:'jobSettings',  label:'Job Settings'},
-      {id:'errors',       label:'Errors'},
+      {id:'overview',     label:'Overview',    hint:'Live totals + recent classifications'},
+      {id:'gallery',      label:'Gallery',     hint:'Browse the kept library and re-cull with the keyboard'},
+      {id:'queue',        label:'Queue',       hint:'Images waiting for the vision worker'},
+      {id:'logs',         label:'Activity',    hint:'Every classification, newest first'},
+      {id:'stats',        label:'Stats',       hint:'Leaderboards + per-source analytics'},
+      {id:'duplicates',   label:'Duplicates',  hint:'Perceptual-hash near-duplicate scan'},
+      {id:'export',       label:'Export',      hint:'Pack kept images into a training-ready folder'},
+      {id:'scrapers',     label:'Scrapers',    hint:'Enable / disable sources for THIS job'},
+      {id:'vision',       label:'Vision',      hint:'This job\'s captioning + scoring; test a worker end-to-end'},
+      {id:'jobSettings',  label:'Job Settings',hint:'Topic, categories, media types, and every override'},
+      {id:'errors',       label:'Errors',      hint:'Recent worker / scraper errors from the log tail'},
     ],
-    // Global sections (shown when view==='jobs').
+    // Global sections (shown when view==='jobs'). Jobs is the home / landing
+    // and stays first; About + FAQ are informational tail. Presets and
+    // Schedules cluster with Jobs; Global Stats/Settings cluster with config.
     globalTabs: [
-      {id:'jobs',      label:'Jobs'},
-      {id:'presets',   label:'Presets'},
-      {id:'schedules', label:'Schedules'},
-      {id:'gstats',    label:'Global Stats'},
-      {id:'settings',  label:'Global Settings'},
-      {id:'faq',       label:'FAQ'},
-      {id:'about',     label:'About'},
+      {id:'jobs',      label:'Jobs',            hint:'Curation targets — activate one to run it'},
+      {id:'presets',   label:'Presets',         hint:'Reusable config bundles jobs inherit from'},
+      {id:'schedules', label:'Schedules',       hint:'Run jobs on a cadence (hourly, daily, custom)'},
+      {id:'gstats',    label:'Global Stats',    hint:'Aggregate analytics across every job'},
+      {id:'globalGallery', label:'Global Gallery', hint:'Every job\'s sorted images in one grid'},
+      {id:'settings',  label:'Global Settings', hint:'Credentials, model endpoints, storage roots'},
+      {id:'liveLogs',  label:'Logs',            hint:'Live-tail pipeline logs'},
+      {id:'faq',       label:'FAQ',             hint:'Common questions about how cull works'},
+      {id:'about',     label:'About',           hint:'Version, brand, keyboard shortcuts'},
     ],
-    // Jobs landing state.
-    jobsList: [], jobsQueue: [], jobsActive: null, jobsLoading: false,
-    newJob: { name: '', base_on: '', preset: '' },
+    // Jobs landing state. `jobsLoading` starts true so the skeleton grid shows
+    // first-paint — otherwise the empty-list branch would flash the welcome
+    // hero before the API call resolves.
+    // Multi-active state: `jobsActive` is the HEAD of the active set (kept
+    // for existing readers), `jobsActiveSlugs` is the full list, and
+    // `jobsPriority` is the per-slug weight (1-10, default `priorityWeightDefault`).
+    jobsList: [], jobsQueue: [], jobsActive: null, jobsActiveSlugs: [],
+    jobsPriority: {}, jobsLoading: true,
+    newJob: { name: '', base_on: '', preset: '', presetFilter: '' },
     presetsList: [], presetsDefault: '', presetsBuiltins: [],
+    presetsMeta: { descriptions: {}, tags: {} },
+    // Preset name that was JUST installed / cloned — pulses the matching card
+    // via .preset-highlight for ~2.5s so the user spots it in the list.
+    recentlyInstalledPreset: null,
+    // Welcome hero visibility: sticky-dismissed via localStorage. Independent
+    // of the update / indexer toasts so dismissing one doesn't affect others.
+    welcome: { dismissed: false },
+    // Keyboard-shortcut cheat-sheet modal. Opened by `?` (and the Welcome + About
+    // buttons). Closed on Esc or backdrop click.
+    showShortcuts: false,
     // Per-job config editor (Job Settings tab) — v2 inherit/override model.
     // eff = effective (resolved) cfg; overrides = the sparse override map.
     je: {
@@ -6222,9 +12092,18 @@ function dashboard() {
     _jeTimer: null,
     _jeSaving: null,
     // Global presets manager state.
+    //
+    // presetView flips between 'grid' (default: comparison + community strip
+    // + main grid) and 'detail' (dedicated full-width editor for one preset).
+    // The grid + community cards are ``x-show``-gated on this flag so the
+    // detail view fills the tab without competing UI beneath it. History
+    // integration (see openPreset / popstate wiring) means the browser Back
+    // button leaves the detail view instead of the whole tab.
+    presetView: 'grid',
     presetEditor: { open: false, name: null, cfg: null, isDefault: false,
                     referencedBy: [], savedFlash: '', error: '', saving: false },
     _peTimer: null,
+    _presetPopstateBound: false,
     newPreset: { name: '', base_on: '' },
     // Dynamic vision-worker fleet (per-job + preset editor).
     visionProviders: ['lmstudio', 'llamacpp', 'ollama'],
@@ -6236,17 +12115,54 @@ function dashboard() {
     globalFleetTest: {},
     _gvTimer: null,
     // Global Stats per-job filter (null = all jobs aggregate).
-    globalStatsJob: '',
+    globalStatsJob: '__all__',
+    // Hover-linked donut ↔ legend: slug of the currently hovered slice
+    // (null = no hover). Drives the "explode" radius bump and legend row tint.
+    statsHoverSlug: null,
+    // T3 Global Gallery — aggregate view across every job. Reuses shouldBlurNsfw,
+    // openModalFromCard, revealNsfw etc. Filters are OWN state (no leak into
+    // the per-job gallery form). "jobs" is a slug allowlist; empty = all.
+    globalGallery: { page: 1, pageSize: 60, total: 0, total_unfiltered: 0, items: [], available: {} },
+    globalGalleryLoading: false,
+    globalGalleryFilters: {
+      q: '', sources: [], categories: [], jobs: [], sort: 'newest',
+    },
     // Canonical scraper names, injected server-side from job_config.SCRAPER_NAMES
     // so this can never drift from the Python source of truth. Used by the
     // preset editor's enabled-toggles.
     scraperNames: {{ scraper_names_json|safe }},
+    // Full ordered list the priority block covers (SCRAPER_NAMES + YT-DLP);
+    // injected from job_config.PRIORITY_NAMES so this can never drift.
+    priorityNames: {{ priority_names_json|safe }},
+    // Per-scraper descriptions (server-side dict), used by the unified card
+    // list. Falls back to '' when a name isn't in the dict — keeps the header
+    // readable even for an unknown row.
+    scraperDescriptions: {{ scraper_descriptions_json|safe }},
+    // Priority weight bounds mirror job_config.PRIORITY_WEIGHT_* so the UI
+    // clamps to the exact same range the validator enforces.
+    priorityWeightMin: {{ priority_weight_min }},
+    priorityWeightMax: {{ priority_weight_max }},
+    priorityWeightDefault: {{ priority_weight_default }},
+    // Scrapers-tab local state: which cards are expanded + drag/keyboard grab.
+    scraperOpen: {},              // {name: bool} — collapse state
+    scraperGrabbed: null,          // name currently in keyboard grab-mode
+    draggingScraper: null,         // name currently being dragged
+    dragOverScraper: null,         // name currently being dragged OVER (visual)
     providers: ['balanced-groq','balanced-lm','balanced-lm-secondary','lm-autodetect'],
     provider: 'balanced-groq',
     throttle: 100,
     status: {}, scrapers: [], models: {}, visionWorkers: [],
     settings: {}, settingsBanner: '', settingsBannerOk: true,
-    settingsDirty: false, settingsErrors: {}, configImporting: false,
+    settingsErrors: {}, configImporting: false,
+    // T5: dirty detection via JSON snapshot. `settingsDirty` is a getter that
+    // compares the live settings object against `_settingsSnapshot` (captured
+    // on every successful fetch/save). Save is disabled when nothing changed.
+    settingsSaving: false, _settingsSnapshot: '',
+    get settingsDirty() { return JSON.stringify(this.settings) !== this._settingsSnapshot; },
+    // Cached video-backend probe (used by the Settings VIDEO_CLASSIFY_ENABLED
+    // banner). `checked=false` on boot so the banner never flashes before the
+    // first probe returns.
+    videoBackend: { checked: false, has_any: true, backends: [] },
     providerTest: {},
     lmstudioUnload: { busy: false, ok: null, message: '' },
     update: { available: false, behind: 0, local_sha: '', remote_sha: '', remote_subject: '', dismissed_sha: '', running: false, error: '', dirty: false, checking: false, checked: false },
@@ -6257,7 +12173,8 @@ function dashboard() {
     _toastSeq: 0,
     confirmDialog: { open: false, title: 'Please confirm', message: '',
                      confirmLabel: 'Confirm', cancelLabel: 'Cancel', danger: false,
-                     input: false, inputValue: '', inputPlaceholder: '', _resolve: null },
+                     input: false, inputValue: '', inputPlaceholder: '',
+                     _resolve: null, _returnFocus: null },
     scraperTest: {},   // per-scraper Test-connection results, keyed by scraper name
     // Wave-2 surfaces (all on-demand — never on the status poll).
     dup: { loading: false, threshold: 10, groups: [], scanned: false, error: '' },
@@ -6301,6 +12218,7 @@ function dashboard() {
     askConfirm(message, opts = {}) {
       // Cancel-resolve any dialog already open so its awaiter can't hang.
       if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      const returnFocus = document.activeElement;
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -6308,7 +12226,7 @@ function dashboard() {
           confirmLabel: opts.confirmLabel || 'Confirm',
           cancelLabel: opts.cancelLabel || 'Cancel',
           danger: !!opts.danger, input: false, inputValue: '', inputPlaceholder: '',
-          _resolve: resolve,
+          _resolve: resolve, _returnFocus: returnFocus,
         };
         this.$nextTick(() => { try { this.$refs.confirmBtn?.focus(); } catch (e) {} });
       });
@@ -6316,6 +12234,7 @@ function dashboard() {
     // Styled replacement for window.prompt(): resolves to the string, or null on cancel.
     askPrompt(message, defaultValue = '', opts = {}) {
       if (this.confirmDialog.open && this.confirmDialog._resolve) this.confirmDialog._resolve(false);
+      const returnFocus = document.activeElement;
       return new Promise(resolve => {
         this.confirmDialog = {
           open: true, message: String(message),
@@ -6323,7 +12242,7 @@ function dashboard() {
           confirmLabel: opts.confirmLabel || 'OK',
           cancelLabel: opts.cancelLabel || 'Cancel',
           danger: !!opts.danger, input: true, inputValue: String(defaultValue || ''),
-          inputPlaceholder: opts.placeholder || '', _resolve: resolve,
+          inputPlaceholder: opts.placeholder || '', _resolve: resolve, _returnFocus: returnFocus,
         };
         this.$nextTick(() => { try { this.$refs.dialogInput?.focus(); this.$refs.dialogInput?.select(); } catch (e) {} });
       });
@@ -6331,8 +12250,14 @@ function dashboard() {
     _closeConfirm(result) {
       const d = this.confirmDialog;
       const resolve = d._resolve;
+      const returnFocus = d._returnFocus;
       const value = d.input ? (result ? d.inputValue : null) : result;
-      this.confirmDialog = { ...d, open: false, _resolve: null };
+      this.confirmDialog = { ...d, open: false, _resolve: null, _returnFocus: null };
+      // Restore focus so the keyboard doesn't land on <body> — matches the
+      // same a11y contract the detail modal uses on close.
+      if (returnFocus && returnFocus.focus) {
+        try { returnFocus.focus(); } catch (_) {}
+      }
       if (resolve) resolve(value);
     },
     // Live connectivity/auth test for one scraper. Sends the current Settings
@@ -6433,9 +12358,23 @@ function dashboard() {
     galleryFilters: {
       q: '', sources: [], categories: [], resolutions: [],
       minOvr: 0, minRel: 0, minQuality: 0,
+      // T2: 'nsfw' filter retained for API back-compat but no longer surfaced
+      // in the UI — global NSFW toggle governs visibility now.
       nsfw: 'any', sort: 'newest', dateFrom: '', dateTo: '',
     },
     galleryInsights: { ngrams:[], top_quality_keywords:[], ovr_quality_threshold:0, considered:0 },
+    // ── Filter modal / popover shared state ──────────────────────────────
+    // Only one panel open at a time; assigning a different tab id from a
+    // second trigger auto-closes the first. `null` means closed. Values:
+    // 'gallery' | 'globalGallery' | 'queue' | 'activity'.
+    filterPanel: null,
+    // Queue-tab filters (client-side over `queueFiles`). Search + source
+    // chips + corrupt-only toggle; the API is unfiltered by design.
+    queueFilters: { q: '', sources: [], corruptOnly: false },
+    // Activity-tab filters (client-side over `history`). Search + source +
+    // category chips + kept/discarded status; API returns the newest 200
+    // rows unfiltered.
+    activityFilters: { q: '', sources: [], categories: [], status: 'any' },
     modalReturnFocus: null,
 
     // ── Keyboard-driven culling (§3a) ────────────────────────────────────
@@ -6473,12 +12412,23 @@ function dashboard() {
       // status pill, and skip the job-scoped polls entirely.
       const j = (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status));
       if (this.view === 'jobs') {
-        const [status, jobs] = await Promise.allSettled([j('/api/status'), j('/api/jobs')]);
-        if (status.status === 'fulfilled') this.applyStatus(status.value);
+        // T1: status flows through SSE while the stream is open; only poll
+        // it in a fallback (no-EventSource) session so the pipeline pill
+        // still updates without the stream.
+        const statusPromise = this._sseOpen ? Promise.resolve(null) : j('/api/status');
+        const [status, jobs] = await Promise.allSettled([statusPromise, j('/api/jobs')]);
+        if (status.status === 'fulfilled' && status.value) this.applyStatus(status.value);
         if (jobs.status === 'fulfilled') this.applyJobs(jobs.value);
         if (this.active === 'settings' || this.active === 'gstats') {
           const s = await j('/api/settings').catch(() => null);
-          if (s && !this.settingsDirty && Object.keys(this.settings).length === 0) this.settings = s;
+          // Only seed settings on first load; guard on the object being empty
+          // rather than the (now getter-based) settingsDirty flag so a stale
+          // snapshot can't lock the form empty. Snapshot afterwards so the
+          // getter reports "clean" until the user actually edits a field.
+          if (s && Object.keys(this.settings).length === 0) {
+            this.settings = s;
+            this._settingsSnapshot = JSON.stringify(this.settings);
+          }
         }
         this.lastRefresh = new Date().toLocaleTimeString();
         return;
@@ -6488,14 +12438,19 @@ function dashboard() {
       const sep = q ? '&' : '?';
       const tab = this.active;
       const need = (id) => tab === id || tab === 'overview';
+      // T1: status/queue/activity now flow through /api/stream/events (SSE)
+      // when the browser supports it. Skip them from the 5 s poll iff the
+      // stream is open; otherwise keep the legacy pulls so no-EventSource
+      // browsers still see fresh data.
+      const streamOn = !!this._sseOpen;
       const tasks = {
-        status:    j('/api/status' + q),
+        status:    streamOn ? null : j('/api/status' + q),
         scrapers:  j('/api/scrapers' + q),
         workers:   j('/api/vision/workers'),
         models:    (need('vision') ? j('/api/lmstudio/models') : null),
-        queue:     (need('queue')  ? j('/api/queue/files' + q + sep + 'limit=60') : null),
+        queue:     (need('queue')  ? (streamOn ? null : j('/api/queue/files' + q + sep + 'limit=60')) : null),
         history:   (need('logs')   ? j('/api/logs/history' + q + sep + 'limit=200') : null),
-        activity:  (need('overview') || tab === 'vision' ? j('/api/activity' + q + sep + 'limit=12') : null),
+        activity:  (need('overview') || tab === 'vision' ? (streamOn ? null : j('/api/activity' + q + sep + 'limit=12')) : null),
         // Vision tab also needs GLOBAL settings for the LMStudio knobs.
         settings:  (tab === 'vision' ? j('/api/settings') : null),
       };
@@ -6511,9 +12466,14 @@ function dashboard() {
       if (out.history)   this.history = out.history;
       if (out.activity)  this.activity = out.activity;
       // Only seed settings on first load OR when the user explicitly hits Reload.
-      if (out.settings && !this.settingsDirty && Object.keys(this.settings).length === 0) {
+      // Snapshot for dirty-detection (T5): the form is clean until the user edits.
+      if (out.settings && Object.keys(this.settings).length === 0) {
         this.settings = out.settings;
+        this._settingsSnapshot = JSON.stringify(this.settings);
       }
+      // Probe video-backend availability once (cheap, cached client-side) so
+      // the Settings banner has an answer to render when the user opens it.
+      if (!this.videoBackend.checked) this.loadVideoBackendStatus();
       this.lastRefresh = new Date().toLocaleTimeString();
     },
 
@@ -6540,6 +12500,12 @@ function dashboard() {
       this.jobsList = payload.jobs || [];
       this.jobsQueue = payload.queue || [];
       this.jobsActive = payload.active || null;
+      // Multi-active reader: prefer the new list field; fall back to the
+      // legacy single-slug when the server hasn't been upgraded yet so a
+      // mixed-version deploy keeps rendering.
+      this.jobsActiveSlugs = payload.active_slugs
+        || (payload.active ? [payload.active] : []);
+      this.jobsPriority = payload.priority || {};
     },
     async loadJobs() {
       this.jobsLoading = true;
@@ -6559,17 +12525,60 @@ function dashboard() {
         body: JSON.stringify(body)});
       const j = await r.json();
       if (!r.ok) { this.notify('Create failed: ' + (j.error || r.status), 'error'); return; }
-      this.newJob = { name: '', base_on: '', preset: '' };
+      this.newJob = { name: '', base_on: '', preset: '', presetFilter: '' };
       await this.loadJobs();
-      // The create response is the v2 job detail ({job:{slug,...}}).
-      this.openJob(j.job.job.slug);
+      // /api/jobs POST returns {success, job: _job_detail(job)} whose inner
+      // shape is {job:{slug,...}, effective, overrides, presets}. Walk both
+      // possible shapes so a flatter future response still works.
+      const slug = j.slug || j.job?.slug || j.job?.job?.slug;
+      if (slug) this.openJob(slug);
     },
     async activateJob(slug) {
+      // Additive by default (multi-active). Passing exclusive=true would
+      // reset the active set to just this slug — not what the Run slider
+      // wants (that's what toggleJobRun's off-then-on flow gives you).
       const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', {method:'POST'});
       if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Activate failed: ' + (j.error || r.status), 'error'); return; }
       await this.loadJobs();
       await this.refresh();
-      this.notify('Activated "' + slug + '".', 'success');
+      this.notify('Running "' + slug + '".', 'success');
+    },
+    async deactivateJob(slug) {
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/deactivate', {method:'POST'});
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.notify('Deactivate failed: ' + (j.error || r.status), 'error'); return; }
+      await this.loadJobs();
+      await this.refresh();
+    },
+    // Run slider on the Jobs card. Toggling ON is additive activate; OFF is
+    // deactivate — mirrors the scraper enable-toggle language so the whole
+    // dashboard feels consistent.
+    async toggleJobRun(slug, wantRunning) {
+      if (wantRunning) { await this.activateJob(slug); }
+      else { await this.deactivateJob(slug); }
+    },
+    // Priority weight (1-10). PUT is fire-and-forget optimistic — we mutate
+    // the local map first so the UI feels instant, then reconcile on reload.
+    async setJobPriority(slug, weight) {
+      const w = Math.max(this.priorityWeightMin,
+                         Math.min(this.priorityWeightMax, parseInt(weight, 10) || this.priorityWeightDefault));
+      this.jobsPriority = { ...this.jobsPriority, [slug]: w };
+      const jb = this.jobsList.find(j => j.slug === slug);
+      if (jb) jb.priority = w;
+      const r = await fetch('/api/jobs/' + encodeURIComponent(slug) + '/priority', {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({weight: w}),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.notify('Priority update failed: ' + (j.error || r.status), 'error');
+      }
+      await this.loadJobs();
+    },
+    stepJobPriority(slug, delta) {
+      const cur = (this.jobsPriority[slug]
+                   || (this.jobsList.find(j => j.slug === slug) || {}).priority
+                   || this.priorityWeightDefault);
+      this.setJobPriority(slug, cur + delta);
     },
     async cloneJob(slug) {
       const name = await this.askPrompt('Name for the clone of "' + slug + '":', slug + ' copy',
@@ -6625,7 +12634,10 @@ function dashboard() {
       }
       this.view = 'job';
       this.currentJob = slug;
-      this.active = 'logs';            // default tab: Historical
+      // Land users on Overview. On a fresh job it shows the first-run welcome
+      // card with clear next-actions; on a warm job it shows queue/sorted/error
+      // totals + a live activity strip — better first-look than a blank log.
+      this.active = 'overview';
       this.sidebarOpen = false;
       // Reset per-job tab data so we don't show the previous job's rows.
       this.fleetTest = {};             // drop stale vision-worker test results
@@ -6637,6 +12649,9 @@ function dashboard() {
                   savedFlash: '', saving: false, error: '', applyPending: false };
       this.refresh();
       this.loadJobEditor();
+      // T1: reopen the SSE stream scoped to the new job so per-job snapshots
+      // (activity/queue) filter server-side instead of on the client.
+      this.openStream();
     },
     // Flush pending edits + apply once if the (active) job has unapplied changes.
     // Cancels the debounce timer first so it can't fire after we've moved on.
@@ -6656,6 +12671,9 @@ function dashboard() {
       this.sidebarOpen = false;
       this.loadJobs();
       this.refresh();
+      // T1: re-scope the SSE to the active-job (global) stream now that we're
+      // back on the jobs landing.
+      this.openStream();
     },
 
     // ── Job Settings (v2 inherit/override + auto-save) ───────────────────
@@ -6790,11 +12808,51 @@ function dashboard() {
       })();
       try { await this._jeSaving; } finally { this._jeSaving = null; this.je.saving = false; }
     },
-    // Apply pending edits to the ACTIVE job: flush then re-project + restart once.
-    async applyActiveJob() {
+    // Apply-changes confirm modal. Shown only when the pipeline is running
+    // and applying will force a restart. Non-running jobs skip the modal
+    // entirely — apply is safe and non-disruptive.
+    applyConfirm: { open: false, slug: null, submitting: false },
+    // Entry point wired to the "Apply changes" button. Checks pipeline
+    // state and either applies immediately (not running) or opens the
+    // restart-confirm modal (running).
+    async requestApplyActiveJob() {
+      if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      const running = !!(this.status?.pipeline?.running);
+      if (!running) {
+        // Safe path: no workers to restart, just flush + re-project.
+        await this.applyActiveJob({ restart: false });
+        return;
+      }
+      this.applyConfirm = { open: true, slug: this.currentJob, submitting: false };
+    },
+    async confirmApplyRestart() {
+      if (this.applyConfirm.submitting) return;
+      this.applyConfirm.submitting = true;
+      try {
+        await this.applyActiveJob({ restart: true });
+        this.applyConfirm.open = false;
+      } finally { this.applyConfirm.submitting = false; }
+    },
+    // Apply pending edits to the ACTIVE job: flush + re-project. Restart is
+    // opt-in — callers pass { restart: true } only when the pipeline is
+    // currently running AND the user has confirmed the restart.
+    async applyActiveJob(opts) {
+      const restart = !!(opts && opts.restart);
       await this.flushJobSave();
       if (this.currentJob !== this.jobsActive) { this.je.applyPending = false; return; }
+      // /activate re-projects env + categories. When the pipeline is running
+      // the supervisor picks up the new env on the next hot-reload cycle;
+      // for an explicit restart we hit /stop then /start via refresh.
       await fetch('/api/jobs/' + encodeURIComponent(this.currentJob) + '/activate', { method: 'POST' });
+      if (restart) {
+        try {
+          await fetch('/api/pipeline/stop', { method: 'POST' });
+          await fetch('/api/pipeline/start', { method: 'POST' });
+          this.notify('Applied and restarted', 'success');
+        } catch (e) { this.notify('Restart failed: ' + e, 'error'); }
+      } else {
+        this.notify('Changes applied', 'success');
+      }
       this.je.applyPending = false;
       this.loadJobs();
       this.refresh();
@@ -6807,12 +12865,64 @@ function dashboard() {
         this.presetsList = p.presets || [];
         this.presetsDefault = p.default || '';
         this.presetsBuiltins = p.builtins || [];
+        this.presetsMeta = { descriptions: p.descriptions || {}, tags: p.tags || {} };
         // Default the "Start from" picker to the library default (no more
         // redundant empty "Clone the default" option). Keep a valid selection.
         if (!this.presetsList.includes(this.newPreset.base_on)) {
           this.newPreset.base_on = this.presetsDefault || (this.presetsList[0] || '');
         }
       } catch (e) { /* swallow */ }
+    },
+    // One-line description for a preset name, or '' if unknown.
+    presetDescription(name) {
+      if (!name) return '';
+      return (this.presetsMeta.descriptions || {})[name] || '';
+    },
+    // Filter the preset dropdown by the composer's search box (case-insensitive
+    // substring across name + tags + description).
+    filteredPresets() {
+      const q = (this.newJob.presetFilter || '').trim().toLowerCase();
+      if (!q) return this.presetsList;
+      const meta = this.presetsMeta || { descriptions: {}, tags: {} };
+      return this.presetsList.filter(p => {
+        if (p.toLowerCase().includes(q)) return true;
+        const desc = (meta.descriptions[p] || '').toLowerCase();
+        if (desc.includes(q)) return true;
+        const tags = (meta.tags[p] || []).join(' ').toLowerCase();
+        return tags.includes(q);
+      });
+    },
+    // Move focus into the New Job composer + scroll it into view. Called by
+    // the welcome hero's primary CTA.
+    focusNewJob() {
+      const el = this.$refs.newJobName;
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      this.$nextTick(() => { try { el?.focus(); } catch (_) {} });
+    },
+    // Hide the welcome hero and remember the choice. Toggling in DevTools
+    // clears the flag; the hero also reappears whenever jobsList is empty
+    // AND localStorage is missing, so a fresh install always onboards.
+    dismissWelcome() {
+      this.welcome.dismissed = true;
+      try { localStorage.setItem('cull_welcome_dismissed', '1'); } catch (_) {}
+    },
+    // Copy small strings (mostly terminal snippets) with a success toast.
+    // Falls back to a hidden textarea for non-secure contexts / older Safari.
+    async copyToClipboard(text) {
+      const t = String(text ?? '');
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(t);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          document.execCommand('copy'); document.body.removeChild(ta);
+        }
+        this.notify('Copied to clipboard', 'success', 1500);
+      } catch (e) {
+        this.notify('Copy failed — select and copy manually', 'warn', 2500);
+      }
     },
     async createPreset() {
       const name = (this.newPreset.name || '').trim();
@@ -6881,9 +12991,66 @@ function dashboard() {
         this.peFleetTest = {};
         this.presetEditor = { open: true, name, cfg, isDefault: d.is_default,
                               referencedBy: d.referenced_by || [], savedFlash: '', error: '', saving: false };
+        this._resetPresetThumbState(name);
+        // Flip to the dedicated detail view + push a history entry so the
+        // browser Back button (and the mobile swipe-back gesture) closes the
+        // editor instead of leaving the tab entirely.
+        this.presetView = 'detail';
+        try {
+          history.pushState({ presetDetail: name }, '', location.href);
+        } catch (_) {}
+        this._bindPresetPopstate();
+        // Scroll to top so the sticky editor header lands under the site nav
+        // instead of behind an already-scrolled page.
+        await this.$nextTick();
+        try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (_) {}
       } catch (e) { this.notify('Failed to load preset: ' + e.message, 'error'); }
     },
-    closePreset() { this.flushPresetSave(); this.presetEditor.open = false; },
+    // Bind ONCE per Alpine root — popstate fires on every back/forward, and
+    // we only care while a preset detail view is mounted.
+    _bindPresetPopstate() {
+      if (this._presetPopstateBound) return;
+      this._presetPopstateBound = true;
+      window.addEventListener('popstate', () => {
+        if (this.presetView === 'detail') {
+          // Same close path as the on-screen Back button, but without
+          // pushing another history entry (the browser already popped).
+          this.flushPresetSave();
+          this.presetView = 'grid';
+          this.presetEditor.open = false;
+        }
+      });
+    },
+    // Called by the on-screen Back / Close controls. Flushes the debounce
+    // timer, closes the editor, and rewinds one history entry so the URL
+    // matches the visible state.
+    closePresetDetail() {
+      this.flushPresetSave();
+      this.presetView = 'grid';
+      this.presetEditor.open = false;
+      try {
+        if (history.state && history.state.presetDetail) history.back();
+      } catch (_) {}
+    },
+    // Pulse a preset card + scroll it into view. Used after install / clone
+    // so the newly landed row is easy to spot in a long grid.
+    _highlightPresetCard(name, delayMs = 200) {
+      this.recentlyInstalledPreset = name;
+      setTimeout(() => {
+        const el = document.getElementById('preset-card-' + name);
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        // Clear the flag once the animation has run so the pulse doesn't
+        // re-trigger on the next re-render (e.g. from a poll refresh).
+        setTimeout(() => { this.recentlyInstalledPreset = null; }, 2800);
+      }, delayMs);
+    },
+    closePreset() {
+      // Legacy method — keep as a thin alias so anything still calling it
+      // (e.g. delete/reset flows) leaves the detail view cleanly.
+      this.closePresetDetail();
+    },
     // Preset list editors mirror the job editor list helpers but write straight
     // into presetEditor.cfg (a preset has no inheritance — values are absolute).
     peList(path) { const v = this._deepGet(this.presetEditor.cfg, path); return Array.isArray(v) ? v.join(', ') : (v || ''); },
@@ -6991,9 +13158,11 @@ function dashboard() {
       this.presetEditor.saving = false;
     },
     async saveSettings() {
+      if (!this.settingsDirty || this.settingsSaving) return;
       this.settingsBanner = 'Saving...';
       this.settingsBannerOk = true;
       this.settingsErrors = {};
+      this.settingsSaving = true;
       try {
         const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify(this.settings)});
@@ -7001,7 +13170,10 @@ function dashboard() {
         if (j.success) {
           this.settingsBanner = 'Saved. Stop + Start the pipeline to pick up changes.';
           this.settingsBannerOk = true;
-          this.settingsDirty = false;
+          // Refresh the snapshot BEFORE clearing settings so the getter reads
+          // "clean" while we wait for the server round-trip; then let refresh()
+          // re-fetch + re-snapshot with the server's canonical values.
+          this._settingsSnapshot = JSON.stringify(this.settings);
           this.settings = {};  // Force reload from server on next refresh
           setTimeout(() => this.settingsBanner = '', 6000);
         } else {
@@ -7016,10 +13188,12 @@ function dashboard() {
       } catch (e) {
         this.settingsBanner = 'Network error - see console.';
         this.settingsBannerOk = false;
+      } finally {
+        this.settingsSaving = false;
       }
       this.refresh();
     },
-    markSettingsDirty() { this.settingsDirty = true; },
+    markSettingsDirty() { /* legacy no-op: dirty is now derived from _settingsSnapshot (T5). */ },
     // Map a vision worker name to the provider its /api/vision/test probe uses.
     workerProvider(name) {
       const n = (name || '').toLowerCase();
@@ -7068,6 +13242,33 @@ function dashboard() {
       if (isCloud) {
         const typedKey = (this.settings[this.cloudApiKey(name)] || '').trim();
         if (typedKey) body.api_key = typedKey;
+      }
+      // Legacy runtime tests (lmstudio/llamacpp/openai-compat) used to read
+      // LMSTUDIO_PRIMARY_URL from .env, which is empty in fleet-based
+      // deployments. Feed the endpoint URL from the actual fleet instead so
+      // the button works against the same worker that will run classification.
+      if (!isCloud && (name === 'lmstudio' || name === 'llamacpp' || name === 'openai-compat' || name === 'openai_compat')) {
+        // Prefer legacy .env URL if the user still has one; otherwise use the
+        // first enabled fleet entry matching the provider.
+        const legacyKey = name === 'lmstudio' ? 'LMSTUDIO_PRIMARY_URL' : 'OPENAI_COMPAT_URL';
+        const legacyUrl = (this.settings && this.settings[legacyKey] || '').trim();
+        if (legacyUrl) {
+          body.url = legacyUrl;
+        } else {
+          const fleet = (typeof this.gFleet === 'function' ? this.gFleet() : []) || [];
+          const target = (name === 'lmstudio')
+            ? fleet.find(w => w && w.enabled !== false && w.provider === 'lmstudio')
+            : fleet.find(w => w && w.enabled !== false && (w.provider === 'llamacpp' || w.provider === 'lmstudio'));
+          if (target) {
+            if (target.base_url) body.url = String(target.base_url).trim();
+            if (target.api_key) body.api_key = String(target.api_key).trim();
+          } else if (name === 'lmstudio') {
+            this.providerTest[name] = { testing: false, ok: false,
+              message: '✗ No LM Studio worker configured in the fleet — add one above first.',
+              models: [] };
+            return;
+          }
+        }
       }
       try {
         const r = await fetch('/api/vision/test', {
@@ -7204,8 +13405,13 @@ function dashboard() {
         const r = await fetch('/api/update/run', { method: 'POST' });
         const j = await r.json();
         if (!j.ok) {
-          this.update.error = j.error || 'Update failed.';
+          // T6: surface the reason as a toast instead of a persistent UI block.
+          // "uncommitted changes present" is the common one — the git checkout
+          // is dirty, so the update is refused until the user commits/stashes.
+          const msg = j.error || 'Update failed.';
+          this.update.error = msg;
           this.update.running = false;
+          this.notify('Update failed: ' + msg, 'error');
         }
         // On success the dashboard process will exit imminently; the update
         // script restarts it. The user just needs to refresh.
@@ -7213,12 +13419,29 @@ function dashboard() {
         // Connection drop is expected once the dashboard restarts.
       }
     },
+    async loadVideoBackendStatus() {
+      // Cheap probe (importlib + shutil.which). Fire once, then again on Settings
+      // reload — the answer only changes when the operator installs a backend.
+      try {
+        const r = await fetch('/api/video/backend-status');
+        if (!r.ok) return;
+        const j = await r.json();
+        this.videoBackend = {
+          checked: true,
+          has_any: !!j.has_any,
+          backends: Array.isArray(j.backends) ? j.backends : [],
+        };
+      } catch (e) { /* leave stale; banner just won't update this cycle */ }
+    },
     async reloadSettings() {
       if (this.settingsDirty && !(await this.askConfirm('Discard your unsaved settings changes?',
                                   { title: 'Discard changes', confirmLabel: 'Discard', danger: true }))) return;
       this.settings = {};
-      this.settingsDirty = false;
+      this._settingsSnapshot = '';  // T5: force refresh() to re-seed + snapshot.
       this.settingsErrors = {};
+      // Re-probe so a freshly-installed ffmpeg is picked up without a full refresh.
+      this.videoBackend = { checked: false, has_any: true, backends: [] };
+      this.loadVideoBackendStatus();
       this.refresh();
     },
     async toggleVisionWorker(name, enabled) {
@@ -7262,6 +13485,18 @@ function dashboard() {
       // Cancel any pending job-editor auto-save so its (pre-toggle) overrides
       // can't clobber the toggle we're about to write server-side.
       if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
+      // YT-DLP lives outside the canonical scrapers.enabled map (its state is
+      // scrapers.yt_dlp.enabled — a separate boolean field). Toggling it via
+      // /api/scrapers/toggle would hit the "unknown scraper" reject branch
+      // and surface a misleading "local folders" error. Route it through the
+      // standard setOverride path instead.
+      if (name === 'YT-DLP') {
+        this.setOverride('scrapers.yt_dlp.enabled', enabled);
+        if (enabled && this.scraperOpen && !this.scraperOpen[name]) {
+          this.scraperOpen = { ...this.scraperOpen, [name]: true };
+        }
+        return;
+      }
       const r = await fetch('/api/scrapers/toggle' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name, enabled})});
       const j = await r.json().catch(()=>({}));
@@ -7271,8 +13506,136 @@ function dashboard() {
       if (j.overrides && this.je.loaded) this.je.overrides = j.overrides;
       // Toggles write an override; the active job applies on leave / Apply.
       if (this.currentJob === this.jobsActive) this.je.applyPending = true;
+      // Auto-open the card the first time a scraper is turned on so users
+      // see the settings body without a second click.
+      if (enabled && this.scraperOpen && !this.scraperOpen[name]) {
+        this.scraperOpen = { ...this.scraperOpen, [name]: true };
+      }
       this.refresh(); this.loadJobEditor();
     },
+
+    // ── Scrapers-tab card list: description / enabled map / priority helpers ──
+    scraperDescription(name) {
+      return (this.scraperDescriptions && this.scraperDescriptions[name]) || '';
+    },
+    get scraperEnabledMap() {
+      // Build {name: bool} from the /api/scrapers payload so the header pill
+      // and toggle share ONE source of truth. Unknown names default to true —
+      // consistent with SCRAPER_DISABLED's "absent = enabled" semantics.
+      const out = {};
+      for (const s of (this.scrapers || [])) {
+        if (s && s.name) out[s.name] = !!s.enabled;
+      }
+      for (const n of (this.priorityNames || [])) {
+        if (!(n in out)) out[n] = true;
+      }
+      // YT-DLP's live state is scrapers.yt_dlp.enabled (its own field, not
+      // the canonical scrapers.enabled map). Read it from the effective cfg
+      // so the slider reflects reality — otherwise it always renders "on"
+      // regardless of what the user configured.
+      if (this.je && this.je.loaded) {
+        const yt = this.effVal('scrapers.yt_dlp.enabled');
+        if (yt !== undefined && yt !== null) out['YT-DLP'] = !!yt;
+      }
+      return out;
+    },
+    // Effective priority (from the job editor's effective config, fall back to
+    // the default order + all-default weights). Every priorityName is covered
+    // deterministically so the UI never renders a partial list.
+    _priorityEff() {
+      const eff = this.effVal('scrapers.priority');
+      const raw = (eff && typeof eff === 'object') ? eff : {};
+      const known = new Set(this.priorityNames || []);
+      const seen = new Set();
+      const order = [];
+      for (const n of (Array.isArray(raw.order) ? raw.order : [])) {
+        if (typeof n === 'string' && known.has(n) && !seen.has(n)) { order.push(n); seen.add(n); }
+      }
+      for (const n of (this.priorityNames || [])) {
+        if (!seen.has(n)) order.push(n);
+      }
+      const rawW = (raw.weights && typeof raw.weights === 'object') ? raw.weights : {};
+      const weights = {};
+      const mn = this.priorityWeightMin, mx = this.priorityWeightMax, def = this.priorityWeightDefault;
+      for (const n of (this.priorityNames || [])) {
+        let w = parseInt(rawW[n], 10);
+        if (!Number.isFinite(w)) w = def;
+        weights[n] = Math.max(mn, Math.min(mx, w));
+      }
+      return { order, weights };
+    },
+    scraperOrder() { return this._priorityEff().order; },
+    scraperWeight(name) { return this._priorityEff().weights[name] ?? this.priorityWeightDefault; },
+    // Auto-derive weight from drag position: top slot = MAX, bottom = MIN,
+    // linear in between. Called from drop/keyboard-reorder but never from the
+    // manual weight input (the user overrides independently).
+    _autoWeightFromIndex(idx, total) {
+      if (total <= 1) return this.priorityWeightDefault;
+      const mn = this.priorityWeightMin, mx = this.priorityWeightMax;
+      const frac = 1 - (idx / (total - 1));
+      return Math.max(mn, Math.min(mx, Math.round(mn + frac * (mx - mn))));
+    },
+    // Persist a whole {order, weights} block as an override (auto-saves).
+    _saveScraperPriority(order, weights) {
+      this.setOverride('scrapers.priority', { order: order.slice(), weights: { ...weights } });
+    },
+    setScraperWeight(name, w) {
+      const clean = Math.max(this.priorityWeightMin, Math.min(this.priorityWeightMax, Math.round(Number(w) || this.priorityWeightDefault)));
+      const eff = this._priorityEff();
+      eff.weights[name] = clean;
+      this._saveScraperPriority(eff.order, eff.weights);
+    },
+    // Reorder helper — moves `name` to index `newIdx` and re-derives weights.
+    _reorderScraper(name, newIdx) {
+      const eff = this._priorityEff();
+      const cur = eff.order.slice();
+      const from = cur.indexOf(name);
+      if (from < 0) return;
+      cur.splice(from, 1);
+      const clampedIdx = Math.max(0, Math.min(cur.length, newIdx));
+      cur.splice(clampedIdx, 0, name);
+      const nextWeights = { ...eff.weights };
+      // Drag also nudges weight: top = 10, bottom = 1. The user can override
+      // any individual weight afterward via the number input.
+      cur.forEach((n, i) => { nextWeights[n] = this._autoWeightFromIndex(i, cur.length); });
+      this._saveScraperPriority(cur, nextWeights);
+    },
+    toggleScraperOpen(name) {
+      this.scraperOpen = { ...this.scraperOpen, [name]: !this.scraperOpen[name] };
+    },
+    // ── HTML5 drag-and-drop (no external lib) ──
+    scraperDragStart(evt, name) {
+      this.draggingScraper = name;
+      try { evt.dataTransfer.setData('text/plain', name); evt.dataTransfer.effectAllowed = 'move'; }
+      catch (_e) { /* older browsers */ }
+    },
+    scraperDragOver(name) { if (this.draggingScraper && this.draggingScraper !== name) this.dragOverScraper = name; },
+    scraperDragLeave(name) { if (this.dragOverScraper === name) this.dragOverScraper = null; },
+    scraperDragEnd() { this.draggingScraper = null; this.dragOverScraper = null; },
+    scraperDrop(targetName) {
+      const src = this.draggingScraper;
+      this.draggingScraper = null; this.dragOverScraper = null;
+      if (!src || src === targetName) return;
+      const order = this.scraperOrder();
+      const targetIdx = order.indexOf(targetName);
+      if (targetIdx < 0) return;
+      this._reorderScraper(src, targetIdx);
+    },
+    // ── Keyboard grab mode: focus a handle, Space toggles grab, arrows move ──
+    toggleScraperGrab(name) {
+      this.scraperGrabbed = (this.scraperGrabbed === name) ? null : name;
+    },
+    moveScraper(name, delta) {
+      const order = this.scraperOrder();
+      const idx = order.indexOf(name);
+      if (idx < 0) return;
+      this._reorderScraper(name, idx + delta);
+    },
+    async resetScraperPriority() {
+      await this.resetOverride('scrapers.priority');
+      this.notify('Scraper priority reset to preset defaults', 'info');
+    },
+
     async scrapersBulk(action) {
       if (this._jeTimer) { clearTimeout(this._jeTimer); this._jeTimer = null; }
       const r = await fetch('/api/scrapers/bulk' + this.jobParam('?'), {method:'POST', headers:{'Content-Type':'application/json'},
@@ -7305,9 +13668,31 @@ function dashboard() {
       this.refresh();
     },
 
+    // URL for the <video> element in the detail modal. Uses ``modal.path``
+    // (set by every openModalFrom*() variant) when available, otherwise falls
+    // back to parsing ``path=<encoded>`` out of the thumbnail URL — the shape
+    // the /api/thumbnail endpoint uses. /api/media/raw serves the raw file with
+    // Range support, which is what makes <video> seek/buffer smoothly.
+    modalVideoSrc() {
+      let p = this.modal && this.modal.path ? this.modal.path : '';
+      if (!p && this.modal && this.modal.imageUrl) {
+        try {
+          const u = new URL(this.modal.imageUrl, window.location.origin);
+          p = u.searchParams.get('path') || '';
+        } catch (_) { /* malformed URL — leave blank so <video> shows an empty state */ }
+      }
+      if (!p) return '';
+      return '/api/media/raw?path=' + encodeURIComponent(p);
+    },
+
     async openModal({imageUrl, promptUrl, name, source, category, summary, path, meta}) {
       // Remember the trigger so we can restore focus on close (a11y).
       this.modalReturnFocus = document.activeElement;
+      // Detect a video item from the filename/path so the modal template
+      // renders <video> instead of <img>. Extension check mirrors the
+      // server-side _VIDEO_THUMB_EXTS set — keep in lockstep if that grows.
+      const videoRe = /\.(mp4|webm|mov|mkv|avi|m4v)(\?|$)/i;
+      const isVideo = videoRe.test(name || '') || videoRe.test(path || '');
       this.modal = {
         open: true, imageUrl,
         prompt: 'Loading...', promptOriginal: '',
@@ -7315,6 +13700,7 @@ function dashboard() {
         name: name || '', source: source || '', category: category || '',
         summary: summary || '', path: path || '', meta: meta || null,
         caption: '', captionOriginal: '', captionSaving: false, captionFlash: '',
+        isVideo,
       };
       try {
         const txt = promptUrl ? await fetch(promptUrl).then(r=>r.text()) : '';
@@ -7369,6 +13755,11 @@ function dashboard() {
       this.modal.open = false;
       this.modal.editing = false;
       this.modal.savedFlash = '';
+      // Flip isVideo=false so the <template x-if="modal.isVideo"> unmounts the
+      // <video> element entirely — otherwise Alpine's x-show on the outer
+      // container only hides it and playback (and audio!) continues in the
+      // background until the modal is reopened.
+      this.modal.isVideo = false;
       // Restore focus to whatever opened the modal (a11y).
       if (this.modalReturnFocus && this.modalReturnFocus.focus) {
         try { this.modalReturnFocus.focus(); } catch (_) { /* element gone */ }
@@ -7426,13 +13817,264 @@ function dashboard() {
     },
     // Global Stats (jobs view): aggregate across all jobs, or one job when the
     // per-job filter is set. Uses an explicit ?job= rather than currentJob.
+    // Requests ?by=job so the payload carries the per-job breakdown that the
+    // donut chart (T4) renders alongside the aggregate totals.
     async loadGlobalStats() {
       this.statsLoading = true;
       try {
-        const q = this.globalStatsJob ? ('?job=' + encodeURIComponent(this.globalStatsJob)) : '';
-        this.stats = await fetch('/api/stats' + q).then(r=>r.json());
+        const scope = this.globalStatsJob || '__all__';
+        this.stats = await fetch('/api/stats?by=job&job=' + encodeURIComponent(scope)).then(r=>r.json());
       } catch (e) { /* swallow */ }
       this.statsLoading = false;
+    },
+    // ── Global Gallery (T3) ────────────────────────────────────────────────
+    async loadGlobalGallery(page) {
+      if (page) this.globalGallery.page = page;
+      this.globalGalleryLoading = true;
+      try {
+        const f = this.globalGalleryFilters;
+        const params = new URLSearchParams();
+        params.set('page', this.globalGallery.page);
+        params.set('page_size', this.globalGallery.pageSize);
+        if (f.q) params.set('q', f.q);
+        if (f.sources.length) params.set('sources', f.sources.join(','));
+        if (f.categories.length) params.set('categories', f.categories.join(','));
+        if (f.sort) params.set('sort', f.sort);
+        if (f.jobs.length) params.set('jobs', f.jobs.join(','));
+        const j = await fetch('/api/gallery/global?' + params.toString()).then(r => r.json());
+        this.globalGallery = { ...this.globalGallery, ...j };
+      } catch (e) { /* swallow — grid stays as-is */ }
+      this.globalGalleryLoading = false;
+    },
+    toggleGlobalGalleryJob(slug) {
+      const list = this.globalGalleryFilters.jobs;
+      const idx = list.indexOf(slug);
+      if (idx === -1) list.push(slug); else list.splice(idx, 1);
+      this.loadGlobalGallery(1);
+    },
+    toggleGlobalGalleryList(field, value) {
+      const list = this.globalGalleryFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+      this.loadGlobalGallery(1);
+    },
+    clearGlobalGalleryFilters() {
+      this.globalGalleryFilters = { q: '', sources: [], categories: [], jobs: [], sort: 'newest' };
+      this.loadGlobalGallery(1);
+    },
+
+    // ── Filter modal (T2) — shared popover controller + per-tab helpers ──
+    // One panel open at a time; clicking a different tab's Filters pill just
+    // swaps `filterPanel` and the previous one closes automatically. Passing
+    // the id currently open closes it.
+    toggleFilterPanel(id, ev) {
+      if (this.filterPanel === id) { this.filterPanel = null; return; }
+      this.filterPanel = id;
+      const btn = ev?.currentTarget;
+      if (!btn || typeof btn.getBoundingClientRect !== 'function') return;
+      const domId = 'filter-panel-' + id.replace(/([A-Z])/g, '-$1').toLowerCase();
+      this.$nextTick(() => {
+        const panel = document.getElementById(domId);
+        if (!panel) return;
+        const rect = btn.getBoundingClientRect();
+        const panelW = Math.min(28 * 16, window.innerWidth - 32);
+        let right = Math.max(8, window.innerWidth - rect.right);
+        if (right + panelW > window.innerWidth - 8) right = 8;
+        panel.style.top = (rect.bottom + 8) + 'px';
+        panel.style.right = right + 'px';
+        panel.style.left = 'auto';
+      });
+    },
+    // Count of active filters for the badge next to the Filters pill. Sort
+    // + free-text search deliberately don't count — Sort has its own pill and
+    // Search stays visible as a chip beside the pill.
+    galleryFilterCount() {
+      const f = this.galleryFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.resolutions?.length || 0)
+           + (f.minOvr ? 1 : 0) + (f.minRel ? 1 : 0) + (f.minQuality ? 1 : 0)
+           + (f.dateFrom ? 1 : 0) + (f.dateTo ? 1 : 0);
+    },
+    globalGalleryFilterCount() {
+      const f = this.globalGalleryFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.jobs?.length || 0);
+    },
+    // ── Queue tab (client-side over queueFiles) ──
+    queueFilterCount() {
+      const f = this.queueFilters;
+      return (f.sources?.length || 0) + (f.corruptOnly ? 1 : 0);
+    },
+    queueSources() {
+      const set = new Set();
+      for (const f of this.queueFiles || []) if (f && f.source) set.add(f.source);
+      return Array.from(set).sort();
+    },
+    filteredQueueFiles() {
+      const f = this.queueFilters;
+      const q = (f.q || '').trim().toLowerCase();
+      return (this.queueFiles || []).filter(row => {
+        if (f.sources.length && !f.sources.includes(row.source)) return false;
+        if (f.corruptOnly && !row.corrupt) return false;
+        if (q) {
+          const hay = ((row.name || '') + ' ' + (row.prompt || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    },
+    toggleQueueFilter(field, value) {
+      const list = this.queueFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+    },
+    clearQueueFilters() {
+      this.queueFilters = { q: '', sources: [], corruptOnly: false };
+    },
+    // ── Activity tab (client-side over history) ──
+    activityFilterCount() {
+      const f = this.activityFilters;
+      return (f.sources?.length || 0)
+           + (f.categories?.length || 0)
+           + (f.status && f.status !== 'any' ? 1 : 0);
+    },
+    activitySources() {
+      const set = new Set();
+      for (const h of this.history || []) if (h && h.source) set.add(h.source);
+      return Array.from(set).sort();
+    },
+    activityCategories() {
+      const set = new Set();
+      for (const h of this.history || []) if (h && h.classification) set.add(h.classification);
+      return Array.from(set).sort();
+    },
+    filteredHistory() {
+      const f = this.activityFilters;
+      const q = (f.q || '').trim().toLowerCase();
+      const terminal = new Set((this.cullTerminal && this.cullTerminal.length)
+                               ? this.cullTerminal.map(s => String(s).toUpperCase())
+                               : ['DISCARD', 'CORRUPT']);
+      return (this.history || []).filter(h => {
+        if (f.sources.length && !f.sources.includes(h.source)) return false;
+        if (f.categories.length && !f.categories.includes(h.classification)) return false;
+        if (f.status === 'kept' && terminal.has(String(h.classification || '').toUpperCase())) return false;
+        if (f.status === 'discarded' && !terminal.has(String(h.classification || '').toUpperCase())) return false;
+        if (q) {
+          const hay = ((h.image || '') + ' ' + (h.source || '') + ' ' + (h.classification || '')).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    },
+    toggleActivityFilter(field, value) {
+      const list = this.activityFilters[field];
+      const idx = list.indexOf(value);
+      if (idx === -1) list.push(value); else list.splice(idx, 1);
+    },
+    clearActivityFilters() {
+      this.activityFilters = { q: '', sources: [], categories: [], status: 'any' };
+    },
+
+    // Deterministic hue from a slug — same slug always maps to the same
+    // colour across chart + legend, and across renders. Simple 32-bit FNV-1a
+    // fold, then hsl() with fixed saturation/lightness to keep every slice
+    // legible in dark, light, and high-contrast themes.
+    _slugHue(slug) {
+      let h = 2166136261 >>> 0;
+      const s = String(slug || '');
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+      }
+      return h % 360;
+    },
+    globalStatsGrandTotal() {
+      const map = this.stats?.by_job || {};
+      let n = 0;
+      for (const k in map) n += (map[k]?.total || 0);
+      return n;
+    },
+    // Build the donut slices. Slice geometry uses an SVG arc from the ring's
+    // outer radius (90) around cx/cy 100 — so 200x200 viewBox has enough
+    // padding for a 1px stroke without clipping. Under the per-job filter we
+    // still show one slice (that job's share of the global total) so the donut
+    // stays meaningful as the user drills in.
+    globalStatsDonutSlices() {
+      const map = this.stats?.by_job || {};
+      const filter = this.globalStatsJob;
+      const total = this.globalStatsGrandTotal();
+      if (!total) return [];
+      // Slice with per-instance pathOffset(cx, cy, r) so the SVG can bump the
+      // radius on hover for an "explode" effect — cheaper than transforming
+      // the whole slice, and keeps donut proportions exact.
+      const buildSlice = (slug, count, startPct, endPct, fill) => ({
+        slug, count, pct: Math.round((endPct - startPct) * 100), fill,
+        pathOffset(cx, cy, r) {
+          if (endPct - startPct >= 0.9999) {
+            return `M ${cx} ${cy-r} A ${r} ${r} 0 1 1 ${cx-0.01} ${cy-r} A ${r} ${r} 0 1 1 ${cx} ${cy-r} Z`;
+          }
+          const a0 = 2 * Math.PI * startPct - Math.PI/2;
+          const a1 = 2 * Math.PI * endPct - Math.PI/2;
+          const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+          const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+          const large = (endPct - startPct) > 0.5 ? 1 : 0;
+          return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
+        },
+      });
+      // Filter to one job → single slice for its % of grand total; leave a
+      // muted "rest" slice so the donut still communicates "share of total".
+      if (filter && filter !== '__all__' && filter !== 'all' && filter !== '*') {
+        const bucket = map[filter];
+        if (!bucket) return [];
+        const pct = bucket.total / total;
+        const hue = this._slugHue(filter);
+        const slices = [buildSlice(filter, bucket.total, 0, pct, `hsl(${hue} 65% 55%)`)];
+        if (pct < 0.999) {
+          slices.push(buildSlice(
+            'other jobs', total - bucket.total, pct, 1,
+            'color-mix(in oklab, var(--color-fg-muted) 45%, transparent)'
+          ));
+        }
+        return slices;
+      }
+      const rows = Object.entries(map)
+        .map(([slug, v]) => ({ slug, count: (v && v.total) || 0 }))
+        .filter(r => r.count > 0)
+        .sort((a, b) => b.count - a.count);
+      let cursor = 0;
+      return rows.map(row => {
+        const pct = row.count / total;
+        const hue = this._slugHue(row.slug);
+        const slice = buildSlice(row.slug, row.count, cursor, cursor + pct, `hsl(${hue} 65% 55%)`);
+        cursor += pct;
+        return slice;
+      });
+    },
+    // Per-source bars: derives kept / discarded shares relative to the largest
+    // source so bar length is comparable at a glance. Percentages inside a
+    // single source still add to 100 (kept + discarded of that source).
+    statsSourceBars() {
+      const rows = this.stats?.sources || [];
+      if (!rows.length) return [];
+      const maxTotal = rows.reduce((m, r) => Math.max(m, r.total || 0), 0) || 1;
+      return rows.map(r => {
+        const total = r.total || 0;
+        const discardPct = Number(r.discard_pct) || 0;
+        const discarded = Math.round(total * discardPct / 100);
+        const kept = Math.max(0, total - discarded);
+        const scale = total / maxTotal;
+        // Split the (share of largest) bar length between kept and discarded.
+        const keptShare = scale * (total > 0 ? kept / total : 0);
+        const discardShare = scale * (total > 0 ? discarded / total : 0);
+        return {
+          source: r.source, total, kept, discarded,
+          discard_pct: Math.round(discardPct * 10) / 10,
+          nsfw_pct: Number(r.nsfw_pct) || 0,
+          keptShare, discardShare,
+        };
+      }).sort((a, b) => b.total - a.total);
     },
 
     // ── Gallery tab ──────────────────────────────────────────────────────
@@ -7650,6 +14292,21 @@ function dashboard() {
         default: return;
       }
     },
+    // Global `?` opens the keyboard cheat-sheet. Suppressed while a field
+    // owns focus, while a modal is up (Esc handles that first), and when any
+    // modifier is held so browser combos still fire (Ctrl+/, ⌘+/, etc.).
+    onHelpKeydown(ev) {
+      if (ev.key !== '?' && !(ev.key === '/' && ev.shiftKey)) return;
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (this.modal?.open || this.confirmDialog?.open || this.showShortcuts) return;
+      const el = document.activeElement;
+      if (el) {
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) return;
+      }
+      ev.preventDefault();
+      this.showShortcuts = true;
+    },
     // 'k' is BOTH "move focus down a row" (vim) AND "keep". We resolve the
     // ambiguity in favour of keep (the headline action); use ArrowDown/j to move
     // down a row. cullRowStride approximates the column count of the responsive
@@ -7762,6 +14419,16 @@ function dashboard() {
       // backend degrades gracefully (no ML extra / empty index / un-indexed key)
       // by returning a friendly message instead of an error.
       this.sim = { open: true, loading: true, results: [], message: '', sourceName: card.name || '' };
+      // Scroll the panel into view immediately — it renders above the gallery
+      // grid, so clicking Find similar on a card far down the list previously
+      // opened the panel off-screen and looked like a no-op.
+      await this.$nextTick();
+      try {
+        const el = this.$refs.simPanel;
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      } catch (_) {}
       const q = this.jobQuery();
       const sep = q ? '&' : '?';
       const url = '/api/embeddings/similar' + q + sep
@@ -7900,31 +14567,161 @@ function dashboard() {
       this.galleryReload();
     },
 
-    // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth - callers
-    // pass {category, path}, we decide based on the BLUR_NSFW_THUMBS setting
-    // and whether the user has clicked the eye for this path. revealNsfw()
-    // flips the per-path reveal so a single image is unblurred without
-    // disabling the global setting.
+    // ── T1: SSE stream lifecycle ───────────────────────────────────────────
+    // Opens ONE long-lived /api/stream/events connection when the tab becomes
+    // visible; closes when it hides so hidden tabs don't hold a socket. The
+    // stream carries `activity`, `queue`, and `status` events with a stable
+    // monotonic id. If EventSource isn't in the browser (or the endpoint
+    // errors), we fall back to the legacy 5 s poll (leaving _sseOpen=false).
+    _sseUrl() {
+      const scope = (this.view === 'job' && this.currentJob) ? this.currentJob : '';
+      const qs = scope ? '?job=' + encodeURIComponent(scope) : '';
+      return '/api/stream/events' + qs;
+    },
+    openStream() {
+      if (typeof EventSource === 'undefined') return;      // fall back to polling
+      if (document.visibilityState !== 'visible') return;  // wait for visibility
+      const scope = (this.view === 'job' && this.currentJob) ? this.currentJob : '';
+      // Reuse an open stream if the scope hasn't changed.
+      if (this._sseSource && this._sseSlug === scope) return;
+      this.closeStream();
+      let src;
+      try { src = new EventSource(this._sseUrl()); }
+      catch (e) { this._sseOpen = false; return; }
+      this._sseSource = src;
+      this._sseSlug = scope;
+      src.addEventListener('open',    () => { this._sseOpen = true; });
+      src.addEventListener('error',   () => { this._sseOpen = false; /* EventSource auto-retries */ });
+      src.addEventListener('activity', ev => this._sseOnActivity(ev));
+      src.addEventListener('queue',    ev => this._sseOnQueue(ev));
+      src.addEventListener('status',   ev => this._sseOnStatus(ev));
+    },
+    closeStream() {
+      if (this._sseSource) { try { this._sseSource.close(); } catch (_) {} }
+      this._sseSource = null;
+      this._sseOpen = false;
+      this._sseSlug = null;
+    },
+    // Handlers merge stream payloads into existing state. Path-diff so we
+    // only mark newly-arrived rows with .sse-fade — the animation should fire
+    // per new item, not on every tick.
+    _sseTagFresh(prevPaths, list) {
+      const p = new Set(prevPaths);
+      const fresh = [];
+      for (const r of list) {
+        if (r && r.path && !p.has(r.path)) fresh.push(r.path);
+      }
+      // Alpine reruns :class each tick; storing the set on the instance lets
+      // the template read it without re-tagging existing items.
+      this._sseFreshPaths = new Set(fresh);
+    },
+    _sseOnActivity(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d || !Array.isArray(d.items)) return;
+        // Scope guard: ignore events for a job we're no longer viewing.
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        const prev = (this.activity || []).map(r => r.path);
+        this._sseTagFresh(prev, d.items);
+        this.activity = d.items;
+      } catch (_) {}
+    },
+    _sseOnQueue(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d) return;
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        // Fold the compact queue snapshot into status so existing bindings
+        // (status.queue.total / by_source) keep working without a rewrite.
+        this.status = { ...(this.status || {}), queue: { total: d.total || 0, by_source: d.sources || {} } };
+      } catch (_) {}
+    },
+    _sseOnStatus(ev) {
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof ev.lastEventId !== 'undefined') this._sseLastEventId = ev.lastEventId;
+        if (!d) return;
+        if (this.view === 'job' && d.job && d.job !== this.currentJob) return;
+        // Merge into the existing status.pipeline so we don't clobber queue/
+        // sorted/errors from the last /api/status poll.
+        const existing = this.status || {};
+        this.status = {
+          ...existing,
+          pipeline: {
+            ...(existing.pipeline || {}),
+            running: !!d.running,
+            vision_worker: d.vision_worker || '',
+            vision_workers: d.vision_workers || [],
+            throttle: (d.throttle != null ? d.throttle : (existing.pipeline?.throttle ?? 100)),
+            pid: d.pid || null,
+          },
+        };
+        this.provider = d.vision_worker || this.provider;
+        this.throttle = (d.throttle != null ? d.throttle : this.throttle);
+      } catch (_) {}
+    },
+
+    // NSFW blur helpers. shouldBlurNsfw(item) is the source of truth — callers
+    // pass {category, path}. T2 folds in the sidebar's global "Show NSFW"
+    // toggle: when OFF (default) EVERY NSFW surface blurs regardless of the
+    // legacy per-user BLUR_NSFW_THUMBS setting. When ON, blur only if the
+    // legacy setting is on AND the user hasn't clicked the per-path eye.
     shouldBlurNsfw(item) {
       if (!item) return false;
       const cat = String(item.category || item.classification || '').toUpperCase();
-      if (cat !== 'NSFW') return false;
-      if ((this.settings.BLUR_NSFW_THUMBS || 'true') !== 'true') return false;
+      const nsfw = cat === 'NSFW' || !!item.nsfw;
+      if (!nsfw) return false;
+      // Global toggle wins outright — Show NSFW ON ⇒ never blur, no matter
+      // what the legacy BLUR_NSFW_THUMBS setting says. Users expect the
+      // header switch to be the single source of truth across every surface
+      // (gallery, global gallery, queue, activity, modal).
+      if (this.showNsfw) return false;
       const key = item.path || item.thumbnail || item.image || '';
-      return !this.revealedNsfw[key];
+      // Per-image reveal (eye) still wins when the global toggle is OFF —
+      // lets a curator peek one image without unhiding the whole set.
+      if (this.revealedNsfw[key]) return false;
+      return true;
     },
     revealNsfw(item) {
       const key = item?.path || item?.thumbnail || item?.image || '';
       if (key) this.revealedNsfw[key] = true;
     },
+    setShowNsfw(on) {
+      this.showNsfw = !!on;
+      try { localStorage.setItem('cull_show_nsfw', this.showNsfw ? '1' : '0'); } catch (_) {}
+      // Flipping the global toggle drops per-image reveals so surfaces snap
+      // back to a consistent state — a user hiding NSFW after revealing an
+      // image expects the image to hide again, not linger unblurred.
+      if (!this.showNsfw) this.revealedNsfw = {};
+    },
 
     start() {
+      // Hydrate sticky-dismissal for the welcome hero BEFORE loading jobs so
+      // the first render doesn't flash the banner and then hide it.
+      try { this.welcome.dismissed = localStorage.getItem('cull_welcome_dismissed') === '1'; } catch (_) {}
+      // T2: hydrate the global NSFW toggle. Default OFF unless the user
+      // previously flipped it on. Applied before any surface renders so the
+      // first paint doesn't flash unblurred imagery.
+      try { this.showNsfw = localStorage.getItem('cull_show_nsfw') === '1'; } catch (_) {}
       this.loadJobs();
       this.loadPresets();
       this.refresh();
+      // T1: open the SSE stream on visibility, close when the tab hides so
+      // background tabs don't hold sockets. Guarded by openStream() itself so
+      // a re-fire in a visible state is a no-op.
+      this.openStream();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.openStream();
+        else this.closeStream();
+      });
       // Global keyboard-cull listener. Gated entirely by cullHotkeysActive()
       // (gallery tab open, no modal, not typing) so it's inert everywhere else.
       window.addEventListener('keydown', (ev) => this.onCullKeydown(ev));
+      // Global help shortcut. `?` opens the keyboard cheat-sheet unless the
+      // user is typing into a field or a modal already owns the keyboard.
+      window.addEventListener('keydown', (ev) => this.onHelpKeydown(ev));
       setInterval(() => this.refresh(), 5000);
       // Lazy-load stats / gallery only when their tab is opened. Stats then
       // auto-refreshes alongside the rest of the dashboard. Gallery stays
@@ -7932,7 +14729,12 @@ function dashboard() {
       this.$watch('active', (tab) => {
         if (tab === 'stats') this.loadStats();
         if (tab === 'gstats') this.loadGlobalStats();
-        if (tab === 'presets') this.loadPresets();
+        if (tab === 'globalGallery' && this.globalGallery.items.length === 0 && !this.globalGalleryLoading) {
+          // Ensure jobsList is loaded so the multi-select can render its chips.
+          if (!this.jobsList.length) this.loadJobs();
+          this.loadGlobalGallery();
+        }
+        if (tab === 'presets') { this.loadPresets(); this.loadCommunityPresets(); }
         if (tab === 'settings') this.loadGlobalVision();
         if (tab === 'schedules') { this.loadSchedules(); if (!this.jobsList.length) this.loadJobs(); }
         // Duplicates is on-demand: the "Scan for duplicates" button is the only
@@ -7955,7 +14757,1032 @@ function dashboard() {
       // server-side cached for 5 minutes so polls are cheap.
       this.checkUpdate();
       setInterval(() => this.checkUpdate(), 30 * 60 * 1000);
+      // Wave-2 UI bootstrap: apply persisted theme, poll demo status,
+      // and preload preset metadata for wizard + comparison grid.
+      // Themes are loaded before the first paint so a custom user theme
+      // saved in a previous session takes effect on reload.
+      this.applyTheme();
+      this.loadThemes();
+      this.loadDemoStatus();
+      this.loadPresetsMeta();
     },
+
+    // ── T3 #22: theme selector ────────────────────────────────────────────
+    // Now backed by a registry of themes (core CSS ones + JSON-shipped
+    // themes.list + user-created themes). The core three (dark/light/hc)
+    // live entirely in the CSS above; anything else is projected into a
+    // dedicated <style id="theme-custom"> tag with a `html.theme-<slug>{...}`
+    // rule so the same token-based selectors apply.
+    theme: (typeof localStorage !== 'undefined' && localStorage.getItem('cull.theme')) || 'dark',
+    themes: { loaded: false, list: [] },   // filled by loadThemes()
+    // Set of theme slugs the CSS ships with — for these applyTheme() knows
+    // the class already exists and skips the <style> injection.
+    _coreThemeSlugs: ['dark','light','hc','ai-slop','beige','wood','cyberpunk','forest'],
+    availableThemes() {
+      // Deduped list of {name, source} for the header dropdown.
+      const seen = new Set();
+      const out = [];
+      const push = (name, source) => {
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+        out.push({ name, source });
+      };
+      // Anchor CSS-only themes first so the dropdown starts with the trio
+      // most users recognise. The forest/wood/etc themes come from
+      // themes.list and slot in in the same order as list_themes() returns.
+      ['dark','light','hc'].forEach(n => push(n, 'core'));
+      (this.themes.list || []).forEach(t => push(t.name, t.source));
+      return out;
+    },
+    // Sanitise a CSS variable value coming from a theme JSON before we
+    // splice it into a <style> tag. Mirrors theme_config._is_safe_value
+    // so the client-side injector can't be tricked into breaking out of
+    // the rule body even if the server response were compromised.
+    _safeCssVal(v) {
+      if (typeof v !== 'string') return '';
+      if (v.length > 128) return '';
+      if (/[<>;`]|url\s*\(|javascript:|expression\s*\(/i.test(v)) return '';
+      return v;
+    },
+    _safeCssKey(k) {
+      // Only allow --color-<segment> tokens we actually ship.
+      return typeof k === 'string' && /^--color-[a-z-]{1,40}$/.test(k);
+    },
+    _buildCustomThemeCss() {
+      // Rebuild the whole custom-theme stylesheet. Called on every load /
+      // save so a mid-edit theme becomes visible immediately.
+      const parts = [];
+      (this.themes.list || []).forEach(t => {
+        if (this._coreThemeSlugs.includes(t.name)) return;   // CSS already ships this
+        const vars = t.vars || {};
+        const rules = [];
+        Object.keys(vars).forEach(k => {
+          if (!this._safeCssKey(k)) return;
+          const v = this._safeCssVal(vars[k]);
+          if (v) rules.push('  ' + k + ': ' + v + ';');
+        });
+        if (t.font_family && typeof t.font_family === 'string' && !/[<>;`]/.test(t.font_family)) {
+          // Font is applied via `body` so `.font-brand` (JetBrains Mono) can
+          // still override for the header/mono callouts.
+          parts.push('html.theme-' + t.name + ' body { font-family: ' + t.font_family.replace(/"/g,'\'') + '; }');
+        }
+        if (rules.length) {
+          parts.push('html.theme-' + t.name + ' {\n' + rules.join('\n') + '\n}');
+        }
+      });
+      let tag = document.getElementById('theme-custom');
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = 'theme-custom';
+        document.head.appendChild(tag);
+      }
+      tag.textContent = parts.join('\n\n');
+    },
+    async loadThemes() {
+      // Called on init + after any theme save / delete so the header dropdown
+      // and the settings editor always show the current library.
+      try {
+        const j = await fetch('/api/themes').then(r => r.json());
+        this.themes.list = Array.isArray(j.themes) ? j.themes : [];
+        this.themes.loaded = true;
+      } catch (e) {
+        this.themes.list = [];
+        this.themes.loaded = true;
+      }
+      this._buildCustomThemeCss();
+      // Re-apply the theme so a just-loaded custom theme takes effect
+      // without the user having to reselect it.
+      this.applyTheme();
+    },
+    applyTheme() {
+      const known = this.availableThemes().map(t => t.name);
+      const t = known.includes(this.theme) ? this.theme : 'dark';
+      // Remove every `theme-*` class so switching from ai-slop → dark
+      // doesn't leave the previous class stuck on <html>.
+      const html = document.documentElement;
+      const classes = Array.from(html.classList);
+      classes.filter(c => c.indexOf('theme-') === 0).forEach(c => html.classList.remove(c));
+      html.classList.add('theme-' + t);
+      html.setAttribute('data-theme', t);
+    },
+    setTheme(t) {
+      const known = this.availableThemes().map(x => x.name);
+      if (!known.includes(t)) t = 'dark';
+      this.theme = t;
+      try { localStorage.setItem('cull.theme', t); } catch (e) {}
+      this.applyTheme();
+    },
+
+    // ── Theme editor state ────────────────────────────────────────────────
+    // Two views: 'grid' (registry cards) and 'detail' (colour-picker editor).
+    // The editor works on a `draft` copy of a user theme so a mid-edit change
+    // isn't lost if the user Back-buttons out without saving; Save writes
+    // `draft` to the server via PUT /api/themes/<name>.
+    themeEditor: {
+      view: 'grid',
+      editing: '',       // slug of the theme being edited
+      draft: { font_family: '', vars: {} },
+      newName: '',
+      newBase: 'dark',
+      saving: false,
+      savedFlash: '',
+      error: '',
+      // The canonical variable list — mirrors theme_config.THEME_VAR_KEYS.
+      // Filled from /api/themes response (var_keys) on first load; fallback
+      // list keeps the picker functional if the response is late.
+      varKeys: [
+        '--color-bg','--color-bg-elev','--color-fg','--color-fg-muted',
+        '--color-surface','--color-surface-alt','--color-border','--color-border-strong',
+        '--color-accent','--color-accent-hover','--color-accent-fg',
+        '--color-success','--color-success-fg','--color-warn','--color-warn-fg',
+        '--color-danger','--color-danger-fg',
+        '--color-input-bg','--color-input-fg','--color-input-placeholder',
+        '--color-pill-bg','--color-pill-fg',
+      ],
+      // Curated web-safe stacks + a handful of Google Fonts. Kept small so
+      // users don't have to scroll through a font dictionary; anyone who
+      // wants a fancier stack can type it into the free-form input.
+      fontStacks: [
+        { label: 'System UI (sans)', value: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif' },
+        { label: 'Inter', value: 'Inter, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'IBM Plex Sans', value: 'IBM Plex Sans, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'Space Grotesk', value: 'Space Grotesk, ui-sans-serif, system-ui, sans-serif' },
+        { label: 'Playfair Display (serif)', value: 'Playfair Display, Georgia, ui-serif, serif' },
+        { label: 'JetBrains Mono', value: 'JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace' },
+      ],
+      // Convert a colour token to a hex string for <input type=color>. The
+      // native picker only accepts #rrggbb — rgba() etc. is not accepted so
+      // we fall back to black when the token isn't a hex.
+      hexOf(k) {
+        const v = (this.draft.vars || {})[k] || '';
+        const m = /^#([0-9a-f]{6})$/i.exec(v);
+        if (m) return '#' + m[1].toLowerCase();
+        // Attempt a rough conversion for rgb(x,y,z) so the picker at least
+        // renders a swatch; anything unrecognised → black default.
+        const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(v);
+        if (rgb) {
+          const h = n => ('0' + Math.max(0,Math.min(255, parseInt(n,10))).toString(16)).slice(-2);
+          return '#' + h(rgb[1]) + h(rgb[2]) + h(rgb[3]);
+        }
+        return '#000000';
+      },
+      setVar(k, v) {
+        // Store exactly what the input holds so a user typing an rgba()
+        // preserves the alpha channel. Sanitisation runs server-side too.
+        if (!this.draft.vars) this.draft.vars = {};
+        this.draft.vars[k] = v;
+      },
+      previewStyle() {
+        // Build an inline `style=` block so the mini-mock overrides the
+        // page's outer theme with the draft in progress. All variables are
+        // scoped to the .theme-preview element only.
+        const parts = [];
+        Object.keys(this.draft.vars || {}).forEach(k => {
+          const v = this.draft.vars[k];
+          if (typeof v === 'string' && v.length && !/[<>;`]/.test(v)) {
+            parts.push(k + ':' + v);
+          }
+        });
+        if (this.draft.font_family && !/[<>;`]/.test(this.draft.font_family)) {
+          parts.push('font-family:' + this.draft.font_family.replace(/"/g,'\''));
+        }
+        return parts.join(';');
+      },
+    },
+    openThemeEditor(name) {
+      // Pre-populate `draft` with the effective theme so the pickers start
+      // on the current colours. A theme that isn't in the user layer yet
+      // still opens (read-only preview) but Save will fail — the UI
+      // encourages "Customize" first, which install-copies it.
+      const t = (this.themes.list || []).find(x => x.name === name);
+      if (!t) { this.notify('Theme not found', 'error'); return; }
+      this.themeEditor.editing = name;
+      this.themeEditor.draft = {
+        font_family: t.font_family || '',
+        vars: { ...(t.vars || {}) },
+      };
+      this.themeEditor.view = 'detail';
+      this.themeEditor.error = '';
+      this.themeEditor.savedFlash = '';
+    },
+    closeThemeEditor() {
+      this.themeEditor.view = 'grid';
+      this.themeEditor.editing = '';
+      this.themeEditor.error = '';
+    },
+    async createTheme() {
+      const slug = (this.themeEditor.newName || '').trim().toLowerCase();
+      if (!/^[a-z0-9_-]{1,40}$/.test(slug)) {
+        this.notify('Theme slug must be 1-40 chars of a-z 0-9 _ -', 'error');
+        return;
+      }
+      // Copy the chosen base into a new user theme.
+      const base = (this.themes.list || []).find(x => x.name === this.themeEditor.newBase);
+      if (!base) { this.notify('Base theme not found', 'error'); return; }
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(slug), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: base.font_family || '',
+            vars: base.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Save failed', 'error'); return; }
+        this.themeEditor.newName = '';
+        await this.loadThemes();
+        this.openThemeEditor(slug);
+      } catch (e) {
+        this.notify('Create failed', 'error');
+      }
+    },
+    async cloneTheme(name) {
+      const suggested = name + '-copy';
+      const slug = (window.prompt('Clone theme "' + name + '" as (slug):', suggested) || '').trim().toLowerCase();
+      if (!slug) return;
+      if (!/^[a-z0-9_-]{1,40}$/.test(slug)) {
+        this.notify('Theme slug must be 1-40 chars of a-z 0-9 _ -', 'error');
+        return;
+      }
+      const src = (this.themes.list || []).find(x => x.name === name);
+      if (!src) { this.notify('Source not found', 'error'); return; }
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(slug), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: src.font_family || '',
+            vars: src.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Clone failed', 'error'); return; }
+        await this.loadThemes();
+        this.openThemeEditor(slug);
+      } catch (e) { this.notify('Clone failed', 'error'); }
+    },
+    async installTheme(name) {
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name) + '/install', {
+          method: 'POST',
+        }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Install failed', 'error'); return; }
+        this.notify('Copied ' + name + ' to your themes — you can edit it now', 'success');
+        await this.loadThemes();
+        this.openThemeEditor(name);
+      } catch (e) { this.notify('Install failed', 'error'); }
+    },
+    async saveTheme() {
+      const name = this.themeEditor.editing;
+      if (!name) return;
+      this.themeEditor.saving = true;
+      this.themeEditor.error = '';
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            font_family: this.themeEditor.draft.font_family || '',
+            vars: this.themeEditor.draft.vars || {},
+          }),
+        }).then(r => r.json());
+        if (!resp.ok) { this.themeEditor.error = resp.error || 'Save failed'; return; }
+        this.themeEditor.savedFlash = 'Saved';
+        setTimeout(() => { this.themeEditor.savedFlash = ''; }, 1500);
+        await this.loadThemes();
+      } catch (e) {
+        this.themeEditor.error = 'Save failed';
+      } finally {
+        this.themeEditor.saving = false;
+      }
+    },
+    async deleteTheme(name) {
+      if (!window.confirm('Delete custom theme "' + name + '"? (Built-in themes are never removed.)')) return;
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name), { method: 'DELETE' }).then(r => r.json());
+        if (!resp.ok) { this.notify(resp.error || 'Delete failed', 'error'); return; }
+        if (this.theme === name) this.setTheme('dark');
+        await this.loadThemes();
+      } catch (e) { this.notify('Delete failed', 'error'); }
+    },
+    async publishTheme(name) {
+      if (!window.confirm('Publish theme "' + name + '" — commit to themes/community/ and push to origin. Continue?')) return;
+      try {
+        const resp = await fetch('/api/themes/' + encodeURIComponent(name) + '/publish', { method: 'POST' }).then(r => r.json());
+        if (!resp.ok) {
+          this.notify((resp.error || 'Publish failed') + (resp.hint ? ' — ' + resp.hint : ''), 'error');
+          return;
+        }
+        this.notify('Published ' + name + (resp.pushed_to ? ' → ' + resp.pushed_to : ''), 'success');
+        await this.loadThemes();
+      } catch (e) { this.notify('Publish failed', 'error'); }
+    },
+
+    // ── T1 #1: demo seed / unseed ─────────────────────────────────────────
+    demoStatus: { exists: false, slug: null, busy: false },
+    async loadDemoStatus() {
+      try {
+        const j = await fetch('/api/demo/status').then(r => r.json());
+        this.demoStatus = { ...this.demoStatus, exists: !!j.exists, slug: j.slug || null };
+      } catch (e) { /* silent — endpoint may not be reachable during a stop */ }
+    },
+    async seedDemo() {
+      this.demoStatus.busy = true;
+      try {
+        const j = await fetch('/api/demo/seed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+        if (j.error) { this.notify(j.error, 'error'); return; }
+        this.notify('Demo data seeded' + (j.slug ? (' as ' + j.slug) : ''), 'success');
+        await this.loadDemoStatus();
+        await this.loadJobs();
+        if (j.slug) { try { await this.activateJob(j.slug); this.openJob(j.slug); } catch (e) {} }
+      } catch (e) { this.notify('Seed failed: ' + e, 'error'); }
+      finally { this.demoStatus.busy = false; }
+    },
+    async unseedDemo() {
+      if (!(await this.askConfirm('Remove the demo job and its seeded data?', { danger: true, confirmLabel: 'Remove' }))) return;
+      this.demoStatus.busy = true;
+      try {
+        const j = await fetch('/api/demo/unseed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+        if (j.error) { this.notify(j.error, 'error'); }
+        else this.notify('Demo data removed', 'success');
+        await this.loadDemoStatus();
+        await this.loadJobs();
+      } catch (e) { this.notify('Unseed failed: ' + e, 'error'); }
+      finally { this.demoStatus.busy = false; }
+    },
+
+    // ── T1 #2: first-run wizard ───────────────────────────────────────────
+    wizard: {
+      open: false, step: 1, subject: '', selectedPreset: '', presets: [],
+      sourceMode: 'none', sourceUrl: '', sourceFolder: '',
+      pickingFolder: false,
+      submitting: false, error: '', canRetryUnique: false,
+    },
+    presetsMeta: [],
+    async loadPresetsMeta() {
+      try {
+        const j = await fetch('/api/presets/descriptions').then(r => r.json());
+        this.presetsMeta = Array.isArray(j.presets) ? j.presets : [];
+      } catch (e) { this.presetsMeta = []; }
+    },
+    openWizard() {
+      this.wizard = { ...this.wizard, open: true, step: 1, subject: '', selectedPreset: '',
+                      presets: this.presetsMeta.slice(), sourceMode: 'none',
+                      sourceUrl: '', sourceFolder: '', pickingFolder: false,
+                      error: '', canRetryUnique: false };
+      if (this.presetsMeta.length === 0) this.loadPresetsMeta().then(() => this.wizard.presets = this.presetsMeta.slice());
+    },
+    // Open a native folder-picker dialog on the server (localhost only). The
+    // Python side spawns a fresh subprocess for Tk, so this never blocks the
+    // Flask worker; the button just shows "Opening…" until the user picks or
+    // dismisses. Empty path == cancel (silent, no toast).
+    async pickWizardFolder() {
+      this.wizard.pickingFolder = true;
+      try {
+        const r = await fetch('/api/system/folder-picker', { method: 'POST' });
+        let j = {};
+        try { j = await r.json(); } catch (e) { j = { ok: false, error: 'bad response' }; }
+        if (j && j.cancelled) return;
+        if (!r.ok || !j || !j.ok) {
+          this.notify(j.error || 'Folder picker failed — type the path manually', 'warn');
+          return;
+        }
+        if (j.path) this.wizard.sourceFolder = j.path;
+      } catch (e) {
+        this.notify('Folder picker unavailable — type the path manually', 'warn');
+      } finally {
+        this.wizard.pickingFolder = false;
+      }
+    },
+    openWizardWithPreset(key) { this.openWizard(); this.$nextTick(() => { this.wizard.selectedPreset = key; this.wizard.step = 1; }); },
+    closeWizard() { this.wizard.open = false; this.wizard.canRetryUnique = false; this.wizard.error = ''; },
+    wizardCanAdvance() {
+      if (this.wizard.step === 1) return this.wizard.subject.trim().length > 0;
+      if (this.wizard.step === 2) return !!this.wizard.selectedPreset;
+      return true;
+    },
+    wizardNext() { if (this.wizardCanAdvance() && this.wizard.step < 3) this.wizard.step++; },
+    wizardBack() { if (this.wizard.step > 1) this.wizard.step--; },
+    // Mirror of pipeline_code/job_config.py::slugify — lowercases, collapses
+    // any non [a-z0-9_] to underscore, strips leading/trailing underscores.
+    _slugifyJs(name) {
+      return String(name || '').toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .replace(/_{2,}/g, '_');
+    },
+    // Given a desired name, return a name whose slug does not collide with
+    // any existing job. Appends -2, -3, ... until unique.
+    _uniqueJobName(name) {
+      const existing = new Set((this.jobsList || []).map(j => j.slug));
+      const baseSlug = this._slugifyJs(name);
+      if (!existing.has(baseSlug)) return name;
+      for (let i = 2; i < 500; i++) {
+        const candidate = name + ' ' + i;
+        if (!existing.has(this._slugifyJs(candidate))) return candidate;
+      }
+      // Fallback: random 4-char suffix.
+      return name + ' ' + Math.random().toString(36).slice(2, 6);
+    },
+    async wizardSubmit(_retrySalt) {
+      if (!this.wizard.subject.trim() || !this.wizard.selectedPreset) {
+        this.wizard.error = 'Subject and preset are required.'; return;
+      }
+      this.wizard.submitting = true; this.wizard.error = '';
+      try {
+        // Refresh jobs list so uniqueness check sees the latest state.
+        try { await this.loadJobs(); } catch (e) {}
+        let desired = this.wizard.subject.trim().slice(0, 60);
+        if (_retrySalt) desired = desired + ' ' + _retrySalt;
+        const name = this._uniqueJobName(desired);
+        const body = { name, preset: this.wizard.selectedPreset, subject: this.wizard.subject.trim() };
+        const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) {
+          this.wizard.error = j.error || ('HTTP ' + r.status);
+          this.wizard.canRetryUnique = true;   // reveal "Retry with new name"
+          return;
+        }
+        // /api/jobs POST returns {success, job: _job_detail(job)} where
+        // _job_detail wraps the identity again under `.job`. Walk both shapes
+        // (and a hypothetical future flattening) so the wizard never trips.
+        const slug = j.slug || j.job?.slug || j.job?.job?.slug;
+        if (!slug) { this.wizard.error = 'Server returned no slug'; return; }
+        // Close the modal immediately on the 201 — the URL/folder + activate
+        // dance below is best-effort and surfaces as toasts, not modal errors.
+        this.wizard.open = false;
+        this.wizard.canRetryUnique = false;
+        this.notify('Job created: ' + name, 'success');
+        try {
+          if (this.wizard.sourceMode === 'url' && this.wizard.sourceUrl.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.enabled', value: true }),
+            });
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.gallery_dl.urls', value: [this.wizard.sourceUrl.trim()] }),
+            });
+          } else if (this.wizard.sourceMode === 'folder' && this.wizard.sourceFolder.trim()) {
+            await fetch('/api/jobs/' + encodeURIComponent(slug) + '/override', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: 'scrapers.local_imports', value: [
+                { name: 'wizard', dir: this.wizard.sourceFolder.trim(), enabled: true }
+              ] }),
+            });
+          }
+        } catch (e) { this.notify('Source override failed: ' + e, 'warn'); }
+        try { await fetch('/api/jobs/' + encodeURIComponent(slug) + '/activate', { method: 'POST' }); }
+        catch (e) { this.notify('Activate failed: ' + e, 'warn'); }
+        try { await this.loadJobs(); } catch (e) {}
+        try { this.openJob(slug); } catch (e) {}
+      } catch (e) { this.wizard.error = String(e); }
+      finally { this.wizard.submitting = false; }
+    },
+    // Called by the "Retry with new name" button on duplicate errors.
+    wizardRetryWithNewName() {
+      const salt = Math.random().toString(36).slice(2, 6);
+      this.wizardSubmit(salt);
+    },
+
+    // ── T1 #3: preset marketplace ─────────────────────────────────────────
+    community: { loading: false, presets: [], urlInput: '', error: '' },
+    async loadCommunityPresets() {
+      this.community.loading = true; this.community.error = '';
+      try {
+        const j = await fetch('/api/presets/community').then(r => r.json());
+        this.community.presets = Array.isArray(j.presets) ? j.presets : (Array.isArray(j) ? j : []);
+      } catch (e) { this.community.error = String(e); }
+      finally { this.community.loading = false; }
+    },
+    presetPreview: { open: false, loading: false, error: '', cfg: null, meta: null, source: '', installName: '', installing: false },
+    // A local community preset lives at presets/community/<name>.preset.json
+    // and has no https URL to fetch. Distinguish by checking whether the
+    // value we've been handed is a filename (matches the community pattern)
+    // or an http(s) URL — the backend routes on ?filename= vs ?url=.
+    _isCommunityFilename(v) {
+      return typeof v === 'string' && /^[a-z0-9_-]+\.preset\.json$/i.test(v);
+    },
+    async previewPresetUrl(source) {
+      if (!source) return;
+      this.presetPreview = { open: true, loading: true, error: '', cfg: null, meta: null, source: source, installName: '', installing: false };
+      try {
+        const q = this._isCommunityFilename(source)
+          ? '/api/presets/preview?filename=' + encodeURIComponent(source)
+          : '/api/presets/preview?url=' + encodeURIComponent(source);
+        const r = await fetch(q);
+        const j = await r.json();
+        if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
+        this.presetPreview.cfg = j.cfg || j.preset || j;
+        this.presetPreview.meta = j.meta || { headline: j.headline, description: j.description };
+        this.presetPreview.installName = (j.filename || source.split('/').pop() || 'community')
+          .replace(/\.preset\.json$/i, '').replace(/\.json$/i, '');
+      } catch (e) { this.presetPreview.error = String(e); }
+      finally { this.presetPreview.loading = false; }
+    },
+    async installPreviewedPreset() {
+      if (!this.presetPreview.cfg) return;
+      this.presetPreview.installing = true;
+      try {
+        const body = { name: this.presetPreview.installName };
+        if (this._isCommunityFilename(this.presetPreview.source)) body.filename = this.presetPreview.source;
+        else body.url = this.presetPreview.source;
+        const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.presetPreview.error = j.error || ('HTTP ' + r.status); return; }
+        const installed = j.name || this.presetPreview.installName;
+        this.notify('Preset installed: ' + installed, 'success');
+        this.presetPreview.open = false;
+        await this.loadPresets();
+        // Scroll the newly landed card into view + fire the highlight pulse
+        // so the user sees exactly what was installed.
+        this._highlightPresetCard(installed);
+      } catch (e) { this.presetPreview.error = String(e); }
+      finally { this.presetPreview.installing = false; }
+    },
+    async installPresetFromUrl(source, filename) {
+      if (!source) return;
+      try {
+        const name = (filename || '').replace(/\.preset\.json$/i, '').replace(/\.json$/i, '') || undefined;
+        const body = { name };
+        if (this._isCommunityFilename(source)) body.filename = source;
+        else body.url = source;
+        const r = await fetch('/api/presets/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
+        this.notify('Preset installed', 'success');
+        await this.loadPresets();
+        this._highlightPresetCard(j.name || name);
+      } catch (e) { this.notify('Install failed: ' + e, 'error'); }
+    },
+    // Publish a preset by opening a PR against origin/main. The server
+    // cuts a fresh `contrib/preset-<slug>-<epoch>` branch inside a
+    // throwaway git worktree — the user's current branch + WIP are never
+    // touched. Uses `gh pr create` when available; falls back to a
+    // github compare URL the user can click to open the PR manually.
+    async publishPresetViaGit(name) {
+      const key = String(name || '').trim();
+      if (!key) return;
+      const bodyText = 'This will branch off origin/main in a scratch worktree, commit "' + key + '" + its thumbnail, push a contrib/* branch, and open a PR. Nothing lands on main directly. Your current branch and working-tree edits are untouched.';
+      const ok = await this.askConfirm(bodyText, {
+        title: 'Publish preset as a PR?',
+        confirmLabel: 'Open PR',
+        cancelLabel: 'Cancel',
+      });
+      if (!ok) return;
+      const toastId = this.notify('Opening PR for ' + key + '…', 'info', 0);
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(key) + '/publish', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const j = await r.json().catch(() => ({}));
+        this.dismissToast(toastId);
+        if (!r.ok || j.ok === false) {
+          const parts = [j.error || ('HTTP ' + r.status)];
+          if (j.hint) parts.push(j.hint);
+          this.notify('Publish failed — ' + parts.join(' · '), 'error', 9000);
+          return;
+        }
+        // "No changes" short-circuit — preset is already on origin/main.
+        if (!j.branch) {
+          this.notify(j.message || ('No changes for ' + key), 'info', 6000);
+          return;
+        }
+        if (j.pr_url) {
+          const verb = j.gh_used ? 'PR opened' : 'branch pushed — click to open PR';
+          this.notify(verb + ': ' + j.pr_url, 'success', 12000);
+          try { window.open(j.pr_url, '_blank', 'noopener'); } catch (_) {}
+        } else {
+          this.notify('Branch pushed: ' + j.branch + ' — open the PR from your git host', 'info', 9000);
+        }
+      } catch (e) {
+        this.dismissToast(toastId);
+        this.notify('Publish failed: ' + e, 'error', 6000);
+      }
+    },
+
+    // ── Preset thumbnail upload state ────────────────────────────────────
+    // cacheBust is incremented after every save/delete so the preview <img>
+    // reloads instead of showing a cached copy of the previous thumbnail.
+    presetThumb: { busy: false, dragOver: false, error: '', status: '', hasCustom: false, cacheBust: 0 },
+    _resetPresetThumbState(name) {
+      this.presetThumb = { busy: false, dragOver: false, error: '', status: '',
+                           hasCustom: false, cacheBust: Date.now() };
+      // hasCustom is populated by _refreshPresetThumbStatus so the "Remove
+      // custom thumbnail" button only shows for real uploads (not the
+      // shipped SVG / gradient placeholder).
+      this._refreshPresetThumbStatus(name);
+    },
+    async _refreshPresetThumbStatus(name) {
+      const key = String(name || '').trim();
+      if (!key) return;
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(key) + '/thumbnail/status');
+        if (!r.ok) { this.presetThumb.hasCustom = false; return; }
+        const j = await r.json();
+        this.presetThumb.hasCustom = !!(j && j.has_custom);
+      } catch (_) { this.presetThumb.hasCustom = false; }
+    },
+    onPresetThumbPick(evt) {
+      const f = evt?.target?.files?.[0];
+      if (f) this._uploadPresetThumb(f);
+      // Clear the input value so picking the same file again re-fires @change.
+      if (evt?.target) evt.target.value = '';
+    },
+    onPresetThumbDrop(evt) {
+      const files = evt?.dataTransfer?.files;
+      if (files && files[0]) this._uploadPresetThumb(files[0]);
+    },
+    async _uploadPresetThumb(file) {
+      const name = this.presetEditor.name;
+      if (!name || !file) return;
+      // Client-side quick checks — the server re-validates via magic bytes.
+      if (file.size > 2 * 1024 * 1024) {
+        this.presetThumb.error = 'File exceeds 2 MB';
+        this.presetThumb.status = '';
+        return;
+      }
+      this.presetThumb.busy = true; this.presetThumb.error = ''; this.presetThumb.status = '';
+      try {
+        const fd = new FormData(); fd.append('file', file, file.name || 'thumbnail');
+        const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/thumbnail', {
+          method: 'POST', body: fd,
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+          this.presetThumb.error = j.error || ('HTTP ' + r.status);
+          return;
+        }
+        this.presetThumb.cacheBust = Date.now();
+        this.presetThumb.status = 'Saved · ' + (j.path || '');
+        this.presetThumb.hasCustom = true;
+        this.notify('Thumbnail updated', 'success', 2500);
+      } catch (e) {
+        this.presetThumb.error = String(e);
+      } finally { this.presetThumb.busy = false; }
+    },
+    async removePresetThumbnail() {
+      const name = this.presetEditor.name;
+      if (!name) return;
+      if (!(await this.askConfirm('Remove the custom thumbnail for "' + name + '"?',
+                                   { title: 'Remove thumbnail', confirmLabel: 'Remove', danger: true }))) return;
+      this.presetThumb.busy = true; this.presetThumb.error = ''; this.presetThumb.status = '';
+      try {
+        const r = await fetch('/api/presets/' + encodeURIComponent(name) + '/thumbnail', { method: 'DELETE' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+          this.presetThumb.error = j.error || ('HTTP ' + r.status);
+          return;
+        }
+        this.presetThumb.cacheBust = Date.now();
+        this.presetThumb.hasCustom = false;
+        this.presetThumb.status = 'Removed';
+        this.notify('Thumbnail removed', 'success', 2500);
+      } catch (e) {
+        this.presetThumb.error = String(e);
+      } finally { this.presetThumb.busy = false; }
+    },
+
+    // ── T1 #4: quick-sort ─────────────────────────────────────────────────
+    quickSort: { open: false, folder: '', preset: 'quality_only', worker: '', busy: false, error: '' },
+    openQuickSort() { this.quickSort = { open: true, folder: '', preset: 'quality_only', worker: '', busy: false, error: '' }; },
+    quickSortWorkers() {
+      const fleet = (this.je.eff?.vision?.workers || this.globalVision.cfg?.vision?.workers || []);
+      return (fleet || []).filter(w => w.enabled !== false);
+    },
+    async submitQuickSort() {
+      if (!this.quickSort.folder.trim()) { this.quickSort.error = 'Folder path required.'; return; }
+      this.quickSort.busy = true; this.quickSort.error = '';
+      try {
+        const body = { folder: this.quickSort.folder.trim(), preset: this.quickSort.preset, worker_id: this.quickSort.worker || undefined };
+        const r = await fetch('/api/quick-sort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.quickSort.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify('Quick-sort started', 'success');
+        this.quickSort.open = false;
+        await this.loadJobs();
+        if (j.slug) this.openJob(j.slug);
+      } catch (e) { this.quickSort.error = String(e); }
+      finally { this.quickSort.busy = false; }
+    },
+
+    // ── T2 #9: vision dry-run ─────────────────────────────────────────────
+    // previewDataUrl is a blob: URL created via URL.createObjectURL — cheap,
+    // sync, and revoked on clear/replace to avoid leaking references.
+    dryRun: { open: false, workerId: '', file: null, filename: '', previewDataUrl: null, busy: false, result: null, error: '', dragOver: false },
+    _setDryRunPreview(f) {
+      // Revoke any prior object URL so we don't leak the previous file.
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = f;
+      this.dryRun.filename = f.name;
+      this.dryRun.previewDataUrl = URL.createObjectURL(f);
+    },
+    handleDryRunPick(ev) {
+      const f = ev.target.files?.[0];
+      if (f) { this._setDryRunPreview(f); }
+    },
+    handleDryRunDrop(ev) {
+      this.dryRun.dragOver = false;
+      const f = ev.dataTransfer.files?.[0];
+      if (f) { this._setDryRunPreview(f); }
+    },
+    clearDryRunFile() {
+      if (this.dryRun.previewDataUrl) {
+        try { URL.revokeObjectURL(this.dryRun.previewDataUrl); } catch (_) {}
+      }
+      this.dryRun.file = null;
+      this.dryRun.filename = '';
+      this.dryRun.previewDataUrl = null;
+      const inp = this.$refs.dryRunFileInput;
+      if (inp) inp.value = '';
+    },
+    formatDryRunSize(n) {
+      if (!Number.isFinite(n)) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(2) + ' MB';
+    },
+    async runDryRun() {
+      if (!this.dryRun.file) return;
+      this.dryRun.busy = true; this.dryRun.error = ''; this.dryRun.result = null;
+      try {
+        const fd = new FormData();
+        fd.append('image', this.dryRun.file);
+        if (this.dryRun.workerId) fd.append('worker_id', this.dryRun.workerId);
+        const r = await fetch('/api/vision/dry-run', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.dryRun.error = j.error || ('HTTP ' + r.status); return; }
+        this.dryRun.result = j;
+      } catch (e) { this.dryRun.error = String(e); }
+      finally { this.dryRun.busy = false; }
+    },
+
+    // ── T2 #10: endpoint discovery ────────────────────────────────────────
+    discovery: { loading: false, candidates: [], error: '' },
+    async rescanDiscovery() {
+      this.discovery.loading = true; this.discovery.error = '';
+      try {
+        const j = await fetch('/api/vision/discover').then(r => r.json());
+        this.discovery.candidates = (Array.isArray(j.candidates) ? j.candidates : (Array.isArray(j) ? j : []))
+          .map(d => ({ ...d, adding: false }));
+      } catch (e) { this.discovery.error = String(e); }
+      finally { this.discovery.loading = false; }
+    },
+    async addDiscoveredEndpoint(d) {
+      d.adding = true;
+      try {
+        const r = await fetch('/api/vision/discover/add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: d.provider, base_url: d.base_url, model: d.model || '' }) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.notify(j.error || ('HTTP ' + r.status), 'error'); return; }
+        this.notify('Endpoint added', 'success');
+        this.discovery.candidates = this.discovery.candidates.filter(x => !(x.base_url === d.base_url && x.provider === d.provider));
+        this.loadJobEditor();
+      } catch (e) { this.notify('Add failed: ' + e, 'error'); }
+      finally { d.adding = false; }
+    },
+
+    // ── T2 #11: digest webhook ────────────────────────────────────────────
+    digest: { webhook_url: '', webhook_style: 'discord', since_hours: 24, top_n: 5,
+              busy: false, action: '', markdown: '', status: '', error: '' },
+    async previewDigest() {
+      this.digest.busy = true; this.digest.action = 'preview'; this.digest.error = ''; this.digest.status = '';
+      try {
+        const body = { since_hours: this.digest.since_hours, top_n: this.digest.top_n, style: this.digest.webhook_style };
+        const r = await fetch('/api/digest/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.digest.error = j.error || ('HTTP ' + r.status); return; }
+        this.digest.markdown = j.markdown || j.text || JSON.stringify(j, null, 2);
+      } catch (e) { this.digest.error = String(e); }
+      finally { this.digest.busy = false; }
+    },
+    async sendDigest() {
+      if (!this.digest.webhook_url) return;
+      this.digest.busy = true; this.digest.action = 'send'; this.digest.error = ''; this.digest.status = '';
+      try {
+        const body = { webhook_url: this.digest.webhook_url, webhook_style: this.digest.webhook_style,
+                       since_hours: this.digest.since_hours, top_n: this.digest.top_n };
+        const r = await fetch('/api/digest/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.digest.error = j.error || ('HTTP ' + r.status); return; }
+        this.digest.status = 'Sent — ' + (j.status || 'OK');
+      } catch (e) { this.digest.error = String(e); }
+      finally { this.digest.busy = false; }
+    },
+
+    // ── T2 #12: export preview ────────────────────────────────────────────
+    exportPreview: { open: false, loading: false, data: null, error: '' },
+    async openExportPreview() {
+      this.exportPreview = { open: true, loading: true, data: null, error: '' };
+      try {
+        const body = { ...this.exportForm };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/export/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.exportPreview.error = j.error || ('HTTP ' + r.status); return; }
+        this.exportPreview.data = j;
+      } catch (e) { this.exportPreview.error = String(e); }
+      finally { this.exportPreview.loading = false; }
+    },
+
+    // ── T3 #13/#14: gallery bulk-select ───────────────────────────────────
+    bulk: { mode: false, selected: [], targetCategory: '', busy: false, error: '' },
+    bulkToggle(path) {
+      const i = this.bulk.selected.indexOf(path);
+      if (i >= 0) this.bulk.selected.splice(i, 1);
+      else this.bulk.selected.push(path);
+    },
+    bulkSelectAllPage() {
+      const paths = (this.gallery.items || []).map(c => c.path);
+      const set = new Set(this.bulk.selected);
+      paths.forEach(p => set.add(p));
+      this.bulk.selected = [...set];
+    },
+    bulkClear() { this.bulk.selected = []; this.bulk.error = ''; },
+    async bulkAction(action) {
+      if (!this.bulk.selected.length || this.bulk.busy) return;
+      if (action !== 'delete' && !this.bulk.targetCategory) return;
+      if (action === 'delete' && !(await this.askConfirm('Move ' + this.bulk.selected.length + ' item(s) to trash?', { danger: true }))) return;
+      this.bulk.busy = true; this.bulk.error = '';
+      try {
+        const body = { action, paths: this.bulk.selected, target_category: this.bulk.targetCategory || undefined };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/gallery/bulk-action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.bulk.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify((j.moved ?? j.count ?? this.bulk.selected.length) + ' items updated', 'success');
+        this.bulk.selected = []; this.bulk.targetCategory = '';
+        this.loadGallery();
+      } catch (e) { this.bulk.error = String(e); }
+      finally { this.bulk.busy = false; }
+    },
+    async bulkRequeue() {
+      if (!this.bulk.selected.length || this.bulk.busy) return;
+      if (!(await this.askConfirm('Requeue ' + this.bulk.selected.length + ' item(s) for reclassification?'))) return;
+      this.bulk.busy = true; this.bulk.error = '';
+      try {
+        const body = { paths: this.bulk.selected };
+        if (this.currentJob) body.job = this.currentJob;
+        const r = await fetch('/api/gallery/requeue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.bulk.error = j.error || ('HTTP ' + r.status); return; }
+        this.notify((j.requeued ?? this.bulk.selected.length) + ' requeued', 'success');
+        this.bulk.selected = [];
+        this.loadGallery();
+      } catch (e) { this.bulk.error = String(e); }
+      finally { this.bulk.busy = false; }
+    },
+
+    // ── T3 #17: gallery-dl URL test ───────────────────────────────────────
+    gdlTest: {},
+    gdlTestAllBusy: false,
+    effUrlsList() {
+      const raw = (this.effUrls && this.effUrls()) || '';
+      return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    },
+    async testGalleryDlUrl(url, idx) {
+      this.gdlTest = { ...this.gdlTest, [idx]: { busy: true, result: null } };
+      try {
+        // cookies_file is a filesystem PATH — the backend reads it and
+        // resolves to Netscape-format content. Sending it as cookies_txt
+        // (raw content) mis-decodes and confuses gallery-dl's cookiejar.
+        const cookiesFile = this.je.eff?.scrapers?.gallery_dl?.cookies_file || undefined;
+        const configJson = this.je.eff?.scrapers?.gallery_dl?.config_json || undefined;
+        const body = { url, cookies_file: cookiesFile, config_json: configJson };
+        const r = await fetch('/api/scrapers/gallery-dl/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        // Normalise: scraper_test returns {ok, extractor, category, sample_urls,
+        // message, error}. Compute sample_count from sample_urls.length so the
+        // UI can display `extractor · ~N items`.
+        const sample_count = Array.isArray(j.sample_urls) ? j.sample_urls.length : null;
+        this.gdlTest = { ...this.gdlTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, sample_count, ...j },
+        } };
+      } catch (e) {
+        this.gdlTest = { ...this.gdlTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
+      }
+    },
+    async testGalleryDlAll() {
+      if (this.gdlTestAllBusy) return;
+      this.gdlTestAllBusy = true;
+      try {
+        const urls = this.effUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          // Serial — polite to remote hosts; per-row state updates as we go.
+          await this.testGalleryDlUrl(urls[i], i);
+        }
+      } finally { this.gdlTestAllBusy = false; }
+    },
+
+    // ── yt-dlp / Youtube scraper URL test (mirrors gallery-dl). ───────────
+    ytTest: {},
+    ytTestAllBusy: false,
+    ytUrlsList() {
+      const raw = (this.ytUrls && this.ytUrls()) || '';
+      return String(raw).split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    },
+    async testYtDlpUrl(url, idx) {
+      this.ytTest = { ...this.ytTest, [idx]: { busy: true, result: null } };
+      try {
+        const body = { url };
+        const r = await fetch('/api/scrapers/yt-dlp/test-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        this.ytTest = { ...this.ytTest, [idx]: {
+          busy: false,
+          result: { ok: r.ok && !!j.ok && !j.error, ...j },
+        } };
+      } catch (e) {
+        this.ytTest = { ...this.ytTest, [idx]: { busy: false, result: { ok: false, error: String(e) } } };
+      }
+    },
+    async testYtDlpAll() {
+      if (this.ytTestAllBusy) return;
+      this.ytTestAllBusy = true;
+      try {
+        const urls = this.ytUrlsList();
+        for (let i = 0; i < urls.length; i++) {
+          await this.testYtDlpUrl(urls[i], i);
+        }
+      } finally { this.ytTestAllBusy = false; }
+    },
+
+    // ── T3 #18: cookies converter ─────────────────────────────────────────
+    cookiesModal: { open: false, domain: '', settingsKey: '', raw: '', busy: false, result: null, error: '' },
+    openCookiesModal(domain, settingsKey) {
+      this.cookiesModal = { open: true, domain: domain || '', settingsKey: settingsKey || '', raw: '', busy: false, result: null, error: '' };
+    },
+    async submitCookies() {
+      if (!this.cookiesModal.raw) return;
+      this.cookiesModal.busy = true; this.cookiesModal.error = ''; this.cookiesModal.result = null;
+      try {
+        const body = { target_domain: this.cookiesModal.domain, raw: this.cookiesModal.raw,
+                       output_name: (this.cookiesModal.domain || 'site').replace(/[^a-z0-9_.-]/gi, '_') };
+        const r = await fetch('/api/cookies/convert', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok || j.error) { this.cookiesModal.error = j.error || ('HTTP ' + r.status); return; }
+        this.cookiesModal.result = j;
+        if (this.cookiesModal.settingsKey && j.path) {
+          this.settings[this.cookiesModal.settingsKey] = j.path;
+          this.markSettingsDirty();
+        } else if (j.path && this.je.eff?.scrapers?.gallery_dl) {
+          try { this.setOverride('scrapers.gallery_dl.cookies_file', j.path); } catch (e) {}
+        }
+        this.notify('Cookies saved', 'success');
+      } catch (e) { this.cookiesModal.error = String(e); }
+      finally { this.cookiesModal.busy = false; }
+    },
+
+    // ── T3 #19: live log tail (SSE) ───────────────────────────────────────
+    liveLogs: { connected: false, follow: true, lines: [], recent: [], error: '', _es: null },
+    async startLogStream() {
+      this.stopLogStream();
+      this.liveLogs.error = '';
+      try {
+        const h = await fetch('/api/logs/history?limit=200').then(r => r.json()).catch(() => ({ lines: [] }));
+        this.liveLogs.recent = (h.lines || h.log || []).slice(-200);
+      } catch (e) { /* non-fatal */ }
+      try {
+        const es = new EventSource('/api/logs/stream');
+        es.onmessage = (ev) => {
+          const line = String(ev.data || '');
+          this.liveLogs.lines.push(line);
+          if (this.liveLogs.lines.length > 2000) this.liveLogs.lines.shift();
+          if (this.liveLogs.follow) this.$nextTick(() => {
+            const el = this.$refs.liveLogsPane;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        };
+        es.onerror = () => { this.liveLogs.error = 'Stream disconnected'; this.stopLogStream(); };
+        this.liveLogs._es = es;
+        this.liveLogs.connected = true;
+      } catch (e) { this.liveLogs.error = String(e); }
+    },
+    stopLogStream() {
+      if (this.liveLogs._es) { try { this.liveLogs._es.close(); } catch (e) {} }
+      this.liveLogs._es = null; this.liveLogs.connected = false;
+    },
+    async copyLogsToClipboard() {
+      try {
+        await navigator.clipboard.writeText(this.liveLogs.lines.join('\n'));
+        this.notify('Logs copied', 'success');
+      } catch (e) { this.notify('Copy failed: ' + e, 'error'); }
+    },
+
+    // ── T3 #20: VRAM hint ─────────────────────────────────────────────────
+    workerInfo: {},
+    async loadWorkerInfo(w) {
+      const key = w.id || w.name;
+      if (!key) return;
+      try {
+        const q = 'worker_id=' + encodeURIComponent(key);
+        const r = await fetch('/api/vision/worker-info?' + q);
+        const j = await r.json();
+        this.workerInfo = { ...this.workerInfo, [key]: j };
+      } catch (e) { this.notify('Info fetch failed: ' + e, 'error'); }
+    },
+
   };
 }
 </script>
@@ -7973,6 +15800,17 @@ def dashboard():
     return render_template_string(
         HTML_TEMPLATE,
         scraper_names_json=json.dumps(list(job_config.SCRAPER_NAMES)),
+        # PRIORITY_NAMES + descriptions + weight bounds power the unified
+        # Scrapers-tab card list. Everything the Alpine template needs to render
+        # a card comes from job_config here — no JS duplication.
+        priority_names_json=json.dumps(list(job_config.PRIORITY_NAMES)),
+        scraper_descriptions_json=json.dumps({
+            **_SCRAPER_DESCRIPTIONS,
+            "YT-DLP": "yt-dlp (YouTube, TikTok, Vimeo, X, Reddit, Twitch clips…). Configure URLs + cookies in the card body.",
+        }),
+        priority_weight_min=job_config.PRIORITY_WEIGHT_MIN,
+        priority_weight_max=job_config.PRIORITY_WEIGHT_MAX,
+        priority_weight_default=job_config.PRIORITY_WEIGHT_DEFAULT,
         export_profiles_json=json.dumps(list(export_profiles.PROFILES)),
         video_bucket_modes_json=json.dumps(list(export_profiles.VIDEO_BUCKET_MODES)),
         caption_styles_json=json.dumps(list(vision_prompt.CAPTION_STYLES)),
@@ -8103,4 +15941,9 @@ if __name__ == "__main__":
     print("Pipeline is NOT auto-started. Use the Start button in the UI.", flush=True)
     _start_idle_unload_thread()
     _start_indexer_thread()
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+    # Bind host: default 0.0.0.0 to keep Docker/RunPod/LAN workflows working out
+    # of the box (the README documents this). Set FLASK_HOST=127.0.0.1 for a
+    # loopback-only install on a shared workstation. FLASK_HOST wins when set;
+    # blank/unset falls back to the historical default.
+    _bind_host = (os.environ.get("FLASK_HOST", "") or "0.0.0.0").strip() or "0.0.0.0"
+    app.run(host=_bind_host, port=FLASK_PORT, debug=False, use_reloader=False)
