@@ -76,6 +76,10 @@ _ADMIN_URL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^/api/credentials(?:/.*|/?)$"),
     re.compile(r"^/api/presets/[^/]+/publish/?$"),
     re.compile(r"^/api/themes/[^/]+/publish/?$"),
+    # Webhooks let an operator exfiltrate job data to any URL that passes the
+    # SSRF gate — admin-only per defence-in-depth. Includes GET (which lists
+    # them and would leak the URLs) and POST (which persists new ones).
+    re.compile(r"^/api/jobs/[^/]+/webhooks(?:/.*|/?)$"),
 )
 
 # Substrings that mark a path as admin-tier even if it doesn't match the URL
