@@ -1,0 +1,28 @@
+{
+  "name": "wood",
+  "font_family": "Playfair Display, Georgia, ui-serif, serif",
+  "vars": {
+    "--color-bg": "#241611",
+    "--color-bg-elev": "#2f1c14",
+    "--color-fg": "#f4e8d8",
+    "--color-fg-muted": "#c4a880",
+    "--color-surface": "rgba(58, 34, 22, 0.9)",
+    "--color-surface-alt": "#3a2216",
+    "--color-border": "rgba(139, 94, 60, 0.4)",
+    "--color-border-strong": "#8b5e3c",
+    "--color-accent": "#d4a04a",
+    "--color-accent-hover": "#c08a35",
+    "--color-accent-fg": "#241611",
+    "--color-success": "#8fa860",
+    "--color-success-fg": "#241611",
+    "--color-warn": "#e0a850",
+    "--color-warn-fg": "#241611",
+    "--color-danger": "#c8553d",
+    "--color-danger-fg": "#f4e8d8",
+    "--color-input-bg": "#2f1c14",
+    "--color-input-fg": "#f4e8d8",
+    "--color-input-placeholder": "#a08560",
+    "--color-pill-bg": "rgba(212, 160, 74, 0.15)",
+    "--color-pill-fg": "#e8c88a"
+  }
+}
