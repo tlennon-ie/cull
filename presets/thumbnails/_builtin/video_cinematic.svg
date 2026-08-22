@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="180" fill="url(#bg)"/>
+  <rect x="0" y="0" width="320" height="24" fill="#000000"/>
+  <rect x="0" y="156" width="320" height="24" fill="#000000"/>
+  <g transform="translate(90 60)">
+    <rect x="0" y="24" width="140" height="60" rx="4" fill="#1f2937" stroke="#f3f4f6" stroke-width="2"/>
+    <g fill="#f3f4f6">
+      <rect x="6"  y="4" width="16" height="20"/>
+      <rect x="30" y="4" width="16" height="20"/>
+      <rect x="54" y="4" width="16" height="20"/>
+      <rect x="78" y="4" width="16" height="20"/>
+      <rect x="102" y="4" width="16" height="20"/>
+      <rect x="126" y="4" width="8"  height="20"/>
+    </g>
+    <g fill="#0f172a">
+      <polygon points="6,24 22,4 30,4 14,24"/>
+      <polygon points="30,24 46,4 54,4 38,24"/>
+      <polygon points="54,24 70,4 78,4 62,24"/>
+      <polygon points="78,24 94,4 102,4 86,24"/>
+      <polygon points="102,24 118,4 126,4 110,24"/>
+    </g>
+    <text x="70" y="60" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" font-weight="600" fill="#f3f4f6">SCENE 01</text>
+    <text x="70" y="74" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9" fill="#9ca3af">TAKE 1</text>
+  </g>
+</svg>

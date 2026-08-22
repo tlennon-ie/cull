@@ -78,7 +78,10 @@ def _parse_reddit_cookies(raw: str) -> list[dict]:
     return cookies
 
 
-REDDIT_COOKIES = _parse_reddit_cookies(os.environ.get("REDDIT_COOKIES", ""))
+# Read REDDIT_COOKIES through the credentials layer (consistent with the other
+# soft-optional keys in this file); functionally the same as os.environ.get
+# but keeps every secret lookup routed through one module for future backends.
+REDDIT_COOKIES = _parse_reddit_cookies(_cred_optional("REDDIT_COOKIES", "") or "")
 
 _NAV_TIMEOUT_MS = 30000
 

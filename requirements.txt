@@ -36,6 +36,15 @@ yt-dlp>=2026.6.9                  # video scraping lane (scraper_yt_dlp.py)
 # ── Dataset export ───────────────────────────────────────────────────────
 huggingface_hub>=1.21.0           # push curated sets to a private HF dataset repo (hf_export.py)
 
+# ── Bundled ffmpeg (for the video lane) ──────────────────────────────────
+# imageio-ffmpeg ships a static ffmpeg binary via pip (~5MB, cross-platform).
+# Bundling it in the BASE install means videos "just work" out of the box:
+#   • dashboard video playback + poster-frame thumbnails,
+#   • the optional video-classify lane (with scenedetect / ffmpeg-python from
+#     the [video] extra) can extract frames without a system-ffmpeg install.
+# video_frames._resolve_ffmpeg_bin() prefers PATH → falls back to this bundle.
+imageio-ffmpeg>=0.4
+
 # ── Optional feature extras (NOT installed by base; see pyproject extras) ──
 # Heavy/optional capabilities import-guard their deps so the base stays lean:
 #   video lane (frame extraction)  →  pip install -e .[video]   (scenedetect, ffmpeg-python)

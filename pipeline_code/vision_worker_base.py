@@ -55,7 +55,7 @@ from typing import Any
 from PIL import Image
 
 from categories import CATEGORIES
-from paths import sorted_dir
+from paths import queue_root, sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import get_next_image_round_robin
 from vision_prompt import (
@@ -110,10 +110,21 @@ class BaseVisionWorker(ABC):
     request_timeout: int = 600
 
     def __init__(self) -> None:
+        # Multi-active mode (shared vision fleet across jobs): each popped
+        # image comes from ``<queue_root>/<slug>/<source>/…`` and its sorted
+        # destination lives under a per-image-derived ``sorted_dir(slug)``.
+        # In that mode ``self.sorted_dir`` becomes the single-active fallback
+        # only; ``_resolve_sorted_dir`` per-image picks the right slug.
+        self._multi_active: bool = bool(
+            (os.environ.get("PIPELINE_ACTIVE_SLUGS_JSON", "") or "").strip()
+        )
         self.sorted_dir: Path = sorted_dir()
         # Pre-create the active taxonomy's folders so the first write doesn't
         # race against mkdir. _finalise also mkdirs lazily so a category added
-        # while the worker is mid-run still routes correctly.
+        # while the worker is mid-run still routes correctly. In multi-active
+        # mode ``self.sorted_dir`` may point at an unrelated slug (or the head
+        # of the active set) — mkdir is still safe and the per-image resolver
+        # creates the correct dest lazily.
         from categories import get_categories  # lazy: pick up edits made between imports
         for category in get_categories():
             # Constrain each taxonomy-derived folder name to a single safe
@@ -123,6 +134,35 @@ class BaseVisionWorker(ABC):
             )
         # Subclasses can stash backend-specific state here in setup().
         self._processed_count: int = 0
+
+    # ── Sorted-dir routing (single-active + multi-active fleet) ───────────
+
+    def _resolve_sorted_dir(self, image_path: Path) -> Path:
+        """Return the sorted-dir under which ``image_path`` should be filed.
+
+        Single-active mode (the default, and every historic call): returns
+        the worker's own ``self.sorted_dir`` — behaviour is byte-identical.
+
+        Multi-active mode (shared vision fleet spawned by the supervisor
+        with ``PIPELINE_ACTIVE_SLUGS_JSON`` set): derives the slug from the
+        image's path — the queue layout is
+        ``<queue_root>/<slug>/<source>/<file>`` — and returns
+        ``paths.sorted_dir(slug)`` so each classified image lands under its
+        originating job's sorted root. Falls back to ``self.sorted_dir`` if
+        the derivation fails.
+        """
+        if not self._multi_active:
+            return self.sorted_dir
+        try:
+            root = queue_root().resolve()
+            resolved = image_path.resolve()
+            rel = resolved.relative_to(root)
+            slug = rel.parts[0] if rel.parts else ""
+        except (ValueError, OSError):
+            return self.sorted_dir
+        if not slug:
+            return self.sorted_dir
+        return sorted_dir(slug)
 
     # ── Subclass contract ─────────────────────────────────────────────────
 
@@ -189,6 +229,15 @@ class BaseVisionWorker(ABC):
         if ctx is None:
             return _Outcome.SKIPPED
 
+        # Video with VIDEO_CLASSIFY_ENABLED=true but NO frame-extraction backend
+        # installed: HOLD the clip in Unclassified_Video (preserving the file
+        # and its .txt / .meta.json siblings) instead of silently DISCARDing it.
+        # This is the common "user turned on video mode without installing
+        # ffmpeg" foot-gun — see run_pipeline supervisor warnings and the
+        # /api/video/backend-status endpoint feeding the dashboard banner.
+        if self._is_video_without_backend(ctx):
+            return self._finalise_hold_video(ctx)
+
         # Acquire the bytes to CLASSIFY. For a still that's the file's own bytes.
         # For a video clip (only when VIDEO_CLASSIFY_ENABLED), we extract a
         # representative frame and classify the FRAME's bytes — the CLIP itself is
@@ -219,6 +268,8 @@ class BaseVisionWorker(ABC):
             return self._finalise_discard(ctx, reason=prefilter_reason)
 
         b64 = base64.standard_b64encode(small).decode()
+        # ``build_classification_prompt`` is memoised in vision_prompt so hot
+        # loops pay one dict lookup, not a full ~8KB string rebuild per image.
         prompt_instruction = build_classification_prompt()
 
         try:
@@ -367,10 +418,12 @@ class BaseVisionWorker(ABC):
 
         # The category (model output) and source (queue-derived) become directory
         # names — constrain each to a single safe component so a crafted value
-        # can't escape the sorted root (path-injection barrier).
+        # can't escape the sorted root (path-injection barrier). In multi-active
+        # mode the sorted root is per-image (derived from the image's queue slug);
+        # single-active mode preserves the historic ``self.sorted_dir`` path.
         safe_category = _safe_component(final_category, "Unknown")
         safe_source = _safe_component(ctx.source_name, "unknown")
-        dest_dir = self.sorted_dir / safe_category / safe_source
+        dest_dir = self._resolve_sorted_dir(ctx.image_path) / safe_category / safe_source
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         safe_name = (
@@ -391,6 +444,21 @@ class BaseVisionWorker(ABC):
                 )
         except FileNotFoundError:
             return _Outcome.SKIPPED
+
+        # Move the scraper-side .meta.json sidecar (distinct from the
+        # vision-worker's .vision.json audit record written just below). Without
+        # this the sibling metadata gets orphaned in the queue root when the
+        # image moves to sorted/, breaking any downstream tool that keys off it.
+        # Best-effort: an orphan is preferable to a crash, so any OSError is
+        # swallowed after the primary image move already succeeded.
+        src_scraper_meta = ctx.image_path.parent / f"{ctx.image_path.stem}.meta.json"
+        if src_scraper_meta.exists():
+            dest_scraper_meta = dest_dir / f"{safe_name}.meta.json"
+            try:
+                shutil.move(str(src_scraper_meta), str(dest_scraper_meta))
+            except OSError as exc:
+                logger.debug("scraper .meta.json move failed for %s: %s",
+                             ctx.image_path.name, exc)
 
         # Auto-caption: write the model's caption to .txt when enabled. The
         # source-side prompt (if any) was just moved to `final_txt`; we only
@@ -439,6 +507,81 @@ class BaseVisionWorker(ABC):
             index_store.set_phash(str(final_img), phash)
         except Exception as exc:  # noqa: BLE001 - phash is best-effort, never fatal
             logger.debug("phash store skipped for %s: %s", final_img.name, exc)
+
+    @staticmethod
+    def _is_video_without_backend(ctx: ClassifyContext) -> bool:
+        """True iff the item is a video, video-mode is enabled, AND no frame-
+        extraction backend (ffmpeg / scenedetect) is installed.
+
+        The three-way check is deliberate: with video-mode OFF the still-image
+        path already handles (misclassifies, technically) a raw video by reading
+        its container bytes — that's the pre-existing behaviour and not our fix
+        to make. Only when the operator has ASKED for video classification but
+        has no backend do we intercept, so the failure mode surfaces exactly
+        where the operator wired it up. Fully defensive: any probe error means
+        "don't intercept" so a broken import can never mass-hold real work.
+        """
+        try:
+            import video_frames
+        except Exception:  # noqa: BLE001 - optional module: don't intercept on failure
+            return False
+        try:
+            if not video_frames.is_video(ctx.image_path):
+                return False
+            if not video_frames.is_enabled():
+                return False
+            return not video_frames.has_any_backend()
+        except Exception as exc:  # noqa: BLE001 - probe must never break the worker
+            logger.debug("video-backend probe failed for %s: %s",
+                         ctx.image_path.name, exc)
+            return False
+
+    def _finalise_hold_video(self, ctx: ClassifyContext) -> str:
+        """Route a video clip to the ``Unclassified_Video`` bucket WITHOUT
+        discarding it, when we lack a frame-extraction backend.
+
+        The clip and its sidecar files land in
+        ``data/sorted/<slug>/Unclassified_Video/<source>/`` via the standard
+        ``_finalise`` move, and a ``.vision.json`` marker records why the
+        classifier bailed. The user can install ffmpeg / scenedetect and
+        re-queue with ``tools/requeue_sorted.py Unclassified_Video`` without
+        losing anything. Logs at WARNING (not INFO) so it's visible on the
+        supervisor stream — this is a configuration gap, not a normal outcome.
+        """
+        reason = (
+            "no video backend installed "
+            "(install ffmpeg or scenedetect to classify)"
+        )
+        logger.warning(
+            "HOLD video (no backend): %s → Unclassified_Video/%s",
+            ctx.image_path.name, ctx.source_name,
+        )
+        # apply_scores enforces the response shape, but we set the category
+        # ourselves so it survives any category-repair pass. _finalise's
+        # _safe_component sanitises the folder name.
+        result = apply_scores({
+            "description": "video clip held: no frame-extraction backend installed",
+            "primary_subject": "video",
+            "is_screenshot": False,
+            "is_composite_grid": False,
+            "contains_text_overlay": False,
+            "is_human_photograph": False,
+            "art_medium": "unclear",
+            "photorealistic_style": False,
+            "has_ai_flaws": False,
+            "woman_present": False,
+            "nsfw": False,
+            "OVR_Quality_Score": 0,
+            "REL_Quality_Score": 0,
+            "quality_score": 0,
+            "category": "Unclassified_Video",
+            "reason": reason,
+        })
+        # apply_scores may rewrite the category (e.g. into DISCARD) based on the
+        # active taxonomy — force it back so the clip lands in the hold bucket.
+        result["category"] = "Unclassified_Video"
+        result["reason"] = reason
+        return self._finalise(ctx, result)
 
     def _finalise_discard(self, ctx: ClassifyContext, reason: str) -> str:
         """Special-case: image bytes are unreadable. Skip the API and route
