@@ -154,7 +154,7 @@ def _apply_inline_config(config, raw_json: str, label: str) -> None:
             try:
                 os.unlink(tmp_path)
             except OSError:
-                pass
+                pass  # temp config already gone; nothing to clean up
 
 
 def _configure_gallery_dl(tmp_dir: Path, archive_path: Path, limit: int) -> None:

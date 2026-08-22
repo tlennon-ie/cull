@@ -113,10 +113,10 @@ _MAX_GALLERY_CONFIG_JSON = 20000
 # staying filesystem-safe: must start with a letter, then letters/digits/space/
 # underscore/hyphen, max 40 chars. _safe_component() is still the path-injection
 # barrier downstream, so this only governs what the dashboard accepts.
-_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
+_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}\Z")
 _RESERVED_CATEGORIES: frozenset[str] = frozenset({"DISCARD", "CORRUPT"})
 # A local-import folder ``name`` becomes a filesystem path component downstream.
-_LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+_LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}\Z")
 
 
 class ValidationError(ValueError):

@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -983,7 +983,7 @@ class Supervisor:
             try:
                 proc.kill()
             except Exception:
-                pass
+                pass  # already reaped — nothing left to stop
 
     def _sweep_stale_processing(self) -> None:
         """Revert `.processing` files back to their original name before respawning.
@@ -1003,7 +1003,7 @@ class Supervisor:
                     proc_file.rename(original)
                     reverted += 1
             except OSError:
-                pass
+                pass  # another worker won the rename; its claim stands
         if reverted:
             print(f"  [env-reload] restored {reverted} in-flight image(s) to the queue", flush=True)
 
@@ -1140,7 +1140,7 @@ class Supervisor:
                 until = self._cooldown_until.get(label, 0.0)
                 if until > now:
                     continue  # still in cooldown
-                if until and until <= now:
+                if until:
                     self._cooldown_until.pop(label, None)
                 self._spawn(spec)
 

@@ -527,7 +527,14 @@ def run_digest(
         else:
             body = _digest_webhook_body(_digest.render_markdown(payload), style)
             try:
-                resp = requests.post(webhook_url, json=body, timeout=_DIGEST_TIMEOUT)
+                # allow_redirects=False so a hostile webhook host can't 302 the
+                # POST at a private address after _is_public_http_url cleared it.
+                resp = requests.post(
+                    webhook_url,
+                    json=body,
+                    timeout=_DIGEST_TIMEOUT,
+                    allow_redirects=False,
+                )
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 logger.warning("digest: webhook POST failed for slug=%s: %s", slug, exc)

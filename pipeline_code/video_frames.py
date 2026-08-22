@@ -359,7 +359,7 @@ def cleanup_frames(frames: list[Path]) -> None:
                 parents.add(parent)
             frame.unlink(missing_ok=True)
         except OSError:
-            pass
+            pass  # frame already swept — keep tidying the rest
     for parent in parents:
         _rmdir_quietly(parent)
 

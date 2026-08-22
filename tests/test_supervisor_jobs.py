@@ -127,7 +127,7 @@ def test_active_job_env_overlays_resolved_over_environ(isolated, monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "secret-key-123")
 
     # v2: PIPELINE_TOPIC comes from the job's subject.
-    job = job_config.create_job("Fresh Job", subject="Fresh Job Topic")
+    job_config.create_job("Fresh Job", subject="Fresh Job Topic")
     job_config.set_active("fresh_job")
 
     env = run_pipeline.active_job_env()
@@ -495,7 +495,9 @@ def test_scraper_priority_missing_env_uses_defaults(isolated, monkeypatch):
     for blob in ("", "not json", '{"order": ["nope"]}'):
         monkeypatch.setenv("SCRAPER_PRIORITY_JSON", blob)
         agents = run_pipeline.compute_desired_agents("topic")
-        assert "X.com" in agents  # X.com is first in default PRIORITY_NAMES
+        # X.com is first in default PRIORITY_NAMES. Keyed lookup rather than
+        # `"X.com" in agents` so this reads as a dict probe, not a URL check.
+        assert agents.get("X.com") is not None
 
 
 def test_scraper_priority_wired_from_job_override(isolated, monkeypatch):

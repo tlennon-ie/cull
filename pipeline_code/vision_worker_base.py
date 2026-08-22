@@ -54,7 +54,6 @@ from typing import Any
 
 from PIL import Image
 
-from categories import CATEGORIES
 from paths import queue_root, sorted_dir
 from pipeline_logging import get_logger
 from queue_manager import get_next_image_round_robin
@@ -613,7 +612,7 @@ class BaseVisionWorker(ABC):
         try:
             processing_path.rename(image_path)
         except OSError:
-            pass
+            pass  # another worker already reclaimed it, or the file is gone
 
 
 # Convenience for `python vision_worker_x.py` — subclasses just call

@@ -147,7 +147,7 @@ def get_or_create(image_path: Path, size: int) -> Path:
         try:
             os.utime(cache_file, None)
         except OSError:
-            pass
+            pass  # atime bump is only a GC hint; the cached file still serves
         return cache_file
     # Render to a temp file then atomic-rename so concurrent readers never
     # see a half-written JPEG.
@@ -164,7 +164,7 @@ def get_or_create(image_path: Path, size: int) -> Path:
         try:
             tmp_file.unlink()
         except OSError:
-            pass
+            pass  # temp render never landed, or is already gone
         raise
     return cache_file
 

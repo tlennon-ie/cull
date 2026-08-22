@@ -256,7 +256,8 @@ def extract_prompt(text: str) -> str:
         try:
             obj = json.loads(biggest)
             return json.dumps(obj, indent=2)
-        except:
+        except Exception:
+            # Not valid JSON after all — hand back the raw brace-delimited text.
             return biggest.strip()
 
     # Try XML/role blocks

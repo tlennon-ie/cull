@@ -71,7 +71,7 @@ class LMAutodetectWorker(BalancedLMWorker):
                     if item.get("id")
                 ]
         except requests.RequestException:
-            pass
+            pass  # endpoint down / not an OpenAI-compatible server
         return []
 
     def _discover(self) -> tuple[str, str]:

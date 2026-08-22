@@ -22,7 +22,7 @@ DEFAULT_DATA_DIR: Path = REPO_ROOT / "data"
 # that passes this gate cannot contain a directory traversal component. That
 # makes ``validate_slug`` a path-injection *barrier* the CodeQL py/path-injection
 # query recognises: every slug→filesystem-path flow is sanitised here first.
-_SAFE_SLUG_RE = re.compile(r"^[a-z0-9_]+$")
+_SAFE_SLUG_RE = re.compile(r"^[a-z0-9_]+\Z")
 
 
 def validate_slug(slug: str) -> str:

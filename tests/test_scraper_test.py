@@ -9,7 +9,6 @@ All network calls are intercepted at _http_request — no real HTTP in tests.
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,7 +28,6 @@ if str(PIPELINE_CODE) not in sys.path:
 
 def _import_scraper_test():
     """Import (or re-import) scraper_test from pipeline_code/."""
-    import importlib
     mod_name = "scraper_test"
     # Remove cached copy so monkeypatching env works across tests.
     sys.modules.pop(mod_name, None)
@@ -256,7 +254,7 @@ class TestCivitaiRed:
 
     def test_red_key_takes_priority_over_com_key(self, st, monkeypatch):
         """If CIVITAI_API_RED_KEY is set, Civitai-Red should succeed with 200."""
-        calls = _patch_http(monkeypatch, st, 200)
+        _patch_http(monkeypatch, st, 200)
         result = st.test_scraper(
             "Civitai-Red",
             env={"CIVITAI_API_RED_KEY": "redkey", "CIVITAI_API_KEY": "comkey"},
@@ -271,7 +269,7 @@ class TestCivitaiRed:
 
     def test_com_key_fallback_used_when_red_key_absent(self, st, monkeypatch):
         """Civitai-Red should fall back to CIVITAI_API_KEY if RED_KEY is absent."""
-        calls = _patch_http(monkeypatch, st, 200)
+        _patch_http(monkeypatch, st, 200)
         result = st.test_scraper("Civitai-Red", env={"CIVITAI_API_KEY": "comkey"})
         assert result["ok"] is True
 

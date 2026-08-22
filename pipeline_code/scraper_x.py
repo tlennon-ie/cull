@@ -6,7 +6,7 @@ scraper_x.py - Scrape X.com for image/media posts
 - Handles JSON prompts, XML/role prompts, plain text prompts
 - Saves to source-based queue using queue_manager for balanced processing
 """
-import asyncio, json, re, hashlib, os, requests, tempfile, time
+import asyncio, re, hashlib, os, requests, tempfile, time
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -348,8 +348,6 @@ def save_item(tweet_id: str, img_src: str, prompt: str, author: str, source: str
             print(f"    SKIP {dedup_key} ({reason})", flush=True)
             return False
 
-    stem = dedup_key
-    
     # Upgrade to orig quality
     img_url = re.sub(r'[?&]name=\w+', '', img_src)
     img_url = img_url + ("&name=orig" if "?" in img_url else "?name=orig")
@@ -581,7 +579,7 @@ async def scrape_search(ctx, query: str, seen: set, saved_count: list):
         dedup_check = f"x_{tweet_id}_"
         if any(k.startswith(dedup_check) for k in seen):
             continue
-        await scrape_tweet_page(ctx, tweet_id, author, seen, saved_count, f"x_search")
+        await scrape_tweet_page(ctx, tweet_id, author, seen, saved_count, "x_search")
         await asyncio.sleep(0.5)
 
     seen.flush()
@@ -701,7 +699,7 @@ async def main():
               "or yt-dlp for X video)", flush=True)
         return
     seen = _make_seen_store()
-    print(f"=== X.com Scraper ===")
+    print("=== X.com Scraper ===")
     print(f"Loaded {len(seen)} already-seen IDs")
     saved_count = [0]
 

@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -911,7 +912,7 @@ def api_pipeline_start():
             _pipeline_proc = subprocess.Popen(args, **kwargs)
             update_env("DASHBOARD_PAUSED", "false")
             return jsonify({"success": True, "pid": _pipeline_proc.pid})
-        except Exception as exc:
+        except Exception:
             logger.exception("failed to start pipeline")
             return jsonify({"error": "failed to start pipeline"}), 500
 
@@ -965,7 +966,7 @@ import categories as _categories_mod
 # Mirror of config_io._CAT_NAME_RE — allow spaces/hyphens for readable labels
 # ("Irish cars"); start with a letter, max 40 chars. _safe_component() guards the
 # filesystem downstream. Keep this in lockstep with config_io.py.
-_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
+_CAT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}\Z")
 _MAX_CATEGORIES = 12
 
 
@@ -1227,10 +1228,12 @@ def api_update_run():
         if not script.exists():
             return jsonify({"ok": False, "error": "update.sh missing"}), 500
         # Make sure the script is executable (fresh clones may not have +x set).
+        # OR on owner-execute only — a flat 0o755 would widen the file's mode for
+        # every other user on the machine just to fix a missing +x.
         try:
-            os.chmod(script, 0o755)
+            script.chmod(script.stat().st_mode | stat.S_IXUSR)
         except OSError:
-            pass
+            pass  # already executable, or a read-only mount — try the spawn anyway
         subprocess.Popen(
             ["/bin/bash", str(script)],
             cwd=str(REPO_ROOT),
@@ -2038,7 +2041,9 @@ def api_presets_list():
     # form doesn't have to guess what each preset is for. Names not shipped
     # by cull (user-created / imported presets) return empty entries.
     try:
-        from builtin_presets import PRESET_DESCRIPTIONS, PRESET_TAGS
+        import builtin_presets as _bp
+        PRESET_DESCRIPTIONS = _bp.PRESET_DESCRIPTIONS
+        PRESET_TAGS = _bp.PRESET_TAGS
     except Exception:  # pragma: no cover - defensive
         PRESET_DESCRIPTIONS, PRESET_TAGS = {}, {}
     names = sorted(lib.get("presets", {}).keys())
@@ -2069,7 +2074,7 @@ def api_presets_list():
 # — e.g. "Female Influencer". The thumbnail routes must accept any valid preset
 # name; internally we slugify it to a filesystem-safe stem via
 # ``_preset_thumb_key`` so lookups are stable regardless of case / whitespace.
-_PRESET_THUMB_KEY_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}$")
+_PRESET_THUMB_KEY_RE = re.compile(r"^[A-Za-z0-9 _-]{1,40}\Z")
 
 
 def _preset_thumb_key(raw: str) -> str | None:
@@ -2270,7 +2275,7 @@ def api_presets_thumbnail_upload(key: str):
     try:
         stream.seek(0)
     except (OSError, AttributeError):
-        pass
+        pass  # non-seekable stream: it is already at the head, so read on
     head = stream.read(32)
     declared_ext = ("." + (upload.filename or "").rsplit(".", 1)[-1].lower()) if "." in (upload.filename or "") else ""
     detected = _detect_upload_ext(head, declared_ext, upload.mimetype or "")
@@ -2404,14 +2409,14 @@ def api_presets_descriptions():
     it never drifts from the shipped preset library.
     """
     try:
-        import builtin_presets  # local import — cheap and keeps the top clean
+        import builtin_presets as _bp  # local import — cheap and keeps the top clean
     except Exception as exc:
-        return jsonify({"error": f"builtin_presets import failed: {exc}"}), 500
+        return _err("builtin preset library unavailable", exc, 500)
     out: list[dict] = []
-    for key in builtin_presets.PRESET_NAMES:
+    for key in _bp.PRESET_NAMES:
         try:
-            meta = builtin_presets.get_preset_display_meta(key)
-            meta["use_cases"] = builtin_presets.preset_use_cases(key)
+            meta = _bp.get_preset_display_meta(key)
+            meta["use_cases"] = _bp.preset_use_cases(key)
             out.append(meta)
         except Exception:
             continue
@@ -2785,7 +2790,7 @@ def _read_vision_prediction(image_path: Path) -> tuple[str, dict[str, Any]]:
                 if cat:
                     predicted = cat
     except (OSError, json.JSONDecodeError, ValueError):
-        pass
+        pass  # no / unreadable audit record — fall through to the defaults
     return predicted, scores
 
 
@@ -2962,7 +2967,7 @@ def brand_asset(filename: str):
     """
     if filename not in _BRAND_ASSETS:
         abort(404)
-    from paths import REPO_ROOT
+    REPO_ROOT = _paths.REPO_ROOT
     asset_path = REPO_ROOT / "assets" / filename
     if not asset_path.exists():
         abort(404)
@@ -3013,7 +3018,7 @@ def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
         try:
             os.utime(poster, None)
         except OSError:
-            pass
+            pass  # atime bump is only a GC hint; serving the poster still works
         return poster
     try:
         import ffmpeg  # type: ignore
@@ -3035,7 +3040,7 @@ def _video_poster_jpeg(video_path: Path, size: int) -> Path | None:
         try:
             tmp.unlink()
         except OSError:
-            pass
+            pass  # temp frame never landed, or is already gone
         return None
     if not tmp.exists() or tmp.stat().st_size == 0:
         return None
@@ -3282,7 +3287,7 @@ def api_activity():
 import time as _time
 import zipfile as _zipfile
 from collections import Counter as _Counter
-from dataclasses import dataclass as _dataclass, field as _field
+from dataclasses import dataclass as _dataclass
 
 _STOPWORDS: frozenset[str] = frozenset({
     "the", "and", "with", "for", "from", "this", "that", "are", "was", "were",
@@ -3535,7 +3540,7 @@ def api_stats():
                     bucket["rel_sum"] += float(rel)
                     bucket["rel_n"] += 1
             except (TypeError, ValueError):
-                pass
+                pass  # non-numeric score in the record — leave it out of the mean
 
     sources = []
     for name, b in by_source.items():
@@ -3947,12 +3952,12 @@ def api_gallery_download():
                 zf.writestr(f"{stem}.vision.json",
                             it.meta_path.read_text(encoding="utf-8"))
             except OSError:
-                pass
+                pass  # audit record is optional — ship the image without it
             if it.txt_path is not None:
                 try:
                     zf.writestr(f"{stem}.txt", it.txt_path.read_text(encoding="utf-8", errors="replace"))
                 except OSError:
-                    pass
+                    pass  # prompt sidecar is optional — ship the image without it
     buffer.seek(0)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return send_file(
@@ -4096,7 +4101,7 @@ def api_export_dataset():
 
 # ── API: push a curated dataset to HuggingFace ────────────────────────────────
 
-_HF_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+_HF_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+\Z")
 
 # Background HF-export jobs, keyed by a generated id. Each value is
 # ``{state: running|done|error, message, data, repo_id, slug}``. The upload runs
@@ -4457,14 +4462,14 @@ def api_vision_health():
 # reject any request whose ``remote_addr`` isn't loopback — they are single-user
 # admin-only.
 
-import mimetypes
-import tempfile as _tempfile
 import time as _wave_time
 from urllib.parse import urlparse as _wave_urlparse
 
 # SSRF guard: reuse the one that ships with scheduler. Keeps the invariant that
 # there's exactly ONE public/private classifier for the whole codebase.
-from scheduler import _is_public_http_url as _wave_is_public_http_url
+# Same SSRF guard the scheduler applies to webhook URLs — reused verbatim so
+# the preset-fetch lane can never diverge from it.
+_wave_is_public_http_url = scheduler._is_public_http_url
 
 # 15s cap on every remote fetch (presets, gists, LM Studio model info).
 _WAVE_HTTP_TIMEOUT: float = 15.0
@@ -4620,7 +4625,7 @@ try:
     try:
         root.destroy()
     except Exception:
-        pass
+        pass  # Tk teardown is noisy on some platforms; the path is already picked
     # Empty string = user cancelled.
     if path:
         sys.stdout.write(path)
@@ -4660,8 +4665,9 @@ def api_system_folder_picker():
             return jsonify({"ok": False, "path": None, "cancelled": False,
                             "error": "folder picker timed out"}), 504
         except FileNotFoundError as exc:
+            logger.warning("folder picker spawn failed: %s", exc)
             return jsonify({"ok": False, "path": None, "cancelled": False,
-                            "error": f"could not spawn picker: {exc}"}), 500
+                            "error": "could not spawn the native folder picker"}), 500
 
         if proc.returncode == 2:
             # tkinter missing: this is common on stripped-down Python builds.
@@ -4743,7 +4749,7 @@ def api_presets_community():
     return jsonify(out)
 
 
-_COMMUNITY_FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.preset\.json$", re.IGNORECASE)
+_COMMUNITY_FILENAME_RE = re.compile(r"^[a-z0-9_-]+\.preset\.json\Z", re.IGNORECASE)
 
 
 def _load_community_preset_body(filename: str) -> tuple[bool, str, dict | None]:
@@ -4799,10 +4805,11 @@ def api_presets_preview():
         _name, cfg = config_io.import_preset(body)
     except config_io.ValidationError as exc:
         # Fall back to treating the raw payload as a bare inheritable cfg.
+        logger.warning("preset envelope parse failed: %s", exc)
         cleaned, err = _validate_inheritable_cfg(body, partial=False)
         if err or cleaned is None:
             return jsonify({"ok": False, "cfg": None, "warnings": [],
-                            "error": f"validation failed: {exc}"}), 400
+                            "error": f"validation failed: {err or 'not a valid preset'}"}), 400
         cfg = cleaned
         warnings.append("payload was not a portable preset envelope; validated as raw cfg")
     return jsonify({"ok": True, "cfg": cfg, "warnings": warnings, "error": None})
@@ -5009,7 +5016,8 @@ def api_vision_dry_run():
         img.convert("RGB").save(buf, format="JPEG", quality=90)
         b64 = _b64encode_bytes(buf.getvalue())
     except (OSError, ValueError) as exc:
-        return jsonify({"ok": False, "error": f"could not read image: {exc}"}), 400
+        logger.warning("vision dry-run image decode failed: %s", exc)
+        return jsonify({"ok": False, "error": "could not read image"}), 400
 
     # ``build_classification_prompt`` reads the score / caption config from env,
     # which the supervisor projects from the active job. Nothing else to wire.
@@ -5317,7 +5325,7 @@ def api_export_preview():
                     with Image.open(sample.image_path) as img:
                         width, height = img.size
                 except (OSError, ValueError):
-                    pass
+                    pass  # undecodable image — it just reports 0x0 in the stats
             longest = max(width, height)
             if longest <= 0:
                 pass
@@ -5427,7 +5435,8 @@ def api_gallery_bulk_action():
                     pass  # non-fatal — the move already succeeded
             moved += 1
         except OSError as exc:
-            failed.append({"path": raw, "error": f"filesystem error: {exc}"})
+            logger.warning("bulk move failed for %r: %s", raw, exc)
+            failed.append({"path": raw, "error": "filesystem error"})
     # Invalidate the sorted cache so the gallery reflects the moves.
     with _sorted_cache_lock:
         _sorted_cache["ts"] = 0.0
@@ -5449,7 +5458,6 @@ def api_gallery_requeue():
     file-shuffling logic remains in one place.
     """
     data = request.get_json() or {}
-    slug = (data.get("job_slug") or "").strip() or _resolve_job_slug() or "default"
     category = (data.get("category") or "").strip() or None
     since_raw = (data.get("since") or "").strip()
     paths_arg = data.get("paths")
@@ -5545,19 +5553,22 @@ def api_scrapers_gallery_dl_test_url():
         try:
             cp = Path(raw_path).expanduser().resolve()
         except (OSError, ValueError) as exc:
-            return jsonify({"ok": False, "error": f"invalid cookies file path: {exc}"})
+            logger.warning("cookies path resolve failed: %s", exc)
+            return jsonify({"ok": False, "error": "invalid cookies file path"})
         if not cp.exists() or not cp.is_file():
-            return jsonify({"ok": False, "error": f"cookies file not found: {cp}"})
+            return jsonify({"ok": False, "error": f"cookies file not found: {raw_path}"})
         try:
             size = cp.stat().st_size
         except OSError as exc:
-            return jsonify({"ok": False, "error": f"cannot stat cookies file: {exc}"})
+            logger.warning("cookies stat failed: %s", exc)
+            return jsonify({"ok": False, "error": "cannot stat cookies file"})
         if size > 1_048_576:  # 1 MB defensive cap
             return jsonify({"ok": False, "error": "cookies file too large (>1 MB)"})
         try:
             content = cp.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            return jsonify({"ok": False, "error": f"cannot read cookies file: {exc}"})
+            logger.warning("cookies read failed: %s", exc)
+            return jsonify({"ok": False, "error": "cannot read cookies file"})
         # Netscape-format sanity check — saves users a bewildering downstream
         # ValueError from gallery-dl's cookiejar parser.
         first_line = content.lstrip().splitlines()[0] if content.strip() else ""
@@ -5695,7 +5706,7 @@ _COOKIES_HEADER = (
 )
 # 30 days from now for cookies with no expiry set — matches the extension defaults.
 _COOKIES_DEFAULT_TTL_SECONDS = 30 * 24 * 3600
-_COOKIES_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_COOKIES_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\Z")
 
 
 def _parse_devtools_cookies(raw: str, target_domain: str) -> list[dict]:
@@ -6204,7 +6215,7 @@ def api_presets_publish(key: str):
                 })
             return jsonify({"ok": False, "error": f"git commit failed: {cleaned}"}), 500
 
-        _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], worktree_dir)
+        _rc, sha_out, _sha_err = _git_run([git_bin, "rev-parse", "HEAD"], worktree_dir)
         new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
 
         rc, _out, err = _git_run(
@@ -6483,7 +6494,7 @@ def api_themes_publish(name: str):
             "error": f"git commit failed: {cleaned}",
         }), 500
 
-    _rc, sha_out, _err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
+    _rc, sha_out, _sha_err = _git_run([git_bin, "rev-parse", "HEAD"], WORKSPACE_ROOT)
     new_sha = sha_out.strip().splitlines()[0] if sha_out.strip() else ""
 
     rc, _out, err = _git_run([git_bin, "push", "origin", "HEAD"], WORKSPACE_ROOT)
@@ -6496,7 +6507,7 @@ def api_themes_publish(name: str):
             "hint": "the commit is saved locally — push it manually with: git push origin HEAD",
         }), 500
 
-    _rc, br_out, _err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
+    _rc, br_out, _br_err = _git_run([git_bin, "rev-parse", "--abbrev-ref", "HEAD"], WORKSPACE_ROOT)
     branch = (br_out.strip().splitlines()[0] if br_out.strip() else "HEAD")
 
     return jsonify({
@@ -15827,7 +15838,6 @@ def dashboard():
 #   * lm-keepalive worker is in PIPELINE_VISION_WORKERS (user explicitly wants
 #     the model resident — pinging every 15s would defeat us anyway)
 
-import time as _time
 
 _IDLE_POLL_SECONDS = 60
 

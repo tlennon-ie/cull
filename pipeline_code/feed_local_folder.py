@@ -17,7 +17,6 @@ No path is hardcoded - paths.py supplies defaults.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -33,7 +32,6 @@ from pipeline_logging import get_logger
 from queue_manager import save_to_queue
 from seen_store import MigrationSpec, SeenStore
 from topic_filter import prompt_optional
-import media_policy
 
 logger = get_logger(__name__)
 

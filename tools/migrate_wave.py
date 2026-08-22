@@ -29,7 +29,6 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_CODE = REPO_ROOT / "pipeline_code"

@@ -58,7 +58,7 @@ SOURCES: dict[str, str] = {
     "unknown": "unknown",
 }
 
-_SAFE_SOURCE = re.compile(r"^[a-z0-9_]+$")
+_SAFE_SOURCE = re.compile(r"^[a-z0-9_]+\Z")
 _QUEUE_IMAGE_EXTS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 # Legacy glob-form aliases — tests + a couple of external callers still import
 # these under the *_GLOBS names. Derived once so the two views can't drift.

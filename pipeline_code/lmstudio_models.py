@@ -7,7 +7,6 @@ Used by dashboard admin panel to let users select models at runtime
 import os
 import requests
 import json
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()

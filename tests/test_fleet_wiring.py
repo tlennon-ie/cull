@@ -19,7 +19,6 @@ the HTTP call is mocked at ``requests.post`` on the worker module.
 """
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
@@ -273,7 +272,6 @@ def test_grammar_absent_when_gate_off(monkeypatch):
 def test_grammar_build_failure_falls_back(monkeypatch):
     """If grammar conversion raises, the request still goes out via response_format
     (best-effort) with no grammar key — the worker must not hard-fail."""
-    import vision_worker_balanced_openai as mod
     import gbnf_grammar
 
     worker, captured = _make_worker(monkeypatch, OPENAI_COMPAT_PROVIDER="llamacpp")

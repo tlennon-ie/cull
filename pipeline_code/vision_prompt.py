@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from categories import (
-    SCHEMA_CATEGORIES,
     category_pipe_string,
     get_category_hints,
     get_global_rules,

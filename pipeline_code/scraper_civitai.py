@@ -200,7 +200,7 @@ def scrape_pages(seen: set) -> int:
     cursor = None
     params = dict(BROWSE_PARAMS)
 
-    print(f"=== Civitai tRPC scraper ===")
+    print("=== Civitai tRPC scraper ===")
     print(f"Base models: {params['baseModels']}")
     print(f"browsingLevel: {params['browsingLevel']} | excludedTags: {len(params['excludedTagIds'])}")
 
