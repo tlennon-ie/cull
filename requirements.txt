@@ -16,7 +16,7 @@ Pillow>=11.0
 python-dotenv>=1.2.2
 
 # ── HTTP clients ─────────────────────────────────────────────────────────
-requests>=2.32                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.32
+requests>=2.34.2                    # CVE-2024-35195 / CVE-2024-47081 fixed in 2.32
 
 # ── Vision provider SDKs (only the ones you'll use need to be installed) ──
 groq>=1.5.0                        # Groq cloud worker
