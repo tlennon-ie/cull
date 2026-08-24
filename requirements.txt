@@ -10,7 +10,7 @@ Flask>=3.1
 Flask-Cors>=6.0                   # 4.x/5.x carried CORS CVEs; 6.x is the secure line
 
 # ── Image handling ───────────────────────────────────────────────────────
-Pillow>=11.0
+Pillow>=12.3.0
 
 # ── Environment loading ──────────────────────────────────────────────────
 python-dotenv>=1.2.2
