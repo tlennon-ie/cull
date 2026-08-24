@@ -68,7 +68,7 @@ dependencies = [
     "groq>=1.5.0",
     "playwright>=1.49",
     "schedule>=1.2",
-    "yt-dlp>=2026.6.9",
+    "yt-dlp>=2026.8.19",
     "huggingface_hub>=1.22.0",
     # Bundled static ffmpeg binary (~5MB, cross-platform). Base-installed so
     # videos work out of the box: dashboard playback + poster frames, and the
