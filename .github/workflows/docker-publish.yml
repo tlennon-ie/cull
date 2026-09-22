@@ -97,7 +97,7 @@ jobs:
       # Publishes an in-toto attestation next to the pushed image so consumers
       # can verify it was built by this workflow from this commit.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
