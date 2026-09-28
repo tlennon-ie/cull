@@ -97,7 +97,7 @@ video = [
 # Embeddings / aesthetic prefilter / ML.
 ml = [
     "torch>=2.2",
-    "open_clip_torch>=2.24",
+    "open_clip_torch>=3.3.0",
 ]
 # Dev / CI tooling.
 dev = [
