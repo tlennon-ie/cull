@@ -68,7 +68,9 @@ and point at the test that pins it.
 
 Please **do not** open a public GitHub issue for security problems.
 
-Email the maintainer at **[email removed]** with:
+Report it privately through GitHub's private vulnerability reporting
+(Security tab → *Report a vulnerability*, or [this link](https://github.com/tlennon-ie/cull/security/advisories/new)).
+Reports there are visible only to the maintainers. Include:
 
 1. A concise description of the issue.
 2. The affected commit / release.
