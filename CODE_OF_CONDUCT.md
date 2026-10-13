@@ -60,8 +60,11 @@ appointed representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainer at **thomaslennon86@gmail.com**. All
-complaints will be reviewed and investigated promptly and fairly.
+reported privately to the project maintainer through the repository's private
+reporting form ([link](https://github.com/tlennon-ie/cull/security/advisories/new)),
+which only maintainers can see. For a specific issue, pull request or comment you can also use GitHub's
+*Report content* option. All complaints will be reviewed and investigated
+promptly and fairly.
 
 All project maintainers are obligated to respect the privacy and security of
 the reporter of any incident.
