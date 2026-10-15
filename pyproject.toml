@@ -90,7 +90,7 @@ cloud = [
 # system install); it is also listed here so ``pip install .[video]`` still
 # pulls it explicitly when the base requirements are ignored.
 video = [
-    "scenedetect>=0.7",
+    "scenedetect>=0.7.1",
     "ffmpeg-python>=0.2",
     "imageio-ffmpeg>=0.4",
 ]
