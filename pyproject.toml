@@ -82,7 +82,7 @@ dependencies = [
 cloud = [
     "openai>=1.40",
     "anthropic>=0.112.0",
-    "google-genai>=1.0",
+    "google-genai>=2.25.0",
 ]
 # Video lane — frame extraction / scene detection.
 # ``imageio-ffmpeg`` is already in the base dependencies (the bundled binary is
