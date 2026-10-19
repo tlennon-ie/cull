@@ -60,7 +60,7 @@ classifiers = [
 # to PyPI, so it is intentionally installed via requirements.txt rather than
 # duplicated here (see the "Known limitation" note in README → Optional extras).
 dependencies = [
-    "Flask>=3.1",
+    "Flask>=3.1.3",
     "Flask-Cors>=6.0.5",
     "Pillow>=12.3.0",
     "python-dotenv>=1.2.3",
