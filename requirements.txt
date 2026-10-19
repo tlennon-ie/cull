@@ -43,7 +43,7 @@ huggingface_hub>=1.22.0           # push curated sets to a private HF dataset re
 #   • the optional video-classify lane (with scenedetect / ffmpeg-python from
 #     the [video] extra) can extract frames without a system-ffmpeg install.
 # video_frames._resolve_ffmpeg_bin() prefers PATH → falls back to this bundle.
-imageio-ffmpeg>=0.4
+imageio-ffmpeg>=0.6.0
 
 # ── Optional feature extras (NOT installed by base; see pyproject extras) ──
 # Heavy/optional capabilities import-guard their deps so the base stays lean:

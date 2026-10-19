@@ -74,7 +74,7 @@ dependencies = [
     # videos work out of the box: dashboard playback + poster frames, and the
     # video-classify lane (paired with the [video] extra) can extract frames
     # with zero system-ffmpeg install. See video_frames._resolve_ffmpeg_bin().
-    "imageio-ffmpeg>=0.4",
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [project.optional-dependencies]
@@ -92,7 +92,7 @@ cloud = [
 video = [
     "scenedetect>=0.7.1",
     "ffmpeg-python>=0.2",
-    "imageio-ffmpeg>=0.4",
+    "imageio-ffmpeg>=0.6.0",
 ]
 # Embeddings / aesthetic prefilter / ML.
 ml = [
